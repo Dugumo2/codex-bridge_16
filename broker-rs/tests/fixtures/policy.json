@@ -1,0 +1,176 @@
+{
+  "说明": "托管线程上服务端请求的自动应答策略（详细设计 4.2 节第 4 条、命令面规格 6.1 节、S1-评审第 27 节拍板 L：提问一律交给人）。Rust 的 policy::decide 与 S4 的 TS 实现都必须逐条通过；expect.kind 为 answer（result 原样回给 app-server）、inbox（登记进 inbox）或 methodNotFound（回 -32601）。params 缺省按 {} 处理。",
+  "cases": [
+    {
+      "name": "never：命令审批自动接受（上游 autoApproveHandler，approvals.ts 20–27 行；turns.ts 1470–1474 行的回包形状）",
+      "policy": "never",
+      "method": "item/commandExecution/requestApproval",
+      "params": {"threadId": "t", "turnId": "u", "itemId": "i", "command": "ls"},
+      "expect": {"kind": "answer", "result": {"decision": "accept"}}
+    },
+    {
+      "name": "never：文件修改审批自动接受",
+      "policy": "never",
+      "method": "item/fileChange/requestApproval",
+      "params": {"threadId": "t", "turnId": "u", "itemId": "i"},
+      "expect": {"kind": "answer", "result": {"decision": "accept"}}
+    },
+    {
+      "name": "never：多题有选项也进 inbox，交给人选择",
+      "policy": "never",
+      "method": "item/tool/requestUserInput",
+      "params": {"threadId": "t", "turnId": "u", "itemId": "i", "questions": [
+        {"id": "q1", "question": "选哪个？", "options": [{"label": "甲"}, {"label": "乙"}]},
+        {"id": "q2", "question": "继续吗？", "options": [{"label": "是", "description": "继续"}]}
+      ]},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "never：没有选项的题目也进 inbox",
+      "policy": "never",
+      "method": "item/tool/requestUserInput",
+      "params": {"threadId": "t", "questions": [{"id": "q1", "question": "名字？"}, {"id": "q2", "question": "x", "options": []}]},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "never：没有 questions 字段也进 inbox",
+      "policy": "never",
+      "method": "item/tool/requestUserInput",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "never：权限请求按 session 授予所请求的全部权限",
+      "policy": "never",
+      "method": "item/permissions/requestApproval",
+      "params": {"threadId": "t", "permissions": {"fileSystem": {"write": ["D:/x"]}}},
+      "expect": {"kind": "answer", "result": {"scope": "session", "permissions": {"fileSystem": {"write": ["D:/x"]}}}}
+    },
+    {
+      "name": "never：权限请求缺 permissions 时授予空对象",
+      "policy": "never",
+      "method": "item/permissions/requestApproval",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "answer", "result": {"scope": "session", "permissions": {}}}
+    },
+    {
+      "name": "never：MCP 表单直接接受、content 为空对象",
+      "policy": "never",
+      "method": "mcpServer/elicitation/request",
+      "params": {"threadId": "t", "serverName": "grok", "mode": "form", "requestedSchema": {"type": "object"}},
+      "expect": {"kind": "answer", "result": {"action": "accept", "content": {}}}
+    },
+    {
+      "name": "never：URL 模式的 MCP 请求同样接受",
+      "policy": "never",
+      "method": "mcpServer/elicitation/request",
+      "params": {"threadId": "t", "mode": "url", "url": "https://example.com", "elicitationId": "e1"},
+      "expect": {"kind": "answer", "result": {"action": "accept", "content": {}}}
+    },
+    {
+      "name": "never：未来新增的请求方法进 inbox（4.2 节第 4 条「其余进 inbox」）",
+      "policy": "never",
+      "method": "item/someFutureRequest",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "never：托管线程上的动态工具回 -32601（4.1 节）",
+      "policy": "never",
+      "method": "item/tool/call",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "methodNotFound"}
+    },
+    {
+      "name": "auto：命令审批进 inbox（正常由服务端 Guardian 审，到了 broker 就要人答）",
+      "policy": "auto",
+      "method": "item/commandExecution/requestApproval",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "auto：文件修改审批进 inbox",
+      "policy": "auto",
+      "method": "item/fileChange/requestApproval",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "auto：提问进 inbox（拍板 L：所有策略下生成 qu_）",
+      "policy": "auto",
+      "method": "item/tool/requestUserInput",
+      "params": {"threadId": "t", "questions": [{"id": "q1", "question": "?", "options": [{"label": "a"}]}]},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "auto：权限请求进 inbox",
+      "policy": "auto",
+      "method": "item/permissions/requestApproval",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "auto：MCP 表单进 inbox",
+      "policy": "auto",
+      "method": "mcpServer/elicitation/request",
+      "params": {"threadId": "t", "mode": "form"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "auto：动态工具回 -32601",
+      "policy": "auto",
+      "method": "item/tool/call",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "methodNotFound"}
+    },
+    {
+      "name": "on-request：命令审批进 inbox",
+      "policy": "on-request",
+      "method": "item/commandExecution/requestApproval",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "on-request：提问进 inbox",
+      "policy": "on-request",
+      "method": "item/tool/requestUserInput",
+      "params": {"threadId": "t", "questions": [{"id": "q1", "question": "?", "options": [{"label": "a"}]}]},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "on-request：动态工具回 -32601",
+      "policy": "on-request",
+      "method": "item/tool/call",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "methodNotFound"}
+    },
+    {
+      "name": "on-failure：权限请求进 inbox",
+      "policy": "on-failure",
+      "method": "item/permissions/requestApproval",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "on-failure：MCP 表单进 inbox",
+      "policy": "on-failure",
+      "method": "mcpServer/elicitation/request",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "untrusted：文件修改审批进 inbox",
+      "policy": "untrusted",
+      "method": "item/fileChange/requestApproval",
+      "params": {"threadId": "t"},
+      "expect": {"kind": "inbox"}
+    },
+    {
+      "name": "untrusted：未来新增的请求方法进 inbox",
+      "policy": "untrusted",
+      "method": "item/someFutureRequest",
+      "params": {},
+      "expect": {"kind": "inbox"}
+    }
+  ]
+}

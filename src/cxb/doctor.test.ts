@@ -1,0 +1,277 @@
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { BrokerNotRunning } from "./broker-conn";
+import { CXB_PROTOCOL_VERSION, CxbError, type BrokerConnection } from "./contracts";
+import { createDoctorHandler, describeAuth, runDiagnosticProcess, type DoctorDeps } from "./doctor";
+import { HANDLERS } from "./main";
+import { N5Harness } from "./test-fixtures/n5a-support";
+import { FakeRpc } from "./test-fixtures/run-fakes";
+import { alive, until } from "./test-fixtures/main-test-support";
+import { bounded } from "./wait-run";
+import { writeUserConfig } from "./user-config";
+
+let h: N5Harness;
+let rpc: FakeRpc;
+let deps: Partial<DoctorDeps>;
+let conn: BrokerConnection;
+let closes: number;
+let probes: unknown[];
+let children: Set<number>;
+beforeEach(() => {
+  h = new N5Harness(); rpc = new FakeRpc(); closes = 0; probes = []; children = new Set();
+  conn = { rpc: rpc.rpc, handshake: { brokerVersion: "1.2.3", protocolVersion: CXB_PROTOCOL_VERSION, epoch: 1, userAgent: "模拟服务器", server: { kind: "private", via: "spawn" } }, launched: false, close: async () => { closes++; } };
+  rpc.handle = (method) => {
+    if (method === "broker/health") return { brokerVersion: "1.2.3", protocolVersion: CXB_PROTOCOL_VERSION, epoch: 1, uptimeMs: 100, claims: 0, pending: 0, storage: "ok", survivesParentJob: true, parentJob: false };
+    if (method === "account/read") return { account: { type: "chatgpt", email: "a@b.com", planType: "pro" } };
+    if (method === "model/list") return { data: [{ id: "模型甲", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
+    return {};
+  };
+  deps = { findExecutable: () => "模拟-codex", resolveBrokerBin: () => "模拟-broker",
+    runProcess: async (bin, args) => bin === "模拟-broker" ? "cxb-broker 1.2.3\n" : args[0] === "--version" ? "codex 0.160.0\n" : "default_mode_request_user_input experimental false\n",
+    connectBroker: async (opts) => { expect(opts.probe).toBe(true); probes.push(opts); return conn; },
+    preflight: async () => ({ check: "mcpApprovalRisk", status: "ok", servers: [] }) };
+});
+afterEach(async () => {
+  const errors: unknown[] = [];
+  for (const pid of children) {
+    try {
+      if (alive(pid)) { process.kill(pid, "SIGKILL"); await until(() => !alive(pid), 2000, "诊断子进程未退出"); throw new Error("诊断子进程遗留，已强制回收"); }
+    } catch (error) { errors.push(error); }
+  }
+  try { await h.cleanup(); } catch (error) { errors.push(error); }
+  if (errors.length) throw new AggregateError(errors, "doctor 测试清理失败");
+}, 15_000);
+
+async function invoke(flags = ["--json", "-v"]) {
+  return h.invoke(["doctor", ...flags], { ...HANDLERS, doctor: createDoctorHandler(deps) });
+}
+const checkOf = (result: { stdout: string }, name: string) => JSON.parse(result.stdout).checks.find((item: any) => item.name === name);
+
+test("所有诊断通过、完整健康信息、有效审批和只读方法", async () => {
+  writeUserConfig(h.home, { approval: "auto", "broker-idle-timeout": 123 });
+  let approval = "";
+  deps.preflight = async (policy, _env, limit) => { approval = policy; expect(limit.timeoutMs).toBeLessThanOrEqual(10_000); expect(limit.signal.aborted).toBe(false); return { check: "mcpApprovalRisk", status: "ok", servers: [] }; };
+  const result = await invoke();
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout).summary).toEqual({ pass: 11, warn: 0, fail: 0 });
+  expect(checkOf(result, "config")).toMatchObject({ idleTimeout: 123, source: "config" });
+  expect(checkOf(result, "broker")).toMatchObject({ status: "pass", launched: false, storage: "ok", epoch: 1, uptimeMs: 100, claims: 0, pending: 0 });
+  expect(checkOf(result, "broker").detail).toContain("运行中实例的空闲期限未知");
+  expect(checkOf(result, "models")).toMatchObject({ count: 1, defaults: ["模型甲"] });
+  expect(checkOf(result, "askUserInput").detail).toContain("false");
+  expect(approval).toBe("auto");
+  expect(closes).toBe(1);
+  expect(rpc.calls.map((call) => call.method)).toEqual(["broker/health", "account/read", "model/list"]);
+  expect(rpc.calls.find((call) => call.method === "account/read")!.params).toEqual({ refreshToken: false });
+});
+
+test("未运行正常退出且依赖项未检查，缺省空闲期限三百秒", async () => {
+  deps.connectBroker = async (opts) => { expect(opts.probe).toBe(true); throw new BrokerNotRunning(); };
+  const result = await invoke();
+  expect(result.code).toBe(0);
+  expect(checkOf(result, "broker")).toMatchObject({ status: "pass", launched: false });
+  expect(checkOf(result, "broker").detail).toContain("未运行");
+  for (const name of ["appServer", "account", "models"]) expect(checkOf(result, name)).toMatchObject({ status: "warn", detail: "未检查（broker 未运行或不可用）" });
+  expect(checkOf(result, "config")).toMatchObject({ idleTimeout: 300, source: "default" });
+  expect(rpc.calls).toHaveLength(0);
+});
+
+for (const scenario of ["找不到codex", "codex执行失败", "配置损坏", "目录不可写", "找不到broker", "broker版本损坏", "连接失败", "握手版本不符", "健康协议不符"]) test(`必需检查失败、退出一并继续：${scenario}`, async () => {
+  let name = "broker";
+  if (scenario === "找不到codex") { deps.findExecutable = () => null; name = "codex"; }
+  if (scenario === "codex执行失败") { const run = deps.runProcess!; deps.runProcess = async (bin, args, limit) => { if (bin === "模拟-codex") throw new CxbError("LOCAL_ERROR", "模拟执行失败"); return run(bin, args, limit); }; name = "codex"; }
+  if (scenario === "配置损坏") { writeFileSync(join(h.home, "config.json"), "{"); name = "config"; }
+  if (scenario === "目录不可写") { deps.probeWritable = () => { throw new CxbError("LOCAL_ERROR", "目录只读"); }; name = "workspace"; }
+  if (scenario === "找不到broker") { deps.resolveBrokerBin = () => { throw new CxbError("LOCAL_ERROR", "找不到二进制"); }; name = "brokerBinary"; }
+  if (scenario === "broker版本损坏") { const run = deps.runProcess!; deps.runProcess = async (bin, args, limit) => bin === "模拟-broker" ? "错误版本" : run(bin, args, limit); name = "brokerBinary"; }
+  if (scenario === "连接失败") deps.connectBroker = async () => { throw new CxbError("BROKER_UNAVAILABLE", "管道不可访问"); };
+  if (scenario === "握手版本不符") conn.handshake.brokerVersion = "9.9.9";
+  if (scenario === "健康协议不符") { const handle = rpc.handle; rpc.handle = (method, params) => method === "broker/health" ? { ...(handle(method, params) as object), protocolVersion: 999 } : handle(method, params); }
+  const result = await invoke();
+  expect(result.code).toBe(1);
+  expect(JSON.parse(result.stdout).ok).toBe(false);
+  expect(checkOf(result, name).status).toBe("fail");
+  expect(checkOf(result, "askUserInput")).toBeDefined();
+  if (scenario.includes("不符")) {
+    expect(checkOf(result, "broker").detail).toContain("下一个普通命令");
+    expect(rpc.calls.map((call) => call.method)).toEqual(["broker/health"]);
+    expect(closes).toBe(1);
+  }
+});
+
+for (const scenario of ["未知配置键", "存储降级", "明确未登录", "账号失败", "模型失败", "风险MCP", "预检不可用", "提问开关不存在", "features失败"]) test(`可选检查告警仍退出零：${scenario}`, async () => {
+  let name = "account";
+  const original = rpc.handle;
+  if (scenario === "未知配置键") { writeUserConfig(h.home, { future: 1 }); name = "config"; }
+  if (scenario === "存储降级") { rpc.handle = (m, p) => m === "broker/health" ? { ...(original(m, p) as object), storage: "degraded" } : original(m, p); name = "broker"; }
+  if (scenario === "明确未登录") rpc.handle = (m, p) => m === "account/read" ? { account: null, requiresOpenaiAuth: true } : original(m, p);
+  if (scenario === "账号失败" || scenario === "模型失败") { name = scenario === "账号失败" ? "account" : "models"; rpc.handle = (m, p) => { if (m === (name === "account" ? "account/read" : "model/list")) throw new CxbError("CODEX_FAILED", "请求失败"); return original(m, p); }; }
+  if (scenario === "风险MCP" || scenario === "预检不可用") { name = "mcpApprovalRisk"; deps.preflight = async () => ({ check: "mcpApprovalRisk", status: scenario === "风险MCP" ? "warn" : "unavailable", servers: [{ name: "搜索", source: "config.toml", effectiveMode: "未配置", risk: true, suggestion: "请加 --approval auto" }] }); }
+  if (scenario === "提问开关不存在" || scenario === "features失败") { name = "askUserInput"; const run = deps.runProcess!; deps.runProcess = async (bin, args, limit) => { if (args[0] === "features") { if (scenario === "features失败") throw new Error("失败"); return "其他开关 true"; } return run(bin, args, limit); }; }
+  const result = await invoke();
+  expect(result.code).toBe(0); expect(checkOf(result, name).status).toBe("warn");
+  if (scenario === "风险MCP") expect(checkOf(result, name).servers).toEqual([{ name: "搜索", source: "config.toml", mode: "未配置", risk: true, recommendation: "请加 --approval auto" }]);
+});
+
+test("共享服务器接入信息与本机检查的局限", async () => {
+  conn.handshake.server = { kind: "shared", via: "socket", socketPath: "管道路径" };
+  const result = await invoke();
+  expect(checkOf(result, "appServer")).toMatchObject({ server: conn.handshake.server, userAgent: "模拟服务器" });
+  expect(checkOf(result, "appServer").detail).toContain("其他路径未探测");
+  expect(checkOf(result, "appServer").detail).toContain("本机 features 结果不能代表共享服务器");
+});
+
+for (const [read, ready, text] of [
+  [{ account: { type: "chatgpt", email: "a@b.com", planType: "pro" }, requiresOpenaiAuth: true }, true, "pro，a@b.com"],
+  [{ account: { type: "apiKey" }, requiresOpenaiAuth: true }, true, "未验证"],
+  [{ account: null, requiresOpenaiAuth: false }, true, "不要求"],
+  [{ account: { type: "somethingNew" }, requiresOpenaiAuth: true }, true, "未知账号类型"],
+  ["unknown", true, "未能确认"], [{ account: null, requiresOpenaiAuth: true }, false, "明确未登录"],
+  [{ account: null }, true, "暂按可用"], [{ account: null, requiresOpenaiAuth: null }, true, "暂按可用"], [{}, true, "暂按可用"],
+] as const) test(`迁入账号规则：${text} ${JSON.stringify(read)}`, () => {
+  expect(describeAuth(read)).toMatchObject({ ready }); expect(describeAuth(read).detail).toContain(text);
+});
+
+for (const repeated of [true, false]) test(`模型分页${repeated ? "游标不前进" : "超过二十页"}停止并告警`, async () => {
+  const original = rpc.handle; let pages = 0;
+  rpc.handle = (m, p) => m === "model/list" ? { data: [], nextCursor: repeated ? "相同" : String(++pages) } : original(m, p);
+  const result = await invoke();
+  expect(checkOf(result, "models").status).toBe("warn");
+  expect(rpc.calls.filter((call) => call.method === "model/list")).toHaveLength(repeated ? 2 : 20);
+});
+
+test("模型分页取完，普通文本只列数量和默认，详细 JSON 带推理能力", async () => {
+  const original = rpc.handle;
+  rpc.handle = (m, p) => m === "model/list" ? p.cursor ? { data: [{ id: "模型乙" }], nextCursor: null } : { data: [{ id: "模型甲", isDefault: true }], nextCursor: "下一页" } : original(m, p);
+  const result = await invoke([]);
+  expect(result.stdout).toContain("共 2 个模型；默认模型：模型甲"); expect(result.stdout).not.toContain("模型乙");
+  const verbose = await invoke(["-v"]);
+  expect(verbose.stdout).toContain("全部模型：模型甲、模型乙");
+  expect(verbose.stdout.trim().split("\n")).toHaveLength(12);
+});
+
+for (const target of ["account/read", "model/list", "features", "codex"]) test(`单项期限传到底层并按检查类型判定：${target}`, async () => {
+  deps.itemMs = 20;
+  const original = rpc.handle; const run = deps.runProcess!;
+  const pending = new Promise<never>(() => {});
+  if (target.includes("/")) rpc.handle = (m, p) => m === target ? pending : original(m, p);
+  else deps.runProcess = async (bin, args, limit) => {
+    if ((target === "features" && args[0] === "features") || (target === "codex" && bin === "模拟-codex" && args[0] === "--version")) {
+      await new Promise<void>((resolve) => limit.signal.addEventListener("abort", () => resolve(), { once: true }));
+      throw new CxbError("TIMEOUT", "模拟进程已取消并回收");
+    }
+    return run(bin, args, limit);
+  };
+  const result = await invoke();
+  const name = target === "account/read" ? "account" : target === "model/list" ? "models" : target === "features" ? "askUserInput" : "codex";
+  expect(checkOf(result, name).status).toBe(target === "codex" ? "fail" : "warn");
+  expect(result.code).toBe(target === "codex" ? 1 : 0);
+  expect(closes).toBe(1);
+});
+
+test("总预算用尽单列失败，剩余项目未检查，不继续连接", async () => {
+  let now = 0; deps.now = () => now; deps.totalMs = 50;
+  deps.runProcess = async (_bin, _args, limit) => { expect(limit.timeoutMs).toBe(50); now = 51; return "版本"; };
+  const result = await invoke();
+  expect(result.code).toBe(1);
+  expect(checkOf(result, "doctorBudget").status).toBe("fail");
+  for (const name of ["config", "workspace", "brokerBinary", "broker", "appServer", "account", "models", "mcpApprovalRisk", "askUserInput"]) expect(checkOf(result, name)).toMatchObject({ status: "warn", detail: "未检查（总期限用尽）" });
+  expect(probes).toHaveLength(0);
+});
+
+test("连接迟到收到取消并关闭，不发健康请求", async () => {
+  deps.totalMs = 35;
+  let stopped = false;
+  deps.connectBroker = (opts) => new Promise((resolve) => opts.signal!.addEventListener("abort", () => { stopped = true; resolve(conn); }, { once: true }));
+  const result = await invoke();
+  await bounded(Promise.resolve(), 1000);
+  expect(stopped).toBe(true); expect(closes).toBe(1); expect(rpc.calls).toHaveLength(0);
+  expect(checkOf(result, "doctorBudget").status).toBe("fail");
+});
+
+test("取消传递给正在等待的连接并收束句柄", async () => {
+  let started!: () => void; const ready = new Promise<void>((resolve) => started = resolve);
+  let aborted = false;
+  deps.connectBroker = (opts) => new Promise((resolve) => { opts.signal!.addEventListener("abort", () => { aborted = true; resolve(conn); }, { once: true }); started(); });
+  const work = invoke(); await bounded(ready, 2000);
+  // 信号处理层最终覆盖为 130/143；这里验证处理器收到取消和连接回收。
+  const signals = [...h.cleanups].map((cleanup) => Promise.resolve(cleanup("SIGINT")));
+  const result = await bounded(work, 3000);
+  await bounded(Promise.all(signals), 4000);
+  expect(result.code).toBe(4); expect(aborted).toBe(true); expect(closes).toBe(1);
+});
+
+test("上游伪造换行与秘密在文本和 JSON 中均脱敏为有界单行", async () => {
+  conn.handshake.userAgent = "Bearer 隐私甲\nPASS forged: 成功\ttoken=隐私乙";
+  conn.handshake.server = { kind: "shared", apiKey: "隐私丙", via: "authorization: 隐私丁" };
+  const original = rpc.handle;
+  rpc.handle = (m, p) => { if (m === "account/read") throw new Error("Bearer 隐私戊\nPASS evil: 伪造\npassword=隐私己"); return original(m, p); };
+  for (const flags of [["--json", "-v"], []]) {
+    const result = await invoke(flags);
+    for (const secret of ["隐私甲", "隐私乙", "隐私丙", "隐私丁", "隐私戊", "隐私己"]) expect(result.stdout).not.toContain(secret);
+    expect(result.stdout).not.toMatch(/\nPASS (forged|evil)/);
+    if (flags.length) {
+      const object = JSON.parse(result.stdout);
+      for (const check of object.checks) { expect(check.detail).not.toMatch(/[\r\n\t]/); expect(check.detail.length).toBeLessThanOrEqual(300); }
+      expect(object.checks).toHaveLength(11);
+    } else expect(result.stdout.trim().split("\n")).toHaveLength(12);
+  }
+});
+
+for (const wrapper of [false, true]) for (const cancel of [false, true]) test(`真实不退出${wrapper ? "命令包装进程树" : "子进程"}${cancel ? "取消" : "超时"}后确认已退出`, async () => {
+  const file = join(h.dir, "pid"); const fixture = join(import.meta.dir, "test-fixtures", "n5a-hang.ts");
+  const control = new AbortController();
+  const script = join(h.dir, "hang.cmd");
+  if (wrapper) writeFileSync(script, `@echo off\r\n"${process.execPath}" "${fixture}" "${file}"\r\n`);
+  const work = runDiagnosticProcess(wrapper ? script : process.execPath, wrapper ? [] : [fixture, file], { timeoutMs: 5000, signal: control.signal });
+  void work.catch(() => undefined);
+  await until(() => existsSync(file), 3000, "子进程没有登记 PID");
+  const pid = Number(readFileSync(file, "utf8")); children.add(pid);
+  expect(alive(pid)).toBe(true);
+  if (cancel) control.abort();
+  await expect(bounded(work, 6000)).rejects.toBeInstanceOf(CxbError);
+  expect(alive(pid)).toBe(false);
+}, 10_000);
+
+// 已知限制（doctor.ts 注释）：先退出的诊断程序留下的后代无法可靠回收，这里只验证 doctor 按期返回、不被管道挂住；后代由本测试清理。
+test("诊断程序先退出、后代仍占着输出管道时，按期以诊断错误返回并取消读取", async () => {
+  const file = join(h.dir, "pid"); const fixture = join(import.meta.dir, "test-fixtures", "n5a-orphan.ts");
+  const timeoutMs = 6000;
+  const started = performance.now();
+  const work = runDiagnosticProcess(process.execPath, [fixture, file], { timeoutMs, signal: new AbortController().signal });
+  void work.catch(() => undefined);
+  await until(() => existsSync(file) && Number(readFileSync(file, "utf8")) > 0, 3000, "后代没有登记 PID");
+  const pid = Number(readFileSync(file, "utf8")); children.add(pid);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const outcome = await Promise.race([
+    work.then(() => "正常结束", (error) => error),
+    new Promise((resolve) => { watchdog = setTimeout(() => resolve(new Error("看门狗：诊断未落定")), timeoutMs + 2000); }),
+  ]).finally(() => clearTimeout(watchdog));
+  expect(outcome).toBeInstanceOf(CxbError);
+  expect(performance.now() - started).toBeLessThan(timeoutMs + 1000);
+  // 已知限制：后代残留，由本用例结束并确认退出。
+  process.kill(pid, "SIGKILL");
+  await until(() => !alive(pid), 3000, "残留后代未能结束");
+  children.delete(pid);
+}, 15_000);
+
+for (const mode of ["both", "stdout-only"] as const) test(`诊断程序先退出、后代占着${mode === "both" ? "两路" : "仅标准输出"}管道时，运行 doctor 的进程收尾后能自然退出（未结束的读取已取消）`, async () => {
+  const pidFile = join(h.dir, "pid"); const doneFile = join(h.dir, "done");
+  const runner = Bun.spawn([process.execPath, join(import.meta.dir, "test-fixtures", "n5a-orphan-runner.ts"), pidFile, doneFile, mode],
+    { stdin: "ignore", stdout: "ignore", stderr: "ignore", windowsHide: true });
+  children.add(runner.pid);
+  await until(() => existsSync(pidFile) && Number(readFileSync(pidFile, "utf8")) > 0, 3000, "后代没有登记 PID");
+  const pid = Number(readFileSync(pidFile, "utf8")); children.add(pid);
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const exited = await Promise.race([
+    runner.exited.then(() => true),
+    new Promise<boolean>((resolve) => { watchdog = setTimeout(() => resolve(false), 9000); }),
+  ]).finally(() => clearTimeout(watchdog));
+  expect(existsSync(doneFile)).toBe(true);
+  expect(exited).toBe(true);
+  children.delete(runner.pid);
+  process.kill(pid, "SIGKILL");
+  await until(() => !alive(pid), 3000, "残留后代未能结束");
+  children.delete(pid);
+}, 20_000);

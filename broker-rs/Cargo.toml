@@ -1,0 +1,39 @@
+[package]
+name = "cxb-broker"
+version = "0.1.0"
+edition = "2021"
+description = "codex-bridge 的 broker：每个工作区一个进程，在 cxb CLI 与 Codex app-server 之间路由 JSON-RPC"
+publish = false
+
+[lib]
+name = "cxb_broker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cxb-broker"
+path = "src/main.rs"
+
+# 版本锁定与 S3 环境探测保持一致；
+# 其余依赖在对应里程碑引入时再加，见 S3-计划.md 第 2 节。
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# M7 共享接入：第 1、2 档共用的 WebSocket（只要握手与帧，不要 TLS 和自带的 TCP 连接）。
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+win32job = "2.0.3"
+
+[target.'cfg(windows)'.dependencies]
+# M7 第 1 档：Windows AF_UNIX 客户端，版本与 S3 环境探测一致（try_clone 已实测）。
+uds_windows = "=1.2.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tokio = { version = "=1.53.1", features = ["test-util"] }

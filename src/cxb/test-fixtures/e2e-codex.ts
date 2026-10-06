@@ -1,0 +1,231 @@
+// N2 端到端测试用的模拟 codex app-server（经 broker-harness 的 writeMockCodexScript 落成 codex.cmd 调用的脚本）。
+// 场景由环境变量选择（broker 经 launch 继承 CLI 的环境）：
+//   MOCK_E2E_SCENARIO：ask（开轮后提问，答后完成）、approval-ask-approval（审批 → 提问 → 审批 → 完成）、
+//                      early-ask（turn/start 回包前就提问）、ask-cancel（提问后等触发文件，发 serverRequest/resolved 撤销再完成）、
+//                      hold（本进程第一轮一直运行到 turn/interrupt，之后各轮立即完成）、complete（每轮立即完成）、
+//                      ask-big（提问，答后以远大于 64 KiB 的中文结果完成）；thread/archive、thread/delete 回成功，thread/list 回空；
+//                      review/start 不分场景：迁到子线程 review-e2e，在子线程上先后提问两次，答完以审查结论完成；
+//   MOCK_E2E_LOG：每条收到的请求、对服务端请求的回包各追加一行 JSON，供用例断言载荷与「恰好一次」；启动时记一行 boot（含 pid）；
+//   MOCK_E2E_TRIGGER：ask-cancel 场景里出现该文件即撤销提问；
+//   MOCK_E2E_BUSY：该文件存在时 thread/read 报告一个 inProgress 的 turn（模拟 broker 重启后核实不通过）。
+// 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
+import { appendFileSync, existsSync } from "node:fs";
+
+const args = process.argv.slice(2);
+if (args[0] !== "app-server") {
+  process.stderr.write("模拟 codex：只支持 app-server 子命令\n");
+  process.exit(1);
+}
+const scenario = process.env.MOCK_E2E_SCENARIO ?? "ask";
+const logPath = process.env.MOCK_E2E_LOG;
+const trigger = process.env.MOCK_E2E_TRIGGER;
+const busyFlag = process.env.MOCK_E2E_BUSY;
+
+function log(entry: unknown): void {
+  if (logPath) appendFileSync(logPath, JSON.stringify(entry) + "\n");
+}
+log({ kind: "boot", pid: process.pid });
+function send(message: unknown): void {
+  process.stdout.write(JSON.stringify(message) + "\n");
+}
+
+const waiting = new Map<string, (message: { result?: unknown; error?: unknown }) => void>();
+let serverRequestCounter = 0;
+const interruptedTurns = new Set<string>();
+const holds = new Map<string, () => void>();
+
+/** 发服务端请求，等回包（回包写进日志）。 */
+function ask(method: string, params: Record<string, unknown>): Promise<{ result?: unknown; error?: unknown }> {
+  const id = `srv-${++serverRequestCounter}`;
+  return new Promise((resolve) => {
+    waiting.set(id, (message) => {
+      log({ kind: "reply", id, method, result: message.result ?? null, error: message.error ?? null });
+      resolve(message);
+    });
+    send({ id, method, params });
+  });
+}
+
+const questionParams = (threadId: string, turnId: string) => ({
+  threadId, turnId, itemId: "ask-1",
+  questions: [{ id: "q1", header: "选择", question: "选哪个文件？", isOther: false,
+    options: [{ label: "a.txt", description: "甲" }, { label: "b.txt", description: "乙" }] }],
+});
+const approvalParams = (threadId: string, turnId: string, itemId: string) => ({
+  threadId, turnId, itemId, command: `echo ${itemId}`, cwd: "D:\\",
+});
+
+function answerText(reply: { result?: unknown }): string {
+  const answers = (reply.result as { answers?: Record<string, { answers?: string[] }> } | null)?.answers;
+  return answers?.q1?.answers?.join("、") ?? "（无回答）";
+}
+
+function complete(threadId: string, turnId: string, text: string): void {
+  const item = { type: "agentMessage", id: "final-1", text, phase: "final_answer" };
+  send({ method: "item/completed", params: { threadId, turnId, item } });
+  send({ method: "turn/completed", params: { threadId, turn: { id: turnId, items: [item], status: interruptedTurns.has(turnId) ? "interrupted" : "completed", error: null } } });
+}
+
+async function runTurn(threadId: string, turnId: string, early: Promise<{ result?: unknown }> | null): Promise<void> {
+  if (scenario === "ask") {
+    const reply = await ask("item/tool/requestUserInput", questionParams(threadId, turnId));
+    complete(threadId, turnId, `已选择：${answerText(reply)}`);
+  } else if (scenario === "early-ask") {
+    const reply = await early!;
+    complete(threadId, turnId, `已选择：${answerText(reply)}`);
+  } else if (scenario === "approval-ask-approval") {
+    await ask("item/commandExecution/requestApproval", approvalParams(threadId, turnId, "approve-1"));
+    const reply = await ask("item/tool/requestUserInput", questionParams(threadId, turnId));
+    await ask("item/commandExecution/requestApproval", approvalParams(threadId, turnId, "approve-2"));
+    complete(threadId, turnId, `已选择：${answerText(reply)}`);
+  } else if (scenario === "ask-cancel") {
+    const id = `srv-${++serverRequestCounter}`;
+    waiting.set(id, (message) => log({ kind: "reply", id, method: "item/tool/requestUserInput", result: message.result ?? null, error: message.error ?? null }));
+    send({ id, method: "item/tool/requestUserInput", params: questionParams(threadId, turnId) });
+    await new Promise<void>((resolve) => {
+      const timer = setInterval(() => {
+        if (trigger && existsSync(trigger)) { clearInterval(timer); resolve(); }
+      }, 20);
+    });
+    waiting.delete(id);
+    send({ method: "serverRequest/resolved", params: { threadId, requestId: id } });
+    log({ kind: "cancelled", id });
+    complete(threadId, turnId, "提问已被撤销");
+  } else if (scenario === "ask-big") {
+    // 结果远大于 64 KiB 且全是多字节字符，验证 wait --json 经管道完整输出（规格 6.3 节）。
+    const reply = await ask("item/tool/requestUserInput", questionParams(threadId, turnId));
+    complete(threadId, turnId, `已选择：${answerText(reply)}\n${"大段中文结果".repeat(12_000)}\n结束标记`);
+  } else if (scenario === "hold" && turnCounter === 1) {
+    await new Promise<void>((resolve) => holds.set(turnId, resolve));
+    complete(threadId, turnId, "已中断");
+  } else if (scenario === "hold" || scenario === "complete") {
+    complete(threadId, turnId, "续跑完成");
+  }
+}
+
+/** review/start 迁到的子线程（详细设计 3.5 节：运行随响应里的 reviewThreadId 转到子线程）。 */
+const REVIEW_THREAD = "review-e2e";
+
+function reviewDone(turnId: string, text: string): void {
+  const item = { type: "exitedReviewMode", id: "review-exit", review: text };
+  send({ method: "item/completed", params: { threadId: REVIEW_THREAD, turnId, item } });
+  send({ method: "turn/completed", params: { threadId: REVIEW_THREAD, turn: { id: turnId, items: [item],
+    status: interruptedTurns.has(turnId) ? "interrupted" : "completed", error: null } } });
+}
+
+/** 子线程上先后提问两次（第二次在 CLI 交接、broker 托管之后到达），答完以审查结论完成；
+ *  被 turn/interrupt 时撤销在等的提问（serverRequest/resolved）并以 interrupted 结束。 */
+async function runReview(turnId: string): Promise<void> {
+  for (const n of [1, 2]) {
+    const id = `srv-${++serverRequestCounter}`;
+    const answered = new Promise<{ result?: unknown } | null>((resolve) => {
+      waiting.set(id, (message) => {
+        log({ kind: "reply", id, method: "item/tool/requestUserInput", result: message.result ?? null, error: message.error ?? null });
+        resolve(message);
+      });
+      holds.set(turnId, () => {
+        waiting.delete(id);
+        send({ method: "serverRequest/resolved", params: { threadId: REVIEW_THREAD, requestId: id } });
+        log({ kind: "cancelled", id });
+        resolve(null);
+      });
+    });
+    send({ id, method: "item/tool/requestUserInput", params: { ...questionParams(REVIEW_THREAD, turnId), itemId: `review-ask-${n}` } });
+    const reply = await answered;
+    holds.delete(turnId);
+    if (!reply) { reviewDone(turnId, "审查已中断"); return; }
+  }
+  reviewDone(turnId, "审查结论：没有问题");
+}
+
+const thread = (id: string) => ({
+  id, preview: "", modelProvider: "openai", createdAt: 1, updatedAt: 1, status: { type: "idle" },
+  path: null, cwd: "D:\\", cliVersion: "0.160.0", source: "mock", name: null, agentNickname: null,
+  agentRole: null, gitInfo: null, turns: [],
+});
+
+let buffer = "";
+let turnCounter = 0;
+process.stdin.setEncoding("utf-8");
+process.stdin.on("data", (chunk: string) => {
+  buffer += chunk;
+  let idx: number;
+  while ((idx = buffer.indexOf("\n")) !== -1) {
+    const line = buffer.slice(0, idx).trim();
+    buffer = buffer.slice(idx + 1);
+    if (!line) continue;
+    const msg = JSON.parse(line);
+    if (msg.id === undefined) continue;
+    if (msg.method === undefined) {
+      const waiter = waiting.get(String(msg.id));
+      if (waiter) { waiting.delete(String(msg.id)); waiter(msg); }
+      continue;
+    }
+    log({ kind: "request", method: msg.method, params: msg.params ?? null });
+    const threadId: string = msg.params?.threadId ?? "thread-e2e";
+    switch (msg.method) {
+      case "initialize":
+        send({ id: msg.id, result: { userAgent: "mock-codex-e2e/0.160.0" } });
+        break;
+      case "thread/start":
+      case "thread/resume":
+        send({ id: msg.id, result: { thread: thread(msg.method === "thread/start" ? "thread-e2e" : threadId),
+          model: "gpt-mock", modelProvider: "openai", cwd: "D:\\", approvalPolicy: "never", sandbox: null } });
+        break;
+      case "thread/memoryMode/set":
+      case "thread/archive":
+      case "thread/delete":
+        send({ id: msg.id, result: {} });
+        break;
+      case "thread/list":
+        send({ id: msg.id, result: { data: [], nextCursor: null, backwardsCursor: null } });
+        break;
+      case "model/list":
+        send({ id: msg.id, result: { data: [], nextCursor: null } });
+        break;
+      case "thread/goal/get":
+        send({ id: msg.id, result: { goal: null } });
+        break;
+      case "thread/read":
+        send({ id: msg.id, result: { thread: { ...thread(threadId),
+          turns: busyFlag && existsSync(busyFlag) ? [{ id: "turn-lost", items: [], status: "inProgress", error: null }] : [] } } });
+        break;
+      case "thread/unsubscribe":
+        send({ id: msg.id, result: { status: "unsubscribed" } });
+        break;
+      case "thread/loaded/list":
+        send({ id: msg.id, result: { data: [], nextCursor: null } });
+        break;
+      case "turn/interrupt": {
+        const turnId = String(msg.params?.turnId ?? "");
+        interruptedTurns.add(turnId);
+        send({ id: msg.id, result: {} });
+        holds.get(turnId)?.();
+        holds.delete(turnId);
+        break;
+      }
+      case "review/start": {
+        const turnId = `review-turn-${String(++turnCounter).padStart(3, "0")}`;
+        const turn = { id: turnId, items: [], status: "inProgress", error: null };
+        send({ id: msg.id, result: { turn, reviewThreadId: REVIEW_THREAD } });
+        send({ method: "turn/started", params: { threadId: REVIEW_THREAD, turn } });
+        void runReview(turnId);
+        break;
+      }
+      case "turn/start": {
+        const turnId = `turn-${String(++turnCounter).padStart(3, "0")}`;
+        let early: Promise<{ result?: unknown }> | null = null;
+        if (scenario === "early-ask") early = ask("item/tool/requestUserInput", questionParams(threadId, turnId));
+        const reply = () => {
+          send({ id: msg.id, result: { turn: { id: turnId, items: [], status: "inProgress", error: null } } });
+          send({ method: "turn/started", params: { threadId, turn: { id: turnId, items: [], status: "inProgress", error: null } } });
+          void runTurn(threadId, turnId, early);
+        };
+        if (early) setTimeout(reply, 200); else reply();
+        break;
+      }
+      default:
+        send({ id: msg.id, error: { code: -32601, message: `模拟 codex 不支持 ${msg.method}` } });
+    }
+  }
+});

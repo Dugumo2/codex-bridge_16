@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+skill/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# Editor
+.vscode
+.idea
+*.swp
+*.swo
+
+# Bun
+bun.lockb
+
+# Reference projects
+.ref/
+
+# Environment files
+.env
+.env.*
+.env.local
+
+# Internal docs
+docs/
+
+# Sandbox / environment files
+.bash_profile
+.bashrc
+.zshrc
+.zprofile
+.profile
+.gitconfig
+.gitmodules
+.ripgreprc
+.mcp.json
+.claude/
+.codex
+
+# Bare git repo artifacts
+HEAD
+config
+config.lock
+config.worktree
+hooks
+objects
+refs
+
+# Rust broker 构建产物
+broker-rs/target/

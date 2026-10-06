@@ -1,0 +1,322 @@
+import { sanitizeForTerminal } from "../questions";
+import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type ThreadSummary, type TurnResult } from "./contracts";
+import { readRunLog, readRunRecord, readThreadIndex, listThreadRuns, type LogLine } from "./ledger";
+import type { CommandContext, CommandHandler } from "./main";
+import { redactParams } from "./server-requests";
+import { resolveThreadLocal, resolveThreadViaBroker, type ThreadRef } from "./thread-ref";
+import { waitRun } from "./wait-run";
+import { commandSession, wireMessage } from "./command-session";
+
+function unsupported(error: unknown): boolean {
+  if (rpcFailure(error).code === -32601) return true;
+  const message = wireMessage(error).trim().toLowerCase();
+  return /^(not implemented|method not implemented|unimplemented|method not found|unknown method|未实现|尚未实现|方法未实现)$/.test(message)
+    || (/thread\/(items|turns)\/list/.test(message) && /not supported|not implemented|unimplemented|unknown method|method not found/.test(message));
+}
+
+const clean = (text: string) => sanitizeForTerminal(text);
+const safeSummary = (value: unknown) => clean(JSON.stringify(redactParams(value)) ?? "");
+const eventLine = (line: LogLine) => ({ ts: line.ts, kind: clean(line.text).split(/\s+/)[0] ?? "", text: clean(line.text) });
+function tail(ctx: CommandContext, ref: ThreadRef) {
+  return (ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : [])
+    .slice(-Number(ctx.parsed.options.limit)).map(eventLine);
+}
+function printLine(ctx: CommandContext, line: { ts: string; kind: string; text: string }) {
+  ctx.out.result(`${line.ts} ${line.text}\n`);
+  ctx.out.resultJson(line);
+}
+
+function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
+  if (run.state === "lost" || run.stopOutcome === "unconfirmed") {
+    ctx.out.notice(`停止中（未确认），先 cxb stop ${id} 核实`);
+  } else if (run.status === "interrupted") {
+    const reasons = { clientDisconnected: "客户端断开", stop: "主动停止", brokerLost: "broker 失联", goalLoop: "空转刹车" };
+    ctx.out.notice(`已中断（${run.interruptReason ? reasons[run.interruptReason] : "服务器中断"}），可继续：cxb run --resume ${id} --continue`);
+  }
+}
+
+function localResult(ctx: CommandContext, ref: ThreadRef) {
+  const index = readThreadIndex(ctx.workspace.workspaceDir).find((entry) => entry.threadId === ref.threadId)!;
+  const run = index.lastRunId ? readRunRecord(ctx.workspace.workspaceDir, index.lastRunId) : null;
+  if (!run) throw new CxbError("NOT_FOUND", "线程没有运行记录", { id: ref.threadId });
+  const last = run.turns.at(-1);
+  resultNotice(ctx, run, ref.shortId ?? ref.threadId);
+  if (run.state === "running" || run.state === "stopping" || last?.ready === "pending") {
+    ctx.out.notice(`结果尚未就绪，请用 cxb wait ${ref.shortId ?? ref.threadId}`);
+    return 5 as const;
+  }
+  ctx.out.result(last?.output ?? "");
+  ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: "result", runId: run.runId, state: run.state,
+    status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none",
+    interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
+  if (!last) {
+    const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)?.filter((line) => line.text.startsWith("启动失败")).at(-1) : null;
+    ctx.out.notice(failure ? String(redactParams(failure.text)) : "运行启动失败，没有生成轮次");
+  }
+  ctx.out.progress(`结果来自本地；运行 ${run.runId}，状态 ${run.state}/${run.status ?? "未知"}`);
+  return 0 as const;
+}
+
+interface ServerItem { type: string; text?: string; phase?: string; review?: string }
+interface ServerTurn { id: string; status: string; items: ServerItem[] }
+/** 与 broker 的输出优先级一致；保持条目顺序。 */
+export function serverOutput(items: ServerItem[]): { output: string; outputSource: TurnResult["outputSource"] } {
+  const review = items.filter((item) => item.type === "exitedReviewMode" && typeof item.review === "string").at(-1)?.review;
+  const agents = items.filter((item) => item.type === "agentMessage" && typeof item.text === "string" && item.text.length > 0);
+  const finals = agents.filter((item) => item.phase === "final_answer").map((item) => item.text!);
+  if (review) return { output: review, outputSource: "review" };
+  if (finals.length) return { output: finals.join("\n"), outputSource: "finalAnswer" };
+  return { output: agents.map((item) => item.text!).join("\n"), outputSource: agents.length ? "accumulated" : "none" };
+}
+
+async function serverResult(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef) {
+  let turn: ServerTurn | undefined;
+  try {
+    const page = await rpc.request<{ data: ServerTurn[] }>("thread/turns/list", {
+      threadId: ref.threadId, cursor: null, limit: 1, sortDirection: "desc", itemsView: "summary",
+    });
+    if (!Array.isArray(page.data)) throw new CxbError("CODEX_FAILED", "服务器轮次分页回包损坏");
+    turn = page.data[0];
+    if (turn) {
+      const items: ServerItem[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const page: { data: Array<{ turnId: string; item: ServerItem }>; nextCursor: string | null } = await rpc.request("thread/items/list", {
+          threadId: ref.threadId, turnId: turn.id, cursor, limit: 64, sortDirection: "asc",
+        });
+        if (!Array.isArray(page.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")
+          || page.data.some((entry) => entry.turnId !== turn!.id || !entry.item || typeof entry.item.type !== "string")) {
+          throw new CxbError("CODEX_FAILED", "服务器条目分页回包损坏");
+        }
+        items.push(...page.data.map((entry) => entry.item));
+        cursor = page.nextCursor;
+        if (cursor !== null && (!cursor || seen.has(cursor) || !page.data.length)) throw new CxbError("CODEX_FAILED", "服务器条目分页游标没有前进");
+        if (cursor !== null) seen.add(cursor);
+      } while (cursor !== null);
+      turn = { ...turn, items };
+    }
+  } catch (error) {
+    if (!unsupported(error)) throw error;
+    ctx.out.progress("服务器不支持分页，改用完整线程读取");
+    const reply = await rpc.request<{ thread: { turns: ServerTurn[] } }>("thread/read", { threadId: ref.threadId, includeTurns: true });
+    if (!Array.isArray(reply.thread?.turns)) throw new CxbError("CODEX_FAILED", "服务器线程回包损坏");
+    turn = reply.thread.turns.at(-1);
+  }
+  const result = serverOutput(turn?.items ?? []);
+  ctx.out.result(result.output);
+  ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: "result", runId: null, status: turn?.status ?? null,
+    result: result.output, outputSource: result.outputSource, updatedAt: null });
+  ctx.out.progress("结果来自服务器");
+  return 0 as const;
+}
+
+function showLog(ctx: CommandContext, ref: ThreadRef) {
+  const segments = new Map<string, LogLine[]>();
+  let active: string | undefined;
+  for (const line of ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : []) {
+    const start = /^运行开始 (\S+)/.exec(line.text);
+    if (start) active = start[1];
+    if (active) { const lines = segments.get(active) ?? []; lines.push(line); segments.set(active, lines); }
+    if (active && line.text === `运行结束 ${active}`) active = undefined;
+  }
+  const runs = listThreadRuns(ctx.workspace.workspaceDir, ref.threadId).map((run) => {
+    const lines = (segments.get(run.runId) ?? []).filter((line) => ctx.parsed.options.full
+      || /^(运行开始|运行结束|轮次开始|轮次完成|停止发起|停止确认|空转刹车|启动失败|交接撤销)(\s|$)/.test(line.text)).map(eventLine);
+    const entry = { runId: run.runId, state: run.state, status: run.status, startedAt: run.startedAt,
+      input: clean(run.input), items: lines, turns: run.turns.map((turn) => ({ ...turn, output: clean(turn.output), error: redactParams(turn.error) })),
+      ...(ctx.parsed.options.full ? { meta: redactParams(run.meta), interruptReason: run.interruptReason, stopOutcome: run.stopOutcome,
+        progress: redactParams(run.progress) } : {}) };
+    ctx.out.result(`运行 ${run.runId} ${run.state}/${run.status ?? "未知"} ${new Date(run.startedAt).toISOString()}\n用户：${entry.input}\n`);
+    for (const line of lines) ctx.out.result(`${line.ts} ${line.text}\n`);
+    for (const turn of entry.turns) ctx.out.result(`Codex：${turn.output}\n`);
+    if (ctx.parsed.options.full) ctx.out.result(`元数据：${safeSummary({ meta: run.meta, interruptReason: run.interruptReason,
+      stopOutcome: run.stopOutcome, progress: run.progress })}\n`);
+    return entry;
+  });
+  ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: "log", runs });
+  return 0 as const;
+}
+
+interface Snapshot { thread: ThreadSummary; run: RunResult | null }
+const PROGRESS_LABELS: Record<string, string> = { "turn/started": "轮次开始", "turn/completed": "轮次完成", "item/started": "条目开始", "item/completed": "条目完成" };
+/** 上游进展通知 → 显示行；只认 `source` 线程上的（null 表示还不知道该认哪个线程，一律丢弃）。 */
+function renderNotification(method: string, raw: unknown, source: string | null) {
+  const p = raw as { threadId?: string; turn?: { id?: string }; item?: { type?: string; id?: string; text?: string } } | null;
+  const label = PROGRESS_LABELS[method];
+  if (!label || !source || p?.threadId !== source) return null;
+  return { ts: new Date().toISOString(), kind: method, text: clean(`${label} ${p.turn?.id ?? p.item?.type ?? ""} ${p.item?.id ?? ""} ${p.item?.text ?? ""}`.trim()) };
+}
+
+/**
+ * 本地日志里属于运行 runId 的行（日志按线程写，用「运行开始 <runId>」「运行结束 <runId>」分段）。
+ * 行不带运行编号，迁走的 review 与父线程上的新运行会交错写同一文件，分不清归属时宁可不补：
+ * R 开始时还有别的运行没结束，或 R 段内出现来历不明（起点已轮转出日志）的结束，都不补；段内出现别的运行开始，就此停止。
+ */
+function runLogLines(ctx: CommandContext, shortId: string | null, runId: string): LogLine[] {
+  const lines: LogLine[] = [];
+  const open = new Set<string>();
+  let inside = false;
+  for (const line of shortId ? readRunLog(ctx.workspace.workspaceDir, shortId) ?? [] : []) {
+    const start = /^运行开始 (\S+)$/.exec(line.text)?.[1];
+    const end = /^运行结束 (\S+)$/.exec(line.text)?.[1];
+    if (start === runId) {
+      if (open.size) return [];
+      inside = true;
+    } else if (start !== undefined) {
+      if (inside) break;
+      open.add(start);
+    } else if (end !== undefined && end !== runId) {
+      if (inside && !open.has(end)) return [];
+      open.delete(end);
+    }
+    if (inside) lines.push(line);
+    if (end === runId) inside = false;
+  }
+  return lines;
+}
+
+/**
+ * `show --follow`：尽力而为的实时进展（完整进展以 `show --log` 为准，任务说明 5.4）。
+ * 先只显示本线程 P 上的通知（R 迁移前占着 P 的认领）；R 是迁到独立子线程 C 的 review 时改为只显示 C 上的通知：
+ * 从快照的 reviewThreadId 或 `broker/run/moved` 得知 C 后，在同一连接上 watch C；订阅生效前 C 的事件先缓冲，
+ * 订阅后读本地日志里属于 R、不早于已显示最后一行且未显示过的行补上（GitHub 式补发；日志异步写盘，可能多或少一行），再排出缓冲。
+ * R 结束后（父线程上的结束通知或快照；迁移后的结束通知也发给父线程的 watcher）不再接收新的原始进展：
+ * 子线程空出后可能被别的运行接着用，上游通知不带运行编号；
+ * 之后只等 R 的结果补齐。终态等子线程订阅与补发做完再输出。
+ */
+async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signal: AbortSignal) {
+  const buffered: Array<{ method: string; params: unknown }> = [];
+  let live = false;
+  /** 当前认的进展来源线程；切到 review 子线程、订阅完成前为 null。 */
+  let source: string | null = null;
+  let childPending: Array<{ method: string; params: unknown }> | null = null;
+  /** 子线程订阅与补发；终态前要等它做完。 */
+  let switching: Promise<void> | null = null;
+  /** R 已结束：不再接收原始进展。 */
+  let ended = false;
+  /** follow 已返回：迟到的回调不再输出。 */
+  let finished = false;
+  let snapshot: Snapshot | undefined;
+  let runId: string | null = null;
+  /** 已显示行的出现次数（同一毫秒可以有内容相同的多行）。 */
+  const printed = new Map<string, number>();
+  let lastTs = "";
+  const emit = (line: { ts: string; kind: string; text: string }) => {
+    const key = `${line.ts} ${line.text}`;
+    printed.set(key, (printed.get(key) ?? 0) + 1);
+    if (line.ts > lastTs) lastTs = line.ts;
+    printLine(ctx, line);
+  };
+  const isEnd = (run: RunResult | null | undefined) => run?.runId === runId && (run.state === "ended" || run.state === "lost");
+  let reject!: (error: unknown) => void;
+  const failure = new Promise<never>((_, fail) => { reject = fail; });
+  void failure.catch(() => undefined);
+  const switchToChild = (child: string | null | undefined) => {
+    if (!child || child === ref.threadId || childPending) return;
+    childPending = [];
+    source = null;
+    switching = rpc.request("broker/threads/watch", { threadId: child }).then(() => {
+      // 回包与取消、断线同批到达时，follow 可能已返回。
+      if (finished) return;
+      // 补发迁移空档：日志里属于 R、不早于补发开始时的水位、尚未显示过的行。水位整批固定，同一毫秒的行按出现次数去重。
+      const floor = lastTs;
+      const seen = new Map<string, number>();
+      for (const line of runId ? runLogLines(ctx, snapshot?.run?.shortId ?? ref.shortId, runId) : []) {
+        if (line.ts < floor) continue;
+        const shown = eventLine(line);
+        const key = `${shown.ts} ${shown.text}`;
+        const count = (seen.get(key) ?? 0) + 1;
+        seen.set(key, count);
+        if (count > (printed.get(key) ?? 0)) emit(shown);
+      }
+      source = child;
+      const queued = childPending ?? [];
+      childPending = [];
+      for (const event of queued) { const line = renderNotification(event.method, event.params, source); if (line) emit(line); }
+    });
+    // 终态前等的是 switching 本身：失败必须保留为拒绝，不能用 .catch 的返回值顶替成成功。
+    switching.catch(reject);
+  };
+  const handle = (method: string, params: unknown) => {
+    if (method === "broker/run/moved") {
+      const moved = params as { runId?: string; reviewThreadId?: string } | null;
+      if (runId && moved?.runId === runId) switchToChild(moved.reviewThreadId);
+      return;
+    }
+    if (method === "broker/run/ended") {
+      if (isEnd((params as { run?: RunResult } | null)?.run)) ended = true;
+      return;
+    }
+    if (ended) return;
+    if (childPending && source === null) {
+      // 子线程订阅中：子线程的事件先存着，补完日志再按序输出。
+      if ((params as { threadId?: string } | null)?.threadId !== ref.threadId) childPending.push({ method, params });
+      return;
+    }
+    const line = renderNotification(method, params, source);
+    if (line) emit(line);
+  };
+  const off = rpc.onAny((method, params) => {
+    try {
+      if (!live) buffered.push({ method, params });
+      else handle(method, params);
+    } catch (error) { reject(error); }
+  });
+  const close = rpc.onClose(() => reject(new CxbError("BROKER_UNAVAILABLE", "跟随期间 broker 连接断开")));
+  try {
+    snapshot = await Promise.race([rpc.request<Snapshot>("broker/threads/watch", { threadId: ref.threadId }), failure]);
+    runId = snapshot.run?.runId ?? snapshot.thread.lastRunId;
+    for (const line of tail(ctx, ref)) emit(line);
+    // 先把快照前后同批通知交给等待器，再清空缓冲；不能以 await 返回时刻划分通知新旧。
+    const replayRpc: BrokerRpc = { ...rpc, on(method, handler) {
+      const dispose = rpc.on(method, handler);
+      for (const event of buffered) if (event.method === method) handler(event.params);
+      return dispose;
+    } };
+    const ready = snapshot.run && (snapshot.run.state === "ended" || snapshot.run.state === "lost") && snapshot.run.turns.at(-1)?.ready !== "pending";
+    const waiting = runId && !ready ? waitRun(replayRpc, { threadId: ref.threadId, runId, timeoutMs: null, signal,
+      workspaceDir: ctx.workspace.workspaceDir }) : Promise.resolve(snapshot.run);
+    void waiting.catch(() => undefined);
+    // 先认 P：R 迁移前占着 P 的认领，P 上不会有别的运行，P 的通知就是 R 的；inline review 不迁移，一直认 P。
+    // R 已在（或之后迁到）独立子线程 C 上时改认 C。
+    source = ref.threadId;
+    switchToChild(snapshot.run?.runId === runId ? snapshot.run?.reviewThreadId : null);
+    // 快照已结束：缓冲里有 R 的结束通知时，排在它前面的进展属于 R，按序处理到它再停；
+    // 没有则 R 在订阅前就已结束，缓冲里的进展都晚于结束。
+    if (isEnd(snapshot.run) && !buffered.some((event) => event.method === "broker/run/ended"
+      && isEnd((event.params as { run?: RunResult } | null)?.run))) ended = true;
+    live = true;
+    for (const event of buffered) handle(event.method, event.params);
+    buffered.length = 0;
+    const run = await Promise.race([waiting, failure]);
+    // 订阅子线程的请求有自身期限，取消与断线经 failure 收束。
+    if (switching) await Promise.race([switching, failure]);
+    ctx.out.result(`运行结束：${run?.status ?? "无运行"}${runId ? `（${runId}）` : ""}\n`);
+    ctx.out.resultJson({ terminal: true, status: run?.status ?? null, runId });
+    return 0 as const;
+  } finally { finished = true; off(); close(); buffered.length = 0; }
+}
+
+export const show: CommandHandler = async (ctx) => {
+  const session = commandSession(ctx);
+  try {
+    const options = ctx.parsed.options;
+    const id = ctx.parsed.positional[0]!;
+    if (options.follow || options.server) {
+      const rpc = await session.connect();
+      const resolved = await resolveThreadViaBroker(rpc, id, { passThrough: !!options.server });
+      const ref = { threadId: resolved.threadId, shortId: resolved.shortId };
+      return options.follow ? await follow(ctx, rpc, ref, session.signal) : await serverResult(ctx, rpc, ref);
+    }
+    const ref = resolveThreadLocal(ctx.workspace.workspaceDir, id);
+    if (options.log) return showLog(ctx, ref);
+    if (options.tail) {
+      const items = tail(ctx, ref);
+      for (const line of items) ctx.out.result(`${line.ts} ${line.text}\n`);
+      ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: "tail", items, next: null });
+      return 0;
+    }
+    return localResult(ctx, ref);
+  } finally { session.dispose(); }
+};

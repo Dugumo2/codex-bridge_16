@@ -1,0 +1,101 @@
+import { CxbError, EXIT, type ExitCodeForRun, type RunResult, type TurnResult, type WaitRun } from "./contracts";
+import { readRunRecord } from "./ledger";
+
+/** 即使被等待方不遵守期限，也必须拒绝等待；迟到拒绝由 race 接住。 */
+export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, signal?: AbortSignal): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abort: (() => void) | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => {
+      abort = () => reject(new CxbError("INTERRUPTED", "等待已取消"));
+      if (signal?.aborted) { abort(); return; }
+      signal?.addEventListener("abort", abort, { once: true });
+      if (timeoutMs !== null) timer = setTimeout(() => reject(new CxbError("TIMEOUT", "等待运行超时")), Math.max(0, timeoutMs));
+    })]);
+  } finally {
+    clearTimeout(timer);
+    if (abort) signal?.removeEventListener("abort", abort);
+  }
+}
+
+export const exitCodeForRun: ExitCodeForRun = (run) => {
+  if (run.loopGuard || run.interruptReason === "goalLoop" || run.status === "goalBlocked") return EXIT.GOAL_BLOCKED_OR_LIMITED;
+  if (run.status === "completed") return EXIT.OK;
+  if (run.status === "failed") return EXIT.CODEX_FAILED;
+  return EXIT.INTERRUPTED;
+};
+
+export const waitRun: WaitRun = async (rpc, opts) => {
+  if (opts.signal?.aborted) throw new CxbError("INTERRUPTED", "等待已取消");
+  let current: RunResult | undefined;
+  // 补读可能早于 ended 或 watch 回包；仅缓存目标运行最近 100 轮，与账本保留量一致。
+  const results = new Map<number, TurnResult>();
+  const disposers: Array<() => void> = [];
+  let finish!: (run: RunResult) => void;
+  let fail!: (error: unknown) => void;
+  let settled = false;
+  const done = new Promise<RunResult>((resolve, reject) => {
+    finish = (run) => { settled = true; resolve(run); };
+    fail = (error) => { settled = true; reject(error); };
+  });
+  const check = () => {
+    if (!current || (current.state !== "ended" && current.state !== "lost")) return;
+    const last = current.turns.at(-1);
+    const replacement = results.get(current.turnsTotal - 1);
+    if (last?.ready === "pending" && replacement?.turnId === last.turnId) {
+      current = { ...current, turns: [...current.turns.slice(0, -1), replacement] };
+    }
+    if (current.turns.at(-1)?.ready !== "pending") finish(current);
+  };
+  const watched = new Set<string>();
+  const watch = (threadId: string) => {
+    if (watched.has(threadId)) return;
+    watched.add(threadId);
+    // 请求错误接入同一个等待，避免连接断开时卡在快照 RPC。快照按 runId 取这次运行，不受线程上更新的运行影响。
+    void rpc.request<{ run: RunResult | null }>("broker/threads/watch", { threadId, runId: opts.runId },
+      { timeoutMs: Math.max(1, Math.min(30_000, opts.timeoutMs ?? 30_000)) }).then((snapshot) => {
+      try {
+        if (snapshot.run) { accept(snapshot.run); return; }
+        // broker 内存里没有这次运行（每个线程只留最近一次、全局最多 MAX_HISTORY 次，或是 broker 重启前的运行），
+        // 之后也不会再有它的通知。手上的结果（例如先到的 ended 带着 pending 的最后一轮）不可交付时，以磁盘记录补全。
+        const disk = opts.workspaceDir ? readRunRecord(opts.workspaceDir, opts.runId) : null;
+        if (disk && disk.threadId !== threadId && disk.reviewThreadId !== threadId) {
+          fail(new CxbError("NOT_FOUND", `运行 ${opts.runId} 不属于该线程`, { id: opts.runId }));
+          return;
+        }
+        if (disk) accept(disk);
+        if (settled) return;
+        if (!disk && !current) { fail(new CxbError("NOT_FOUND", `找不到运行 ${opts.runId}`, { id: opts.runId })); return; }
+        // broker 只淘汰已结束且结果就绪的运行，磁盘上仍是运行中或结果未就绪说明写入未落盘或记录未完整加载。
+        fail(new CxbError("BROKER_UNAVAILABLE", `运行 ${opts.runId} 当前无法取得可靠的终态，请稍后重试`, { id: opts.runId, retryable: true }));
+      } catch (error) { fail(error); }
+    }, fail);
+  };
+  const accept = (run: RunResult | null | undefined) => {
+    if (run?.runId !== opts.runId) return;
+    // 旧快照不能把已经收到的终态降回 running，也不能覆盖已就绪的结果。
+    if (!current || (current.state !== "ended" && current.state !== "lost")) current = run;
+    else if ((run.state === "ended" || run.state === "lost") && run.turnsTotal >= current.turnsTotal
+      && run.turns.at(-1)?.ready !== "pending") current = run;
+    check();
+  };
+  try {
+    disposers.push(rpc.on("broker/run/ended", (raw) => accept((raw as { run?: RunResult })?.run)));
+    disposers.push(rpc.on("broker/thread/result", (raw) => {
+      const event = raw as { runId?: string; turn?: number; result?: TurnResult };
+      if (event?.runId !== opts.runId || !Number.isSafeInteger(event.turn) || !event.result) return;
+      results.set(event.turn!, event.result);
+      if (results.size > 100) results.delete(Math.min(...results.keys()));
+      check();
+    }));
+    disposers.push(rpc.onClose(() => fail(new CxbError("BROKER_UNAVAILABLE", "等待期间 broker 连接断开", { retryable: true }))));
+    watch(opts.threadId);
+    return await bounded(done, opts.timeoutMs, opts.signal);
+  } catch (error) {
+    if (error instanceof CxbError) throw error;
+    throw new CxbError("BROKER_UNAVAILABLE", "无法读取运行结果", { cause: error, retryable: true });
+  } finally {
+    for (const dispose of disposers) dispose();
+    results.clear();
+  }
+};
