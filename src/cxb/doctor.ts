@@ -48,7 +48,8 @@ interface DiagStatus { outcome: "exited" | "timeout" | "failed"; exitCode?: numb
 function readDiagStatus(path: string): DiagStatus | null {
   try {
     const value = JSON.parse(readFileSync(path, "utf8")) as DiagStatus;
-    if (value?.outcome === "exited" && Number.isSafeInteger(value.exitCode)) return value;
+    // Windows 退出码是 u32：越界的值说明状态文件损坏，按 diag-exec 异常处理，不能当成诊断程序的结果。
+    if (value?.outcome === "exited" && Number.isSafeInteger(value.exitCode) && value.exitCode! >= 0 && value.exitCode! <= 0xffff_ffff) return value;
     if (value?.outcome === "timeout") return value;
     if (value?.outcome === "failed" && typeof value.reason === "string") return value;
     return null;

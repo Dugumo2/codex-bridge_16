@@ -149,7 +149,8 @@ pub fn cmd_line(parts: &[(&str, bool)]) -> Result<String, String> {
         if index != 0 {
             line.push(' ');
         }
-        let quote = *force_quote || value.is_empty() || value.contains([' ', '\t']);
+        // cmd 把逗号、分号、等号与空白一样当参数分隔符（批处理的 %1 等按它们拆分），含这些字符也要加引号。
+        let quote = *force_quote || value.is_empty() || value.contains([' ', '\t', ',', ';', '=']);
         if quote {
             line.push('"');
         }
@@ -181,6 +182,17 @@ mod tests {
             ])
             .unwrap(),
             "/d /s /c \"\"D:\\有 空格\\a.cmd\" \"\" \"尾 空格\\\"\""
+        );
+        assert_eq!(
+            cmd_line(&[
+                ("a.cmd", false),
+                ("a=b", false),
+                ("c,d", false),
+                ("e;f", false),
+                ("plain", false)
+            ])
+            .unwrap(),
+            "/d /s /c \"a.cmd \"a=b\" \"c,d\" \"e;f\" plain\""
         );
     }
 

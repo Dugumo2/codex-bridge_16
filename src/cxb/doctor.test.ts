@@ -285,6 +285,8 @@ for (const [label, mode, args, expected] of [
   ["状态为 failed 报 diag-exec 失败并附原因", "failed", [], { code: "LOCAL_ERROR", message: "模拟：创建进程失败" }],
   ["没有状态文件报 diag-exec 异常", "missing", [], { code: "LOCAL_ERROR", message: "没有有效的状态文件" }],
   ["状态文件损坏报 diag-exec 异常", "corrupt", [], { code: "LOCAL_ERROR", message: "没有有效的状态文件" }],
+  ["状态文件里退出码为负数报 diag-exec 异常", "negative", [], { code: "LOCAL_ERROR", message: "没有有效的状态文件" }],
+  ["状态文件里退出码超出 u32 报 diag-exec 异常", "overflow", [], { code: "LOCAL_ERROR", message: "没有有效的状态文件" }],
 ] as const) test(`经 diag-exec 运行：${label}`, async () => {
   const diag = fakeDiag(mode);
   const work = runDiagnosticProcess(process.execPath, [exitFixture, ...args], { timeoutMs: 9000, signal: new AbortController().signal }, diag.shim);

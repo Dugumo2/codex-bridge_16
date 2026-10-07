@@ -457,6 +457,22 @@ test("交接的存活风险先提示，失败交接不能假报成功", async ()
   expect(failed.closed()).toBe(true);
 });
 
+test("设置目标时线程被归档门禁挡住：退出 8 并提示核实命令，不报成目标能力问题（N7-A 2.3.2 节）", async () => {
+  const unit = unitExecution(["run", "中文", "--json", "--goal", "目标"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => {
+    if (method === "thread/goal/set") {
+      throw new CxbError("BROKER_UNAVAILABLE", "远端失败", { cause: { rpcCode: -32001, detail: "线程生命周期操作尚未完成",
+        data: { reason: "lifecyclePending", kind: "archive", phase: "outcomeUnknown", threadId: "thread-占用" } } });
+    }
+    return original(method, params);
+  };
+  const error = await createRunHandler(fakeServerRequests())(unit.ctx).then(() => null, (error) => error);
+  expect(error).toMatchObject({ code: "THREAD_HELD", exitCode: 8 });
+  expect(error.message).toContain("cxb rm thread-占用");
+  expect(error.message).not.toContain("目标能力");
+});
+
 test("共享刹车 completed 仍退出九；失败七；goal 不可用为本地错误", async () => {
   for (const kind of ["共享刹车", "失败", "goal 不可用"]) {
     const unit = unitExecution(["run", "中文", "--json", ...(kind === "goal 不可用" ? ["--goal", "目标"] : [])]);

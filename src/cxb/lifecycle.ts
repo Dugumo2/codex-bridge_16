@@ -1,6 +1,7 @@
 // src/cxb/lifecycle.ts — 线程归档、永久删除的待核实状态在 CLI 上的展示与提示（任务说明 N7-A 2.3、5.5 节）。
 // broker 是唯一判定者：这里只把它给出的记录和错误原因翻成用户看得懂的状态与下一步命令。
 
+import { sanitizeForTerminal } from "../questions";
 import { CxbError, rpcData, type LifecycleInfo } from "./contracts";
 
 const COMMITTING = new Set(["committing", "upstreamDone", "draining"]);
@@ -24,11 +25,16 @@ export function lifecycleHint(kind: LifecycleInfo["kind"], phase: string, id: st
     + "（共享服务器上的旧请求无法确认已结束时，线程会保持待核实）";
 }
 
-/** broker 回 -32001 lifecyclePending 时的统一错误（退出 8，可重试）。 */
-export function lifecyclePendingError(error: unknown, id: string): CxbError {
+/**
+ * broker 回 -32001 lifecyclePending 时的统一错误（退出 8，可重试）。
+ * 提示里的线程取回包的 `data.threadId`（被占的可能是关联子线程，不是调用方给的线程）；缺失时才用调用方的 ID。
+ */
+export function lifecyclePendingError(error: unknown, fallbackId: string): CxbError {
   const data = rpcData(error);
   const kind = data.kind === "delete" ? "delete" : "archive";
   const phase = typeof data.phase === "string" ? data.phase : "outcomeUnknown";
+  const id = typeof data.threadId === "string" && data.threadId
+    ? sanitizeForTerminal(data.threadId).replace(/\s+/gu, " ") : fallbackId;
   const cause = error instanceof CxbError ? error.cause : error;
   return new CxbError("THREAD_HELD", lifecycleHint(kind, phase, id), { cause, retryable: true, id });
 }

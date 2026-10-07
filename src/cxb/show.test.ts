@@ -178,6 +178,19 @@ describe("show 服务器与跟随", () => {
       else { await expect(show(t.ctx)).rejects.toMatchObject({ exitCode: 7 }); expect(t.fake.calls.some((c) => c.method === "thread/read")).toBe(false); }
     }
   });
+  test("--server 查询待核实的线程：提示状态与核实命令，JSON 带出生命周期记录（N7-A 5.5 节）", async () => {
+    const lifecycle = { operationId: "op-1", kind: "archive", phase: "outcomeUnknown", shortId: "abcd1234", preview: null };
+    const t = context(dir, ["show", "abcd", "--server", "--json"]);
+    t.fake.handle = (method, p) => {
+      if (method === "broker/threads/list") return { threads: [summary({ lifecycle } as any)] };
+      if (method === "thread/turns/list") return { data: [{ id: "last", status: "completed" }] };
+      return { data: [{ turnId: "last", item: { type: "agentMessage", text: "末轮", phase: "final_answer" } }], nextCursor: null, cursor: p.cursor };
+    };
+    expect(await show(t.ctx)).toBe(0);
+    expect(t.notices.join()).toContain("归档待核实");
+    expect(t.notices.join()).toContain("cxb rm abcd1234");
+    expect(t.json[0]).toMatchObject({ lifecycle });
+  });
   test("服务器输出采用最后一次非空审查，空 final 不遮蔽累积内容", () => {
     expect(serverOutput([{ type: "exitedReviewMode", review: "旧审查" }, { type: "exitedReviewMode", review: "新审查" }]).output).toBe("新审查");
     expect(serverOutput([{ type: "exitedReviewMode", review: "" }, { type: "agentMessage", text: "累积" }, { type: "agentMessage", phase: "final_answer", text: "" }])).toEqual({ output: "累积", outputSource: "accumulated" });

@@ -289,7 +289,10 @@ export const show: CommandHandler = async (ctx) => {
     if (options.follow || options.server) {
       const rpc = await session.connect();
       const resolved = await resolveThreadViaBroker(rpc, id, { passThrough: !!options.server });
-      const ref = { threadId: resolved.threadId, shortId: resolved.shortId };
+      const lifecycle = resolved.summary?.lifecycle;
+      // 待核实的归档或删除照样提示（与本地分支一致）；--server 的 JSON 一并带出记录。
+      if (lifecycle) ctx.out.notice(`${lifecycleLabel(lifecycle)}：${lifecycleHint(lifecycle.kind, lifecycle.phase, resolved.shortId ?? resolved.threadId)}`);
+      const ref = { threadId: resolved.threadId, shortId: resolved.shortId, ...(lifecycle ? { lifecycle } : {}) };
       return options.follow ? await follow(ctx, rpc, ref, session.signal) : await serverResult(ctx, rpc, ref);
     }
     const ref = resolveThreadLocal(ctx.workspace.workspaceDir, id);

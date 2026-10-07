@@ -115,12 +115,15 @@ afterEach(async () => {
   for (const socket of sockets) await clean("关闭连接", () => socket.destroy());
   await clean("收取进程登记", readTrace);
   await clean("关闭观测器", () => watcher.close());
+  // broker 子进程按句柄判定：exit 事件就是已退出的证据，不再按 PID 回查（PID 可能已被新进程复用，回查与强杀都会误伤；
+  // N7-A 证伪实验 30 遍未复现「已退出的 PID 仍存活」，按更稳的写法收尾）。
   await Promise.all(children.map(({ child, exited }) => clean("回收 broker", async () => {
-    if (child.pid && alive(child.pid)) child.kill("SIGKILL");
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     await bounded(exited, 8000);
-    if (child.pid) expect(alive(child.pid)).toBe(false);
   })));
-  await Promise.all([...pids].map(pid => clean("核实子进程退出", async () => {
+  const brokerPids = new Set(children.map(({ child }) => child.pid));
+  // 其余登记的是 broker 拉起的模拟 codex（与 broker 同一 Job，broker 退出即随之结束），没有句柄只能按 PID 核实。
+  await Promise.all([...pids].filter((pid) => !brokerPids.has(pid)).map(pid => clean("核实子进程退出", async () => {
     if (alive(pid)) process.kill(pid, "SIGKILL");
     await until(() => !alive(pid), 5000);
   })));

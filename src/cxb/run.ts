@@ -268,6 +268,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     if (!options.resume && !options.memory) await request("thread/memoryMode/set", { threadId, mode: "disabled" });
     if (options.goal) {
       try { await request("thread/goal/set", { threadId, objective: options.goal, ...(options.budget ? { tokenBudget: options.budget } : {}) }); } catch (error) {
+        // broker 的占用类错误（-32001，含归档或删除待核实的门禁）交统一分类器，不能报成目标能力问题。
+        if (rpcDetail(error).code === -32001) throw error;
         if (rpcDetail(error).code !== undefined) throw new CxbError("LOCAL_ERROR", "无法设置目标，请确认 Codex 已开启目标能力", { cause: error });
         throw error;
       }

@@ -14,10 +14,11 @@ interface Candidate { threadId: string; shortId: string }
 
 /** 精确优先，其次唯一前缀；多个前缀匹配抛 AMBIGUOUS（退出 2），零个返回 null。 */
 export function matchThread<T extends Candidate>(ref: string, candidates: readonly T[]): T | null {
-  const exact = candidates.find((c) => c.threadId === ref || c.shortId === ref);
+  // 短 ID 可能为空（只有生命周期记录的服务器线程），空值只按 threadId 匹配。
+  const exact = candidates.find((c) => c.threadId === ref || (!!c.shortId && c.shortId === ref));
   if (exact) return exact;
   // 每个候选至多出现一次：同一线程的两个字段都命中前缀也只算一个。
-  const matches = candidates.filter((c) => c.threadId.startsWith(ref) || c.shortId.startsWith(ref));
+  const matches = candidates.filter((c) => c.threadId.startsWith(ref) || (!!c.shortId && c.shortId.startsWith(ref)));
   if (matches.length > 1) {
     throw new CxbError("AMBIGUOUS", `线程 ID 前缀 ${ref} 不唯一：${matches.slice(0, 5).map((c) => c.shortId).join("、")}${matches.length > 5 ? " 等" : ""}`, { id: ref });
   }

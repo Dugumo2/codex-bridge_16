@@ -64,4 +64,17 @@ describe("乙组 stop", () => {
     expect(error.message).toContain(kind === "delete" ? "cxb rm thread-test --purge" : "cxb rm thread-test");
     c.checkClean();
   });
+  test("被占的是关联子线程时，提示里的核实命令指向回包给出的那个线程", async () => {
+    const c = context(["stop", "abcd1234"]);
+    c.fake.handle = (m) => {
+      if (m === "broker/threads/list") return { threads: [thread()] };
+      throw new CxbError("BROKER_UNAVAILABLE", "模拟线上错误",
+        { cause: { rpcCode: -32001, data: { reason: "lifecyclePending", kind: "archive", phase: "outcomeUnknown", threadId: "review-child" } } });
+    };
+    const error = await stop(c.ctx).then(() => null, (error) => error);
+    expect(error.exitCode).toBe(8);
+    expect(error.message).toContain("cxb rm review-child");
+    expect(error.message).not.toContain("cxb rm thread-test");
+    c.checkClean();
+  });
 });

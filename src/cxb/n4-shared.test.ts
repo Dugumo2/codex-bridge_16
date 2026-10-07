@@ -107,6 +107,11 @@ describe("thread-ref：短 ID、前缀与服务器 ID", () => {
     expect(() => matchThread("ab", candidates)).toThrow(expect.objectContaining({ code: "AMBIGUOUS" }));
     expect(() => matchThread("0199aaaa", candidates)).toThrow(expect.objectContaining({ code: "AMBIGUOUS" }));
     expect(matchThread("zz", candidates)).toBeNull();
+    // 只有生命周期记录的服务器线程可能没有短 ID：只按 threadId 匹配，不影响其他候选。
+    const withNull = [...candidates, { threadId: "0199cccc-4444", shortId: null as unknown as string }];
+    expect(matchThread("ab12", withNull)?.threadId).toBe("0199aaaa-1111");
+    expect(matchThread("0199cccc", withNull)?.threadId).toBe("0199cccc-4444");
+    expect(matchThread("server-uuid", withNull)).toBeNull();
     // 同一线程的 threadId 与短 ID 都以该前缀开头：只算一个，不报歧义。
     expect(matchThread("abc", [{ threadId: "abc-1", shortId: "abc12345" }, { threadId: "t-9", shortId: "ffff" }])?.threadId).toBe("abc-1");
     // 精确匹配某线程的短 ID，同时是另一线程 threadId 的前缀时，不报歧义。

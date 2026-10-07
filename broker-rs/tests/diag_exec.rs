@@ -407,6 +407,32 @@ async fn 批处理参数逐字相等且程序路径含空格() {
 }
 
 #[tokio::test]
+async fn 批处理参数含_cmd_分隔符逗号分号等号时仍逐字相等() {
+    let mut harness = Harness::new().await;
+    // cmd 把逗号、分号、等号与空白一样当参数分隔符；不加引号时 a=b 会被拆成两个参数。
+    let batch = harness.root.join("delimiters.cmd");
+    std::fs::write(&batch, concat!(
+        "@echo off\r\nsetlocal\r\n",
+        "set \"a=x%~1\"\r\nset \"b=x%~2\"\r\nset \"c=x%~3\"\r\nset \"d=x%~4\"\r\n",
+        "> \"%CXB_DIAG_FIXTURE_ROOT%\\batch.json\" echo [\"%a:~1%\",\"%b:~1%\",\"%c:~1%\",\"%d:~1%\"]\r\n"
+    )).unwrap();
+    let args = ["a=b", "c,d", "e;f", "plain"];
+    let mut command = harness.diag(5000, &batch);
+    command.args(args);
+    let mut child = harness.spawn(command);
+    let output = capture(&mut child).await;
+    assert!(
+        output.0.success(),
+        "批处理失败：{:?} {:?}",
+        harness.status_value(),
+        output.2
+    );
+    let actual: Vec<String> =
+        serde_json::from_slice(&std::fs::read(harness.root.join("batch.json")).unwrap()).unwrap();
+    assert_eq!(actual, args);
+}
+
+#[tokio::test]
 async fn 参数错误不写状态且运行失败有中文原因() {
     let mut harness = Harness::new().await;
     for args in [
