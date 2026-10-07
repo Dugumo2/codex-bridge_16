@@ -536,19 +536,27 @@ impl Machine {
             return;
         }
         let mut thread = thread.unwrap().to_owned();
+        if self.lifecycle_gate(&request, &thread, actions) {
+            return;
+        }
+        if let Some(run) = expected.and_then(Value::as_str) {
+            if !self.runs.runs.contains_key(run) {
+                self.lifecycle_history_stop(request.clone(), run.to_owned(), actions);
+                return;
+            }
+        }
         if let Some(expected) = expected.and_then(Value::as_str) {
             let record = self.runs.runs.get(expected);
             let belongs = record.is_some_and(|run| {
                 run.thread_id == thread || run.review_thread_id.as_deref() == Some(&thread)
             });
-            let retired = matches!(self.run_lookup(expected), crate::runs::RunLookup::Retired { thread_id } if thread_id == thread);
             let ended = belongs
                 && record.is_some_and(|run| {
                     run.state == RunState::Ended
                         || run.state == RunState::Lost
                             && run.stop_outcome == Some(StopOutcome::Confirmed)
                 });
-            if ended || retired {
+            if ended {
                 actions.push(Action::Send {conn: request.conn, message: proto::response_ok(request.id.clone(),
                     json!({"threadId":thread,"runId":expected,"interruptSent":false,"goal":"unchanged",
                         "alreadyStopped":true,"stopOutcome":"confirmed","run":self.run_snapshot(expected)}))});
@@ -561,7 +569,22 @@ impl Machine {
                 .find(|(id, claim)| {
                     claim.run_id.as_deref() == Some(expected) && (belongs || id.as_str() == thread)
                 })
-                .map(|(id, _)| id.clone());
+                .map(|(id, _)| id.clone())
+                .or_else(|| {
+                    record
+                        .filter(|r| {
+                            belongs
+                                && !r.joined
+                                && (r.state == RunState::Stopping
+                                    || r.state == RunState::Lost
+                                        && r.stop_outcome != Some(StopOutcome::Confirmed))
+                        })
+                        .map(|r| {
+                            r.review_thread_id
+                                .clone()
+                                .unwrap_or_else(|| r.thread_id.clone())
+                        })
+                });
             let Some(actual) = actual else {
                 stop_error(
                     request,
@@ -612,6 +635,9 @@ impl Machine {
             }
             thread = child.clone();
         }
+        if self.lifecycle_gate(&request, &thread, actions) {
+            return;
+        }
         if self
             .claims
             .get(&thread)
@@ -642,6 +668,11 @@ impl Machine {
         let lost = review
             .as_ref()
             .and_then(|(run, _, _)| self.runs.runs.get(run))
+            .or_else(|| {
+                expected
+                    .and_then(Value::as_str)
+                    .and_then(|id| self.runs.runs.get(id))
+            })
             .or_else(|| self.latest_run(&thread))
             .filter(|r| {
                 (r.state == RunState::Stopping
@@ -763,6 +794,7 @@ impl Machine {
             .expect("丢失运行可建立停止核实");
         let mut op = self.stops.operations.remove(&id).unwrap();
         op.run_id = Some(run.into());
+        self.runs.verifying_history.insert(run.into());
         op.target = None;
         op.turn_absent = false;
         op.already_stopped = false;
@@ -1821,6 +1853,15 @@ impl Machine {
         deadline: std::time::Instant,
         actions: &mut Vec<Action>,
     ) {
+        if let Operation::Lifecycle {
+            thread,
+            operation,
+            attempt,
+        } = &context.operation
+        {
+            self.lifecycle_reply(thread, operation, *attempt, Err(error), false, actions);
+            return;
+        }
         if self.closing {
             self.apply_reply(context, Err(error), actions);
             return;

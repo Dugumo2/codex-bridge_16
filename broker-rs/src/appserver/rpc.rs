@@ -45,6 +45,8 @@ impl MessageWriter for mpsc::UnboundedSender<String> {
 
 /// 回包交给谁。
 enum ReplyTo {
+    Durable(u64),
+    DurableLate(u64),
     /// 调用方自己等（握手等不需要与通知排序的场合）。
     Oneshot(oneshot::Sender<Result<Value, AppError>>),
     /// 作为 [`AppEvent::Reply`] 放进事件通道：与通知、服务端请求同一条通道、同一把锁下交付。
@@ -69,7 +71,10 @@ impl State {
         self.emit_closed();
     }
     fn emit_closed(&mut self) {
-        if !self.closed_sent && self.acked.is_empty() {
+        if !self.closed_sent
+            && self.acked.is_empty()
+            && (!self.private_exit_required || self.private_exit_reported)
+        {
             if let Some(reason) = &self.closed_reason {
                 self.closed_sent = true;
                 // Closed 是事件通道的最后一条：发出后释放发送端，读端随之结束（M2 起的约定）。
@@ -109,9 +114,14 @@ impl State {
             ReplyTo::Oneshot(sender) => {
                 let _ = sender.send(result);
             }
-            ReplyTo::Event(tag) => {
+            ReplyTo::Event(tag) | ReplyTo::Durable(tag) => {
                 if let Some(events) = &self.events {
                     let _ = events.send(AppEvent::Reply { tag, result });
+                }
+            }
+            ReplyTo::DurableLate(tag) => {
+                if let Some(events) = &self.events {
+                    let _ = events.send(AppEvent::LateReply { tag, result });
                 }
             }
         }
@@ -131,9 +141,13 @@ struct State {
     // 已受理回答先结算，随后发送 Closed 并释放发送端。
     // 关闭后未受理的回答返回 Err，由 core 补投本地 Failed。
     events: Option<mpsc::UnboundedSender<AppEvent>>,
+    /// 私有档等待监督方报告实例退出后再发 Closed。
+    private_exit_required: bool,
+    private_exit_reported: bool,
 }
 
 struct Shared {
+    private_instance: Mutex<Option<(crate::store::lifecycle::Instance, watch::Receiver<bool>)>>,
     state: Mutex<State>,
     /// 立即中止读写任务（出错关闭，或正常关闭写不完时）。
     shutdown: watch::Sender<bool>,
@@ -319,6 +333,32 @@ impl std::fmt::Debug for ClientHandle {
 }
 
 impl ClientHandle {
+    pub(crate) fn set_private_instance(
+        &self,
+        instance: crate::store::lifecycle::Instance,
+        exited: watch::Receiver<bool>,
+    ) {
+        *self.shared.private_instance.lock().unwrap() = Some((instance, exited));
+        let mut state = self.shared.state.lock().unwrap();
+        state.private_exit_required = true;
+        state.private_exit_reported = false;
+    }
+    pub(crate) fn private_instance(&self) -> Option<(crate::store::lifecycle::Instance, bool)> {
+        self.shared
+            .private_instance
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(i, e)| (i.clone(), *e.borrow()))
+    }
+    pub(crate) fn private_instance_exited(&self, instance: crate::store::lifecycle::Instance) {
+        let mut state = self.shared.state.lock().unwrap();
+        state.private_exit_reported = true;
+        if let Some(events) = &state.events {
+            let _ = events.send(AppEvent::PrivateInstanceExited { instance });
+        }
+        state.emit_closed();
+    }
     pub(crate) fn failure_reporter(&self) -> FailureReporter {
         FailureReporter(Arc::downgrade(&self.shared))
     }
@@ -348,7 +388,12 @@ impl ClientHandle {
         timeout_ms: Option<u64>,
         tag: u64,
     ) -> Result<(), AppError> {
-        self.start(method, params, timeout_ms, ReplyTo::Event(tag))
+        let reply = if matches!(method, "thread/archive" | "thread/delete") {
+            ReplyTo::Durable(tag)
+        } else {
+            ReplyTo::Event(tag)
+        };
+        self.start(method, params, timeout_ms, reply)
             .map_err(|(_, error)| error)
     }
 
@@ -384,7 +429,26 @@ impl ClientHandle {
                         method: method_name,
                         timeout_ms,
                     };
-                    if let ReplyTo::Event(tag) = &pending.reply {
+                    if let ReplyTo::Durable(tag) = pending.reply {
+                        // 生命周期的迟到回包不能因普通十分钟缓存期限或 64 条上限被丢弃。
+                        let deadline = (tokio::time::Instant::now()
+                            + Duration::from_millis(crate::stop::LATE_MS))
+                        .into_std();
+                        state.pending.insert(
+                            id,
+                            Pending {
+                                reply: ReplyTo::DurableLate(tag),
+                                timer: pending.timer,
+                            },
+                        );
+                        if let Some(events) = &state.events {
+                            let _ = events.send(AppEvent::TimedOut {
+                                tag,
+                                error,
+                                deadline,
+                            });
+                        }
+                    } else if let ReplyTo::Event(tag) = &pending.reply {
                         let tag = *tag;
                         let late_deadline = tokio::time::Instant::now()
                             + Duration::from_millis(crate::stop::LATE_MS);
@@ -628,6 +692,7 @@ where
     let (drained, _) = watch::channel(false);
     let (done, _) = watch::channel(false);
     let shared = Arc::new(Shared {
+        private_instance: Mutex::new(None),
         state: Mutex::new(State {
             next_id: 1,
             acked: HashMap::new(),
@@ -639,6 +704,8 @@ where
             server_requests: HashSet::new(),
             closed_reason: None,
             events: Some(events),
+            private_exit_required: false,
+            private_exit_reported: false,
         }),
         shutdown,
         drain,
@@ -831,6 +898,61 @@ mod tests {
         m.client.close().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn n7_生命周期三十秒超时后迟到登记不受十分钟淘汰且断线不是回包() {
+        let mut m = Memory::new(None);
+        m.client
+            .request_ordered("thread/archive", None, None, 7)
+            .unwrap();
+        let sent = m.sent().await;
+        tokio::time::advance(Duration::from_millis(29_999)).await;
+        assert!(m.events.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::TimedOut {
+                tag: 7,
+                error: AppError::Timeout {
+                    timeout_ms: 30_000,
+                    ..
+                },
+                ..
+            })
+        ));
+        tokio::time::advance(Duration::from_millis(crate::stop::LATE_MS + 1)).await;
+        assert!(m.events.try_recv().is_err());
+        m.feed(json!({"id":sent["id"],"result":{}}));
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::LateReply {
+                tag: 7,
+                result: Ok(_)
+            })
+        ));
+        m.client
+            .request_ordered("thread/delete", None, None, 8)
+            .unwrap();
+        m.sent().await;
+        tokio::time::advance(Duration::from_secs(30)).await;
+        // 存活通知与迟到回包共用通道，先排空前一个请求的存活证据。
+        loop {
+            match m.events.recv().await {
+                Some(AppEvent::Responsive) => {}
+                Some(AppEvent::TimedOut { tag: 8, .. }) => break,
+                other => panic!("意外事件：{other:?}"),
+            }
+        }
+        m.client.fail("测试断线");
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::LateReply {
+                tag: 8,
+                result: Err(AppError::Closed(_))
+            })
+        ));
+        m.client.close().await;
+    }
+
     #[tokio::test]
     async fn 断线时有序请求按发出顺序失败且排在关闭事件之前() {
         let mut m = Memory::new(None);
@@ -857,6 +979,64 @@ mod tests {
             Err(AppError::Closed("断线".into()))
         );
         assert!(m.events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn n7_实例退出报告在先_eof_后仍先于_closed_送达() {
+        let mut m = Memory::new(None);
+        let instance = crate::store::lifecycle::Instance {
+            pid: 701,
+            created_at: 1,
+        };
+        let (_tx, exited) = watch::channel(false);
+        m.client.set_private_instance(instance.clone(), exited);
+        m.client
+            .request_ordered("thread/archive", None, None, 1)
+            .unwrap();
+        m.sent().await;
+        m.client.fail("EOF");
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::Reply { tag: 1, .. })
+        ));
+        m.client.private_instance_exited(instance);
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::PrivateInstanceExited { .. })
+        ));
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::Closed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn n7_实例退出报告在先_eof_后仍保持事件顺序() {
+        let mut m = Memory::new(None);
+        let instance = crate::store::lifecycle::Instance {
+            pid: 702,
+            created_at: 2,
+        };
+        let (_tx, exited) = watch::channel(false);
+        m.client.set_private_instance(instance.clone(), exited);
+        m.client
+            .request_ordered("thread/delete", None, None, 2)
+            .unwrap();
+        m.sent().await;
+        m.client.private_instance_exited(instance);
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::PrivateInstanceExited { .. })
+        ));
+        m.client.fail("进程已退出");
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::Reply { tag: 2, .. })
+        ));
+        assert!(matches!(
+            m.events.recv().await,
+            Some(AppEvent::Closed { .. })
+        ));
     }
 
     /// 收集事件直到出现名为 barrier 的通知，返回其间收到的、属于 tag 的回包。

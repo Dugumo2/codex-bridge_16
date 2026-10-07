@@ -292,7 +292,73 @@ fn 线程流量学习删除和目标状态均接入() {
             &mut m,
             client(request(1, 2, method, json!({"threadId":"线程"}))),
         );
-        reply(&mut m, &first_request(&a), Ok(json!({})));
+        let mut a = a;
+        for _ in 0..2 {
+            for action in &a {
+                if let Action::Store(crate::store::StoreOp::Lifecycle(work)) = action {
+                    work.ticket.finish(match work.kind {
+                        crate::store::lifecycle::WorkKind::Scan { .. } => {
+                            crate::store::lifecycle::ResultValue::Scanned(vec![])
+                        }
+                        _ => crate::store::lifecycle::ResultValue::Written(1),
+                    });
+                }
+            }
+            a = apply(
+                &mut m,
+                Event::Timer {
+                    token: ClaimToken {
+                        thread_id: String::new(),
+                        claim_id: 0,
+                    },
+                    kind: TimerKind::Lifecycle,
+                },
+            );
+        }
+        let a = reply(&mut m, &first_request(&a), Ok(json!({})));
+        for action in &a {
+            if let Action::Store(crate::store::StoreOp::Lifecycle(work)) = action {
+                work.ticket
+                    .finish(crate::store::lifecycle::ResultValue::Written(2));
+            }
+        }
+        apply(
+            &mut m,
+            Event::Timer {
+                token: ClaimToken {
+                    thread_id: String::new(),
+                    claim_id: 0,
+                },
+                kind: TimerKind::Lifecycle,
+            },
+        );
+        m.threads_written(m.runs.index.version, None);
+        let a = apply(
+            &mut m,
+            Event::Timer {
+                token: ClaimToken {
+                    thread_id: String::new(),
+                    claim_id: 0,
+                },
+                kind: TimerKind::Lifecycle,
+            },
+        );
+        for action in &a {
+            if let Action::Store(crate::store::StoreOp::Lifecycle(work)) = action {
+                work.ticket
+                    .finish(crate::store::lifecycle::ResultValue::Written(3));
+            }
+        }
+        apply(
+            &mut m,
+            Event::Timer {
+                token: ClaimToken {
+                    thread_id: String::new(),
+                    claim_id: 0,
+                },
+                kind: TimerKind::Lifecycle,
+            },
+        );
     }
     apply(&mut m, notify("thread/deleted", json!({"threadId":"线程"})));
     assert_eq!(count(&m, "run_forget_thread"), 3);

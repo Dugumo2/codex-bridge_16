@@ -232,6 +232,7 @@ impl Machine {
                 .values()
                 .map(|e| e.thread_id.as_str())
                 .chain(self.claims.keys().map(String::as_str))
+                .chain(self.lifecycle_threads().map(String::as_str))
                 .collect();
             let mut threads: Vec<_> = ids
                 .into_iter()
@@ -382,11 +383,11 @@ impl Machine {
                 ok(
                     &request,
                     json!({"thread":self.thread_summary(thread),
-                    "run":match &run_id {
+                    "run":if self.lifecycle_only(thread) {None} else {match &run_id {
                         Some(id) => self.thread_run(thread, id),
                         None => self.latest_run(thread),
-                    },
-                    "pending":self.inbox_pending(thread)}),
+                    }},
+                    "pending":self.inbox_pending(thread),"lifecycle":self.lifecycle_projection(thread)}),
                     actions,
                 );
             }
@@ -881,7 +882,28 @@ impl Machine {
             .find(|e| e.thread_id == thread);
         let claim = self.claims.get(thread);
         let record = self.records.get(thread);
-        if index.is_none() && claim.is_none() && record.is_none() {
+        let lifecycle = self.lifecycle_record(thread);
+        if index.is_none() {
+            if let Some(lifecycle) = lifecycle {
+                return Some(ThreadSummary {
+                    thread_id: thread.into(),
+                    short_id: lifecycle.short_id.clone(),
+                    state: SummaryState::Idle,
+                    owner: None,
+                    turn_id: None,
+                    goal_active: false,
+                    pending_count: 0,
+                    last_run_id: None,
+                    updated_at: lifecycle.updated_at,
+                    model: None,
+                    preview: lifecycle.preview.clone(),
+                    cwd: None,
+                    meta: None,
+                    lifecycle: self.lifecycle_projection(thread),
+                });
+            }
+        }
+        if index.is_none() && claim.is_none() && record.is_none() && lifecycle.is_none() {
             return None;
         }
         let state = if self.stop_busy(thread) {
@@ -908,17 +930,26 @@ impl Machine {
             }
         };
         Some(ThreadSummary {
+            lifecycle: self.lifecycle_projection(thread),
             thread_id: thread.into(),
-            short_id: index.map(|i| i.short_id.clone()).unwrap_or_default(),
+            short_id: index
+                .map(|i| i.short_id.clone())
+                .or_else(|| lifecycle.map(|r| r.short_id.clone()))
+                .unwrap_or_default(),
             state,
             owner,
             turn_id: claim.and_then(Claim::turn_id).map(str::to_owned),
             goal_active: record.is_some_and(|r| r.goal_active),
             pending_count: self.inbox_pending_count(thread),
             last_run_id: index.and_then(|i| i.last_run_id.clone()),
-            updated_at: index.map_or(0, |i| i.updated_at),
+            updated_at: index
+                .map(|i| i.updated_at)
+                .or_else(|| lifecycle.map(|r| r.updated_at))
+                .unwrap_or(0),
             model: index.and_then(|i| i.model.clone()),
-            preview: index.and_then(|i| i.preview.clone()),
+            preview: index
+                .and_then(|i| i.preview.clone())
+                .or_else(|| lifecycle.and_then(|r| r.preview.clone())),
             cwd: index.and_then(|i| i.cwd.clone()),
             meta: index.and_then(|i| i.meta.clone()),
         })

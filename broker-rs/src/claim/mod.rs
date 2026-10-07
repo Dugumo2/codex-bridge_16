@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 mod ext;
+pub mod lifecycle;
 pub mod loop_guard;
 #[cfg(test)]
 #[path = "tests/m7.rs"]
@@ -238,6 +239,11 @@ pub struct ClaimToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
+    Lifecycle {
+        thread: String,
+        operation: String,
+        attempt: u64,
+    },
     BreakerProbe {
         generation: u64,
     },
@@ -319,6 +325,7 @@ pub struct RequestContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
+    Lifecycle,
     Unsubscribe,
     SettlementRetry {
         attempt: u8,
@@ -469,6 +476,9 @@ pub enum Action {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
+    PrivateInstanceExited {
+        instance: crate::store::lifecycle::Instance,
+    },
     AppResponsive,
     BreakerProbeTimer {
         generation: u64,
@@ -571,6 +581,7 @@ pub struct Clock {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Machine {
+    pub lifecycle: crate::claim::lifecycle::Lifecycle,
     /// core 按线上编号登记仍可回写线程事实的请求；超时保留到迟到处理退役。
     pub purge_inflight: HashMap<u64, String>,
     pub extensions: ext::Extensions,
@@ -630,12 +641,22 @@ pub struct Machine {
 pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     let mut actions = Vec::new();
     match event {
+        Event::PrivateInstanceExited { instance } => state.lifecycle_instance_exited(&instance),
         Event::AppResponsive => state.observe_app_response(&mut actions),
         Event::BreakerProbeTimer { generation } => {
             state.breaker_probe_timer(generation, &mut actions)
         }
         Event::TransportFailed { context, error } => {
-            state.apply_reply(context, Err(error), &mut actions)
+            if let Operation::Lifecycle {
+                thread,
+                operation,
+                attempt,
+            } = &context.operation
+            {
+                state.lifecycle_reply(thread, operation, *attempt, Err(error), false, &mut actions);
+            } else {
+                state.apply_reply(context, Err(error), &mut actions)
+            }
         }
         Event::TimedOut {
             tag,
@@ -747,6 +768,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.evict_records();
     state.prune_ext_meta();
     state.prune_reclaims(&mut actions);
+    state.lifecycle_drive(&mut actions);
     state.prune_goal_versions();
     // 资格代号只服务于产生它的那一次回包处理。
     state.grant_intent = None;
@@ -857,13 +879,74 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         let thread_id = thread_id(&request.params).map(str::to_owned);
+        match request.method.as_str() {
+            "broker/threads/archive" | "thread/archive" => {
+                self.lifecycle_request(
+                    request,
+                    crate::store::lifecycle::Kind::Archive,
+                    false,
+                    actions,
+                );
+                return;
+            }
+            "thread/delete" => {
+                self.lifecycle_request(
+                    request,
+                    crate::store::lifecycle::Kind::Delete,
+                    false,
+                    actions,
+                );
+                return;
+            }
+            "broker/threads/purge"
+                if request
+                    .params
+                    .as_ref()
+                    .is_some_and(|p| p["serverDelete"] == true) =>
+            {
+                self.lifecycle_request(
+                    request,
+                    crate::store::lifecycle::Kind::Delete,
+                    true,
+                    actions,
+                );
+                return;
+            }
+            _ => {}
+        }
+        if !matches!(
+            request.method.as_str(),
+            "broker/threads/watch"
+                | "broker/threads/list"
+                | "thread/read"
+                | "thread/turns/list"
+                | "thread/items/list"
+                | "thread/goal/get"
+                | "broker/inbox/list"
+                | "broker/inbox/wait"
+                | "broker/health"
+                | "broker/inbox/resolve"
+                | "broker/threads/stop"
+        ) && self.lifecycle_gate(&request, thread_id.as_deref().unwrap_or(""), actions)
+        {
+            return;
+        }
         // 删除清单已锁定的线程不能在磁盘操作期间重新认领或改写索引。
         if thread_id
             .as_deref()
             .is_some_and(|thread| self.run_purge_busy(thread))
             && !matches!(
                 request.method.as_str(),
-                "broker/threads/watch" | "broker/threads/purge"
+                "broker/threads/watch"
+                    | "broker/threads/purge"
+                    | "thread/read"
+                    | "thread/turns/list"
+                    | "thread/items/list"
+                    | "thread/goal/get"
+                    | "broker/inbox/list"
+                    | "broker/inbox/wait"
+                    | "broker/threads/list"
+                    | "broker/health"
             )
         {
             actions.push(Action::Send {
@@ -1030,6 +1113,20 @@ impl Machine {
 
     /// #2 的屏障：只有 resume 回包进入邮箱后才取出流式请求。
     fn submit_stream(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
+        if let Some(error) = self.lifecycle_error(thread_id) {
+            if let Some(request) = self
+                .claims
+                .get_mut(thread_id)
+                .and_then(|c| c.pending_start.take())
+            {
+                actions.push(Action::Send {
+                    conn: request.conn,
+                    message: proto::response_err(request.id, error),
+                });
+                self.release_with_kind(thread_id, ReleaseKind::StartFailed, actions);
+            }
+            return;
+        }
         let Some(claim) = self.claims.get_mut(thread_id) else {
             return;
         };
@@ -1085,6 +1182,15 @@ impl Machine {
         result: Result<Value, Value>,
         actions: &mut Vec<Action>,
     ) {
+        if let Operation::Lifecycle {
+            thread,
+            operation,
+            attempt,
+        } = &context.operation
+        {
+            self.lifecycle_reply(thread, operation, *attempt, result, true, actions);
+            return;
+        }
         self.release_stream_slot(context.stream_id);
         if self.closing {
             if let Operation::ResultRead(read) = &context.operation {
@@ -1142,6 +1248,7 @@ impl Machine {
             Operation::BreakerProbe { generation } => {
                 self.breaker_probe_reply(*generation, actions)
             }
+            Operation::Lifecycle { .. } => unreachable!("生命周期回包已分派"),
             Operation::ResultRead(read) => self.run_result_reply(read.clone(), result, actions),
             Operation::ContinueResume => self.continue_reply(&context, result, actions),
             Operation::ContinueRead(_)
@@ -1548,6 +1655,7 @@ impl Machine {
             }
         }
         self.restore_moving_stop(moving_stop, child, claim_id);
+        self.lifecycle_review_moved(parent, child, actions);
         self.reclaim_check(child, actions);
         if let Some(events) = self.unclaimed.remove(child) {
             let mut completed = false;
@@ -1741,7 +1849,11 @@ impl Machine {
             }
         }
         if !event.committed && event.method == "thread/deleted" {
+            self.lifecycle_observe(thread_id, true, actions);
             self.run_forget_thread(thread_id, actions);
+        }
+        if !event.committed && event.method == "turn/started" {
+            self.lifecycle_observe(thread_id, false, actions);
         }
         if !has_claim && self.pending_reviews > 0 && !event.committed {
             event.committed = true;
@@ -2043,6 +2155,7 @@ impl Machine {
 
     /// #18 与停止操作：joined 不碰服务器，自有认领仅标记 owner_gone。
     fn disconnect(&mut self, conn: ConnId, actions: &mut Vec<Action>) {
+        self.lifecycle_disconnect(conn);
         self.live_conns.remove(&conn);
         self.cxb_conns.remove(&conn);
         self.inbox_disconnect(conn);
@@ -2161,6 +2274,7 @@ impl Machine {
             return;
         }
         match kind {
+            TimerKind::Lifecycle => self.lifecycle_tick(),
             TimerKind::JoinedCheckRetry { attempt } => {
                 self.joined_check_retry(&token, attempt, actions)
             }

@@ -32,6 +32,10 @@ pub mod ws;
 /// app-server 主动发给 broker 的消息，按到达顺序交付。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
+    /// 私有 app-server 进程实例已退出；身份用于结算旧实例上的生命周期请求。
+    PrivateInstanceExited {
+        instance: crate::store::lifecycle::Instance,
+    },
     /// 通知，原样透传（6.2 节「协议升级防护」：不按白名单过滤）。
     Notification {
         method: String,

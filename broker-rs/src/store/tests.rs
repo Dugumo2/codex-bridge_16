@@ -435,6 +435,32 @@ fn 日志部分追加重试不重复_超过十_mib_轮转一份() {
     assert!(!temp.dir().join("runs/log.log.2").exists());
 }
 
+#[test]
+fn n7_轮转前后逐行保留时间戳运行编号与事件格式() {
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let line = format!(
+        "2026-10-07T00:00:00.000Z run-abc-123abc 条目完成 {}\n",
+        "甲".repeat(240)
+    );
+    let block = line.repeat(1024);
+    for _ in 0..16 {
+        disk.append_log("runs/n7.log", block.as_bytes()).unwrap();
+    }
+    for file in ["runs/n7.log", "runs/n7.log.1"] {
+        let text = fs::read_to_string(temp.dir().join(file)).unwrap();
+        assert!(!text.is_empty());
+        for value in text.lines() {
+            let fields: Vec<_> = value.splitn(4, ' ').collect();
+            assert_eq!(
+                &fields[..3],
+                &["2026-10-07T00:00:00.000Z", "run-abc-123abc", "条目完成"]
+            );
+            assert_eq!(fields[3].chars().count(), 240);
+        }
+    }
+}
+
 #[tokio::test]
 async fn 初始化超时之后不再创建文件() {
     let temp = Temp::new();

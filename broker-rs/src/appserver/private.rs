@@ -250,6 +250,12 @@ impl Drop for StartupGuard {
 async fn connect_once(options: &PrivateOptions) -> Result<AppConnection, StartupError> {
     let mut child = spawn_process(options)?;
     let pid = child.id();
+    #[cfg(windows)]
+    let instance = child
+        .raw_handle()
+        .and_then(|h| crate::store::lifecycle::instance_from_handle(pid?, h as _));
+    #[cfg(not(windows))]
+    let instance: Option<crate::store::lifecycle::Instance> = None;
     let stdin = child.stdin.take().expect("已配置 stdin 管道");
     let mut stdout = child.stdout.take().expect("已配置 stdout 管道");
     let stderr = child.stderr.take().expect("已配置 stderr 管道");
@@ -273,6 +279,9 @@ async fn connect_once(options: &PrivateOptions) -> Result<AppConnection, Startup
         Some(options.request_timeout_ms),
     );
     let mut guard = StartupGuard(Some(client.clone()));
+    if let Some(ref instance) = instance {
+        client.set_private_instance(instance.clone(), exited_rx.clone());
+    }
     let stdout_reporter = client.failure_reporter();
     let stdout_input = input.clone();
     let stdout_task = tokio::spawn(async move {
@@ -312,8 +321,9 @@ async fn connect_once(options: &PrivateOptions) -> Result<AppConnection, Startup
         }
     });
     let reporter = client.failure_reporter();
+    let exit_events = client.clone();
     tokio::spawn(async move {
-        supervise(child, stop_rx, reporter, exited).await;
+        supervise(child, stop_rx, reporter, exited, exit_events, instance).await;
         // 保留入站发送端到退出原因已发布，避免 EOF 抢先覆盖意外退出的重试信号。
         drop(input);
         tokio::join!(finish_pipe(stdout_task), finish_pipe(stderr_task));
@@ -342,6 +352,8 @@ async fn supervise(
     mut stop: oneshot::Receiver<()>,
     reporter: FailureReporter,
     exited: watch::Sender<bool>,
+    exit_events: super::rpc::ClientHandle,
+    instance: Option<crate::store::lifecycle::Instance>,
 ) {
     tokio::select! {
         biased;
@@ -350,6 +362,9 @@ async fn supervise(
                 tracing::warn!(%error, "等待 app-server 退出失败");
             }
             exited.send_replace(true);
+            if let Some(instance) = instance.clone() {
+                exit_events.private_instance_exited(instance);
+            }
             reporter.fail(PROCESS_EXIT);
             return;
         }
@@ -359,6 +374,9 @@ async fn supervise(
     match tokio::time::timeout(STDIN_EXIT_WAIT, child.wait()).await {
         Ok(Ok(_)) => {
             exited.send_replace(true);
+            if let Some(instance) = instance.clone() {
+                exit_events.private_instance_exited(instance);
+            }
             return;
         }
         Ok(Err(error)) => tracing::warn!(%error, "等待 app-server 优雅退出失败"),
@@ -374,6 +392,9 @@ async fn supervise(
         }
         Ok(Err(error)) => tracing::warn!(%error, "等待 app-server 强制退出失败"),
         Err(_) => tracing::warn!("强制结束 app-server 后等待超过 3 秒，交由 Job 兜底"),
+    }
+    if let Some(instance) = instance {
+        exit_events.private_instance_exited(instance);
     }
 }
 

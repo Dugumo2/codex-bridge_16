@@ -205,7 +205,10 @@ impl Core {
         self
     }
 
-    pub fn with_store(mut self, store: Option<StoreHandle>, loaded: Loaded) -> Self {
+    pub fn with_store(mut self, store: Option<StoreHandle>, mut loaded: Loaded) -> Self {
+        if store.is_none() && loaded.lifecycle.is_none() {
+            loaded.lifecycle = Some(Err("存储初始化失败，无法核实旧生命周期记录".into()));
+        }
         self.epoch = loaded.epoch;
         self.store = store;
         self.loaded = loaded;
@@ -225,6 +228,8 @@ impl Core {
 
     fn restore(&mut self) {
         let loaded = std::mem::take(&mut self.loaded);
+        self.machine
+            .lifecycle_restore(loaded.lifecycle.unwrap_or_else(|| Ok(Default::default())));
         self.dispatch(Event::Restore {
             index: loaded.index,
             runs: loaded.runs,
@@ -263,6 +268,9 @@ impl Core {
 
     fn handle(&mut self, msg: CoreMsg) {
         match msg {
+            CoreMsg::Store(StoreEvent::ThreadsWritten { version, error }) => {
+                self.machine.threads_written(version, error);
+            }
             CoreMsg::Store(StoreEvent::Superseded { file }) => {
                 self.store_terminal = true;
                 tracing::error!(%file, "状态文件已由更新的 broker 接管，正常关闭");
@@ -401,6 +409,11 @@ impl Core {
                 self.on_client_request(conn, id, method, params)
             }
             // 只吞掉 initialized；其余客户端通知一律忽略（上游 1648–1651、1727–1730 行）。
+            Incoming::Notification { method, params } if method == "$/cancelRequest" => {
+                if let Some(id) = params.as_ref().and_then(|p| p.get("id")) {
+                    self.machine.lifecycle_cancel(conn, id);
+                }
+            }
             Incoming::Notification { method, .. } => {
                 tracing::debug!(conn, %method, "忽略客户端通知");
             }
@@ -500,7 +513,9 @@ impl Core {
             .and_then(Value::as_str)
             .or_else(|| context.token.as_ref().map(|token| token.thread_id.as_str()))
         {
-            self.machine.purge_inflight.insert(tag, thread.to_owned());
+            if !matches!(context.operation, claim::Operation::Lifecycle { .. }) {
+                self.machine.purge_inflight.insert(tag, thread.to_owned());
+            }
         }
         self.pending_app.insert(tag, context);
         if let Err(error) = sent {
@@ -591,10 +606,19 @@ impl Core {
             self.machine.purge_inflight.remove(&tag);
             let (_, context, _) = self.late_app.remove(index).unwrap();
             // 入站与 RPC 的截止事件同序；邮箱处理延迟不能改变 RPC 已接收的回包效力。
-            self.dispatch(Event::LateReply {
-                context,
-                result: app_result(result),
-            });
+            if matches!(result, Err(AppError::Closed(_)))
+                && matches!(context.operation, claim::Operation::Lifecycle { .. })
+            {
+                self.dispatch(Event::TransportFailed {
+                    context,
+                    error: app_result(result).unwrap_err(),
+                });
+            } else {
+                self.dispatch(Event::LateReply {
+                    context,
+                    result: app_result(result),
+                });
+            }
         }
     }
 
@@ -605,6 +629,9 @@ impl Core {
             AppEvent::Responsive => {
                 self.touch();
                 self.dispatch(Event::AppResponsive);
+            }
+            AppEvent::PrivateInstanceExited { instance } => {
+                self.dispatch(Event::PrivateInstanceExited { instance });
             }
             AppEvent::TimedOut {
                 tag,
@@ -664,6 +691,9 @@ impl Core {
 
     /// 空闲判定（第 8 节）：活动认领与在途请求阻止空闲退出。
     fn is_busy(&self) -> bool {
+        if self.machine.lifecycle_busy() {
+            return true;
+        }
         // 结果补读与释放后的自动退订都是内部收尾，不代表有 turn 在跑；关闭会断开连接，不必等它们回包。
         self.pending_app.values().any(|c| {
             !matches!(
@@ -681,6 +711,7 @@ impl Core {
     /// `broker/health`（2.3 节）：storage 取 [`StoreHandle::status`]，没有 store 时为 degraded。
     fn health(&mut self, conn: ConnId, id: Value) {
         let storage = if !self.store_terminal
+            && self.machine.lifecycle.degraded.is_none()
             && self
                 .store
                 .as_ref()
@@ -695,7 +726,7 @@ impl Core {
         self.send(conn, &proto::response_ok(id, json!({
             "brokerVersion":env!("CARGO_PKG_VERSION"),"protocolVersion":PROTOCOL_VERSION,"epoch":self.epoch,
             "server":self.config.server,"claims":self.machine.claims.len(),"pending":pending,
-            "uptimeMs":self.started.elapsed().as_millis() as u64,"survivesParentJob":self.survives_parent_job,"parentJob":self.parent_job_evidence,"storage":storage
+            "uptimeMs":self.started.elapsed().as_millis() as u64,"survivesParentJob":self.survives_parent_job,"parentJob":self.parent_job_evidence,"storage":storage,"storageReason":self.machine.lifecycle.degraded
         })));
     }
 

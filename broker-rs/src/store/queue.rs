@@ -14,16 +14,27 @@ const MAX_PENDING_FILES: usize = 512;
 const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const DAILY: Duration = Duration::from_secs(24 * 3600);
 // 为「丢了 N 行」以及换行预留空间，文本与提示合计不超过 1 MiB。
-const LOG_MARKER_RESERVE: usize = 64;
+const LOG_MARKER_RESERVE: usize = 128;
+
+fn log_timestamp() -> String {
+    crate::runs::utc_timestamp(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    )
+}
 
 #[derive(Default)]
 struct LogBuffer {
     lines: VecDeque<(u64, String)>,
     bytes: usize,
     dropped: u64,
+    dropped_at: String,
 }
 
 enum Content {
+    Lifecycle(lifecycle::Work),
     Json(Vec<u8>),
     Log(LogBuffer),
     Purge(purge::PurgeWork),
@@ -32,6 +43,7 @@ enum Content {
 impl Content {
     fn bytes(&self) -> usize {
         match self {
+            Self::Lifecycle(work) => format!("{:?}", work.kind).len(),
             Self::Json(bytes) => bytes.len(),
             Self::Log(log) => log.bytes + LOG_MARKER_RESERVE,
             Self::Purge(work) => {
@@ -42,7 +54,7 @@ impl Content {
     fn log_bytes(&self) -> usize {
         match self {
             Self::Log(log) => log.bytes,
-            Self::Json(_) | Self::Purge(_) => 0,
+            Self::Json(_) | Self::Purge(_) | Self::Lifecycle(_) => 0,
         }
     }
 }
@@ -106,6 +118,40 @@ impl Shared {
     }
 
     pub fn submit(&self, op: StoreOp) {
+        if let StoreOp::Lifecycle(mut work) = op {
+            let mut state = self.lock();
+            if state.draining || state.terminal {
+                work.ticket
+                    .finish(lifecycle::ResultValue::Failed("存储已关闭".into()));
+                return;
+            }
+            if let lifecycle::WorkKind::Scan { seeds } = &mut work.kind {
+                for (name, pending) in &state.pending {
+                    if name.starts_with("runs/") && name.ends_with(".json") {
+                        if let Content::Json(bytes) = &pending.content {
+                            if let Ok(header) = serde_json::from_slice(bytes) {
+                                seeds.push(header);
+                            }
+                        }
+                    }
+                }
+            }
+            state.sequence += 1;
+            let order = state.sequence;
+            state.pending.insert(
+                format!("lifecycle-{order}"),
+                Pending {
+                    content: Content::Lifecycle(work),
+                    order,
+                    dirty: false,
+                    retry_at: Instant::now(),
+                    retry_delay: RETRY_MIN,
+                },
+            );
+            drop(state);
+            self.wake.notify_one();
+            return;
+        }
         if let StoreOp::Purge(mut work) = op {
             let mut state = self.lock();
             if state.draining || state.terminal {
@@ -159,6 +205,7 @@ impl Shared {
             StoreOp::PutInbox(inbox) => serde_json::to_vec(inbox),
             StoreOp::AppendLog { .. } => unreachable!("日志不经过状态序列化"),
             StoreOp::Purge(_) => unreachable!("删除任务不经过状态序列化"),
+            StoreOp::Lifecycle(_) => unreachable!("生命周期任务不经过通用序列化"),
         });
     }
 
@@ -181,6 +228,7 @@ impl Shared {
             _ => Some(serialize(&op).expect("状态记录可序列化")),
         };
         let (name, content) = match op {
+            StoreOp::Lifecycle(_) => unreachable!("生命周期任务单独登记"),
             StoreOp::Purge(_) => unreachable!("删除任务单独登记"),
             StoreOp::PutRun(run) => {
                 if !valid_id(&run.run_id) {
@@ -209,6 +257,7 @@ impl Shared {
                         let (_, line) = log.lines.pop_front().unwrap();
                         log.bytes -= line.len() + 1;
                         log.dropped += 1;
+                        log.dropped_at = log_timestamp();
                     }
                 }
                 (format!("runs/{short_id}.log"), Content::Log(log))
@@ -317,6 +366,11 @@ impl Shared {
         state.report.abandoned.sort();
         state.report.abandoned.dedup();
         for pending in state.pending.values() {
+            if let Content::Lifecycle(work) = &pending.content {
+                work.ticket.finish(lifecycle::ResultValue::Failed(
+                    "存储任务未完成即关闭".into(),
+                ));
+            }
             if let Content::Purge(work) = &pending.content {
                 work.ticket
                     .finish(purge::PurgeResult::Failed("存储任务未完成即关闭".into()));
@@ -346,6 +400,9 @@ fn merge(old: Content, new: Content) -> Content {
         (Content::Log(mut old), Content::Log(new)) => {
             old.bytes += new.bytes;
             old.dropped = old.dropped.saturating_add(new.dropped);
+            if new.dropped != 0 {
+                old.dropped_at = new.dropped_at;
+            }
             old.lines.extend(new.lines);
             Content::Log(old)
         }
@@ -383,6 +440,7 @@ fn enforce_limits(state: &mut State) -> Vec<String> {
         log.bytes -= line.len() + 1;
         log_bytes -= line.len() + 1;
         log.dropped = log.dropped.saturating_add(1);
+        log.dropped_at = log_timestamp();
     }
     let mut evicted = Vec::new();
     loop {
@@ -485,6 +543,30 @@ fn worker_with_interval(disk: &mut Disk, shared: &Shared, cleanup_interval: Dura
                 }
             }
             let result = match &pending.content {
+                Content::Lifecycle(work) => {
+                    disk.gate.initialization = Some((
+                        Instant::now() + Duration::from_secs(10),
+                        Duration::from_secs(10),
+                    ));
+                    let result = disk.lifecycle_work(work);
+                    disk.gate.initialization = None;
+                    match result {
+                        Ok(result) => {
+                            work.ticket.finish(result);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            work.ticket.finish(lifecycle::ResultValue::Failed(format!(
+                                "生命周期存储失败：{error}"
+                            )));
+                            if matches!(error, StoreError::Superseded { .. }) {
+                                Err(error)
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    }
+                }
                 Content::Purge(work) => {
                     if work.ticket.result().is_some() {
                         Ok(())
@@ -496,6 +578,14 @@ fn worker_with_interval(disk: &mut Disk, shared: &Shared, cleanup_interval: Dura
                         };
                         match result {
                             Ok(result) => {
+                                if matches!(result, purge::PurgeResult::Finished(_)) {
+                                    if let Some(index) = &work.index {
+                                        (shared.on_event)(StoreEvent::ThreadsWritten {
+                                            version: index.version,
+                                            error: None,
+                                        });
+                                    }
+                                }
                                 work.ticket.finish(result);
                                 Ok(())
                             }
@@ -516,7 +606,14 @@ fn worker_with_interval(disk: &mut Disk, shared: &Shared, cleanup_interval: Dura
                 Content::Log(log) => {
                     let mut bytes = Vec::with_capacity(log.bytes + LOG_MARKER_RESERVE);
                     if log.dropped != 0 {
-                        bytes.extend_from_slice(format!("丢了 {} 行\n", log.dropped).as_bytes());
+                        let timestamp = log
+                            .lines
+                            .front()
+                            .and_then(|(_, line)| line.split_once(' ').map(|(ts, _)| ts))
+                            .unwrap_or(&log.dropped_at);
+                        bytes.extend_from_slice(
+                            format!("{timestamp} - 丢行 丢了 {} 行\n", log.dropped).as_bytes(),
+                        );
                     }
                     for (_, line) in &log.lines {
                         bytes.extend_from_slice(line.as_bytes());
@@ -525,6 +622,16 @@ fn worker_with_interval(disk: &mut Disk, shared: &Shared, cleanup_interval: Dura
                     disk.append_log(&name, &bytes)
                 }
             };
+            if name == "threads.json" {
+                if let Content::Json(bytes) = &pending.content {
+                    if let Ok(index) = serde_json::from_slice::<ThreadIndexFile>(bytes) {
+                        (shared.on_event)(StoreEvent::ThreadsWritten {
+                            version: index.version,
+                            error: result.as_ref().err().map(ToString::to_string),
+                        });
+                    }
+                }
+            }
             if let Err(StoreError::Superseded { file }) = &result {
                 shared.finish(Some(StoreEvent::Superseded { file: file.clone() }));
                 return;

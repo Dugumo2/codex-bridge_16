@@ -15,6 +15,104 @@ fn shared() -> Shared {
 }
 
 #[test]
+fn n7_生命周期失败票据终结后不得重发旧版本() {
+    use lifecycle::{File, ResultValue, Ticket, Work, WorkKind};
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let shared = shared();
+    fs::create_dir(disk.dir.join("lifecycle.json")).unwrap();
+    let ticket = Ticket::default();
+    shared.submit(StoreOp::Lifecycle(Work {
+        kind: WorkKind::Write {
+            version: 1,
+            file: File::default(),
+        },
+        ticket: ticket.clone(),
+    }));
+    shared.begin_drain();
+    worker(&mut disk, &shared);
+    assert!(matches!(ticket.result(), Some(ResultValue::Failed(_))));
+    assert!(shared.lock().pending.is_empty());
+    fs::remove_dir(disk.dir.join("lifecycle.json")).unwrap();
+    assert!(!disk.dir.join("lifecycle.json").exists());
+}
+
+#[test]
+fn n7_普通合并索引写入确认最高版本() {
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let versions = Arc::new(Mutex::new(Vec::new()));
+    let captured = versions.clone();
+    let mut shared = shared();
+    shared.on_event = Box::new(move |event| {
+        if let StoreEvent::ThreadsWritten { version, error } = event {
+            assert!(error.is_none());
+            captured.lock().unwrap().push(version);
+        }
+    });
+    for version in [1, 2, 3] {
+        shared.submit(StoreOp::PutThreads(ThreadIndexFile {
+            version,
+            ..Default::default()
+        }));
+    }
+    shared.begin_drain();
+    worker(&mut disk, &shared);
+    assert_eq!(*versions.lock().unwrap(), vec![3]);
+    assert_eq!(
+        read::<ThreadIndexFile>(&disk.dir.join("threads.json"))
+            .payload
+            .version,
+        3
+    );
+}
+
+#[test]
+fn n7_全部丢弃仍有带时间戳的单一标记() {
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let shared = shared();
+    shared.submit(StoreOp::AppendLog {
+        short_id: "t".into(),
+        lines: vec!["甲".repeat(MAX_PENDING_LOG_BYTES)],
+    });
+    shared.begin_drain();
+    worker(&mut disk, &shared);
+    let text = fs::read_to_string(disk.dir.join("runs/t.log")).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    let parts: Vec<_> = text.trim_end().splitn(4, ' ').collect();
+    assert_eq!(parts[0].len(), 24);
+    assert!(parts[0].ends_with('Z'));
+    assert_eq!(&parts[1..], &["-", "丢行", "丢了 1 行"]);
+}
+
+#[test]
+fn n7_两路截断计数合并只写一个标记() {
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let shared = shared();
+    let line = format!(
+        "2026-10-07T00:00:00.000Z run-abc-123abc 条目完成 {}",
+        "甲".repeat(2000)
+    );
+    for _ in 0..2 {
+        shared.submit(StoreOp::AppendLog {
+            short_id: "t".into(),
+            lines: vec![line.clone(); 300],
+        });
+    }
+    let dropped = match &shared.lock().pending["runs/t.log"].content {
+        Content::Log(log) => log.dropped,
+        _ => panic!("必须是日志"),
+    };
+    shared.begin_drain();
+    worker(&mut disk, &shared);
+    let text = fs::read_to_string(disk.dir.join("runs/t.log")).unwrap();
+    assert_eq!(text.matches(" - 丢行 ").count(), 1);
+    assert_eq!(text.lines().count() as u64 + dropped, 601);
+}
+
+#[test]
 fn 删除扫描纳入待写历史且在途写入整体拒绝() {
     use crate::runs::{PurgePlan, ThreadIndexFile};
     use crate::store::purge::{PurgeTicket, PurgeWork};
@@ -165,14 +263,17 @@ async fn 日志入口上限与丢行提示() {
     let temp = Temp::new();
     let mut disk = temp.disk();
     let shared = Arc::new(shared());
-    let line = "甲".repeat(1000);
+    let line = format!(
+        "2026-10-07T00:00:00.000Z run-abc-123abc 条目完成 {}",
+        "甲".repeat(1000)
+    );
     shared.submit(StoreOp::AppendLog {
         short_id: "t".into(),
         lines: vec![line.clone(); 1000],
     });
     shared.submit(StoreOp::AppendLog {
         short_id: "t".into(),
-        lines: vec!["最后一行".into()],
+        lines: vec!["2026-10-07T00:00:01.000Z run-abc-123abc 运行结束 最后一行".into()],
     });
     let dropped = {
         let state = shared.lock();
@@ -189,7 +290,9 @@ async fn 日志入口上限与丢行提示() {
     assert!(report.abandoned.is_empty());
     thread.join().unwrap();
     let text = fs::read_to_string(temp.dir().join("runs/t.log")).unwrap();
-    assert!(text.starts_with(&format!("丢了 {dropped} 行\n")));
+    assert!(text.starts_with(&format!(
+        "2026-10-07T00:00:00.000Z - 丢行 丢了 {dropped} 行\n"
+    )));
     assert!(text.ends_with("最后一行\n"));
     assert!(text.len() <= MAX_PENDING_LOG_BYTES);
 }

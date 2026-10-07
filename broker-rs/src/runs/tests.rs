@@ -56,6 +56,54 @@ use crate::results::{Snapshot, MAX_TEXT_BYTES};
 use crate::store::{StoreOp, RETENTION_MS};
 use serde_json::json;
 
+#[test]
+fn n7_每类日志带运行编号且内容清洗与空内容符合四段格式() {
+    let mut m = machine();
+    let run = "run-abc-123abc";
+    open(&mut m, run, "P");
+    for event in [
+        "运行开始",
+        "运行结束",
+        "轮次开始",
+        "轮次完成",
+        "条目开始",
+        "条目完成",
+        "停止发起",
+        "停止确认",
+        "空转刹车",
+        "空转刹车暂停目标",
+        "启动失败",
+        "交接撤销",
+    ] {
+        for content in [String::new(), "甲\n乙\t丙\r丁\0".repeat(100)] {
+            let mut a = vec![];
+            m.runs.log(run, 1000, event, &content, &mut a);
+            let line = a
+                .iter()
+                .find_map(|a| {
+                    if let Action::Store(StoreOp::AppendLog { lines, .. }) = a {
+                        Some(&lines[0])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let parts: Vec<_> = line.splitn(4, ' ').collect();
+            assert_eq!(&parts[..3], &["1970-01-01T00:00:01.000Z", run, event]);
+            assert_eq!(parts[3].chars().count(), content.chars().count().min(240));
+            assert!(!parts[3].chars().any(char::is_control));
+            assert_eq!(
+                parts[3],
+                content
+                    .chars()
+                    .take(240)
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect::<String>()
+            );
+        }
+    }
+}
+
 fn machine() -> Machine {
     let mut m = Machine::new(false);
     m.clock = Clock {
@@ -271,7 +319,7 @@ fn open_consumes_only_own_meta_and_uses_injected_clock() {
     assert_eq!(index_puts(&actions), 1);
     assert_eq!(m.latest_run("线程").unwrap().run_id, "运行");
     assert_eq!(m.run_snapshot("运行").unwrap()["turnsTotal"], 0);
-    assert!(actions.iter().any(|a| matches!(a, Action::Store(StoreOp::AppendLog { lines, .. }) if lines[0].starts_with("1970-01-01T00:00:01.000Z 运行开始"))));
+    assert!(actions.iter().any(|a| matches!(a, Action::Store(StoreOp::AppendLog { lines, .. }) if lines[0].starts_with("1970-01-01T00:00:01.000Z 运行 运行开始"))));
     assert!(open(&mut m, "运行", "线程").is_empty());
 }
 

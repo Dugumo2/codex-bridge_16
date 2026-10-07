@@ -263,6 +263,7 @@ pub type ThreadIndex = BTreeMap<ShortId, ThreadIndexEntry>;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadIndexFile {
+    pub version: u64,
     pub threads: ThreadIndex,
     pub removed: BTreeMap<String, u64>,
     /// purge 的文件清单随删除标记保留，供部分失败重试与跨重启幂等报告。
@@ -352,6 +353,8 @@ pub enum SummaryOwner {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Value>,
     pub thread_id: String,
     pub short_id: ShortId,
     pub state: SummaryState,
