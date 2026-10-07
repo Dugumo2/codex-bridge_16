@@ -53,6 +53,7 @@ function readTrace(): void {
 }
 class Rpc {
   notifications: Frame[] = [];
+  onNotification?: (frame: Frame) => void;
   private next = 1;
   private buffer = "";
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: unknown) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -63,7 +64,7 @@ class Rpc {
       for (let end; (end = this.buffer.indexOf("\n")) >= 0;) {
         const line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + 1);
         const frame: Frame = JSON.parse(line);
-        if (frame.id === undefined || frame.method) { this.notifications.push(frame); continue; }
+        if (frame.id === undefined || frame.method) { this.notifications.push(frame); this.onNotification?.(frame); continue; }
         const pending = this.pending.get(frame.id);
         if (!pending) continue;
         clearTimeout(pending.timer); this.pending.delete(frame.id);
@@ -90,7 +91,7 @@ class Rpc {
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cxb-n4-review-"));
   sockets = new Set(); clients = []; children = []; pids = new Set(); observed = []; observerErrors = []; traceOffset = 0; baseObserver = "";
-  for (const name of ["data", "codex-home"]) mkdirSync(join(dir, name));
+  for (const name of ["data", "codex-home", "profile"]) mkdirSync(join(dir, name));
   watcher = watch(dir, () => { try { readTrace(); } catch (error) { observerErrors.push(error); } });
   // 透明观测器只记录现有 mock 的输入与进程号，不改应答或时序。
   writeFileSync(join(dir, "observe.ts"), `import { appendFileSync } from "node:fs";
@@ -149,10 +150,11 @@ async function start(): Promise<{ client: Rpc; exited: Promise<void> }> {
   writeFileSync(join(mock, "codex.cmd"), `@echo off\r\n"${process.execPath}" --preload "%~dp0observe.ts" "%~dp0codex-mock.ts" %*\r\n`);
   const env = Object.fromEntries(Object.entries(envWithPathPrefix(mock)).filter(([key]) => {
     const name = key.toUpperCase();
-    return !["CXB_HOME", "CODEX_HOME", "CXB_SERVER"].includes(name)
+    return !["CXB_HOME", "CODEX_HOME", "USERPROFILE", "HOME", "CXB_SERVER"].includes(name)
       && !/SOCKET|ENDPOINT/.test(name) && !name.startsWith("MOCK_");
   }));
-  Object.assign(env, { CXB_HOME: join(dir, "data"), CODEX_HOME: join(dir, "codex-home"), CXB_SERVER: "private" });
+  Object.assign(env, { CXB_HOME: join(dir, "data"), CODEX_HOME: join(dir, "codex-home"),
+    USERPROFILE: join(dir, "profile"), HOME: join(dir, "profile"), CXB_SERVER: "private" });
   const path = testSocketPath(dir);
   const child = spawn(BROKER_BIN, ["serve", "--cwd", dir, "--endpoint", endpointFor(path), "--idle-timeout", "60000"], {
     env, cwd: dir, windowsHide: true, stdio: "ignore",
@@ -322,3 +324,58 @@ test("停止先于迁移回包时不操作父线程，迁移后合并同一运�
   await complete(client);
   expect((await stopping).stopOutcome).toBe("confirmed");
 },30_000);
+for (const detachFirst of [true, false]) test(`同批交接与停止：${detachFirst ? "交接先到" : "停止先到"}仍只停止活动 review 子线程`, async () => {
+  const { client } = await start();
+  await client.request("thread/start");
+  await client.request("review/start", { threadId: parent, target: { type: "uncommittedChanges" } });
+  const runId = (await client.request("broker/threads/watch", { threadId: parent })).run.runId;
+  let transferred!: Promise<any>;
+  let stopping!: Promise<any>;
+  client.socket.cork();
+  try {
+    const detach = () => { transferred = client.request("broker/threads/detach", { threadId: parent, runId, policy: "auto" }); };
+    const stop = () => { stopping = client.request("broker/threads/stop", { threadId: parent }); };
+    if (detachFirst) { detach(); stop(); } else { stop(); detach(); }
+  } finally { client.socket.uncork(); }
+  void transferred.catch(() => {}); void stopping.catch(() => {});
+  await until(() => { readTrace(); return observed.some((r) => r.method === "turn/interrupt"); });
+  expect(observed.filter((r) => r.method === "turn/interrupt").map((r) => r.params)).toEqual([{ threadId: child, turnId: reviewTurn }]);
+  expect((await client.request("broker/threads/watch", { threadId: parent })).run.state).toBe("stopping");
+  await complete(client);
+  expect(await stopping).toMatchObject({ runId, alreadyStopped: false, stopOutcome: "confirmed" });
+  expect(["detached", "alreadyDetached", "runEnded"]).toContain((await transferred).outcome);
+  const ended = await client.request("broker/threads/watch", { threadId: child });
+  expect(ended.run).toMatchObject({ runId, state: "ended", reviewThreadId: child });
+}, 60_000);
+
+for (const firstTarget of [parent, child]) test(`迁移通知与父子停止交错：先停${firstTarget === parent ? "父" : "子"}线程，两次停止汇合到同一 review`, async () => {
+  const { client } = await start();
+  await client.request("thread/start");
+  await client.request("n4/hold");
+  const reviewing = client.request("review/start", { threadId: parent, target: { type: "uncommittedChanges" } });
+  void reviewing.catch(() => {});
+  await until(async () => (await client.request("n4/state")).held === 1);
+  let stops: Promise<any>[] = [];
+  let movedRun = "";
+  client.onNotification = (frame) => {
+    if (frame.method !== "broker/run/moved") return;
+    movedRun = frame.params!.runId as string;
+    stops = [firstTarget, firstTarget === parent ? child : parent].map((threadId) => {
+      const work = client.request("broker/threads/stop", { threadId });
+      void work.catch(() => {});
+      return work;
+    });
+  };
+  try {
+    await client.request("n4/release");
+    await reviewing;
+    await until(() => { readTrace(); return stops.length === 2 && observed.some((r) => r.method === "turn/interrupt"); });
+    const interrupts = observed.filter((r) => r.method === "turn/interrupt");
+    expect(interrupts.map((r) => r.params)).toEqual([{ threadId: child, turnId: reviewTurn }]);
+    expect((await client.request("broker/threads/watch", { threadId: parent })).run.state).toBe("stopping");
+    await complete(client);
+    const replies = await bounded(Promise.all(stops), 50_000);
+    for (const reply of replies) expect(reply).toMatchObject({ runId: movedRun, stopOutcome: "confirmed" });
+    expect((await client.request("broker/threads/watch", { threadId: child })).run.state).toBe("ended");
+  } finally { client.onNotification = undefined; }
+}, 60_000);

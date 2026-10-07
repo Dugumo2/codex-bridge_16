@@ -11,15 +11,41 @@ import { STOP_SETTLING_LIMIT_MS, stopThread } from "./stop-thread";
 import { context, reasonError } from "./test-fixtures/n4a-unit";
 import { FakeRpc, runResult } from "./test-fixtures/run-fakes";
 import { matchThread, resolveThreadLocal, resolveThreadViaBroker } from "./thread-ref";
+import { watchdog } from "./test-fixtures/test-watchdog";
 
 let dir: string;
+const sessionCleanups: Array<() => Promise<void>> = [];
+function trackedSession(c: ReturnType<typeof context>) {
+  const session = commandSession(c.ctx);
+  let closed = false;
+  const connect = c.ctx.connect;
+  c.ctx.connect = async () => {
+    const connection = await connect();
+    sessionCleanups.push(async () => { await watchdog(connection.close()); closed = true; });
+    return connection;
+  };
+  sessionCleanups.push(async () => {
+    session.dispose();
+    expect(session.signal.aborted).toBe(true);
+    expect(c.cleanup.size).toBe(0);
+    expect(c.fake.subscriptions).toBe(0);
+    expect(c.fake.notificationErrors).toEqual([]);
+    if (c.connects) expect(closed).toBe(true);
+  });
+  return session;
+}
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "cxb-n4-shared-"));
   mkdirSync(join(dir, "runs"));
 });
-afterEach(() => {
+afterEach(async () => {
+  const errors: unknown[] = [];
+  for (const cleanup of sessionCleanups.splice(0).reverse()) {
+    try { await cleanup(); } catch (error) { errors.push(error); }
+  }
   rmSync(dir, { recursive: true, force: true });
   expect(existsSync(dir)).toBe(false);
+  if (errors.length) throw new AggregateError(errors, "会话收尾失败");
 });
 
 function writeIndex(threads: Record<string, unknown>) {
@@ -133,14 +159,15 @@ describe("thread-ref：短 ID、前缀与服务器 ID", () => {
 describe("command-session：连接与请求的错误归类", () => {
   test("连接层已定的退出码原样保留（版本不符 12、broker 不可用 6），超时改报 6", async () => {
     for (const code of ["PROTOCOL_MISMATCH", "BROKER_UNAVAILABLE", "INTERRUPTED"] as const) {
-      const { ctx } = context(dir, ["ls"]);
-      ctx.connect = async () => { throw new CxbError(code, "连接失败"); };
-      await expect(commandSession(ctx).connect()).rejects.toMatchObject({ code });
+      const c = context(dir, ["ls"]);
+      c.ctx.connect = async () => { throw new CxbError(code, "连接失败"); };
+      await expect(trackedSession(c).connect()).rejects.toMatchObject({ code });
     }
   });
 
   test("请求错误：线程不存在 2、存储失败 1、broker 私有方法 6、上游方法 7，原因仍可从 cause 读出", async () => {
-    const { ctx, fake } = context(dir, ["ls"]);
+    const c = context(dir, ["ls"]);
+    const { fake } = c;
     const failures: Record<string, unknown> = {
       "thread/archive": new CxbError("BROKER_UNAVAILABLE", "线上", { cause: new RpcError("x", -32600, "no rollout found for thread id t-1") }),
       "broker/threads/purge": reasonError("storageError"),
@@ -152,7 +179,7 @@ describe("command-session：连接与请求的错误归类", () => {
       "thread/name/set": reasonError("purgePending", -32001),
     };
     fake.handle = (method) => { throw failures[method]; };
-    const rpc = await commandSession(ctx).connect();
+    const rpc = await trackedSession(c).connect();
     const codes = Object.fromEntries(await Promise.all(Object.keys(failures).map(async (method) =>
       [method, await rpc.request(method, {}).then(() => "成功", (error: CxbError) => error.code)])));
     expect(codes).toEqual({ "thread/archive": "NOT_FOUND", "broker/threads/purge": "LOCAL_ERROR",
@@ -163,8 +190,9 @@ describe("command-session：连接与请求的错误归类", () => {
   });
 
   test("已取消时不再发请求", async () => {
-    const { ctx, fake } = context(dir, ["ls"]);
-    const session = commandSession(ctx);
+    const c = context(dir, ["ls"]);
+    const { fake } = c;
+    const session = trackedSession(c);
     const rpc = await session.connect();
     session.dispose();
     await expect(rpc.request("broker/threads/list", {})).rejects.toMatchObject({ code: "INTERRUPTED" });

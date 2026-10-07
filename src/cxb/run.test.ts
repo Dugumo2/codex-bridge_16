@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import type { RunResult } from "./contracts";
 import { join } from "node:path";
@@ -9,9 +9,11 @@ import { createReviewHandler } from "./review";
 import { RpcError } from "../types";
 import { parseArgv } from "./args";
 import type { CommandContext } from "./main";
-import { createOutput, type Cleanup } from "./output";
+import { createOutput, registerSignalHandlers, type Cleanup } from "./output";
 import { FakeRpc, runResult, wireError } from "./test-fixtures/run-fakes";
 import { bounded, waitRun } from "./wait-run";
+import { deferred, messageBarrier, watchdog } from "./test-fixtures/test-watchdog";
+import { attachServerRequests, handover, renderPending } from "./server-requests";
 import { CLEANUP_BUDGET, TEST_BUDGET, RunHarness, fakeServerRequests, until, alive } from "./test-fixtures/run-harness";
 
 let h: RunHarness;
@@ -262,6 +264,7 @@ function unitExecution(args: string[], server: "private" | "shared" = "private")
   const capture = h.capture();
   const callbacks = new Set<Cleanup>();
   h.disposers.push(async () => { await Promise.all([...callbacks].map((callback) => callback())); });
+  h.disposers.push(() => { expect(fake.notificationErrors).toEqual([]); });
   const parsed = parseArgv(args);
   const out = createOutput({ command: "run", json: parsed.globals.json, verbose: parsed.globals.verbose, stdout: capture.output, stderr: capture.diagnostic });
   const ctx: CommandContext = { parsed, out, workspace: h.workspace, connect: async () => connection,
@@ -522,6 +525,143 @@ function continueUnit(args: string[], opts: { from?: RunResult; server?: "privat
 const methods = (unit: { fake: FakeRpc }) => unit.fake.calls.map((call) => call.method);
 const turnText = (unit: { fake: FakeRpc }) => unit.fake.calls.find((call) => call.method === "turn/start")?.params.input[0].text as string;
 
+const realRequests: ServerRequestDeps = { attachServerRequests, handover, renderPending };
+
+test("续跑：启动回包等待审批，真实处理器先回包再完成运行", async () => {
+  const unit = continueUnit(["--json", "--approval", "never"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = async (method, params) => {
+    if (method !== "turn/start") return original(method, params);
+    unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
+    await unit.fake.serverRequest("item/commandExecution/requestApproval", {
+      threadId: "thread-test", turnId: "turn-test", itemId: "approval-1", command: "echo 测试", cwd: h.workspace.root,
+    }, "approval-1");
+    expect(unit.fake.replies).toEqual([{ id: "approval-1", result: { decision: "accept" } }]);
+    return { runId: "run-test" };
+  };
+  expect(await watchdog(createRunHandler(realRequests)(unit.ctx))).toBe(0);
+  expect(unit.fake.replies).toEqual([{ id: "approval-1", result: { decision: "accept" } }]);
+  expect(unit.fake.inFlightServerRequests).toBe(0);
+  expect(unit.fake.subscriptions).toBe(0);
+  expect(unit.closed()).toBe(true);
+});
+
+test("续跑：启动回包尚未放行的提问触发交接，不代答、不停止运行", async () => {
+  const startReply = deferred<object>();
+  const delivered = deferred<void>();
+  const unit = continueUnit(["--json"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = async (method, params) => {
+    if (method === "turn/start") {
+      unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
+      await unit.fake.serverRequest("item/tool/requestUserInput", { threadId: "thread-test", turnId: "turn-test",
+        itemId: "ask-1", questions: [{ id: "q1", header: "选择", question: "选哪个？", isOther: false, isSecret: false, options: null }] }, "ask-1");
+      delivered.resolve();
+      return startReply.promise;
+    }
+    if (method === "broker/threads/detach") return { outcome: "detached", turnId: "turn-test", pending: [] };
+    if (method === "broker/threads/watch" && unit.fake.calls.some((c) => c.method === "turn/start")) {
+      return { run: runResult({ state: "running", status: null }) };
+    }
+    return original(method, params);
+  };
+  try {
+    expect(await watchdog(createRunHandler(realRequests)(unit.ctx))).toBe(5);
+    await delivered.wait();
+    expect(methods(unit)).toContain("broker/threads/detach");
+    expect(methods(unit)).not.toContain("broker/threads/stop");
+    expect(unit.fake.replies).toEqual([]);
+    expect(unit.fake.inFlightServerRequests).toBe(0);
+    expect(unit.fake.subscriptions).toBe(0);
+    expect(unit.closed()).toBe(true);
+  } finally { startReply.resolve({ runId: "run-test" }); await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]); }
+});
+
+test("续跑 --detach：交接完成后返回新运行句柄且不停止、不等待结果", async () => {
+  const unit = continueUnit(["--detach", "--json"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => method === "broker/threads/detach"
+    ? { outcome: "detached", turnId: "turn-test", pending: [] } : original(method, params);
+  expect(await watchdog(createRunHandler(realRequests)(unit.ctx))).toBe(0);
+  await unit.out.flush();
+  expect(JSON.parse(unit.output().stdout)).toEqual({ threadId: "thread-test", shortId: "abcd1234", runId: "run-test", status: "running" });
+  expect(unit.fake.calls.find((c) => c.method === "broker/threads/detach")?.params).toMatchObject({ threadId: "thread-test", runId: "run-test" });
+  expect(unit.fake.calls.filter((c) => c.method === "broker/threads/watch")).toHaveLength(1);
+  expect(methods(unit)).not.toContain("broker/threads/stop");
+  expect(unit.fake.subscriptions).toBe(0);
+  expect(unit.closed()).toBe(true);
+});
+
+for (const [stage, method, hasRun] of [
+  ["读取模型", "model/list", false], ["解析线程", "broker/threads/list", false],
+  ["读取原运行", "broker/threads/watch", false], ["登记恢复参数", "broker/threads/resumeOverrides", false],
+  ["登记元数据", "broker/threads/annotate", false], ["读取目标", "thread/goal/get", false],
+  ["启动尚未认领", "turn/start", false], ["启动已认领", "turn/start", true],
+  ["等待共享定案", "定案", true], ["等待结果", "broker/threads/watch", true],
+  ["交接尚未确认", "broker/threads/detach", true],
+] as const) test(`续跑 Ctrl-C 清理：${stage}取消等待，只停止本次已认领运行`, async () => {
+  const unit = continueUnit(method === "broker/threads/detach" ? ["--detach"] : [], { server: "shared" });
+  const savedCode = process.exitCode ?? 0;
+  const listeners = process.listenerCount("SIGINT");
+  const exitCalls: unknown[] = [];
+  const exit = spyOn(process, "exit").mockImplementation(((code: unknown) => { exitCalls.push(code); }) as typeof process.exit);
+  const signals = registerSignalHandlers(unit.out, { cleanupTimeoutMs: 50_000 });
+  const register = unit.ctx.registerCleanup;
+  unit.ctx.registerCleanup = (callback) => {
+    const cancelUnit = register(callback);
+    const cancelSignal = signals.registerCleanup(callback);
+    return () => { cancelUnit(); cancelSignal(); };
+  };
+  const reached = deferred<void>();
+  const release = deferred<any>();
+  const original = unit.fake.handle;
+  unit.fake.handle = (called, params) => {
+    const afterStart = unit.fake.calls.some((c) => c.method === "turn/start");
+    if (called === "broker/threads/stop") return { stopOutcome: "confirmed" };
+    if (called === method && (method !== "broker/threads/watch" || afterStart === hasRun)) {
+      if (hasRun && called === "turn/start") unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
+      reached.resolve();
+      return release.promise;
+    }
+    if (called === "turn/start") {
+      unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
+      if (method === "定案") { reached.resolve(); return { runId: "run-test" }; }
+      return { runId: "run-test", absorbedBy: null };
+    }
+    return original(called, params);
+  };
+  const work = createRunHandler(realRequests)(unit.ctx);
+  void work.catch(() => {});
+  try {
+    await reached.wait();
+    // 进程内投递 SIGINT，经过真实输出层，覆盖 130 映射；不声称验证 Windows 控制台按键。
+    process.emit("SIGINT");
+    await watchdog(signals.shutdown!);
+    await expect(watchdog(work)).rejects.toMatchObject({ code: "INTERRUPTED", exitCode: 4 });
+    expect(process.exitCode).toBe(130);
+    expect(exitCalls).toEqual([130]);
+    const stops = unit.fake.calls.filter((c) => c.method === "broker/threads/stop");
+    expect(stops).toHaveLength(hasRun ? 1 : 0);
+    if (hasRun) expect(stops[0]!.params).toEqual({ threadId: "thread-test", runId: "run-test" });
+    const callsBeforeLateReply = unit.fake.calls.length;
+    release.resolve({ runId: "run-test", absorbedBy: null });
+    await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]);
+    expect(unit.fake.calls.length).toBe(callsBeforeLateReply);
+    expect(unit.fake.subscriptions).toBe(0);
+    expect(unit.callbacks.size).toBe(0);
+    expect(unit.closed()).toBe(true);
+  } finally {
+    release.resolve({});
+    try { await watchdog(Promise.allSettled([work, ...[...unit.callbacks].map((cb) => Promise.resolve(cb()))])); }
+    finally {
+      signals.dispose();
+      exit.mockRestore();
+      process.exitCode = savedCode;
+      expect(process.listenerCount("SIGINT")).toBe(listeners);
+    }
+  }
+});
+
 function refusalError(reason: string) {
   const code = reason === "stopping" || reason === "threadBusy" ? -32001 : -32000;
   return new CxbError("BROKER_UNAVAILABLE", "远端请求失败", {
@@ -642,11 +782,11 @@ test("共享服务器：回包没有 absorbedBy 时扣住到 broker/run/settled�
     const work = createRunHandler(fakeServerRequests())(unit.ctx);
     void work.catch(() => {});
     await until(() => unit.fake.calls.some((call) => call.method === "turn/start"));
-    // 否定性检查只能给一段观察窗：回包已处理，但定案前不得开始等结果（第二次 watch）。
-    await Bun.sleep(100);
+    // turn/start 已到达；按内存夹具调度假设观察连续三轮状态稳定后，只有目标定案才能放行。
+    await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]);
     expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
     unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-另一次", absorbedBy: null });
-    await Bun.sleep(20);
+    await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]);
     expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
     unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-test", absorbedBy });
     if (absorbedBy === null) expect(await work).toBe(0);
@@ -701,8 +841,8 @@ test("共享服务器：定案通知缺 absorbedBy 不算定案，继续等明�
   void work.catch(() => {});
   await until(() => unit.fake.calls.some((call) => call.method === "turn/start"));
   unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-test" });
-  // 否定性检查的观察窗：缺字段的通知不得放行到等结果（第二次 watch）。
-  await Bun.sleep(100);
+  // 缺字段通知处理后连续三轮状态稳定；它不能放行到结果等待。
+  await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]);
   expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
   unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-test", absorbedBy: "turn-外部" });
   await expect(bounded(work, 5000)).rejects.toMatchObject({ code: "THREAD_HELD", exitCode: 8 });

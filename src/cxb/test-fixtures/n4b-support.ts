@@ -1,9 +1,12 @@
 import { expect } from "bun:test";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseArgv } from "../args";
 import { CxbError, type ExitCode, type InboxItem, type ThreadSummary } from "../contracts";
 import type { CommandContext } from "../main";
 import type { RegisterCleanup } from "../output";
-import { bounded } from "../wait-run";
+import { watchdog } from "./test-watchdog";
 import { FakeRpc } from "./run-fakes";
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -30,26 +33,49 @@ export function context(args: string[], fake = new FakeRpc()) {
   const parsed = parseArgv(args);
   const text: string[] = [], json: any[] = [], notices: string[] = [], progress: string[] = [];
   const cleanup = new Set<Parameters<RegisterCleanup>[0]>();
+  const dir = mkdtempSync(join(tmpdir(), "cxb-n4b-unit-"));
+  const connections: Array<{ closed: boolean; close(): Promise<void> }> = [];
   let connects = 0;
   const ctx: CommandContext = {
     parsed,
-    workspace: { dir: process.env.TEMP!, root: process.env.TEMP!, key: "测试", dataRoot: process.env.TEMP!,
-      workspaceDir: (process.env.TEMP! + "/不存在的乙组数据目录"), pipePath: "", endpoint: "" },
+    workspace: { dir, root: dir, key: "测试", dataRoot: dir, workspaceDir: dir, pipePath: "", endpoint: "" },
     out: { result(s) { if (!parsed.globals.json) text.push(s); }, resultJson(o) { if (parsed.globals.json) json.push(o); },
       notice(s) { notices.push(s); }, progress(s) { if (parsed.globals.verbose) progress.push(s); },
       error() {}, async flush() {}, async finish() {} },
     registerCleanup(fn) { cleanup.add(fn); return () => { cleanup.delete(fn); }; },
-    async connect() { connects++; return { rpc: fake.rpc, handshake: {} as any, launched: false, async close() {} }; },
+    async connect() {
+      connects++;
+      const connection = { rpc: fake.rpc, handshake: {} as any, launched: false, closed: false,
+        async close() { this.closed = true; } };
+      connections.push(connection);
+      return connection;
+    },
   };
   cleanups.push(async () => {
-    await Promise.all([...cleanup].map((fn) => fn()));
-    await bounded(new Promise<void>((done) => setImmediate(done)), 1000);
-    expect(cleanup.size).toBe(0);
-    expect(fake.subscriptions).toBe(0);
+    const errors: unknown[] = [];
+    const clean = async (work: () => unknown) => { try { await watchdog(Promise.resolve().then(work), 1000); } catch (error) { errors.push(error); } };
+    for (const fn of cleanup) await clean(fn);
+    await clean(() => new Promise<void>((done) => setImmediate(done)));
+    for (const connection of connections) await clean(() => connection.close());
+    await clean(() => {
+      expect(cleanup.size).toBe(0);
+      expect(fake.subscriptions).toBe(0);
+      expect(fake.inFlightServerRequests).toBe(0);
+      expect(fake.notificationErrors).toEqual([]);
+      expect(connections.every((c) => c.closed)).toBe(true);
+    });
+    await clean(() => { rmSync(dir, { recursive: true, force: true }); expect(existsSync(dir)).toBe(false); });
+    if (errors.length) throw new AggregateError(errors, "单测会话收尾失败");
   });
   return { ctx, fake, text, json, notices, progress, get connects() { return connects; },
-    async cancel() { await Promise.all([...cleanup].map((fn) => fn())); },
-    checkClean() { expect(cleanup.size).toBe(0); expect(fake.subscriptions).toBe(0); } };
+    async cancel() {
+      // 同步抛错也转成各自的拒绝；单个挂起或失败不能阻止其他回调执行。
+      const results = await Promise.allSettled([...cleanup].map((fn) =>
+        watchdog(Promise.resolve().then(() => fn()), 1000, "取消清理回调")));
+      const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+      if (errors.length) throw new AggregateError(errors, "取消清理失败");
+    },
+    checkClean() { expect(cleanup.size).toBe(0); expect(fake.subscriptions).toBe(0); expect(fake.notificationErrors).toEqual([]); } };
 }
 
 export function failure(reason: string, rpcCode = -32000) {
@@ -57,12 +83,12 @@ export function failure(reason: string, rpcCode = -32000) {
 }
 
 export async function errorCode(work: Promise<unknown>, code: ExitCode) {
-  try { await bounded(work, 2000); throw new Error("预期命令失败却成功"); }
+  try { await watchdog(work, 3000, "命令应先于看门狗结束"); throw new Error("预期命令失败却成功"); }
   catch (error) { expect(error).toBeInstanceOf(CxbError); expect((error as CxbError).exitCode).toBe(code); }
 }
 
 export function gate<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve, wait: () => bounded(promise, 2000) };
+  return { promise, resolve, wait: () => watchdog(promise, 5000, "测试控制点") };
 }

@@ -45,13 +45,14 @@ export class RunHarness {
     const root = join(this.dir, "工作区");
     const dataRoot = join(this.dir, "data");
     const codexHome = join(this.dir, "codex-home");
-    for (const dir of [root, dataRoot, codexHome]) mkdirSync(dir);
+    const profile = join(this.dir, "profile");
+    for (const dir of [root, dataRoot, codexHome, profile]) mkdirSync(dir);
     const pipePath = testSocketPath(this.dir);
     this.workspace = { root, dir: root, key: "测试", dataRoot, workspaceDir: dataRoot, pipePath, endpoint: endpointFor(pipePath) };
     this.env = Object.fromEntries(Object.entries(envWithPathPrefix(this.dir)).filter(([key]) =>
-      !/^(?:CXB_HOME|CODEX_HOME|CXB_SERVER.*|.*SOCKET.*|.*ENDPOINT.*|MOCK_PROXY_.*)$/i.test(key)));
+      !/^(?:CXB_HOME|CODEX_HOME|USERPROFILE|HOME|CXB_SERVER.*|.*SOCKET.*|.*ENDPOINT.*|MOCK_PROXY_.*)$/i.test(key)));
     Object.assign(this.env, { CXB_HOME: dataRoot, CODEX_HOME: codexHome, CXB_SERVER: "private",
-      TEMP: tmpdir(), TMP: tmpdir(), RUN_FIXTURE_PID: join(this.dir, "mock.pid") });
+      USERPROFILE: profile, HOME: profile, TEMP: tmpdir(), TMP: tmpdir(), RUN_FIXTURE_PID: join(this.dir, "mock.pid") });
     // 创建模拟进程时即登记 PID；清理阶段不依赖 broker.json 或临时 PID 文件补找资源。
     this.watcher = watch(this.dir, () => {
       const file = join(this.dir, "mock.pid");
