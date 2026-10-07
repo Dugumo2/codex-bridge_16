@@ -81,6 +81,16 @@ async fn event(connection: &mut AppConnection) -> AppEvent {
         .unwrap()
 }
 
+/// 私有实例退出后，监督方先报告实例退出、Closed 仍是通道最后一条（任务说明 N7-A 2.3.5 终结证据）。
+async fn closed_after_exit(connection: &mut AppConnection) -> AppEvent {
+    let exited = event(connection).await;
+    assert!(
+        matches!(exited, AppEvent::PrivateInstanceExited { .. }),
+        "Closed 之前应先收到实例退出事件，实际：{exited:?}"
+    );
+    event(connection).await
+}
+
 async fn close(connection: &AppConnection) {
     tokio::time::timeout(WAIT, connection.handle.close())
         .await
@@ -190,7 +200,7 @@ async fn 真实进程握手请求通知服务端请求和关闭回收() {
     assert_gone(shell_pid).await;
     assert_gone(bun_pid).await;
     assert!(matches!(
-        event(&mut connection).await,
+        closed_after_exit(&mut connection).await,
         AppEvent::Closed { .. }
     ));
     assert_eq!(connection.events.recv().await, None);
@@ -259,7 +269,7 @@ async fn 运行中退出收到一次_closed_且不重启() {
     event(&mut connection).await;
     let pending = connection.handle.request("exit", None);
     assert_eq!(
-        event(&mut connection).await,
+        closed_after_exit(&mut connection).await,
         AppEvent::Closed {
             reason: "App server process exited unexpectedly".into(),
         }
@@ -326,7 +336,7 @@ async fn stdout_未换行超过十兆关闭并回收() {
     event(&mut connection).await;
     let pending = connection.handle.request("overflow", None);
     assert!(
-        matches!(event(&mut connection).await, AppEvent::Closed { reason } if reason.contains("10 MiB"))
+        matches!(closed_after_exit(&mut connection).await, AppEvent::Closed { reason } if reason.contains("10 MiB"))
     );
     assert!(matches!(pending.await.unwrap(), Err(AppError::Closed(_))));
     close(&connection).await;
