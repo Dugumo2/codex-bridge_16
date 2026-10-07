@@ -9,7 +9,7 @@
 //   MOCK_E2E_TRIGGER：ask-cancel 场景里出现该文件即撤销提问；
 //   MOCK_E2E_BUSY：该文件存在时 thread/read 报告一个 inProgress 的 turn（模拟 broker 重启后核实不通过）。
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
@@ -22,6 +22,7 @@ const scenario = selectedScenario.replace(/-pending$/, "");
 const logPath = process.env.MOCK_E2E_LOG;
 const trigger = process.env.MOCK_E2E_TRIGGER;
 const busyFlag = process.env.MOCK_E2E_BUSY;
+const gateDir = process.env.MOCK_E2E_GATE_DIR;
 
 function log(entry: unknown): void {
   if (logPath) appendFileSync(logPath, JSON.stringify(entry) + "\n");
@@ -38,6 +39,41 @@ const holds = new Map<string, () => void>();
 const completedTurns = new Map<string, unknown[]>();
 const heldReads: Array<{ id: unknown; threadId: string }> = [];
 let resultsReleased = false;
+const heldLifecycle: Array<{ id: unknown; method: string; threadId: string }> = [];
+
+function gate(name: string): boolean {
+  return !gateDir || existsSync(`${gateDir}/${name}`);
+}
+
+function deleteMode(): string | undefined {
+  const path = process.env.MOCK_E2E_SERVER_DELETE_MODE_FILE;
+  if (path && existsSync(path)) return readFileSync(path, "utf8").trim();
+  return process.env.MOCK_E2E_SERVER_DELETE_MODE;
+}
+
+function holdLifecycle(method: string): boolean {
+  if (!gateDir) return false;
+  if (method === "thread/archive" && process.env.MOCK_E2E_HOLD_ARCHIVE === "1" && !gate("archive.release")) return true;
+  if (method === "thread/delete" && process.env.MOCK_E2E_HOLD_DELETE === "1" && !gate("delete.release")) return true;
+  return false;
+}
+
+function releaseLifecycle(): void {
+  for (const pending of heldLifecycle.splice(0)) {
+    const releaseName = pending.method === "thread/delete" ? "delete.release" : "archive.release";
+    if (!gate(releaseName)) {
+      heldLifecycle.push(pending);
+      continue;
+    }
+    if (deleteMode() === "unsupported" && pending.method === "thread/delete") {
+      send({ id: pending.id, error: { code: -32601, message: "Method not found: thread/delete" } });
+    } else if (deleteMode() === "missing" && pending.method === "thread/delete") {
+      send({ id: pending.id, error: { code: -32600, message: `thread not found: ${pending.threadId}` } });
+    } else {
+      send({ id: pending.id, result: {} });
+    }
+  }
+}
 
 /** 发服务端请求，等回包（回包写进日志）。 */
 function ask(method: string, params: Record<string, unknown>): Promise<{ result?: unknown; error?: unknown }> {
@@ -70,6 +106,7 @@ function complete(threadId: string, turnId: string, text: string): void {
   const turn = { id: turnId, items: [item], itemsView: "full", status: interruptedTurns.has(turnId) ? "interrupted" : "completed", error: null };
   completedTurns.set(threadId, [turn]);
   const pending = delayResult && !resultsReleased;
+  send({ method: "item/started", params: { threadId, turnId, item: { type: "agentMessage", id: "final-1" } } });
   if (!pending) send({ method: "item/completed", params: { threadId, turnId, item } });
   send({ method: "turn/completed", params: { threadId, turn: pending ? { ...turn, items: [], itemsView: "notLoaded" } : turn } });
 }
@@ -106,13 +143,13 @@ async function runTurn(threadId: string, turnId: string, early: Promise<{ result
   } else if (scenario === "hold" && turnCounter === 1) {
     await new Promise<void>((resolve) => holds.set(turnId, resolve));
     complete(threadId, turnId, "已中断");
-  } else if (scenario === "hold" || scenario === "complete") {
+  } else if (["hold", "complete", "unknown", "restart-unknown", "purge", "lost-stop"].includes(scenario)) {
     complete(threadId, turnId, "续跑完成");
   }
 }
 
 /** review/start 迁到的子线程（详细设计 3.5 节：运行随响应里的 reviewThreadId 转到子线程）。 */
-const REVIEW_THREAD = "review-e2e";
+const REVIEW_THREAD = process.env.MOCK_E2E_REVIEW_THREAD || "review-e2e";
 
 function reviewDone(turnId: string, text: string): void {
   const item = { type: "exitedReviewMode", id: "review-exit", review: text };
@@ -154,6 +191,7 @@ const thread = (id: string) => ({
 
 let buffer = "";
 let turnCounter = 0;
+if (gateDir) setInterval(releaseLifecycle, 25);
 process.stdin.setEncoding("utf-8");
 process.stdin.on("data", (chunk: string) => {
   buffer += chunk;
@@ -181,8 +219,22 @@ process.stdin.on("data", (chunk: string) => {
           model: "gpt-mock", modelProvider: "openai", cwd: "D:\\", approvalPolicy: "never", sandbox: null } });
         break;
       case "thread/memoryMode/set":
+        send({ id: msg.id, result: {} });
+        break;
       case "thread/archive":
       case "thread/delete":
+        if (holdLifecycle(msg.method)) {
+          heldLifecycle.push({ id: msg.id, method: msg.method, threadId });
+          break;
+        }
+        if (deleteMode() === "unsupported" && msg.method === "thread/delete") {
+          send({ id: msg.id, error: { code: -32601, message: "Method not found: thread/delete" } });
+          break;
+        }
+        if (deleteMode() === "missing" && msg.method === "thread/delete") {
+          send({ id: msg.id, error: { code: -32600, message: `thread not found: ${threadId}` } });
+          break;
+        }
         send({ id: msg.id, result: {} });
         break;
       case "thread/list":
@@ -217,6 +269,9 @@ process.stdin.on("data", (chunk: string) => {
         const turnId = String(msg.params?.turnId ?? "");
         interruptedTurns.add(turnId);
         send({ id: msg.id, result: {} });
+        if (process.env.MOCK_E2E_CONFIRM_INTERRUPT === "1") {
+          send({ method: "turn/completed", params: { threadId, turn: { id: turnId, items: [], status: "interrupted", error: null } } });
+        }
         holds.get(turnId)?.();
         holds.delete(turnId);
         break;
