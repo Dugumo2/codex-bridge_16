@@ -137,6 +137,9 @@ impl Runs {
         {
             return entry.short_id.clone();
         }
+        if let Some(short) = self.lifecycle_gates.get(thread) {
+            return short.clone();
+        }
         let mut candidate = (entropy ^ (entropy >> 32)) as u32;
         let short = loop {
             let short = format!("{candidate:08x}");
@@ -204,8 +207,9 @@ impl Runs {
         }
     }
 
-    pub(crate) fn put_threads(&self, actions: &mut Vec<Action>) {
+    pub(crate) fn put_threads(&mut self, actions: &mut Vec<Action>) {
         if self.phase == Phase::Open {
+            self.index.version = self.index.version.checked_add(1).expect("索引版本已耗尽");
             actions.push(Action::Store(StoreOp::PutThreads(self.index.clone())));
         }
     }
@@ -229,7 +233,7 @@ impl Runs {
                 .collect();
             actions.push(Action::Store(StoreOp::AppendLog {
                 short_id: record.short_id.clone(),
-                lines: vec![format!("{} {event} {content}", utc_timestamp(now))],
+                lines: vec![format!("{} {run} {event} {content}", utc_timestamp(now))],
             }));
         }
     }
@@ -337,7 +341,8 @@ impl Runs {
                     self.notices.iter().any(|n| match n {
                         RunNotice::TurnResult { run_id, .. }
                         | RunNotice::RunEnded { run_id, .. } => run_id == &r.run_id,
-                    }) || matches!(r.state, RunState::Running | RunState::Stopping)
+                    }) || self.verifying_history.contains(&r.run_id)
+                        || matches!(r.state, RunState::Running | RunState::Stopping)
                         || self.reads.values().any(|read| {
                             read.read.run_id == r.run_id && read.phase != reads::ReadPhase::Done
                         })
@@ -398,7 +403,7 @@ pub(super) fn schedule(thread: &str, timer: RunTimer, delay_ms: u64, actions: &m
 }
 
 /// 公历日期换算，以 Unix 毫秒为唯一输入；按 400 年周期处理闰年。
-pub(super) fn utc_timestamp(now: u64) -> String {
+pub(crate) fn utc_timestamp(now: u64) -> String {
     let seconds = now / 1000;
     let days = (seconds / 86400) as i64 + 719468;
     let era = days / 146097;

@@ -10,6 +10,12 @@ use super::*;
 
 impl Core {
     pub(super) fn dispatch(&mut self, event: Event) {
+        if let Some((instance, exited)) = self.app.inner.private_instance() {
+            self.machine.lifecycle.instance = Some(instance.clone());
+            if exited {
+                self.machine.lifecycle_instance_exited(&instance);
+            }
+        }
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

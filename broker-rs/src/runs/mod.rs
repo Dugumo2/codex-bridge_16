@@ -149,6 +149,8 @@ pub enum ReleaseKind {
 /// 内存账本。活动记录随认领，历史最多 200 个线程；内部登记的清理随结果、释放和淘汰。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Runs {
+    pub(crate) verifying_history: std::collections::HashSet<RunId>,
+    pub(crate) lifecycle_gates: std::collections::BTreeMap<String, String>,
     purge: Option<purge::PendingPurge>,
     pub runs: HashMap<RunId, RunRecord>,
     pub index: ThreadIndexFile,
@@ -180,6 +182,7 @@ mod state;
 use crate::results::{
     full_items, limit_text, output_from_items, summarize_item, Activity, Snapshot,
 };
+pub(crate) use state::utc_timestamp;
 use state::{schedule, ActiveRun, Phase};
 pub use state::{MAX_RESULT_QUEUE, MAX_RESULT_READS, MAX_TURNS};
 
@@ -837,7 +840,7 @@ impl Machine {
         self.runs.log(
             run,
             self.clock.now_ms,
-            "空转刹车暂停 goal",
+            "空转刹车暂停目标",
             &format!("{outcome:?}"),
             actions,
         );
@@ -881,6 +884,7 @@ impl Machine {
         }
         record.stop_outcome = Some(StopOutcome::Confirmed);
         record.stop_check = None;
+        self.runs.verifying_history.remove(run);
         self.runs.updated.insert(run.into(), self.clock.now_ms);
         self.runs.put(run, actions);
         self.runs.log(
@@ -1218,6 +1222,7 @@ impl Machine {
         self.runs.cleanup_scheduled = true;
         schedule("", RunTimer::DailyCleanup, CLEANUP_INTERVAL_MS, actions);
         self.runs.evict();
+        self.lifecycle_recompute_gates();
     }
 
     pub(crate) fn shutdown_runs(&mut self, actions: &mut Vec<Action>) {

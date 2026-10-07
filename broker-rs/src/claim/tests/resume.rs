@@ -136,6 +136,77 @@ fn reason(actions: &[Action]) -> Option<String> {
     })
 }
 
+fn n7_gate(machine: &mut Machine) {
+    use crate::store::lifecycle::{File, Kind, Phase, Record};
+    machine.lifecycle_restore(Ok(File {
+        records: std::collections::BTreeMap::from([(
+            "线程".into(),
+            Record {
+                operation_id: "恢复操作".into(),
+                kind: Kind::Archive,
+                thread_id: "线程".into(),
+                short_id: "12345678".into(),
+                preview: None,
+                phase: Phase::Forwarded,
+                attempts: vec![],
+                created_at: 0,
+                updated_at: 0,
+            },
+        )]),
+    }));
+}
+
+#[test]
+fn n7_续跑预检已受理但提交时遇门禁不能开工() {
+    let mut machine = fixture(true);
+    let a = begin(&mut machine);
+    n7_gate(&mut machine);
+    let expected = machine.lifecycle_error("线程").unwrap();
+    let (all, _, _, _) = pump(&mut machine, a);
+    assert!(!requests(&all).iter().any(|r| r.method == "turn/start"));
+    assert_eq!(reason(&all).as_deref(), Some("lifecyclePending"));
+    let errors: Vec<_> = sends(&all)
+        .into_iter()
+        .filter_map(|(_, message)| message.get("error").cloned())
+        .collect();
+    assert_eq!(
+        errors,
+        vec![expected],
+        "提交点必须保留操作编号、种类、阶段和实际线程"
+    );
+    no_run(&machine);
+}
+
+#[test]
+fn n7_恢复订阅屏障已受理但回包时遇门禁按失败出口结算() {
+    let mut machine = Machine::new(false);
+    machine.live_conns.insert(1);
+    let a = step_raw(
+        &mut machine,
+        client(request(1, 71, "turn/start", json!({"threadId":"线程"}))),
+    );
+    let resume = first_request(&a);
+    assert_eq!(resume.method, "thread/resume");
+    n7_gate(&mut machine);
+    let a = response(&mut machine, &resume, Ok(json!({"thread":{"id":"线程"}})));
+    assert_eq!(reason(&a).as_deref(), Some("lifecyclePending"));
+    assert!(!requests(&a).iter().any(|r| r.method == "turn/start"));
+    assert!(!machine.claims.contains_key("线程"));
+}
+
+#[test]
+fn n7_目标恢复读回包遇门禁不再写入活动目标() {
+    let (mut machine, read) = goal_read();
+    n7_gate(&mut machine);
+    let a = response(
+        &mut machine,
+        &read,
+        Ok(json!({"goal":{"status":"paused","objective":"目标"}})),
+    );
+    assert!(!requests(&a).iter().any(|r| r.method == "thread/goal/set"));
+    assert_eq!(machine.goal_restores, Default::default());
+}
+
 fn no_run(machine: &Machine) {
     assert!(!machine.claims.contains_key("线程"));
     assert!(!machine.runs.runs.contains_key(NEW));

@@ -126,7 +126,7 @@ pub(crate) fn continue_field(params: &Option<Value>) -> Option<&Value> {
 }
 
 fn fail(request: &ClientRequest, reason: &str, actions: &mut Vec<Action>) {
-    let code = if matches!(reason, THREAD_BUSY | STOPPING) {
+    let code = if matches!(reason, THREAD_BUSY | STOPPING | "lifecyclePending") {
         code::THREAD_BUSY
     } else {
         code::GENERAL_ERROR
@@ -524,6 +524,10 @@ impl Machine {
     }
 
     fn continue_commit(&mut self, thread: &str, actions: &mut Vec<Action>) {
+        if let Some(error) = self.lifecycle_error(thread) {
+            self.continue_fail_error(thread, error, actions);
+            return;
+        }
         let Some(progress) = self.continues.pending.get(thread) else {
             return;
         };
@@ -581,6 +585,30 @@ impl Machine {
     }
 
     fn continue_fail(&mut self, thread: &str, reason: Option<&str>, actions: &mut Vec<Action>) {
+        let error = reason.map(|reason| {
+            proto::error_object(
+                if matches!(reason, THREAD_BUSY | STOPPING | "lifecyclePending") {
+                    code::THREAD_BUSY
+                } else {
+                    code::GENERAL_ERROR
+                },
+                "续跑条件未满足",
+                Some(json!({"reason": reason})),
+            )
+        });
+        self.continue_fail_value(thread, error, actions);
+    }
+
+    fn continue_fail_error(&mut self, thread: &str, error: Value, actions: &mut Vec<Action>) {
+        self.continue_fail_value(thread, Some(error), actions);
+    }
+
+    fn continue_fail_value(
+        &mut self,
+        thread: &str,
+        error: Option<Value>,
+        actions: &mut Vec<Action>,
+    ) {
         let Some(progress) = self.continues.pending.remove(thread) else {
             return;
         };
@@ -591,8 +619,11 @@ impl Machine {
         else {
             return;
         };
-        if let (Some(reason), Some(request)) = (reason, &claim.pending_start) {
-            fail(request, reason, actions);
+        if let (Some(error), Some(request)) = (error, &claim.pending_start) {
+            actions.push(Action::Send {
+                conn: request.conn,
+                message: proto::response_err(request.id.clone(), error),
+            });
         }
         // 保留 pending_start 到统一释放出口，名额只由该出口结算；恢复旧 last_run，预检不覆盖历史。
         let last_run = self
@@ -632,6 +663,7 @@ impl Machine {
             return;
         };
         if self.closing
+            || self.lifecycle_error(thread).is_some()
             || self.quiescing
             || !claim.resume_goal
             || claim.settling()
@@ -700,6 +732,7 @@ impl Machine {
     fn restore_owned(&self, progress: &RestoreProgress) -> bool {
         let thread = &progress.token.thread_id;
         !self.closing
+            && self.lifecycle_error(thread).is_none()
             && !self.quiescing
             && self.current(&progress.token)
             && self.claims.get(thread).is_some_and(|claim| {

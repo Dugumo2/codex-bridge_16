@@ -303,6 +303,27 @@ struct Harness {
     client_output: mpsc::UnboundedReceiver<WriterCmd>,
 }
 
+#[tokio::test(start_paused = true)]
+async fn n7_存储初始化失败不能把未知生命周期当成空记录开放写请求() {
+    let mut h = Harness::new(false);
+    h.core = h.core.with_store(None, Loaded::default());
+    h.core.restore();
+    h.client(1, "turn/start", json!({"threadId":"P"}));
+    let reply = h.incoming_client().await;
+    assert_eq!(reply["error"]["data"]["reason"], "storageError");
+    assert!(h.app_output.try_recv().is_err());
+    h.client(2, "broker/health", json!({}));
+    let reply = h.incoming_client().await;
+    assert_eq!(reply["result"]["storage"], "degraded");
+    assert!(reply["result"]["storageReason"]
+        .as_str()
+        .unwrap()
+        .contains("无法核实"));
+    h.client(3, "thread/read", json!({"threadId":"P"}));
+    let request = h.outgoing().await;
+    assert_eq!(request["method"], "thread/read");
+}
+
 impl Harness {
     fn new(shared: bool) -> Self {
         let (app_input, inbound) = mpsc::unbounded_channel();
@@ -2340,6 +2361,7 @@ async fn 存储被接管后关闭产生的写入也不再投递() {
 
 #[tokio::test(start_paused = true)]
 async fn 初始化扩展门控重复声明与恢复后纪元不丢失() {
+    assert_eq!(USER_AGENT, "cxb-broker");
     let mut h = Harness::new(false);
     h.core.epoch = 42;
     h.core.loaded.epoch = 42;

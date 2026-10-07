@@ -48,6 +48,9 @@ impl Machine {
     }
 
     fn purge_rejection(&self, thread: &str) -> Option<&'static str> {
+        if self.lifecycle_error(thread).is_some() && !self.lifecycle_owns_local_purge(thread) {
+            return Some("lifecyclePending");
+        }
         if self.purge_guardian_pending(thread) {
             return Some("purgePending");
         }
@@ -260,6 +263,12 @@ impl Machine {
                     .purges
                     .insert(pending.work.thread.clone(), plan.clone());
                 pending.work.plan = plan;
+                self.runs.index.version = self
+                    .runs
+                    .index
+                    .version
+                    .checked_add(1)
+                    .expect("索引版本已耗尽");
                 pending.work.index = Some(self.runs.index.clone());
                 pending.work.seeds.clear();
                 pending.work.ticket = PurgeTicket::default();

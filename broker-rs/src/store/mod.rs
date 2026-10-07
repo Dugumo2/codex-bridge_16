@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 mod disk;
+pub mod lifecycle;
 mod load;
 pub(crate) mod purge;
 mod queue;
@@ -54,6 +55,7 @@ pub struct BrokerInfo {
 /// core 投递给写入任务的请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreOp {
+    Lifecycle(lifecycle::Work),
     /// 查找或删除文件也交给唯一写入任务；结果由有期限的状态机计时器收取。
     Purge(purge::PurgeWork),
     /// 写 runs/<runId>.json，payload 为完整运行记录。
@@ -78,10 +80,18 @@ pub enum StorageStatus {
 /// 写入任务主动通知 core 的事件；经 [`StoreConfig`] 里的回调投进 core 邮箱。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreEvent {
+    ThreadsWritten {
+        version: u64,
+        error: Option<String>,
+    },
     /// 目标文件外壳的 epoch 比本 broker 大：已有更新的 broker，本进程应关闭。
-    Superseded { file: String },
+    Superseded {
+        file: String,
+    },
     /// 写入任务意外退出（panic 等），之后不再写盘；core 记 error、继续服务（任务说明 8.2 第 3 条）。
-    WriterDied { reason: String },
+    WriterDied {
+        reason: String,
+    },
 }
 
 /// 关闭第 5 步：写入队列在期限内写完了哪些、丢了哪些。
@@ -105,6 +115,7 @@ pub struct StoreConfig {
 /// 启动时读出的旧数据。规则（哪些标 lost、哪些要补读）由 runs 模块按 3.6、7.2 节处理，store 只负责读和重建索引。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Loaded {
+    pub lifecycle: Option<Result<lifecycle::File, String>>,
     pub epoch: u64,
     /// threads.json 的内容；缺项或比 runs 旧时已用 runs/*.json 重建（7.2「跨文件一致性」），
     /// `removed` 里的线程不重建；运行记录带 reviewThreadId 与 reviewShortId 的，同时重建子线程的索引项。

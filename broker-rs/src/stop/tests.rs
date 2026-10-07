@@ -4050,12 +4050,30 @@ fn 未做成任何动作时按观察与失败报告() {
 fn 按运行停止拒绝换代和未知认领且旧终态不影响新运行() {
     let mut m = running();
     for run in [json!("other"), json!(""), json!(null), json!(42)] {
-        let actions = client(
+        let mut actions = client(
             &mut m,
             "broker/threads/stop",
             90,
             json!({"threadId":"线程","runId":run}),
         );
+        if run == "other" {
+            for action in &actions {
+                if let Action::Store(crate::store::StoreOp::Lifecycle(work)) = action {
+                    work.ticket
+                        .finish(crate::store::lifecycle::ResultValue::Run(None));
+                }
+            }
+            actions = apply(
+                &mut m,
+                Event::Timer {
+                    token: ClaimToken {
+                        thread_id: String::new(),
+                        claim_id: 0,
+                    },
+                    kind: TimerKind::Lifecycle,
+                },
+            );
+        }
         let message = actions
             .iter()
             .find_map(|a| match a {

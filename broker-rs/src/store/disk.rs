@@ -47,6 +47,7 @@ pub(super) struct Metadata {
 }
 
 pub(super) struct Disk {
+    pub lifecycle_version: u64,
     pub dir: PathBuf,
     pub epoch: u64,
     pub gate: Gate,
@@ -132,6 +133,7 @@ impl Disk {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("存储 epoch 已溢出"))?;
         let mut disk = Self {
+            lifecycle_version: 0,
             dir,
             epoch,
             gate,
@@ -520,6 +522,11 @@ impl Disk {
             }
             Err(error) => return Err(error.into()),
         };
+        let indexed_threads: std::collections::BTreeSet<_> = index
+            .threads
+            .values()
+            .map(|e| e.thread_id.clone())
+            .collect();
         let mut selection =
             super::load::Selection::new(&index, index_bytes, super::load::MAX_INITIALIZATION_BYTES);
         for entry in fs::read_dir(self.dir.join("runs"))? {
@@ -562,7 +569,43 @@ impl Disk {
             }
         };
         self.gate.check()?;
+        let lifecycle = read_envelope_limited::<super::lifecycle::File>(
+            &self.dir.join("lifecycle.json"),
+            super::load::MAX_INITIALIZATION_BYTES,
+        )
+        .and_then(|envelope| {
+            if envelope.as_ref().is_some_and(|f| f.epoch > self.epoch) {
+                return Err(io::Error::other("生命周期文件属于更新的 broker"));
+            }
+            let mut file = envelope.map(|f| f.payload).unwrap_or_default();
+            for (id, record) in &file.records {
+                if id != &record.thread_id
+                    || record.operation_id.is_empty()
+                    || record.short_id.is_empty()
+                    || record
+                        .attempts
+                        .windows(2)
+                        .any(|pair| pair[0].attempt >= pair[1].attempt)
+                    || record
+                        .attempts
+                        .iter()
+                        .any(|a| !matches!(a.server_kind.as_str(), "private" | "shared"))
+                {
+                    return Err(io::Error::other("生命周期记录结构无效"));
+                }
+            }
+            super::lifecycle::recover_instances(&mut file);
+            Ok(file)
+        })
+        .map_err(|error| format!("生命周期文件无法读取：{error}"));
+        if let Ok(file) = &lifecycle {
+            index.threads.retain(|_, entry| {
+                indexed_threads.contains(&entry.thread_id)
+                    || !file.records.contains_key(&entry.thread_id)
+            });
+        }
         Ok(Loaded {
+            lifecycle: Some(lifecycle),
             epoch: self.epoch,
             index,
             runs,

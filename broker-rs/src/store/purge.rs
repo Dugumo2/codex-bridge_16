@@ -1,5 +1,5 @@
 //! purge 的磁盘阶段：先准备清单，再持久化删除标记，最后逐项删除。
-use super::{disk::read_envelope_limited, disk::Disk, StoreError};
+use super::{disk::Disk, StoreError};
 use crate::runs::{PurgeFailure, PurgePlan, PurgeReport, RunRecord, ThreadIndexFile};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -83,34 +83,7 @@ impl Disk {
     pub(super) fn prepare_purge(&mut self, work: &PurgeWork) -> Result<PurgePlan, StoreError> {
         let mut plan = work.plan.clone();
         plan.threads.insert(work.thread.clone());
-        let mut headers = std::collections::BTreeMap::new();
-        let mut bytes = 0;
-        for entry in fs::read_dir(self.dir.join("runs"))? {
-            self.gate.check()?;
-            if work.ticket.result().is_some() {
-                return Err(std::io::Error::other("删除准备已取消").into());
-            }
-            let entry = entry?;
-            if entry.path().extension().is_none_or(|ext| ext != "json") {
-                continue;
-            }
-            bytes += entry.metadata()?.len();
-            if bytes > super::load::MAX_INITIALIZATION_BYTES {
-                return Err(std::io::Error::other("删除扫描超过字节预算").into());
-            }
-            let header = read_envelope_limited::<RunHeader>(
-                &entry.path(),
-                super::load::MAX_INITIALIZATION_BYTES,
-            )?;
-            if let Some(header) = header {
-                if header.epoch > self.epoch {
-                    return Err(StoreError::Superseded {
-                        file: entry.file_name().to_string_lossy().into(),
-                    });
-                }
-                headers.insert(header.payload.run_id.clone(), header.payload);
-            }
-        }
+        let mut headers = self.scan_run_headers()?;
         for header in &work.seeds {
             headers.insert(header.run_id.clone(), header.clone());
         }

@@ -58,6 +58,10 @@ impl Machine {
             reply(to, Err(error("notFound")), actions);
             return;
         };
+        if let Some(error) = self.lifecycle_error(&entry.item.thread_id) {
+            reply(to, Err(error), actions);
+            return;
+        }
         if self.run_purge_busy(&entry.item.thread_id) {
             reply(
                 to,
@@ -349,6 +353,13 @@ impl Machine {
             return;
         };
         let thread = self.inbox.entries[&id].item.thread_id.clone();
+        if phase == Phase::Resume {
+            if let Some(error) = self.lifecycle_error(&thread) {
+                self.retry_inbox(&id, error, actions);
+                self.guardian_unsubscribe(&thread, actions);
+                return;
+            }
+        }
         if phase == Phase::Resume && !can_learn {
             self.finish_inbox(&id, InboxStatus::Cancelled, None, actions);
             self.guardian_unsubscribe(&thread, actions);
