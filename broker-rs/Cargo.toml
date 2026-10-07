@@ -33,7 +33,7 @@ win32job = "2.0.3"
 [target.'cfg(windows)'.dependencies]
 # M7 第 1 档：Windows AF_UNIX 客户端，版本与 S3 环境探测一致（try_clone 已实测）。
 uds_windows = "=1.2.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Console"] }
 
 [dev-dependencies]
 tokio = { version = "=1.53.1", features = ["test-util"] }
