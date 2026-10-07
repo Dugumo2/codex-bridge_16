@@ -165,6 +165,13 @@ export function rpcFailure(error: unknown): { code: number | null; reason: strin
   return { code, reason: code !== null && typeof reason === "string" ? reason : null };
 }
 
+/** 线上错误的 `data` 对象（生命周期错误的 kind、blockers、upstream 等附加字段）；没有时为空对象。 */
+export function rpcData(error: unknown): Record<string, unknown> {
+  const wire = error instanceof CxbError ? error.cause : error;
+  const data = (wire as { data?: unknown } | null | undefined)?.data;
+  return data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
+}
+
 export interface BrokerConnection {
   rpc: BrokerRpc;
   handshake: BrokerHandshake;
@@ -299,6 +306,8 @@ export interface ThreadSummary {
   preview: string | null;
   cwd: string | null;
   meta: RunMeta | null;
+  /** 有待核实的归档或删除时 broker 带出；只有记录、没有索引项的线程其余字段为空闲默认值。 */
+  lifecycle?: LifecycleInfo;
 }
 
 // ─── 提问通道（拍板 I、L；S1-评审第 27、28 节）────────────────────────────────
@@ -401,9 +410,38 @@ export interface StopReply {
   run: RunResult | null;
 }
 
-/** `broker/threads/purge` 的回包：路径相对工作区数据目录；部分失败不回滚、如实列出。 */
+/**
+ * 线程生命周期操作（归档、永久删除）的待核实记录（任务说明 N7-A 2.3.1、2.3.5 节）：
+ * broker 的 `broker/threads/watch`、`broker/threads/list` 在线程摘要上带出，本地 `lifecycle.json` 保存同一事实。
+ */
+export interface LifecycleInfo {
+  operationId: string;
+  kind: "archive" | "delete";
+  /** broker 内存阶段（如 `outcomeUnknown`、`draining`、`committing`）或落盘阶段（`localPurging`、`forwarded`、`upstreamDone`）。 */
+  phase: string;
+  shortId: string | null;
+  preview: string | null;
+}
+
+/** `broker/threads/archive` 的回包（2.3.1 节）。 */
+export interface ArchiveReply {
+  threadId: string;
+  operationId: string;
+  archived: true | "alreadyDone";
+  localIndex: "removed" | "alreadyAbsent";
+}
+
+/** 归档、删除被挡住时 broker 列出的阻塞项（2.3.2 节，`threadBusy` 的 `data.blockers`）。 */
+export interface LifecycleBlocker {
+  threadId: string;
+  runId: string | null;
+  reason: string;
+}
+
+/** `broker/threads/purge` 的回包：路径相对工作区数据目录；部分失败不回滚、如实列出。`serverDelete` 时含 `server-thread` 一项与 operationId。 */
 export interface PurgeReply {
   threadId: string;
+  operationId?: string;
   deleted: string[];
   alreadyDeleted: string[];
   failed: Array<{ path: string; reason: string }>;

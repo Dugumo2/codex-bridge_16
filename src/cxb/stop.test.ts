@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { CxbError } from "./contracts";
 import { stop } from "./stop";
 import { cleanupContexts, context, errorCode, failure, thread } from "./test-fixtures/n4b-support";
 
@@ -40,4 +41,27 @@ describe("乙组 stop", () => {
       c.checkClean();
     });
   }
+  test("--run 把运行 ID 传给 broker，用来核实已失联的历史运行（任务说明 N7-A 2.3.1、5.5 节）", async () => {
+    const c = context(["stop", "abcd1234", "--run", "run-old", "--json"]);
+    c.fake.handle = (m) => m === "broker/threads/list" ? { threads: [thread()] } : {
+      threadId: "thread-test", runId: "run-old", interruptSent: false, stopOutcome: "confirmed", goal: "unchanged", alreadyStopped: false, run: null,
+    };
+    expect(await stop(c.ctx)).toBe(0);
+    expect(c.fake.calls[1]).toMatchObject({ method: "broker/threads/stop", params: { threadId: "thread-test", runId: "run-old" } });
+    expect(c.json[0]).toMatchObject({ ok: true, runId: "run-old" });
+    c.checkClean();
+  });
+  for (const kind of ["archive", "delete"] as const) test(`线程上有${kind === "archive" ? "归档" : "删除"}待核实时退出 8 并按 kind 提示核实命令`, async () => {
+    const c = context(["stop", "abcd1234"]);
+    c.fake.handle = (m) => {
+      if (m === "broker/threads/list") return { threads: [thread()] };
+      throw new CxbError("BROKER_UNAVAILABLE", "模拟线上错误",
+        { cause: { rpcCode: -32001, data: { reason: "lifecyclePending", kind, phase: "outcomeUnknown", threadId: "thread-test" } } });
+    };
+    const error = await stop(c.ctx).then(() => null, (error) => error);
+    expect(error).toBeInstanceOf(CxbError);
+    expect(error.exitCode).toBe(8);
+    expect(error.message).toContain(kind === "delete" ? "cxb rm thread-test --purge" : "cxb rm thread-test");
+    c.checkClean();
+  });
 });

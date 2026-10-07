@@ -10,7 +10,9 @@ export const stop: CommandHandler = async (ctx) => {
   try {
     const rpc = await scope.connect();
     const ref = await resolveThreadViaBroker(rpc, ctx.parsed.positional[0]!, { passThrough: true });
-    const result = await stopThread(rpc, { threadId: ref.threadId, clear: ctx.parsed.options.clear }, { signal: scope.signal });
+    const runId = ctx.parsed.options.run;
+    const result = await stopThread(rpc, { threadId: ref.threadId, clear: ctx.parsed.options.clear, ...(runId ? { runId } : {}) },
+      { signal: scope.signal });
     const ok = result.stopOutcome === "confirmed";
     const label = safeLine(ref.shortId ?? ref.threadId);
     if (ok) ctx.out.result(result.alreadyStopped ? `线程 ${label} 没有运行中的运行。` : `已停止线程 ${label}。`);

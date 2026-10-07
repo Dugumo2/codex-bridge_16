@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CxbError } from "./contracts";
 import { ls } from "./ls";
+import { show } from "./show";
 import { removeTemp } from "./test-fixtures/main-test-support";
 import { context, ledger, summary } from "./test-fixtures/n4a-unit";
 import { runResult, wireError } from "./test-fixtures/run-fakes";
@@ -100,6 +101,52 @@ describe("ls", () => {
     expect(t.json[0].source).toBe("local");
     expect(t.json[0].items.map((item: any) => item.status).sort()).toEqual([...states].sort());
     expect(t.json[0].truncated).toBe(false);
+  });
+});
+
+describe("ls、show 的归档与删除待核实（任务说明 N7-A 5.5 节）", () => {
+  const lifecycleFile = (records: Record<string, unknown>) =>
+    writeFileSync(join(dir, "lifecycle.json"), JSON.stringify({ epoch: 1, payload: { records } }));
+  const record = (threadId: string, patch: Record<string, unknown> = {}) => ({ threadId, operationId: "op-1", kind: "archive",
+    phase: "forwarded", shortId: "abcd1234", preview: "预览", updatedAt: 5000, ...patch });
+  test("local：索引项带记录显示归档待核实；purge 已删索引、只剩记录的线程按记录列出", async () => {
+    ledger(dir);
+    lifecycleFile({ "thread-test": record("thread-test"), "thread-gone": record("thread-gone", { kind: "delete", phase: "upstreamDone", shortId: "dead0001", preview: null }) });
+    const t = context(dir, ["ls", "--local", "--json"]);
+    expect(await ls(t.ctx)).toBe(0);
+    const items = Object.fromEntries(t.json[0].items.map((item: any) => [item.threadId, item]));
+    expect(items["thread-test"]).toMatchObject({ status: "归档待核实", lifecycle: { kind: "archive" } });
+    expect(items["thread-gone"]).toMatchObject({ shortId: "dead0001", status: "删除提交中", lastRunId: null, lifecycle: { kind: "delete" } });
+  });
+  test("broker 列表带 lifecycle 时显示状态，不读运行记录", async () => {
+    ledger(dir, []);
+    const t = context(dir, ["ls", "--json"]);
+    const lifecycle = { operationId: "op-2", kind: "delete", phase: "outcomeUnknown", shortId: "dead0001", preview: null };
+    t.fake.handle = (m) => m === "broker/threads/list"
+      ? { threads: [summary({ threadId: "thread-gone", shortId: "dead0001", lastRunId: "run-已删除", lifecycle } as any)] }
+      : { data: [], nextCursor: null };
+    expect(await ls(t.ctx)).toBe(0);
+    expect(t.json[0].items[0]).toMatchObject({ status: "删除待核实", lifecycle });
+  });
+  test("lifecycle.json 损坏时 ls --local 报本地错误（退出 1），不当作没有待核实", async () => {
+    ledger(dir);
+    writeFileSync(join(dir, "lifecycle.json"), JSON.stringify({ payload: { records: { "thread-test": { kind: "未知" } } } }));
+    await expect(ls(context(dir, ["ls", "--local"]).ctx)).rejects.toMatchObject({ exitCode: 1 });
+    writeFileSync(join(dir, "lifecycle.json"), JSON.stringify({ payload: {} }));
+    await expect(ls(context(dir, ["ls", "--local"]).ctx)).rejects.toMatchObject({ exitCode: 1 });
+  });
+  test("show：只剩记录的线程能用原短 ID 找到，提示按 kind 完成核实；有索引的照常显示结果并提示", async () => {
+    ledger(dir);
+    lifecycleFile({ "thread-gone": record("thread-gone", { kind: "delete", phase: "outcomeUnknown", shortId: "dead0001" }), "thread-test": record("thread-test") });
+    const gone = context(dir, ["show", "dead", "--json"]);
+    expect(await show(gone.ctx)).toBe(0);
+    expect(gone.notices.join()).toContain("删除待核实");
+    expect(gone.notices.join()).toContain("cxb rm dead0001 --purge");
+    expect(gone.json[0]).toMatchObject({ threadId: "thread-gone", shortId: "dead0001", runId: null, lifecycle: { kind: "delete" } });
+    const kept = context(dir, ["show", "abcd"]);
+    expect(await show(kept.ctx)).toBe(0);
+    expect(kept.notices.join()).toContain("归档待核实");
+    expect(kept.texts.join("")).not.toBe("");
   });
 });
 

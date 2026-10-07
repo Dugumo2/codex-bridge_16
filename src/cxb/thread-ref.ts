@@ -2,7 +2,7 @@
 // 短 ID、唯一前缀、服务器 UUID）。规则：先精确匹配 threadId 或 shortId，再按前缀匹配两者；多于一个报歧义。
 
 import { CxbError, type BrokerRpc, type ThreadSummary } from "./contracts";
-import { readThreadIndex } from "./ledger";
+import { readLifecycle, readThreadIndex, type LifecycleRecord } from "./ledger";
 
 export interface ThreadRef {
   threadId: string;
@@ -42,9 +42,18 @@ export async function resolveThreadViaBroker(rpc: Pick<BrokerRpc, "request">, re
   throw notFound(ref);
 }
 
-/** 用本地 `threads.json` 解析（不连 broker）；找不到抛 NOT_FOUND，索引损坏抛 LOCAL_ERROR。 */
-export function resolveThreadLocal(workspaceDir: string, ref: string): ThreadRef {
-  const hit = matchThread(ref, readThreadIndex(workspaceDir));
+/**
+ * 用本地 `threads.json` 与 `lifecycle.json` 解析（不连 broker）；找不到抛 NOT_FOUND，任一文件损坏抛 LOCAL_ERROR。
+ * purge 已删索引、删除结果待核实的线程只剩生命周期记录，仍能用原短 ID 找到（任务说明 N7-A 5.5 节），这时附带记录。
+ */
+export function resolveThreadLocal(workspaceDir: string, ref: string): ThreadRef & { lifecycle?: LifecycleRecord } {
+  const records = readLifecycle(workspaceDir);
+  const index = readThreadIndex(workspaceDir);
+  const indexed = new Set(index.map((entry) => entry.threadId));
+  const candidates = [...index, ...records.filter((record) => !indexed.has(record.threadId))
+    .map((record) => ({ threadId: record.threadId, shortId: record.shortId ?? record.threadId }))];
+  const hit = matchThread(ref, candidates);
   if (!hit) throw notFound(ref);
-  return { threadId: hit.threadId, shortId: hit.shortId };
+  const lifecycle = records.find((record) => record.threadId === hit.threadId);
+  return { threadId: hit.threadId, shortId: indexed.has(hit.threadId) ? hit.shortId : lifecycle?.shortId ?? null, ...(lifecycle ? { lifecycle } : {}) };
 }

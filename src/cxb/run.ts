@@ -12,6 +12,7 @@ import { absorbedRefusal, buildContinuePrompt, continueRefusal, localContinueRef
 import { ASK_FEATURE_KEY, CxbError, EXIT, rpcFailure, type BrokerConnection, type BrokerRpc, type ExitCode,
   type ResumeOverrides, type RunResult, type ServerRequestDeps } from "./contracts";
 import { readRunRecord } from "./ledger";
+import { lifecyclePendingError } from "./lifecycle";
 import { resolveThreadViaBroker } from "./thread-ref";
 import type { CommandContext, CommandHandler } from "./main";
 import type { Output } from "./output";
@@ -36,6 +37,8 @@ function decide(error: CxbError): CxbError { decided.add(error); return error; }
 function executionError(error: unknown, id?: string): CxbError {
   if (error instanceof CxbError && (error.code !== "BROKER_UNAVAILABLE" || decided.has(error))) return error;
   const detail = rpcDetail(error);
+  // 归档、删除进行中或待核实的线程被 broker 门禁挡住（N7-A 2.3.6 节），提示完成核实的命令而不是 wait。
+  if (detail.code === -32001 && rpcFailure(error).reason === "lifecyclePending") return lifecyclePendingError(error, safe(id ?? "<线程ID>"));
   if (detail.code === -32001) return new CxbError("THREAD_HELD", `线程被占用，可用 cxb wait ${safe(id ?? "<线程ID>")} 观察`, { id });
   if (detail.code !== undefined) {
     // 0.160.0 恢复不存在的线程报「no rollout found for thread id …」（thread_processor.rs:5916）；broker 私有方法报 data.reason unknownThread。
@@ -428,7 +431,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     if (code === EXIT.CODEX_FAILED) {
       const detail = JSON.stringify(last?.error ?? "");
       if (policy === "never" && /mcp/i.test(detail)) {
-        const report = await approvalPreflight(policy);
+        const report = await approvalPreflight(policy, process.env,
+          { signal: controller.signal, ...(Number.isFinite(deadline) ? { deadline } : {}) });
         // 只提取受限的服务器标识；绝不把上游整段错误（可能含凭据）写入 stderr。
         const error = last?.error as { message?: unknown; serverName?: unknown } | null;
         const message = typeof error?.message === "string" ? error.message : "";
@@ -471,7 +475,7 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
     if (options.continue) {
       // 解析层已拒绝标准输入、文件、--goal、--template；位置参数是本次补充，不替换原始要求。
       const supplement = positional.join(" ").trim() ? positional.join(" ") : null;
-      reportApprovalPreflight(await approvalPreflight(globals.approval), ctx.out);
+      reportApprovalPreflight(await cancellablePreflight(ctx), ctx.out);
       return executeRun(ctx, deps, { command: "run", sandbox: globals.sandbox,
         continue: { supplement, ...(options.run ? { fromRunId: options.run } : {}) } });
     }
@@ -494,7 +498,18 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
       }
     }
     if (!prompt.trim()) throw new CxbError("USAGE", "模板生成的提示词不能为空");
-    reportApprovalPreflight(await approvalPreflight(ctx.parsed.globals.approval), ctx.out);
+    reportApprovalPreflight(await cancellablePreflight(ctx), ctx.out);
     return executeRun(ctx, deps, { command: "run", sandbox, prompt });
   };
+}
+
+/** 开跑前的审批预检：Ctrl-C 取消（INTERRUPTED），读配置的期限不超过本命令的 --timeout。 */
+async function cancellablePreflight(ctx: CommandContext) {
+  const { globals } = ctx.parsed;
+  const controller = new AbortController();
+  const unregister = ctx.registerCleanup(() => { controller.abort(); });
+  try {
+    return await approvalPreflight(globals.approval, process.env,
+      { signal: controller.signal, ...(globals.timeout > 0 ? { deadline: performance.now() + globals.timeout * 1000 } : {}) });
+  } finally { unregister(); }
 }

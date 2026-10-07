@@ -25,13 +25,25 @@ function object(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-/** Codex 0.160.0 的 MCP 配置位于 config.toml 的 mcp_servers 表，包含 tools 覆盖。 */
-export async function approvalPreflight(policy: ApprovalPolicyName, env: NodeJS.ProcessEnv = process.env): Promise<ApprovalPreflightResult> {
+/** 读配置的期限上限；调用方给了截止时刻（`performance.now()` 毫秒）时取两者较小者。 */
+const READ_LIMIT_MS = 30_000;
+
+export interface PreflightOptions {
+  /** 截止时刻，与 `performance.now()` 同一时钟。 */
+  deadline?: number;
+  /** 取消时以 INTERRUPTED 结束（不降级为 unavailable）。 */
+  signal?: AbortSignal;
+}
+
+/** Codex 0.160.0 的 MCP 配置位于 config.toml 的 mcp_servers 表，包含 tools 覆盖。超时与读取、解析失败降级为 unavailable。 */
+export async function approvalPreflight(policy: ApprovalPolicyName, env: NodeJS.ProcessEnv = process.env,
+  options: PreflightOptions = {}): Promise<ApprovalPreflightResult> {
   try {
     const getEnv = (name: string) => Object.entries(env).find(([key]) => key.toUpperCase() === name)?.[1];
     const source = join(getEnv("CODEX_HOME") || join(getEnv("USERPROFILE") || homedir(), ".codex"), "config.toml");
+    const limit = options.deadline === undefined ? READ_LIMIT_MS : Math.min(READ_LIMIT_MS, Math.max(0, options.deadline - performance.now()));
     let raw: string;
-    try { raw = await bounded(readFile(source, "utf8"), 30_000); } catch (error) {
+    try { raw = await bounded(readFile(source, "utf8"), limit, options.signal); } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { check: "mcpApprovalRisk", status: "ok", servers: [] };
       throw error;
     }
@@ -56,7 +68,8 @@ export async function approvalPreflight(policy: ApprovalPolicyName, env: NodeJS.
         risk, suggestion: risk ? "需要搜索/MCP 时请加 --approval auto" : "无需调整" });
     }
     return { check: "mcpApprovalRisk", status: servers.some((server) => server.risk) ? "warn" : "ok", servers };
-  } catch {
+  } catch (error) {
+    if (error instanceof CxbError && error.code === "INTERRUPTED") throw error;
     return { check: "mcpApprovalRisk", status: "unavailable", servers: [] };
   }
 }

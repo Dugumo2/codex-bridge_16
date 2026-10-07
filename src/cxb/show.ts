@@ -1,6 +1,7 @@
 import { sanitizeForTerminal } from "../questions";
 import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type ThreadSummary, type TurnResult } from "./contracts";
 import { readRunLog, readRunRecord, readThreadIndex, listThreadRuns, type LogLine } from "./ledger";
+import { lifecycleHint, lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
 import { redactParams } from "./server-requests";
 import { resolveThreadLocal, resolveThreadViaBroker, type ThreadRef } from "./thread-ref";
@@ -16,7 +17,7 @@ function unsupported(error: unknown): boolean {
 
 const clean = (text: string) => sanitizeForTerminal(text);
 const safeSummary = (value: unknown) => clean(JSON.stringify(redactParams(value)) ?? "");
-const eventLine = (line: LogLine) => ({ ts: line.ts, kind: clean(line.text).split(/\s+/)[0] ?? "", text: clean(line.text) });
+const eventLine = (line: LogLine) => ({ ts: line.ts, kind: clean(line.event), text: clean(line.text) });
 function tail(ctx: CommandContext, ref: ThreadRef) {
   return (ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : [])
     .slice(-Number(ctx.parsed.options.limit)).map(eventLine);
@@ -50,7 +51,8 @@ function localResult(ctx: CommandContext, ref: ThreadRef) {
     status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none",
     interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
   if (!last) {
-    const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)?.filter((line) => line.text.startsWith("启动失败")).at(-1) : null;
+    const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)
+      ?.filter((line) => line.runId === run.runId && line.event === "启动失败").at(-1) : null;
     ctx.out.notice(failure ? String(redactParams(failure.text)) : "运行启动失败，没有生成轮次");
   }
   ctx.out.progress(`结果来自本地；运行 ${run.runId}，状态 ${run.state}/${run.status ?? "未知"}`);
@@ -111,18 +113,22 @@ async function serverResult(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef)
   return 0 as const;
 }
 
+/** 不带 --full 时显示的事件（任务说明 N7-A 2.1 节的清单去掉逐条目进展）。 */
+const SUMMARY_EVENTS = new Set(["运行开始", "运行结束", "轮次开始", "轮次完成", "停止发起", "停止确认", "空转刹车", "空转刹车暂停目标",
+  "启动失败", "交接撤销", "丢行"]);
+
+/** 属于 runId 的行，外加夹在它首末行之间的丢行标记（丢掉的行可能属于它）。 */
+function linesOfRun(all: LogLine[], runId: string): LogLine[] {
+  const first = all.findIndex((line) => line.runId === runId);
+  if (first < 0) return [];
+  const last = all.findLastIndex((line) => line.runId === runId);
+  return all.slice(first, last + 1).filter((line) => line.runId === runId || line.runId === null);
+}
+
 function showLog(ctx: CommandContext, ref: ThreadRef) {
-  const segments = new Map<string, LogLine[]>();
-  let active: string | undefined;
-  for (const line of ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : []) {
-    const start = /^运行开始 (\S+)/.exec(line.text);
-    if (start) active = start[1];
-    if (active) { const lines = segments.get(active) ?? []; lines.push(line); segments.set(active, lines); }
-    if (active && line.text === `运行结束 ${active}`) active = undefined;
-  }
+  const all = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : [];
   const runs = listThreadRuns(ctx.workspace.workspaceDir, ref.threadId).map((run) => {
-    const lines = (segments.get(run.runId) ?? []).filter((line) => ctx.parsed.options.full
-      || /^(运行开始|运行结束|轮次开始|轮次完成|停止发起|停止确认|空转刹车|启动失败|交接撤销)(\s|$)/.test(line.text)).map(eventLine);
+    const lines = linesOfRun(all, run.runId).filter((line) => ctx.parsed.options.full || SUMMARY_EVENTS.has(line.event)).map(eventLine);
     const entry = { runId: run.runId, state: run.state, status: run.status, startedAt: run.startedAt,
       input: clean(run.input), items: lines, turns: run.turns.map((turn) => ({ ...turn, output: clean(turn.output), error: redactParams(turn.error) })),
       ...(ctx.parsed.options.full ? { meta: redactParams(run.meta), interruptReason: run.interruptReason, stopOutcome: run.stopOutcome,
@@ -148,32 +154,9 @@ function renderNotification(method: string, raw: unknown, source: string | null)
   return { ts: new Date().toISOString(), kind: method, text: clean(`${label} ${p.turn?.id ?? p.item?.type ?? ""} ${p.item?.id ?? ""} ${p.item?.text ?? ""}`.trim()) };
 }
 
-/**
- * 本地日志里属于运行 runId 的行（日志按线程写，用「运行开始 <runId>」「运行结束 <runId>」分段）。
- * 行不带运行编号，迁走的 review 与父线程上的新运行会交错写同一文件，分不清归属时宁可不补：
- * R 开始时还有别的运行没结束，或 R 段内出现来历不明（起点已轮转出日志）的结束，都不补；段内出现别的运行开始，就此停止。
- */
+/** 本地日志里属于运行 runId 的行（行内带运行编号；迁走的 review 与父线程上的新运行交错写同一文件也分得开）。 */
 function runLogLines(ctx: CommandContext, shortId: string | null, runId: string): LogLine[] {
-  const lines: LogLine[] = [];
-  const open = new Set<string>();
-  let inside = false;
-  for (const line of shortId ? readRunLog(ctx.workspace.workspaceDir, shortId) ?? [] : []) {
-    const start = /^运行开始 (\S+)$/.exec(line.text)?.[1];
-    const end = /^运行结束 (\S+)$/.exec(line.text)?.[1];
-    if (start === runId) {
-      if (open.size) return [];
-      inside = true;
-    } else if (start !== undefined) {
-      if (inside) break;
-      open.add(start);
-    } else if (end !== undefined && end !== runId) {
-      if (inside && !open.has(end)) return [];
-      open.delete(end);
-    }
-    if (inside) lines.push(line);
-    if (end === runId) inside = false;
-  }
-  return lines;
+  return (shortId ? readRunLog(ctx.workspace.workspaceDir, shortId) ?? [] : []).filter((line) => line.runId === runId);
 }
 
 /**
@@ -310,6 +293,14 @@ export const show: CommandHandler = async (ctx) => {
       return options.follow ? await follow(ctx, rpc, ref, session.signal) : await serverResult(ctx, rpc, ref);
     }
     const ref = resolveThreadLocal(ctx.workspace.workspaceDir, id);
+    if (ref.lifecycle) {
+      ctx.out.notice(`${lifecycleLabel(ref.lifecycle)}：${lifecycleHint(ref.lifecycle.kind, ref.lifecycle.phase, ref.shortId ?? ref.threadId)}`);
+      // purge 已删索引、只剩记录：没有本地结果可显示，--json 带出记录供调用方判断。
+      if (!readThreadIndex(ctx.workspace.workspaceDir).some((entry) => entry.threadId === ref.threadId)) {
+        ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: options.log ? "log" : options.tail ? "tail" : "result", runId: null });
+        return 0;
+      }
+    }
     if (options.log) return showLog(ctx, ref);
     if (options.tail) {
       const items = tail(ctx, ref);

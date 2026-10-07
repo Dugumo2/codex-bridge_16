@@ -1,6 +1,6 @@
 // src/types.ts — Protocol types for Codex app server (JSON-RPC over stdio)
 
-import type { ApprovalPolicy, SandboxMode, ReasoningEffort } from "./config";
+import type { SandboxMode, ReasoningEffort } from "./config";
 
 // --- JSON-RPC primitives ---
 
@@ -39,7 +39,7 @@ export type JsonRpcMessage =
 
 // --- Threads ---
 
-export type { ApprovalPolicy, SandboxMode, ReasoningEffort } from "./config";
+export type { SandboxMode, ReasoningEffort } from "./config";
 
 /** Error carrying a JSON-RPC error code for protocol-level error forwarding. */
 export class RpcError extends Error {

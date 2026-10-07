@@ -3,6 +3,7 @@
 // run、review 有自己的期限模型（整条命令的剩余时间），不走这里。
 
 import { CxbError, rpcFailure, type BrokerRpc } from "./contracts";
+import { lifecyclePendingError } from "./lifecycle";
 import type { CommandContext } from "./main";
 import { redactParams } from "./server-requests";
 import { bounded } from "./wait-run";
@@ -63,6 +64,12 @@ export function commandSession(ctx: CommandContext): CommandSession {
           }
           // 永久删除进行中，broker 对该线程的请求（watch、purge 除外）一律回 -32001 purgePending（claim/mod.rs）：线程被占，不是 broker 或 Codex 失败。
           if (reason === "purgePending") throw new CxbError("THREAD_HELD", "线程正在永久删除，稍后再试", { cause, retryable: true });
+          // 归档、删除进行中或结果待核实（N7-A 2.3.2 节）：线程被门禁挡住，按 kind 提示完成核实的命令。
+          if (reason === "lifecyclePending") {
+            const id = (params as { threadId?: unknown } | undefined)?.threadId;
+            throw lifecyclePendingError(error, typeof id === "string" ? id : "<线程ID>");
+          }
+          if (reason === "threadBusy") throw new CxbError("THREAD_HELD", "线程仍有未结束的运行或停止未确认，请先 cxb stop 后重试", { cause });
           if (reason === "storageError" || reason === "storageTimeout") throw new CxbError("LOCAL_ERROR", "broker 存储操作失败", { cause });
           const unavailable = code === null || reason === "shuttingDown" || method.startsWith("broker/");
           throw new CxbError(unavailable ? "BROKER_UNAVAILABLE" : "CODEX_FAILED",

@@ -1,6 +1,6 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { config } from "../config";
 import type { AccountRead } from "../types";
@@ -37,43 +37,47 @@ export function safeDiagnostic(value: unknown): unknown {
 
 export function findExecutable(name: string): string | null { return Bun.which(name); }
 
-/** 回收预留：taskkill 最多 3 秒，最后确认退出与读取落定最多 1 秒。 */
-const RECLAIM_RESERVE_MS = 4000;
+/** diag-exec 期限到后终止 Job、等进程退出（最多 2 秒）并写状态文件的预留，再加 1 秒余量。 */
+const DIAG_RESERVE_MS = 3000;
+/** 结束进程后确认退出与读取落定的等待上限。 */
 const FINAL_WAIT_MS = 1000;
 
+interface DiagStatus { outcome: "exited" | "timeout" | "failed"; exitCode?: number; reason?: string }
+
+/** 读 diag-exec 的状态文件；缺失或损坏返回 null（调用方按 diag-exec 异常处理）。 */
+function readDiagStatus(path: string): DiagStatus | null {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as DiagStatus;
+    if (value?.outcome === "exited" && Number.isSafeInteger(value.exitCode)) return value;
+    if (value?.outcome === "timeout") return value;
+    if (value?.outcome === "failed" && typeof value.reason === "string") return value;
+    return null;
+  } catch { return null; }
+}
+
 /**
- * 运行诊断程序（如 `codex --version`）。超时或取消时用 taskkill /T 结束仍在运行的进程树（codex.cmd 经命令解释器，不能只杀包装进程）；
- * 等待输出、回收、收尾共用一个绝对截止时间，整体不超过 `limit.timeoutMs`。
- * 已知限制：诊断程序自己先退出、留下的后代仍占着输出管道时，无法可靠找到这些后代——Windows 不维护进程树，
- * 按父进程编号查找会因编号复用误杀无关进程，中间进程退出后也会断链。此时只取消本端读取、按期返回，后代可能残留；
- * 根治需在启动时用 Job Object 管住整棵树（留 N7）。
+ * 运行诊断程序（如 `codex --version`）。给了 `broker` 时经 `cxb-broker diag-exec` 运行（任务说明 N7-A 2.2 节）：
+ * 诊断程序在创建时即属于关闭即结束的 Job，正常退出或期限到时 diag-exec 终止整个 Job，
+ * 诊断程序先退出、后代仍占着输出管道的情况也随之回收；结果以状态文件为准（退出码 124、125 可能与诊断程序自己的退出码重叠）。
+ * 不给 `broker` 时直接运行（只用于不会派生子进程的 `cxb-broker --version`）。
+ * 超出期限或取消时结束本端启动的进程（diag-exec 的 Job 句柄随之关闭，整棵树由系统结束）并取消读取；
+ * 等待、结束、收尾共用一个绝对截止时间，整体不超过 `limit.timeoutMs`。
  */
-export async function runDiagnosticProcess(bin: string, args: string[], limit: DiagnosticLimit): Promise<string> {
+export async function runDiagnosticProcess(bin: string, args: string[], limit: DiagnosticLimit, broker?: string): Promise<string> {
   if (limit.signal.aborted) throw new CxbError("INTERRUPTED", "诊断已取消");
-  // 尾部预算不足时不再创建无法保证回收的新进程。
-  if (limit.timeoutMs <= RECLAIM_RESERVE_MS) throw new CxbError("TIMEOUT", "剩余期限不足以执行并回收诊断程序");
+  // 尾部预算不足时不再创建无法保证按期回收的新进程。
+  if (limit.timeoutMs <= DIAG_RESERVE_MS + FINAL_WAIT_MS) throw new CxbError("TIMEOUT", "剩余期限不足以执行并回收诊断程序");
   const deadline = performance.now() + limit.timeoutMs;
   const left = () => Math.max(0, deadline - performance.now());
+  const statusFile = broker ? join(tmpdir(), `cxb-diag-${randomUUID()}.json`) : null;
+  const argv = broker
+    ? [broker, "diag-exec", "--timeout-ms", String(Math.floor(limit.timeoutMs - DIAG_RESERVE_MS - FINAL_WAIT_MS)), "--status-file", statusFile!, "--", bin, ...args]
+    : [bin, ...args];
   let child: ReturnType<typeof Bun.spawn>;
-  try { child = Bun.spawn([bin, ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true }); }
+  try { child = Bun.spawn(argv, { stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true }); }
   catch (cause) { throw new CxbError("LOCAL_ERROR", "无法执行诊断程序", { cause }); }
-  let stopping: Promise<void> | undefined;
-  const stop = () => stopping ??= (async () => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    if (process.platform === "win32") {
-      await new Promise<void>((resolve, reject) => {
-        const killer = execFile("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"],
-          { windowsHide: true, timeout: Math.max(1, Math.floor(Math.min(3000, left() - FINAL_WAIT_MS))), killSignal: "SIGKILL", maxBuffer: 4096 },
-          (error, _stdout, stderr) => {
-            if (error && child.exitCode === null && child.signalCode === null) reject(new CxbError("LOCAL_ERROR", `无法回收诊断进程树：${safeSummary(stderr) || "taskkill 未按期完成"}`, { cause: error }));
-            else resolve();
-          });
-        killer.stdin?.destroy();
-      });
-    }
-    try { child.kill("SIGKILL"); } catch { /* 可能已经退出，仍等 exited 确认。 */ }
-  })();
-  const abort = () => { void stop().catch(() => undefined); };
+  const stop = () => { try { child.kill("SIGKILL"); } catch { /* 可能已经退出，仍等 exited 确认。 */ } };
+  const abort = () => stop();
   const readers: Array<ReadableStreamDefaultReader<Uint8Array>> = [];
   /** 每路读取是否仍未结束；一路先失败时另一路可能还挂着，要分别记录。 */
   const open = [true, true];
@@ -97,20 +101,26 @@ export async function runDiagnosticProcess(bin: string, args: string[], limit: D
   const outputs = [collect(child.stdout as ReadableStream<Uint8Array>, 0), collect(child.stderr as ReadableStream<Uint8Array>, 1)];
   const io = Promise.all([child.exited, ...outputs]);
   try {
-    const [code, stdout, stderr] = await bounded(io, left() - RECLAIM_RESERVE_MS, limit.signal);
-    if (code !== 0) throw new CxbError("LOCAL_ERROR", `诊断程序退出 ${code}：${safeSummary(stderr)}`);
+    const [code, stdout, stderr] = await bounded(io, left() - FINAL_WAIT_MS, limit.signal);
+    if (!statusFile) {
+      if (code !== 0) throw new CxbError("LOCAL_ERROR", `诊断程序退出 ${code}：${safeSummary(stderr)}`);
+      return stdout;
+    }
+    const status = readDiagStatus(statusFile);
+    if (!status) throw new CxbError("LOCAL_ERROR", `diag-exec 异常（退出 ${code}，没有有效的状态文件）：${safeSummary(stderr)}`);
+    if (status.outcome === "timeout") throw new CxbError("TIMEOUT", "诊断程序超过期限，已结束其进程树");
+    if (status.outcome === "failed") throw new CxbError("LOCAL_ERROR", `diag-exec 失败：${safeSummary(status.reason!)}`);
+    if (status.exitCode !== 0) throw new CxbError("LOCAL_ERROR", `诊断程序退出 ${status.exitCode}：${safeSummary(stderr)}`);
     return stdout;
   } finally {
     limit.signal.removeEventListener("abort", abort);
-    let cleanupError: unknown;
-    try { await stop(); }
-    catch (error) { cleanupError = error; try { child.kill("SIGKILL"); } catch { /* 仍通过 exited 确认。 */ } }
-    // 无论哪一路先失败，未结束的读取都要取消：管道可能仍被已退出进程的后代占着。
+    stop();
+    // 无论哪一路先失败，未结束的读取都要取消。
     readers.forEach((reader, index) => { if (open[index]) void reader.cancel().catch(() => undefined); });
     // 收尾只在剩余期限内尽力等待，超时不覆盖原来的诊断错误。
     try { await bounded(Promise.allSettled([child.exited, ...outputs]), Math.max(1, Math.min(FINAL_WAIT_MS, left()))); }
     catch { /* 已按期限放弃等待。 */ }
-    if (cleanupError) throw cleanupError;
+    if (statusFile) { try { unlinkSync(statusFile); } catch { /* 未写出或已删除。 */ } }
   }
 }
 
@@ -150,7 +160,7 @@ export interface DoctorDeps {
 
 export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): CommandHandler {
   const deps: DoctorDeps = { findExecutable, runProcess: runDiagnosticProcess, resolveBrokerBin, connectBroker,
-    preflight: (policy, env) => approvalPreflight(policy, env), probeWritable, now: () => performance.now(), totalMs: 60_000, itemMs: 10_000, ...overrides };
+    preflight: (policy, env, limit) => approvalPreflight(policy, env, { deadline: performance.now() + limit.timeoutMs, signal: limit.signal }), probeWritable, now: () => performance.now(), totalMs: 60_000, itemMs: 10_000, ...overrides };
   return async (ctx) => {
     const controller = new AbortController();
     const unregister = ctx.registerCleanup(() => controller.abort());
@@ -160,13 +170,15 @@ export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): Comman
     let closing: Promise<void> | undefined;
     const close = () => connection ? (closing ??= connection.close()) : Promise.resolve();
     let codex: string | null = null;
+    /** 运行 codex 诊断用的 broker 可执行文件（diag-exec）。 */
+    let diagBroker: string | undefined;
     let brokerBin: string | undefined;
     let brokerVersion: string | undefined;
     let brokerUsable = false;
     let exhausted = false;
     const processes = new Set<Promise<string>>();
-    const runProcess: DoctorDeps["runProcess"] = (bin, args, limit) => {
-      const work = deps.runProcess(bin, args, limit);
+    const runProcess: DoctorDeps["runProcess"] = (bin, args, limit, broker) => {
+      const work = deps.runProcess(bin, args, limit, broker);
       processes.add(work);
       void work.finally(() => processes.delete(work)).catch(() => undefined);
       return work;
@@ -213,7 +225,9 @@ export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): Comman
       await check("codex", "fail", async (limit) => {
         codex = deps.findExecutable("codex");
         if (!codex) throw new CxbError("LOCAL_ERROR", "PATH 中找不到 codex");
-        const version = await runProcess(codex, ["--version"], limit);
+        // codex 经 broker 的 diag-exec 在 Job 里运行，broker 找不到时不直接运行（无法保证回收进程树）。
+        diagBroker = deps.resolveBrokerBin();
+        const version = await runProcess(codex, ["--version"], limit, diagBroker);
         if (!version.trim()) throw new CxbError("LOCAL_ERROR", "codex 未报告版本");
         return { status: "pass", detail: `${codex}；${version}`, path: codex, version };
       });
@@ -300,8 +314,8 @@ export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): Comman
           servers: result.servers.map((server) => ({ name: server.name, source: server.source, mode: server.effectiveMode, risk: server.risk, recommendation: server.suggestion })) };
       });
       await check("askUserInput", "warn", async (limit) => {
-        if (!codex) return { status: "warn", detail: "未检查（codex 不可用）" };
-        const output = await runProcess(codex, ["features", "list"], limit);
+        if (!codex || !diagBroker) return { status: "warn", detail: "未检查（codex 不可用）" };
+        const output = await runProcess(codex, ["features", "list"], limit, diagBroker);
         const line = output.split(/\r?\n/).find((line) => /^\s*default_mode_request_user_input\s/.test(line));
         return line ? { status: "pass", detail: `提问开关存在，cxb 会按线程打开；当前状态：${line}` } : { status: "warn", detail: "提问将退回文字提问" };
       });
