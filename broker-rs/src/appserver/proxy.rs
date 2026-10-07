@@ -84,11 +84,7 @@ pub async fn connect_proxy(
 
 fn validate_path(path: &Path) -> Result<&str, String> {
     let path = path.to_str().ok_or("proxy socket 路径不是有效 UTF-8")?;
-    if path.is_empty()
-        || path.contains([
-            '&', '|', '<', '>', '^', '%', '!', '(', ')', '"', '\r', '\n', '\0',
-        ])
-    {
+    if path.is_empty() || !crate::cli::diag::cmd_safe(path) {
         return Err("proxy socket 路径不能为空，且不能包含 cmd 元字符或空字符".into());
     }
     Ok(path)
@@ -113,9 +109,16 @@ fn proxy_command(cwd: &Path, path: &str) -> Command {
         use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
         let mut command = Command::new("cmd.exe");
         // 参数已拒绝全部 cmd 元字符。raw_arg 保留引号，兼容空格及末尾反斜杠（S0 p1-proxy:341–348）。
-        command.raw_arg(format!(
-            "/d /s /c \"codex app-server proxy --sock \"{path}\"\""
-        ));
+        command.raw_arg(
+            crate::cli::diag::cmd_line(&[
+                ("codex", false),
+                ("app-server", false),
+                ("proxy", false),
+                ("--sock", false),
+                (path, true),
+            ])
+            .expect("proxy 路径已经校验"),
+        );
         // 先暂停主线程，加入独立 Job 后才运行，堵住先生成子孙、再加入 Job 的竞态。
         command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         command

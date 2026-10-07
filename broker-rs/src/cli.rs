@@ -10,6 +10,9 @@ use clap::{Args, Parser, Subcommand};
 use crate::endpoint::Endpoint;
 use crate::error::BrokerError;
 
+#[path = "diag.rs"]
+pub mod diag;
+
 /// 空闲退出的缺省时长：5 分钟（详细设计第 8 节；上游为 30 分钟）。
 pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
@@ -26,6 +29,8 @@ pub enum Command {
     Serve(ServeCommand),
     /// 经中间进程拉起 serve 后立即退出，使 serve 脱离调用方的进程树（详细设计第 5 节）。
     Launch(ServeArgs),
+    /// 在独立 Job 中代运行诊断程序，并原子写入结果。
+    DiagExec(diag::DiagArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -78,6 +83,7 @@ impl ServeArgs {
 /// 执行子命令，返回进程退出码。
 pub fn run(cli: Cli) -> Result<i32, BrokerError> {
     match cli.command {
+        Command::DiagExec(args) => Ok(diag::run(&args)),
         Command::Serve(command) => {
             let config = command.args.resolve()?;
             tracing::info!(?config, launched_breakaway = ?command.launched_breakaway, "启动 serve");
