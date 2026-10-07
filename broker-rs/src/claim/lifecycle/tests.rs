@@ -220,6 +220,53 @@ fn reason(a: &[Action], reason: &str) -> bool {
         .any(|a| matches!(a,Action::Send{message,..} if message["error"]["data"]["reason"]==reason))
 }
 
+#[test]
+#[allow(non_snake_case)]
+fn 续修四_上游成功但票据未完成时对外阶段为_upstreamDone() {
+    let mut m = Machine::default();
+    sent(&mut m);
+    upstream(&mut m, 1, Ok(json!({})));
+    assert_eq!(
+        m.lifecycle_projection("P").unwrap()["phase"],
+        "upstreamDone"
+    );
+    assert_eq!(
+        m.lifecycle_error("P").unwrap()["data"]["phase"],
+        "upstreamDone"
+    );
+}
+
+#[test]
+#[allow(non_snake_case)]
+fn 续修四_重启恢复_upstreamDone_立即投影为提交中阶段() {
+    let mut source = Machine::default();
+    sent(&mut source);
+    let mut file = source.lifecycle.file.clone();
+    file.records.get_mut("P").unwrap().phase = DiskPhase::UpstreamDone;
+    let mut restored = Machine::default();
+    restored.lifecycle_restore(Ok(file));
+    assert_eq!(
+        restored.lifecycle_projection("P").unwrap()["phase"],
+        "upstreamDone"
+    );
+    assert_eq!(
+        restored.lifecycle_error("P").unwrap()["data"]["phase"],
+        "upstreamDone"
+    );
+}
+
+#[test]
+fn 续修四_意图写入期间仍对外报告_persisting() {
+    let mut m = Machine::default();
+    begin(&mut m);
+    scan(&mut m, vec![]);
+    assert_eq!(m.lifecycle_projection("P").unwrap()["phase"], "persisting");
+    assert_eq!(
+        m.lifecycle_error("P").unwrap()["data"]["phase"],
+        "persisting"
+    );
+}
+
 fn private_draining(old: &disk::Instance, new: &disk::Instance) -> Machine {
     let mut m = Machine::new(false);
     m.lifecycle.instance = Some(old.clone());
