@@ -48,7 +48,6 @@ export const config = {
   defaultSandbox: "workspace-write" as const,
 
   // Approval policies accepted by the Codex app server
-  approvalPolicies: ["never", "on-request", "on-failure", "untrusted"] as const,
   // CLI/config approval modes: server policies plus "auto", which maps to
   // approvalPolicy "on-request" reviewed by Codex's Guardian subagent
   // (approvalsReviewer "auto_review") with the interactive flow as the
@@ -91,13 +90,6 @@ export const config = {
     return 30_000; // 30s in ms
   },
 
-  // Stages of connectDirect's close(). Named here rather than inlined so the
-  // shutdown path's cost is legible; nothing's correctness depends on them.
-  appServerStdinExitWait: 5_000,   // stdin EOF → SIGTERM
-  appServerTermExitWait: 3_000,    // SIGTERM → SIGKILL
-  /** Reap bound for the broker's startup guard, which kills the app-server
-   *  by PID rather than through close(). */
-  appServerReapTimeout: 3_000,
 
   // Limits
   maxRunsPerWorkspace: 50,
@@ -124,8 +116,6 @@ export const config = {
   // Display
   threadsListLimit: 20,
 
-  // Client identity (sent during initialize handshake)
-  clientName: "cxb",
   clientVersion: pkg.version,
 };
 
@@ -158,7 +148,6 @@ export function sandboxModeOf(policy: unknown): SandboxMode | undefined {
     default: return undefined;
   }
 }
-export type ApprovalPolicy = (typeof config.approvalPolicies)[number];
 export type ApprovalMode = (typeof config.approvalModes)[number];
 
 // ─── Pure utility functions ─────────────────────────────────────────────────

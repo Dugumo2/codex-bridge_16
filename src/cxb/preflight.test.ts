@@ -61,3 +61,13 @@ test("缺省路径与缺文件为正常；解析失败或不可读只在详细�
   mkdirSync(join(dir, "config.toml"));
   expect((await approvalPreflight("never", { CODEX_HOME: dir })).status).toBe("unavailable");
 });
+
+test("取消时以 INTERRUPTED 结束，不降级为 unavailable（任务说明 N7-A 5.3 节）", async () => {
+  writeFileSync(join(dir, "config.toml"), "[mcp_servers.a]\n");
+  const control = new AbortController();
+  control.abort();
+  await expect(approvalPreflight("never", { CODEX_HOME: dir }, { signal: control.signal })).rejects.toMatchObject({ code: "INTERRUPTED" });
+  // 未取消、期限充足时照常检查。
+  const result = await approvalPreflight("never", { CODEX_HOME: dir }, { signal: new AbortController().signal, deadline: performance.now() + 5000 });
+  expect(result.status).toBe("warn");
+});

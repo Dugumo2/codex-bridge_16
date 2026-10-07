@@ -73,17 +73,22 @@ describe("ledger：只读 broker 账本", () => {
     expect(() => listThreadRuns(dir, "t-1")).toThrow(CxbError);
   });
 
-  test("日志：先轮转文件再当前文件，丢弃没有换行结尾的半行，事件名里的空格不拆分", () => {
+  test("日志：先轮转文件再当前文件，丢弃没有换行结尾的半行，按前三个空格切出 runId、事件、内容", () => {
     expect(readRunLog(dir, "aaaa1111")).toBeNull();
-    writeFileSync(join(dir, "runs", "aaaa1111.log.1"), "2026-10-06T00:00:00.000Z 运行开始 run-1\n");
-    writeFileSync(join(dir, "runs", "aaaa1111.log"), "2026-10-06T00:00:01.000Z 空转刹车暂停 goal Paused\r\n2026-10-06T00:00:02.000Z 写到一半");
+    writeFileSync(join(dir, "runs", "aaaa1111.log.1"), "2026-10-06T00:00:00.000Z run-1 运行开始 run-1\n");
+    writeFileSync(join(dir, "runs", "aaaa1111.log"), "2026-10-06T00:00:01.000Z - 丢行 丢了 2 行\r\n"
+      + "2026-10-06T00:00:01.000Z run-1 空转刹车暂停目标 内容 含 空格\n2026-10-06T00:00:02.000Z run-1 运行结束\n2026-10-06T00:00:03.000Z run-1 写到一半");
     expect(readRunLog(dir, "aaaa1111")).toEqual([
-      { ts: "2026-10-06T00:00:00.000Z", text: "运行开始 run-1" },
-      { ts: "2026-10-06T00:00:01.000Z", text: "空转刹车暂停 goal Paused" },
+      { ts: "2026-10-06T00:00:00.000Z", runId: "run-1", event: "运行开始", content: "run-1", text: "运行开始 run-1" },
+      { ts: "2026-10-06T00:00:01.000Z", runId: null, event: "丢行", content: "丢了 2 行", text: "丢行 丢了 2 行" },
+      { ts: "2026-10-06T00:00:01.000Z", runId: "run-1", event: "空转刹车暂停目标", content: "内容 含 空格", text: "空转刹车暂停目标 内容 含 空格" },
+      { ts: "2026-10-06T00:00:02.000Z", runId: "run-1", event: "运行结束", content: "", text: "运行结束" },
     ]);
-    // 完整的行没有合法时间戳就是损坏，不当作日志显示。
-    writeFileSync(join(dir, "runs", "aaaa1111.log"), "乱码一行\n");
-    expect(() => readRunLog(dir, "aaaa1111")).toThrow(expect.objectContaining({ code: "LOCAL_ERROR" }));
+    // 完整的行格式不对就是损坏：没有时间戳、旧格式（第二段是事件名）、缺事件、旧的无时间戳丢行标记。
+    for (const bad of ["乱码一行", "2026-10-06T00:00:00.000Z 运行开始 run-1", "2026-10-06T00:00:00.000Z run-1", "丢了 3 行"]) {
+      writeFileSync(join(dir, "runs", "aaaa1111.log"), `${bad}\n`);
+      expect(() => readRunLog(dir, "aaaa1111")).toThrow(expect.objectContaining({ code: "LOCAL_ERROR" }));
+    }
   });
 });
 

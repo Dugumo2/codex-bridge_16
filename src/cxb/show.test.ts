@@ -90,6 +90,29 @@ describe("show 本地读取", () => {
     expect(JSON.stringify(full.json)).not.toContain("不可见");
     expect(full.json[0].runs[0].progress).toBeDefined();
   });
+  test("log 按行内 runId 拆开交错写入的两个运行，丢行标记归入覆盖它的运行，旧格式日志报损坏", async () => {
+    ledger(dir, [runResult(), runResult({ runId: "run-two", startedAt: 3000, input: "第二次要求" })]);
+    logs(dir, ["运行开始 run-test", "run-two 运行开始 run-two", "条目完成 R甲", "run-two 条目完成 S甲",
+      "- 丢行 丢了 3 行", "空转刹车暂停目标 Paused", "运行结束 run-test", "run-two 运行结束 run-two"]);
+    const full = context(dir, ["show", "abcd", "--log", "--full", "--json"]);
+    expect(await show(full.ctx)).toBe(0);
+    const [first, second] = full.json[0].runs.map((run: any) => run.items.map((line: any) => line.text));
+    expect(first).toEqual(["运行开始 run-test", "条目完成 R甲", "丢行 丢了 3 行", "空转刹车暂停目标 Paused", "运行结束 run-test"]);
+    expect(second).toEqual(["运行开始 run-two", "条目完成 S甲", "丢行 丢了 3 行", "运行结束 run-two"]);
+    const normal = context(dir, ["show", "abcd", "--log", "--json"]);
+    await show(normal.ctx);
+    expect(normal.json[0].runs[0].items.map((line: any) => line.kind)).toEqual(["运行开始", "丢行", "空转刹车暂停目标", "运行结束"]);
+    writeFileSync(join(dir, "runs", "abcd1234.log"), "2026-10-06T00:00:00.000Z 运行开始 run-test\n");
+    await expect(show(context(dir, ["show", "abcd", "--log"]).ctx)).rejects.toMatchObject({ exitCode: 1 });
+  });
+  test("启动失败摘要只取该运行的行", async () => {
+    ledger(dir, [runResult({ turns: [], turnsTotal: 0, status: "failed" })]);
+    logs(dir, ["run-other 启动失败 别的运行的原因", "运行开始 run-test", "启动失败 本运行的原因", "run-other 启动失败 之后别的运行"]);
+    const t = context(dir, ["show", "abcd"]);
+    expect(await show(t.ctx)).toBe(0);
+    expect(t.notices.join()).toContain("本运行的原因");
+    expect(t.notices.join()).not.toContain("别的运行");
+  });
 });
 
 describe("show 真 broker", () => {
@@ -243,7 +266,7 @@ describe("show 服务器与跟随", () => {
       if (method === "broker/threads/list") return { threads: [summary()] };
       if (params?.threadId === "review-child") {
         // 迁移到订阅之间发生、已写进父线程日志的一行，follow 要补出来。
-        appendFileSync(join(dir, "runs", "abcd1234.log"), "2026-10-06T00:00:05.000Z 条目完成 改了文件\n");
+        appendFileSync(join(dir, "runs", "abcd1234.log"), "2026-10-06T00:00:05.000Z run-test 条目完成 改了文件\n");
         release();
         return { thread: summary({ threadId: "review-child", shortId: "rev12345" }), run: reviewRun, pending: [] };
       }
@@ -315,13 +338,14 @@ describe("show 服务器与跟随", () => {
   }
   const texts = (json: any[]) => json.filter((l) => typeof l.text === "string").map((l) => l.text as string);
 
-  test("follow 补发迁移空档时，日志段里出现别的运行就停止补发，不把别的运行的行当成目标运行的", async () => {
+  test("follow 补发迁移空档时，与父线程新运行交错写入的行按 runId 拆开，只补目标运行的", async () => {
     const f = followMoved(() => {
-      // 父线程上的新运行 S 与 R 写同一份日志、行不带运行编号，交错后无法拆分。
-      f.log("2026-10-06T00:00:05.000Z 条目完成 R迁移前");
-      f.log("2026-10-06T00:00:06.000Z 运行开始 run-s");
-      f.log("2026-10-06T00:00:07.000Z 条目完成 S的进展");
-      f.log("2026-10-06T00:00:08.000Z 运行结束 run-s");
+      // 父线程上的新运行 S 与 R 写同一份日志、交错写入。
+      f.log("2026-10-06T00:00:05.000Z run-test 条目完成 R迁移前");
+      f.log("2026-10-06T00:00:06.000Z run-s 运行开始 run-s");
+      f.log("2026-10-06T00:00:07.000Z run-s 条目完成 S的进展");
+      f.log("2026-10-06T00:00:07.000Z run-test 条目完成 R在S之后");
+      f.log("2026-10-06T00:00:08.000Z run-s 运行结束 run-s");
       return { thread: summary({ threadId: "review-child" }), run: f.reviewRun, pending: [] };
     });
     const running = show(f.t.ctx);
@@ -331,15 +355,18 @@ describe("show 服务器与跟随", () => {
     expect(await bounded(running, 1000, "跟随未结束")).toBe(0);
     const shown = texts(f.t.json);
     expect(shown).toContain("条目完成 R迁移前");
+    expect(shown).toContain("条目完成 R在S之后");
     expect(shown.some((text) => text.includes("run-s") || text.includes("S的进展"))).toBe(false);
   });
 
   for (const [label, initial, appended] of [
     ["目标运行开始时别的运行还没结束", ["运行开始 run-s", "运行开始 run-test"],
-      ["2026-10-06T00:00:05.000Z 条目完成 S的进展", "2026-10-06T00:00:06.000Z 运行结束 run-s"]],
-    ["段内出现来历不明的运行结束（起点已轮转出日志）", ["运行开始 run-test"],
-      ["2026-10-06T00:00:05.000Z 条目完成 S的进展", "2026-10-06T00:00:06.000Z 运行结束 run-s"]],
-  ] as const) test(`follow 补发时${label}，分不清归属就不补`, async () => {
+      ["2026-10-06T00:00:05.000Z run-s 条目完成 S的进展", "2026-10-06T00:00:06.000Z run-test 条目完成 R的补发",
+        "2026-10-06T00:00:07.000Z run-s 运行结束 run-s"]],
+    ["段内出现起点已轮转出日志的别的运行的结束", ["运行开始 run-test"],
+      ["2026-10-06T00:00:05.000Z run-s 条目完成 S的进展", "2026-10-06T00:00:06.000Z run-test 条目完成 R的补发",
+        "2026-10-06T00:00:07.000Z run-s 运行结束 run-s"]],
+  ] as const) test(`follow 补发时${label}，仍按 runId 只补目标运行的行`, async () => {
     const f = followMoved(() => {
       for (const line of appended) f.log(line);
       return { thread: summary({ threadId: "review-child" }), run: f.reviewRun, pending: [] };
@@ -350,12 +377,13 @@ describe("show 服务器与跟随", () => {
     f.t.emit("broker/run/ended", { run: runResult({ reviewThreadId: "review-child" }) });
     expect(await bounded(running, 1000, "跟随未结束")).toBe(0);
     const shown = texts(f.t.json);
+    expect(shown).toContain("条目完成 R的补发");
     expect(shown.some((text) => text.includes("S的进展") || text === "运行结束 run-s")).toBe(false);
   });
 
   test("follow 补发时之前的运行已完整结束（有开始有结束），照常补出目标运行的行", async () => {
     const f = followMoved(() => {
-      f.log("2026-10-06T00:00:05.000Z 条目完成 R的补发");
+      f.log("2026-10-06T00:00:05.000Z run-test 条目完成 R的补发");
       return { thread: summary({ threadId: "review-child" }), run: f.reviewRun, pending: [] };
     }, ["运行开始 run-old", "运行结束 run-old", "运行开始 run-test"]);
     const running = show(f.t.ctx);
@@ -391,7 +419,7 @@ describe("show 服务器与跟随", () => {
 
   test("follow 补发时同一毫秒的多行（含内容相同的行）都补出，已显示过的行不重复", async () => {
     const f = followMoved(() => {
-      for (const name of ["甲", "甲", "乙", "丙"]) f.log(`2026-10-06T00:00:05.000Z 条目完成 同毫秒${name}`);
+      for (const name of ["甲", "甲", "乙", "丙"]) f.log(`2026-10-06T00:00:05.000Z run-test 条目完成 同毫秒${name}`);
       return { thread: summary({ threadId: "review-child" }), run: f.reviewRun, pending: [] };
     });
     const running = show(f.t.ctx);
@@ -473,7 +501,7 @@ describe("show 服务器与跟随", () => {
     await bounded(watched, 1000, "未订阅子线程");
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(t.json.some((line) => line.terminal)).toBe(false);
-    appendFileSync(join(dir, "runs", "abcd1234.log"), "2026-10-06T00:00:05.000Z 条目完成 迁移空档\n");
+    appendFileSync(join(dir, "runs", "abcd1234.log"), "2026-10-06T00:00:05.000Z run-test 条目完成 迁移空档\n");
     releaseChild({ thread: summary({ threadId: "review-child" }), run: runResult({ reviewThreadId: "review-child" }), pending: [] });
     expect(await bounded(runningShow, 1000, "跟随未结束")).toBe(0);
     const gap = t.json.findIndex((line) => line.text === "条目完成 迁移空档");

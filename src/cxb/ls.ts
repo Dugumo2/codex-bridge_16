@@ -1,12 +1,15 @@
 import { sanitizeForTerminal } from "../questions";
-import { CxbError, type ThreadSummary } from "./contracts";
-import { readRunRecord, readThreadIndex } from "./ledger";
+import { CxbError, type LifecycleInfo, type ThreadSummary } from "./contracts";
+import { readLifecycle, readRunRecord, readThreadIndex } from "./ledger";
+import { lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
 import { commandSession } from "./command-session";
 
 interface ListItem {
   threadId: string; shortId: string | null; status: string; lastRunId: string | null;
   updatedAt: number; model: string | null; preview: string | null; goal: string | null;
+  /** 待核实的归档或删除（`--json` 原样带出）。 */
+  lifecycle?: LifecycleInfo;
 }
 interface ServerThread {
   id: string; updatedAt: number; model?: string | null; preview?: string;
@@ -16,14 +19,33 @@ const preview = (text: string | null | undefined) => text == null ? null
   : [...sanitizeForTerminal(text).replace(/\s+/gu, " ")].slice(0, 120).join("");
 const sorted = (items: Iterable<ListItem>) => [...items].sort((a, b) => b.updatedAt - a.updatedAt || a.threadId.localeCompare(b.threadId));
 
-function localItems(ctx: CommandContext, threads: Array<Pick<ThreadSummary, "threadId" | "shortId" | "lastRunId" | "updatedAt" | "model" | "preview" | "meta"> & { state?: ThreadSummary["state"] }>): ListItem[] {
+type LocalThread = Pick<ThreadSummary, "threadId" | "shortId" | "lastRunId" | "updatedAt" | "model" | "preview" | "meta">
+  & { state?: ThreadSummary["state"]; lifecycle?: LifecycleInfo };
+
+function localItems(ctx: CommandContext, threads: LocalThread[]): ListItem[] {
   return threads.map((thread) => {
-    const run = (!thread.state || thread.state === "idle") && thread.lastRunId
+    // 待核实的归档或删除优先显示（门禁挡着，线程不能照常使用）；只剩记录的线程没有运行可读。
+    const run = !thread.lifecycle && (!thread.state || thread.state === "idle") && thread.lastRunId
       ? readRunRecord(ctx.workspace.workspaceDir, thread.lastRunId) : null;
-    const status = thread.state && thread.state !== "idle" ? thread.state
+    const status = thread.lifecycle ? lifecycleLabel(thread.lifecycle) : thread.state && thread.state !== "idle" ? thread.state
       : run?.state === "lost" ? "lost" : run?.status ?? "idle";
     return { ...thread, status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
   });
+}
+
+/** 本地索引并上 lifecycle.json：索引项带上记录；purge 已删索引、只剩记录的线程按记录补一项。 */
+function localThreads(workspaceDir: string): LocalThread[] {
+  const records = new Map(readLifecycle(workspaceDir).map((record) => [record.threadId, record]));
+  const threads: LocalThread[] = readThreadIndex(workspaceDir).map((entry) => {
+    const record = records.get(entry.threadId);
+    records.delete(entry.threadId);
+    return record ? { ...entry, lifecycle: record } : entry;
+  });
+  for (const record of records.values()) {
+    threads.push({ threadId: record.threadId, shortId: record.shortId ?? record.threadId, lastRunId: null, updatedAt: record.updatedAt,
+      model: null, preview: record.preview, meta: null, lifecycle: record });
+  }
+  return threads;
 }
 
 export const ls: CommandHandler = async (ctx) => {
@@ -34,7 +56,7 @@ export const ls: CommandHandler = async (ctx) => {
     let more = false;
     const limit = Number(ctx.parsed.options.limit);
     if (ctx.parsed.options.local) {
-      items = localItems(ctx, readThreadIndex(ctx.workspace.workspaceDir));
+      items = localItems(ctx, localThreads(ctx.workspace.workspaceDir));
       ctx.out.progress("已跳过服务器查询：指定了 --local");
     } else {
       let rpc;
@@ -46,7 +68,7 @@ export const ls: CommandHandler = async (ctx) => {
         if (session.signal.aborted || error instanceof CxbError && error.code === "LOCAL_ERROR") throw error;
         ctx.out.notice("无法连接或读取 broker，改为显示本地账本");
       }
-      items = localItems(ctx, summaries ?? readThreadIndex(ctx.workspace.workspaceDir));
+      items = localItems(ctx, summaries ?? localThreads(ctx.workspace.workspaceDir));
       if (rpc && summaries) {
         const started = Date.now();
         const merged = new Map(items.map((item) => [item.threadId, item]));

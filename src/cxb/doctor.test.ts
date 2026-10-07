@@ -219,12 +219,32 @@ test("上游伪造换行与秘密在文本和 JSON 中均脱敏为有界单行",
   }
 });
 
-for (const wrapper of [false, true]) for (const cancel of [false, true]) test(`真实不退出${wrapper ? "命令包装进程树" : "子进程"}${cancel ? "取消" : "超时"}后确认已退出`, async () => {
+test("codex 的两项诊断经 broker 的 diag-exec 运行，broker 自身版本直接运行", async () => {
+  const calls: Array<{ bin: string; args: string[]; broker?: string }> = [];
+  const run = deps.runProcess!;
+  deps.runProcess = async (bin, args, limit, broker) => { calls.push({ bin, args, broker }); return run(bin, args, limit, broker); };
+  expect((await invoke()).code).toBe(0);
+  expect(calls).toEqual([
+    { bin: "模拟-codex", args: ["--version"], broker: "模拟-broker" },
+    { bin: "模拟-broker", args: ["--version"], broker: undefined },
+    { bin: "模拟-codex", args: ["features", "list"], broker: "模拟-broker" },
+  ]);
+});
+test("找不到 broker 时不直接运行 codex，codex 一项失败", async () => {
+  const calls: string[] = [];
+  deps.resolveBrokerBin = () => { throw new CxbError("BROKER_UNAVAILABLE", "找不到 cxb-broker"); };
+  const run = deps.runProcess!;
+  deps.runProcess = async (bin, args, limit, broker) => { calls.push(bin); return run(bin, args, limit, broker); };
+  const result = await invoke();
+  expect(checkOf(result, "codex").status).toBe("fail");
+  expect(calls).not.toContain("模拟-codex");
+  expect(checkOf(result, "askUserInput").status).toBe("warn");
+});
+
+for (const cancel of [false, true]) test(`直接运行的不退出子进程${cancel ? "取消" : "超时"}后确认已退出`, async () => {
   const file = join(h.dir, "pid"); const fixture = join(import.meta.dir, "test-fixtures", "n5a-hang.ts");
   const control = new AbortController();
-  const script = join(h.dir, "hang.cmd");
-  if (wrapper) writeFileSync(script, `@echo off\r\n"${process.execPath}" "${fixture}" "${file}"\r\n`);
-  const work = runDiagnosticProcess(wrapper ? script : process.execPath, wrapper ? [] : [fixture, file], { timeoutMs: 5000, signal: control.signal });
+  const work = runDiagnosticProcess(process.execPath, [fixture, file], { timeoutMs: 5000, signal: control.signal });
   void work.catch(() => undefined);
   await until(() => existsSync(file), 3000, "子进程没有登记 PID");
   const pid = Number(readFileSync(file, "utf8")); children.add(pid);
@@ -234,8 +254,65 @@ for (const wrapper of [false, true]) for (const cancel of [false, true]) test(`�
   expect(alive(pid)).toBe(false);
 }, 10_000);
 
-// 已知限制（doctor.ts 注释）：先退出的诊断程序留下的后代无法可靠回收，这里只验证 doctor 按期返回、不被管道挂住；后代由本测试清理。
-test("诊断程序先退出、后代仍占着输出管道时，按期以诊断错误返回并取消读取", async () => {
+/** 用 diag-exec 替身当 broker：.cmd 包装把模式与记录文件放在参数最前面。 */
+function fakeDiag(mode: string) {
+  const record = join(h.dir, `diag-${mode}.json`);
+  const shim = join(h.dir, `diag-${mode}.cmd`);
+  writeFileSync(shim, `@"${process.execPath}" "${join(import.meta.dir, "test-fixtures", "n7b-fake-diag.ts")}" ${mode} "${record}" %*\r\n`);
+  return { shim, record, argv: () => JSON.parse(readFileSync(record, "utf8")) as string[] };
+}
+const exitFixture = join(import.meta.dir, "test-fixtures", "n7b-exit.ts");
+
+test("经 diag-exec 运行：参数约定、按状态文件取结果、状态文件用后删除", async () => {
+  const diag = fakeDiag("exited");
+  const output = await runDiagnosticProcess(process.execPath, [exitFixture, "codex 0.160.0", "", "0"], { timeoutMs: 9000, signal: new AbortController().signal }, diag.shim);
+  expect(output).toBe("codex 0.160.0");
+  const argv = diag.argv();
+  expect(argv.slice(0, 2)).toEqual(["diag-exec", "--timeout-ms"]);
+  expect(Number(argv[2])).toBeGreaterThan(0);
+  expect(Number(argv[2])).toBeLessThanOrEqual(9000 - 4000);
+  expect(argv[3]).toBe("--status-file");
+  expect(argv.slice(5)).toEqual(["--", process.execPath, exitFixture, "codex 0.160.0", "", "0"]);
+  expect(existsSync(argv[4]!)).toBe(false);
+}, 15_000);
+
+for (const [label, mode, args, expected] of [
+  ["诊断程序自己退出 124（与超时退出码重叠）按程序失败报告", "exited", ["", "坏了", "124"], { code: "LOCAL_ERROR", message: "诊断程序退出 124" }],
+  ["状态文件里大于 255 的退出码原样报告（不用 diag-exec 自身被截断的退出码）", "big", [], { code: "LOCAL_ERROR", message: "诊断程序退出 300" }],
+  ["状态为 timeout 报超时", "timeout", [], { code: "TIMEOUT" }],
+  ["状态为 failed 报 diag-exec 失败并附原因", "failed", [], { code: "LOCAL_ERROR", message: "模拟：创建进程失败" }],
+  ["没有状态文件报 diag-exec 异常", "missing", [], { code: "LOCAL_ERROR", message: "没有有效的状态文件" }],
+  ["状态文件损坏报 diag-exec 异常", "corrupt", [], { code: "LOCAL_ERROR", message: "没有有效的状态文件" }],
+] as const) test(`经 diag-exec 运行：${label}`, async () => {
+  const diag = fakeDiag(mode);
+  const work = runDiagnosticProcess(process.execPath, [exitFixture, ...args], { timeoutMs: 9000, signal: new AbortController().signal }, diag.shim);
+  const error = await work.then(() => null, (error) => error);
+  expect(error).toBeInstanceOf(CxbError);
+  expect(error.code).toBe(expected.code);
+  if ("message" in expected) expect(error.message).toContain(expected.message);
+}, 15_000);
+
+for (const cancel of [false, true]) test(`经 diag-exec 运行：${cancel ? "取消" : "超出期限"}时结束 diag-exec 进程并按期返回`, async () => {
+  const diag = fakeDiag("hang");
+  const control = new AbortController();
+  const started = performance.now();
+  const work = runDiagnosticProcess(process.execPath, [exitFixture], { timeoutMs: 6000, signal: control.signal }, diag.shim);
+  void work.catch(() => undefined);
+  await until(() => existsSync(`${diag.record}.pid`), 5000, "diag-exec 替身没有登记 PID");
+  const pid = Number(readFileSync(`${diag.record}.pid`, "utf8")); children.add(pid);
+  if (cancel) control.abort();
+  const error = await bounded(work.then(() => null, (error) => error), 8000);
+  expect(error).toBeInstanceOf(CxbError);
+  expect(error.code).toBe(cancel ? "INTERRUPTED" : "TIMEOUT");
+  expect(performance.now() - started).toBeLessThan(cancel ? 4000 : 7000);
+  // .cmd 包装下 diag-exec 替身是孙进程：结束包装进程不一定结束它；真 diag-exec 由 Job 保证（合并后经真 broker 验证）。
+  if (alive(pid)) { process.kill(pid, "SIGKILL"); await until(() => !alive(pid), 3000, "替身未能结束"); }
+  children.delete(pid);
+}, 15_000);
+
+// 直接运行（只用于不派生子进程的 cxb-broker --version）时，先退出的程序留下的后代无法可靠回收；
+// 这里只验证 doctor 按期返回、不被管道挂住，后代由本测试清理。经 diag-exec 时后代由 Job 回收（合并后经真 broker 验证）。
+test("直接运行的诊断程序先退出、后代仍占着输出管道时，按期以诊断错误返回并取消读取", async () => {
   const file = join(h.dir, "pid"); const fixture = join(import.meta.dir, "test-fixtures", "n5a-orphan.ts");
   const timeoutMs = 6000;
   const started = performance.now();

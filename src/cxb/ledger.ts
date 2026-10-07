@@ -6,7 +6,7 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CxbError, type RunMeta, type RunResult } from "./contracts";
+import { CxbError, type LifecycleInfo, type RunMeta, type RunResult } from "./contracts";
 
 /** threads.json 里的一项（Rust runs::types::ThreadIndexEntry，只取 CLI 用到的字段）。 */
 export interface ThreadIndexEntry {
@@ -21,15 +21,25 @@ export interface ThreadIndexEntry {
   meta: RunMeta | null;
 }
 
-/** 日志的一行：`<UTC 时间戳> <事件> <内容>`（Rust runs::state::log，内容截到 240 个字符、控制字符换成空格）。 */
+/**
+ * 日志的一行：`<UTC 时间戳> <runId> <事件> <内容>`（Rust runs::state::log；任务说明 N7-A 2.1 节）。
+ * 按前三个空格切分；不属于任何运行的行（丢行标记）runId 写 `-`。事件名不含空格，内容截到 240 个字符、控制字符换成空格。
+ */
 export interface LogLine {
   /** ISO 8601 毫秒精度 UTC 时间戳，如 `2026-10-06T08:00:00.000Z`。 */
   ts: string;
-  /** 时间戳之后的全部文字（事件名本身可能含空格，如「空转刹车暂停 goal」，不再拆分）。 */
+  /** 所属运行；丢行标记等不属于任何运行的行为 null。 */
+  runId: string | null;
+  event: string;
+  /** 可为空串。 */
+  content: string;
+  /** 显示用：`事件 内容`（内容为空时只有事件）。 */
   text: string;
 }
 
 const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+/** broker 的 runId 形如 `run-<base36>-<6 位十六进制>`；只要求 `run-` 前缀，旧格式（第二段是中文事件名）因此会被判为损坏。 */
+const RUN_ID = /^run-\S+$/;
 const RUN_STATES = new Set(["running", "stopping", "ended", "lost"]);
 const RUN_STATUSES = new Set(["completed", "interrupted", "failed", "goalBlocked"]);
 const TURN_READY = new Set(["pending", "ready", "unavailable"]);
@@ -68,6 +78,31 @@ function readPayload(path: string, label: string): unknown {
   } catch (cause) {
     throw new CxbError("LOCAL_ERROR", `${label}无法解析`, { cause });
   }
+}
+
+/** lifecycle.json 的一条记录（Rust 的生命周期操作意图，任务说明 N7-A 2.3.5 节；只取 CLI 用到的字段）。 */
+export interface LifecycleRecord extends LifecycleInfo {
+  threadId: string;
+  updatedAt: number;
+}
+
+/** 读生命周期记录；文件不存在返回空数组，损坏抛 LOCAL_ERROR（broker 同样拒绝改状态，不能当作「没有待核实」）。按 updatedAt 倒序。 */
+export function readLifecycle(workspaceDir: string): LifecycleRecord[] {
+  const path = join(workspaceDir, "lifecycle.json");
+  if (!existsSync(path)) return [];
+  const payload = readPayload(path, "生命周期记录 lifecycle.json ") as { records?: unknown } | undefined;
+  const records = payload?.records;
+  if (!isObject(records)) throw new CxbError("LOCAL_ERROR", "生命周期记录 lifecycle.json 缺少 records");
+  return Object.entries(records).map(([key, record]) => {
+    if (!isObject(record) || record.threadId !== key || typeof record.operationId !== "string"
+      || (record.kind !== "archive" && record.kind !== "delete") || typeof record.phase !== "string"
+      || typeof record.updatedAt !== "number" || !optionalString(record.shortId) || !optionalString(record.preview)) {
+      throw new CxbError("LOCAL_ERROR", `生命周期记录 lifecycle.json 的条目 ${key} 损坏`);
+    }
+    return { threadId: key, operationId: record.operationId, kind: record.kind as LifecycleInfo["kind"], phase: record.phase,
+      shortId: (record.shortId as string | null | undefined) ?? null, preview: (record.preview as string | null | undefined) ?? null,
+      updatedAt: record.updatedAt };
+  }).sort((a, b) => b.updatedAt - a.updatedAt || a.threadId.localeCompare(b.threadId));
 }
 
 /** 读线程索引；文件不存在返回空数组，损坏抛 LOCAL_ERROR。按 updatedAt 倒序。 */
@@ -125,10 +160,12 @@ function parseLog(text: string, label: string): LogLine[] {
   for (const raw of lines) {
     const line = raw.replace(/\r$/, "");
     if (!line) continue;
-    const space = line.indexOf(" ");
-    const ts = space < 0 ? line : line.slice(0, space);
-    if (!TIMESTAMP.test(ts)) throw new CxbError("LOCAL_ERROR", `${label}有损坏的行`);
-    parsed.push({ ts, text: space < 0 ? "" : line.slice(space + 1) });
+    const [ts, run, event, ...rest] = line.split(" ");
+    const content = rest.join(" ");
+    if (!TIMESTAMP.test(ts!) || run === undefined || (run !== "-" && !RUN_ID.test(run)) || !event) {
+      throw new CxbError("LOCAL_ERROR", `${label}有损坏的行`);
+    }
+    parsed.push({ ts: ts!, runId: run === "-" ? null : run, event, content, text: content ? `${event} ${content}` : event });
   }
   return parsed;
 }
