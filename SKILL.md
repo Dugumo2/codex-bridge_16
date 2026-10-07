@@ -68,7 +68,7 @@ cxb run --resume <线程ID> "继续：……"                         # 在同�
 - `run`、`review`、`wait` 要几分钟：用 `run_in_background=true` 启动，告诉用户已在运行后结束本轮。运行期间**不要轮询、阻塞或派代理盯着**，完成时会自动通知。用户问进度时读后台输出或 `cxb show <线程ID> --tail`。
 - **禁止 shell 的 `&` 后台**（`cxb run "..." &`）：调用方会误判已完成并丢掉通知。也不要用轮询脚本冒充完成通知。
 - **`cxb run` 一断开，broker 就立即叫 Codex 停下**（主动停止或意外断开都一样），确认停下之前显示「停止中」。进度会保存，之后用 `cxb run --resume <线程ID> --continue` 接着干。想让 Codex 不受断开影响地一直干，就用 `--detach`，再 `cxb wait <线程ID>`。
-- 停止 Codex：停掉 `cxb run` 的后台任务，或 `cxb stop <线程ID>`。`cxb stop` 会等到确认（最多约 40 秒），也能停 `--detach` 托管中的线程；没确认可以再发一次重试。`--clear` 同时放弃 goal（默认只暂停）。
+- 停止 Codex：停掉 `cxb run` 的后台任务，或 `cxb stop <线程ID> [--run <runId>]`。`cxb stop` 会等到确认（最多约 40 秒），也能停 `--detach` 托管中的线程；没确认会以退出码 3 提示「已发出停止，Codex 尚未确认停下，状态为停止中」，可以再次重试。`--run` 用于核实指定的历史 `lost`/`stopping` 运行；`--clear` 同时放弃 goal（默认只暂停）。指定运行不属于该线程退出 2，线程属于其他客户端、正在判定归属或实际执行线程被占用退出 8，broker 不可用退出 6。
 - **退出码 5 不是失败**：运行遇到需要人回答的事项时，cxb 把它交给 broker 托管、Codex 不中断，然后以 5 退出并打印事项与命令。先 `cxb inbox` 看事项、`cxb reply` 回答，再 `cxb wait <线程ID>`（后台）接上拿最终结果。
 - **退出码 9（目标受阻或刹车）**：goal 被标为 blocked、达到预算，或 broker 的自动续跑刹车替你暂停了 goal（stderr 有「自动续跑刹车：连续无动作／轮数上限」）。先 `cxb show <线程ID> --log` 看原因；要继续就 `cxb run --resume <线程ID> --continue [新的指示]`，要放弃目标就 `cxb stop <线程ID> --clear`。
 - `cxb show <线程ID> --follow` 只在确实需要实时流时用。加 `--json` 时逐行输出 JSON（最后一行是终态）。它是**尽力而为**的实时显示，个别进展可能少显示；完整进展以 `cxb show <线程ID> --log` 为准。
@@ -88,7 +88,7 @@ cxb ls [--all|--limit <数量>] [--local]
 cxb inbox [--kind <类型>] [--all] [--limit <数量>]
 cxb reply <事项ID> <内容>|-
 cxb wait [ID] [--timeout <秒>]
-cxb stop <ID> [--clear]
+cxb stop <ID> [--clear] [--run <runId>]
 cxb rm <ID> [--purge]
 cxb config [<键> [值]] [--unset] | cxb config templates
 cxb doctor
@@ -103,5 +103,7 @@ cxb doctor
 ## 9. 安全和边界
 
 - 不要把令牌、Cookie、完整环境变量写进提示词或交给 MCP。
-- `cxb rm <ID> --purge` 永久删除、不可恢复：先 `cxb stop`，确认线程已结束再删；默认的 `cxb rm` 只归档。
+- `cxb rm <ID>` 通过 broker 归档；没有生命周期记录时可便利停止最近一次未结束运行，已有待核实记录时直接重试同 kind 的归档或删除核实。`cxb rm <ID> --purge` 通过 `broker/threads/purge{serverDelete:true}` 一次完成服务器线程、关联 review 子线程运行记录和日志的永久删除，不可恢复。
+- `rm` 遇 `THREAD_HELD`（退出码 8）会逐条列出阻塞线程、`runId` 和下一步：运行中用 `cxb stop <线程>`，停止中或失联未确认用 `cxb stop <线程> --run <runId>`，gd_ 事项先用 `cxb inbox` 处理，生命周期待核实则重试对应的 `cxb rm <ID>` 或 `cxb rm <ID> --purge`；不会自动停止或重放。
+- 归档请求结果未知退出 6，提示重试 `cxb rm <ID>`；上游明确拒绝退出 7，并显示脱敏原因。purge 回包中列出的 `outcomeUnknown` 失败项提示重试 `cxb rm <ID> --purge`，JSON 保留逐项失败原因。
 - 不逆向 Claude 的内部认证，不读取会话令牌。
