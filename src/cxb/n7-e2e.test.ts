@@ -222,13 +222,13 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     expect(refused.code).toBe(8);
     const refusedJson = json(refused.stdout);
     expect(refusedJson.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ runId: childRunId, reason: "lostUnconfirmed" })]));
-    expect(refused.stderr).toContain(childRunId);
-    expect(refused.stderr).toContain("cxb stop");
-    expect(refused.stderr).toContain("--run");
-    expect(refused.stderr).toContain("deadbeef");
+    // 阻塞项的线程是 review 子线程（编号由首个 broker 的模拟服务器决定），提示要指向它而不是父线程。
+    const blocker = refusedJson.blockers.find((b: any) => b.runId === childRunId);
+    expect(blocker.threadId).not.toBe(handle.threadId);
+    expect(refused.stderr).toContain(`cxb stop ${blocker.threadId} --run ${childRunId}`);
 
     writeFileSync(join(sandbox, "busy.flag"), "", "utf8");
-    const stopped = await cxb("lost-stop", "stop", "--json", "deadbeef", "--run", childRunId);
+    const stopped = await cxb("lost-stop", "stop", "--json", blocker.threadId, "--run", childRunId);
     expect(stopped.code).toBe(0);
     expect(json(stopped.stdout)).toMatchObject({ stopOutcome: "confirmed", runId: childRunId });
     const removed = await cxb("lost-stop", "rm", "--json", handle.shortId);
