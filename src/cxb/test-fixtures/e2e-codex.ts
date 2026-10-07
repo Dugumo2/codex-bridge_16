@@ -16,7 +16,9 @@ if (args[0] !== "app-server") {
   process.stderr.write("模拟 codex：只支持 app-server 子命令\n");
   process.exit(1);
 }
-const scenario = process.env.MOCK_E2E_SCENARIO ?? "ask";
+const selectedScenario = process.env.MOCK_E2E_SCENARIO ?? "ask";
+const delayResult = selectedScenario.endsWith("-pending");
+const scenario = selectedScenario.replace(/-pending$/, "");
 const logPath = process.env.MOCK_E2E_LOG;
 const trigger = process.env.MOCK_E2E_TRIGGER;
 const busyFlag = process.env.MOCK_E2E_BUSY;
@@ -33,6 +35,9 @@ const waiting = new Map<string, (message: { result?: unknown; error?: unknown })
 let serverRequestCounter = 0;
 const interruptedTurns = new Set<string>();
 const holds = new Map<string, () => void>();
+const completedTurns = new Map<string, unknown[]>();
+const heldReads: Array<{ id: unknown; threadId: string }> = [];
+let resultsReleased = false;
 
 /** 发服务端请求，等回包（回包写进日志）。 */
 function ask(method: string, params: Record<string, unknown>): Promise<{ result?: unknown; error?: unknown }> {
@@ -62,8 +67,11 @@ function answerText(reply: { result?: unknown }): string {
 
 function complete(threadId: string, turnId: string, text: string): void {
   const item = { type: "agentMessage", id: "final-1", text, phase: "final_answer" };
-  send({ method: "item/completed", params: { threadId, turnId, item } });
-  send({ method: "turn/completed", params: { threadId, turn: { id: turnId, items: [item], status: interruptedTurns.has(turnId) ? "interrupted" : "completed", error: null } } });
+  const turn = { id: turnId, items: [item], itemsView: "full", status: interruptedTurns.has(turnId) ? "interrupted" : "completed", error: null };
+  completedTurns.set(threadId, [turn]);
+  const pending = delayResult && !resultsReleased;
+  if (!pending) send({ method: "item/completed", params: { threadId, turnId, item } });
+  send({ method: "turn/completed", params: { threadId, turn: pending ? { ...turn, items: [], itemsView: "notLoaded" } : turn } });
 }
 
 async function runTurn(threadId: string, turnId: string, early: Promise<{ result?: unknown }> | null): Promise<void> {
@@ -187,8 +195,17 @@ process.stdin.on("data", (chunk: string) => {
         send({ id: msg.id, result: { goal: null } });
         break;
       case "thread/read":
+        if (completedTurns.has(threadId) && !resultsReleased && delayResult) {
+          heldReads.push({ id: msg.id, threadId });
+          break;
+        }
         send({ id: msg.id, result: { thread: { ...thread(threadId),
-          turns: busyFlag && existsSync(busyFlag) ? [{ id: "turn-lost", items: [], status: "inProgress", error: null }] : [] } } });
+          turns: busyFlag && existsSync(busyFlag) ? [{ id: "turn-lost", items: [], status: "inProgress", error: null }] : completedTurns.get(threadId) ?? [] } } });
+        break;
+      case "fixture/releaseResult":
+        resultsReleased = true;
+        for (const read of heldReads.splice(0)) send({ id: read.id, result: { thread: { ...thread(read.threadId), turns: completedTurns.get(read.threadId) ?? [] } } });
+        send({ id: msg.id, result: {} });
         break;
       case "thread/unsubscribe":
         send({ id: msg.id, result: { status: "unsubscribed" } });

@@ -47,11 +47,19 @@ describe("乙组 reply 编码", () => {
   });
   test("Guardian 适配记录后生成 snake_case，拒绝不构建事件", () => {
     const gd = { kind: "guardian" as const, params: { reviewId: "review-1", turnId: "turn-1", targetItemId: "item-1",
-      startedAtMs: 10, completedAtMs: 20, decisionSource: "autoReview", review: { status: { type: "denied" }, riskLevel: "high" },
-      action: { type: "mcpTool", toolName: "工具", connectorId: "连接", source: "unifiedExec" } } };
+      threadId: "thread-test", startedAtMs: 10, completedAtMs: 20, decisionSource: "agent",
+      review: { status: "denied", riskLevel: "high", userAuthorization: "low", rationale: "需要确认" },
+      action: { type: "mcpToolCall", server: "服务", toolName: "工具", connectorId: "连接", connectorName: null, toolTitle: null } } };
     expect(encode(gd, "yes")).toEqual({ override: true, event: { id: "review-1", turn_id: "turn-1", target_item_id: "item-1",
-      started_at_ms: 10, completed_at_ms: 20, decision_source: "auto_review", status: "denied", risk_level: "high",
-      action: { type: "mcp_tool", tool_name: "工具", connector_id: "连接", source: "unified_exec" } } });
+      started_at_ms: 10, completed_at_ms: 20, decision_source: "agent", status: "denied", risk_level: "high",
+      user_authorization: "low", rationale: "需要确认",
+      action: { type: "mcp_tool_call", server: "服务", tool_name: "工具", connector_id: "连接", connector_name: null, tool_title: null } } });
+    // 0.160.0 v2/item.rs:667：writeStdin 的两个标识符必须映射到核心事件字段。
+    expect(encode({ ...gd, params: { ...gd.params, action: {
+      type: "writeStdin", approvalId: "approval-1", processId: "process-1", stdin: "确认\n", cwd: "D:\\工作区",
+    } } }, "yes")).toMatchObject({ event: { action: {
+      type: "write_stdin", approval_id: "approval-1", process_id: "process-1", stdin: "确认\n", cwd: "D:\\工作区",
+    } } });
     expect(encode({ kind: "guardian", params: {} }, "no")).toEqual({ override: false });
     expect(() => encode({ kind: "guardian", params: {} }, "yes")).toThrow("缺少有效");
   });
@@ -102,9 +110,18 @@ describe("乙组 reply 命令", () => {
     for (const word of ["yes", "no"]) {
       const c = context(["reply", "gd_test1234", word]);
       c.fake.handle = (m) => m === "broker/inbox/list" ? { items: [item({ id: "gd_test1234", kind: "guardian",
-        params: { reviewId: "review-1", review: { status: "denied" }, action: { type: "command" } } })] }
+        params: { reviewId: "review-1", threadId: "thread-test", turnId: "turn-test", targetItemId: "item-test",
+          startedAtMs: 10, completedAtMs: 20, decisionSource: "agent",
+          review: { status: "denied", riskLevel: "high", userAuthorization: "low", rationale: "需要确认" },
+          action: { type: "command", source: "unifiedExec", command: "echo 测试", cwd: "D:\\工作区" } } })] }
         : m === "broker/threads/list" ? { threads: [thread()] } : { status: "resolved", duplicate: false };
       expect(await reply(c.ctx)).toBe(0);
+      const answer = c.fake.calls.find((call) => call.method === "broker/inbox/resolve")!.params.answer;
+      expect(answer).toEqual(word === "no" ? { override: false } : { override: true, event: {
+        id: "review-1", turn_id: "turn-test", target_item_id: "item-test", started_at_ms: 10, completed_at_ms: 20,
+        decision_source: "agent", status: "denied", risk_level: "high", user_authorization: "low", rationale: "需要确认",
+        action: { type: "command", source: "unified_exec", command: "echo 测试", cwd: "D:\\工作区" },
+      } });
       expect(c.text[0]).toContain("已回复");
       if (word === "yes") expect(c.notices.join("")).toContain('cxb run --resume abcd1234 "继续"');
       else expect(c.notices).toHaveLength(0);

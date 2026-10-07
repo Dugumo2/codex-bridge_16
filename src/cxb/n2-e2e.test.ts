@@ -1,3 +1,4 @@
+import { waitEnded } from "./test-fixtures/wait-ended";
 // N2 端到端验收（Claude 写，只依据规格，不看各路自测）：从外部启动 `bun src/cxb/main.ts run`，
 // 经真 Rust broker 与模拟 codex（test-fixtures/e2e-codex.ts，服务端请求答复前本轮一直运行），验证
 // 「等待回应时的交接」（命令面规格 3.1 节）、提问一律交给人（S1-评审第 27 节 L）、inbox 生命周期（详细设计 2.3 节）。
@@ -111,26 +112,12 @@ async function pendingItems(conn: BrokerConnection, includeClosed = false): Prom
   return (await conn.rpc.request<{ items: InboxItem[] }>("broker/inbox/list", { includeClosed })).items;
 }
 
-/** 等这次运行结束且最后一轮结果就绪：订阅先于快照。 */
-async function waitEnded(conn: BrokerConnection, threadId: string): Promise<RunResult> {
-  let ended: RunResult | null = null;
-  const off = conn.rpc.on("broker/run/ended", (params) => {
-    const p = params as { threadId: string; run: RunResult };
-    if (p.threadId === threadId) ended = p.run;
-  });
-  try {
-    const snapshot = await conn.rpc.request<{ run: RunResult | null }>("broker/threads/watch", { threadId });
-    if (snapshot.run && snapshot.run.state === "ended") ended = snapshot.run;
-    await until(() => ended !== null && ended.turns.at(-1)?.ready !== "pending", 20_000, "运行没有结束");
-    return ended!;
-  } finally { off(); }
-}
 
 const ANSWER_B = { answers: { q1: { answers: ["b.txt"] } } };
 
 describe("N2 端到端：提问交给人、交接退出 5、托管后回答", () => {
   test("提问：run 交接退出 5，turn 不被中断；回答后运行按回答完成，app-server 恰好收到一次回包", async () => {
-    const r = await cxbRun("ask", "请选择文件并创建它");
+    const r = await cxbRun("ask-pending", "请选择文件并创建它");
     expect(r.code).toBe(5);
     expect(r.stdout).toMatch(/qu_\w+/);
     expect(r.stdout).toContain("cxb reply");
@@ -155,7 +142,12 @@ describe("N2 端到端：提问交给人、交接退出 5、托管后回答", ()
     const resolved = await conn.rpc.request<{ status: string; duplicate: boolean }>("broker/inbox/resolve", { id: items[0]!.id, answer: ANSWER_B });
     expect(resolved).toEqual({ status: "resolved", duplicate: false });
 
-    const run = await waitEnded(conn, items[0]!.threadId);
+    let pendingSeen = false;
+    const run = await waitEnded(conn, items[0]!.threadId, items[0]!.runId!, async () => {
+      pendingSeen = true;
+      await conn.rpc.request("fixture/releaseResult", {}, { timeoutMs: 5000 });
+    });
+    expect(pendingSeen).toBe(true);
     expect(run.status).toBe("completed");
     expect(run.turns.at(-1)!.output).toBe("已选择：b.txt");
     const replies = repliesOf("item/tool/requestUserInput");

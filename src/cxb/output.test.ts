@@ -220,14 +220,14 @@ describe("输出与错误约定", () => {
       const stdoutWrite = spyOn(process.stdout, "write").mockImplementation(terminalOut.stream.write.bind(terminalOut.stream));
       const stderrWrite = spyOn(process.stderr, "write").mockImplementation(terminalErr.stream.write.bind(terminalErr.stream));
       let out: ReturnType<typeof createOutput> | undefined;
-      let calls: unknown[][] = [];
+      let streamOptions: unknown[] = [];
       try {
         Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: stdoutTTY });
         Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: stderrTTY });
         out = createOutput({ command: "run", json: false, verbose: false });
         out.result("终端结果🙂");
         out.notice("终端诊断🙂");
-        calls = [...factory.mock.calls];
+        streamOptions = factory.mock.calls.map((call) => call[1]);
       } finally {
         stdoutWrite.mockRestore();
         stderrWrite.mockRestore();
@@ -238,10 +238,12 @@ describe("输出与错误约定", () => {
         else Reflect.deleteProperty(process.stderr, "isTTY");
       }
       await deadline(out!.flush());
-      expect(calls).toEqual([
-        ...(!stdoutTTY ? [["", { fd: 1, autoClose: false }]] : []),
-        ...(!stderrTTY ? [["", { fd: 2, autoClose: false }]] : []),
-      ]);
+      // 只核对保留标准描述符的设计约束，不约束路径参数、调用顺序或其他选项。
+      const redirectedFds = [...(!stdoutTTY ? [1] : []), ...(!stderrTTY ? [2] : [])];
+      expect(streamOptions).toHaveLength(redirectedFds.length);
+      for (const fd of redirectedFds) {
+        expect(streamOptions).toContainEqual(expect.objectContaining({ fd, autoClose: false }));
+      }
       expect(terminalOut.text()).toBe(stdoutTTY ? "终端结果🙂" : "");
       expect(terminalErr.text()).toBe(stderrTTY ? "终端诊断🙂\n" : "");
       expect(redirectedOut.text()).toBe(stdoutTTY ? "" : "终端结果🙂");
