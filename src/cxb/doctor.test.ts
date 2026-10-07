@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { BrokerNotRunning } from "./broker-conn";
+import { BrokerNotRunning, resolveBrokerBin } from "./broker-conn";
 import { CXB_PROTOCOL_VERSION, CxbError, type BrokerConnection } from "./contracts";
 import { createDoctorHandler, describeAuth, runDiagnosticProcess, type DoctorDeps } from "./doctor";
 import { HANDLERS } from "./main";
@@ -181,7 +181,9 @@ test("总预算用尽单列失败，剩余项目未检查，不继续连接", as
 });
 
 test("连接迟到收到取消并关闭，不发健康请求", async () => {
-  deps.totalMs = 35;
+  // 只让连接一项吃掉总预算：前面的检查不碰磁盘（真实探测要 fsync，负载高时会在连接前就耗尽 35 毫秒的旧预算）。
+  deps.probeWritable = () => {};
+  deps.totalMs = 300;
   let stopped = false;
   deps.connectBroker = (opts) => new Promise((resolve) => opts.signal!.addEventListener("abort", () => { stopped = true; resolve(conn); }, { once: true }));
   const result = await invoke();
@@ -307,6 +309,29 @@ for (const cancel of [false, true]) test(`经 diag-exec 运行：${cancel ? "取
   expect(performance.now() - started).toBeLessThan(cancel ? 4000 : 7000);
   // .cmd 包装下 diag-exec 替身是孙进程：结束包装进程不一定结束它；真 diag-exec 由 Job 保证（合并后经真 broker 验证）。
   if (alive(pid)) { process.kill(pid, "SIGKILL"); await until(() => !alive(pid), 3000, "替身未能结束"); }
+  children.delete(pid);
+}, 15_000);
+
+// 经真 broker 的 diag-exec（N7-A 甲路）：N5 的已知限制——先退出的诊断程序留下的后代——由 Job 回收。
+test("经真 diag-exec 运行：诊断程序先退出、后代占着输出时，按期正常返回且后代已被结束", async () => {
+  const file = join(h.dir, "pid");
+  const started = performance.now();
+  const output = await runDiagnosticProcess(process.execPath, [join(import.meta.dir, "test-fixtures", "n7b-orphan.ts"), file],
+    { timeoutMs: 9000, signal: new AbortController().signal }, resolveBrokerBin());
+  const pid = Number(readFileSync(file, "utf8")); children.add(pid);
+  expect(output).toContain("父程序退出");
+  expect(performance.now() - started).toBeLessThan(8000);
+  await until(() => !alive(pid), 3000, "后代没有被 Job 结束");
+  children.delete(pid);
+}, 15_000);
+test("经真 diag-exec 运行：诊断程序超时，整棵树被结束并报超时", async () => {
+  const file = join(h.dir, "pid");
+  const work = runDiagnosticProcess(process.execPath, [join(import.meta.dir, "test-fixtures", "n5a-hang.ts"), file],
+    { timeoutMs: 6000, signal: new AbortController().signal }, resolveBrokerBin());
+  await until(() => existsSync(file), 5000, "子进程没有登记 PID");
+  const pid = Number(readFileSync(file, "utf8")); children.add(pid);
+  await expect(bounded(work, 9000)).rejects.toMatchObject({ code: "TIMEOUT" });
+  await until(() => !alive(pid), 3000, "超时后子进程没有被结束");
   children.delete(pid);
 }, 15_000);
 
