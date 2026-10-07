@@ -41,6 +41,14 @@ impl Phase {
     }
 }
 
+fn visible_phase(op: &Pending) -> &'static str {
+    if op.record.phase == DiskPhase::UpstreamDone && op.phase == Phase::Persisting {
+        "upstreamDone"
+    } else {
+        op.phase.name()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WritePurpose {
     Intent,
@@ -358,7 +366,7 @@ impl Machine {
                 failure(
                     "lifecyclePending",
                     Some(op),
-                    json!({"threadId":thread,"kind":op.record.kind,"phase":op.phase.name()}),
+                    json!({"threadId":thread,"kind":op.record.kind,"phase":visible_phase(op)}),
                 )
             })
     }
@@ -379,7 +387,7 @@ impl Machine {
 
     pub(crate) fn lifecycle_projection(&self, thread: &str) -> Option<Value> {
         self.lifecycle.operations.get(thread).map(|op| json!({"operationId":op.record.operation_id,
-            "kind":op.record.kind,"phase":op.phase.name(),"shortId":op.record.short_id,"preview":op.record.preview}))
+            "kind":op.record.kind,"phase":visible_phase(op),"shortId":op.record.short_id,"preview":op.record.preview}))
     }
 
     fn lifecycle_headers(&self, headers: &[RunHeader]) -> Vec<RunHeader> {
@@ -527,7 +535,7 @@ impl Machine {
                 let err = failure(
                     "lifecyclePending",
                     Some(&op),
-                    json!({"threadId":thread,"kind":op.record.kind,"phase":op.phase.name()}),
+                    json!({"threadId":thread,"kind":op.record.kind,"phase":visible_phase(&op)}),
                 );
                 response(&request, Err(err), actions);
             } else {
