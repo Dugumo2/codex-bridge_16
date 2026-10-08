@@ -611,6 +611,7 @@ setInterval(() => {}, 1000);
   // 放行之后，同类动作不再扣住（例如之后的 thread/resume 立即回包）。
   type HoldPoint = "pause" | "clear" | "resume" | "continuation";
   interface StopMockOptions {
+    backgroundTerminals?: import("./test-support/background-terminals-mock").BackgroundTerminalsMockOptions;
     goal?: { status: "active" | "paused" | "blocked" } | null;
     goalFeatureDisabled?: boolean;
     pauseFails?: boolean;
@@ -626,10 +627,14 @@ setInterval(() => {}, 1000);
   }
   const stopMock = (logPath: string, opts: StopMockOptions = {}) => `
 import { appendFileSync } from "node:fs";
+// CXB_INLINE_BACKGROUND_TERMINALS_BEGIN
+import { createBackgroundTerminalsMock } from "./background-terminals-mock";
+// CXB_INLINE_BACKGROUND_TERMINALS_END
 const O = ${JSON.stringify(opts)};
 const LOG = ${JSON.stringify(logPath)};
 const log = (e) => appendFileSync(LOG, JSON.stringify(e) + "\\n");
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const background = createBackgroundTerminalsMock(send, O.backgroundTerminals);
 const heldActions = {};
 const releasedPoints = new Set();
 const gate = (what, f) => {
@@ -690,6 +695,7 @@ process.stdin.on("data", (chunk) => {
     }
     const p = msg.params ?? {};
     if (msg.method !== "initialize") log({ ev: "recv", method: msg.method, params: p });
+    if (background.handle(msg)) continue;
     switch (msg.method) {
       case "initialize":
         send({ id: msg.id, result: { userAgent: "stop-mock" } });
@@ -797,7 +803,7 @@ process.stdin.on("end", () => process.exit(0));
   const startStopBroker = async (opts: StopMockOptions = {}, dir = tempDir) => {
     const sockPath = testSocketPath(dir);
     const logPath = join(dir, "mock.log");
-    writeMockCodexScript(dir, stopMock(logPath, opts));
+    writeMockCodexScript(dir, stopMock(logPath, { backgroundTerminals: { enabled: true }, ...opts }));
     const proc = spawnBroker(endpointFor(sockPath), dir);
     await waitForSocket(sockPath);
     return { sockPath, logPath, proc };

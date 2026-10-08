@@ -68,7 +68,7 @@ function cliEnv(scenario: string): NodeJS.ProcessEnv {
     CODEX_HOME: join(sandbox, "codex-home"),
     CXB_BROKER_BIN: BROKER_BIN,
     CXB_SERVER: "private",
-    MOCK_E2E_SCENARIO: scenario,
+    MOCK_BACKGROUND_TERMINALS: JSON.stringify({ enabled: true }), MOCK_E2E_SCENARIO: scenario,
     MOCK_E2E_LOG: join(sandbox, "mock.log"),
     MOCK_E2E_BUSY: join(sandbox, "busy.flag"),
   };

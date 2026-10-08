@@ -28,7 +28,7 @@ function env(): NodeJS.ProcessEnv {
   return { ...clean, PATH: `${join(sandbox, "mock")}${delimiter}${inheritedPath}`,
     CXB_HOME: join(sandbox, "data"), CODEX_HOME: join(sandbox, "codex"), USERPROFILE: join(sandbox, "profile"),
     HOME: join(sandbox, "profile"), CXB_SERVER: "private", CXB_BROKER_BIN: BROKER_BIN,
-    MOCK_E2E_SCENARIO: scenario, MOCK_E2E_LOG: join(sandbox, "mock.log") };
+    MOCK_BACKGROUND_TERMINALS: JSON.stringify({ enabled: true }), MOCK_E2E_SCENARIO: scenario, MOCK_E2E_LOG: join(sandbox, "mock.log") };
 }
 
 function entries(): any[] {

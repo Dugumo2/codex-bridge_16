@@ -20,7 +20,7 @@ let pendingStart: { id: unknown; threadId: string; turn: any } | undefined;
 const rawSend = fixtureSender();
 const statusHistory = createStatusHistory(scenario.statusRead, rawSend, longResumeTurns);
 const send = statusHistory.wrap(rawSend);
-const subagents = createSubagentMock(send, scenario.subagents);
+const subagents = createSubagentMock(send, scenario.subagents, scenario.backgroundTerminals);
 const reply = (id: unknown, result: unknown) => send({ id, result });
 const notify = (method: string, params: unknown) => send({ method, params });
 function state(id: string) {

@@ -40,7 +40,7 @@ describe.skipIf(!RUNNABLE)("broker-ext 子代理停止与门禁（SA-b）", () =
 
   async function startBroker() {
     const sockPath = h.testSocketPath(tempDir);
-    const mockDir = h.createMockCodex(tempDir, { subagents: { enabled: true }, statusRead: { historyMode: "paged" }, sendTurnCompleted: false });
+    const mockDir = h.createMockCodex(tempDir, { backgroundTerminals: { enabled: true }, subagents: { enabled: true }, statusRead: { historyMode: "paged" }, sendTurnCompleted: false });
     const proc = h.spawnBroker(context, h.endpointFor(sockPath), mockDir, { env: { CXB_HOME: join(tempDir, "cxb-home") } });
     await h.waitForSocket(sockPath);
     return { sockPath, proc };

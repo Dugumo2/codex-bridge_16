@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { brokerVersionOf, connectBroker } from "./broker-conn";
 import type { BrokerConnection } from "./contracts";
 import { resolveWorkspace } from "./workspace";
-import { Processes, bounded, removeTemp } from "./test-fixtures/main-test-support";
+import { Processes, removeTemp } from "./test-fixtures/main-test-support";
 import type { BackgroundTerminalsMockOptions, BackgroundTerminalSeed, BackgroundThreadScenario } from "../test-support/background-terminals-mock";
 
 const windows = process.platform === "win32";

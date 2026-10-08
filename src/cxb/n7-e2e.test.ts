@@ -73,7 +73,7 @@ function cliEnv(scenario: string): NodeJS.ProcessEnv {
     CXB_BROKER_BIN: BROKER_BIN, CXB_SERVER: "private",
     MOCK_E2E_LEGACY_REVIEW: legacyReview ? "1" : "",
     MOCK_E2E_REVIEW_INNER_TURN: innerReview ? "1" : "",
-    MOCK_E2E_SCENARIO: scenario, MOCK_E2E_LOG: join(sandbox, "mock.log"),
+    MOCK_BACKGROUND_TERMINALS: JSON.stringify({ enabled: true }), MOCK_E2E_SCENARIO: scenario, MOCK_E2E_LOG: join(sandbox, "mock.log"),
     MOCK_E2E_GATE_DIR: gateDir, MOCK_E2E_SERVER_DELETE_MODE_FILE: deleteModeFile,
     MOCK_E2E_BUSY: join(sandbox, "busy.flag"),
     MOCK_E2E_CONFIRM_INTERRUPT: scenario === "lost-stop" ? "1" : "",

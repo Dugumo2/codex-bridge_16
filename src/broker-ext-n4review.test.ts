@@ -143,7 +143,7 @@ async function rpcError(promise: Promise<unknown>): Promise<unknown> {
   throw new Error("应收到 RPC 错误");
 }
 async function start(): Promise<{ client: Rpc; exited: Promise<void> }> {
-  const mock = createMockCodex(dir, { sendTurnCompleted: false, legacyReview: true });
+  const mock = createMockCodex(dir, { backgroundTerminals: { enabled: true }, sendTurnCompleted: false, legacyReview: true });
   baseObserver ||= readFileSync(join(dir, "observe.ts"), "utf8");
   writeFileSync(join(dir, "observe.ts"), baseObserver + transportObserver);
   // 只调整临时启动器，mock 源文件保持 createMockCodex 生成的原样。
