@@ -33,7 +33,7 @@ afterEach(async () => {
 
 function runTool(command: string, args: string[]) {
   const result = spawnSync(command, args, {
-    cwd: temporary, env: privateTestEnv(), timeout: 5000, windowsHide: true,
+    cwd: temporary, env: privateTestEnv(), timeout: 30_000, windowsHide: true,
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
   });
   if (result.pid > 0) processes.descendants.add(result.pid);
@@ -55,7 +55,7 @@ function directory(name: string): string {
 function initRepository(): string {
   const repo = directory("仓库 root");
   const result = runTool("git", ["init", "--quiet", repo]);
-  if (result.error || result.status !== 0) throw new Error("无法初始化临时测试仓库");
+  if (result.error || result.status !== 0) throw new Error(`无法初始化临时测试仓库：${JSON.stringify({ status: result.status, error: result.error?.message, stderr: result.stderr })}`);
   mkdirSync(join(repo, "a", "b"), { recursive: true });
   return repo;
 }

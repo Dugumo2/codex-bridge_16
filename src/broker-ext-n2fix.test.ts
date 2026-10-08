@@ -363,7 +363,8 @@ test("按运行 stop 不停尚未认领的运行，旧运行结束后也不停�
   await finish(client,"thread-001",old.turn.id);
   const next=await client.request("review/start",{threadId:"thread-001",target:{type:"uncommittedChanges"},delivery:"inline"});
   const before=await client.request("n2/state");
-  expect(await client.request("broker/threads/stop",{threadId:"thread-001",runId:old.runId,clear:true})).toMatchObject({runId:old.runId,alreadyStopped:true,interruptSent:false,stopOutcome:"confirmed"});
+  // 后继已占用线程：旧 runId 不能取得本线程后台命令的清理授权，也不能快捷确认。
+  expect(await rpcError(client.request("broker/threads/stop",{threadId:"thread-001",runId:old.runId,clear:true}))).toMatchObject({code:-32000,data:{reason:"runMismatch"}});
   expect(await rpcError(client.request("broker/threads/stop",{threadId:"thread-001",runId:"wrong"}))).toMatchObject({code:-32000,data:{reason:"runMismatch"}});
   const after=await client.request("n2/state");
   expect(after.requests.slice(before.requests.length).some((r:any)=>["turn/interrupt","thread/goal/set","thread/goal/clear"].includes(r.method))).toBe(false);

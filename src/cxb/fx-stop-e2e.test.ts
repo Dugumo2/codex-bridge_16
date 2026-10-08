@@ -1,11 +1,12 @@
 /** Windows 真 broker + CLI 入口：后台命令清理与显式放弃树清理。 */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { brokerVersionOf, connectBroker } from "./broker-conn";
 import type { BrokerConnection } from "./contracts";
 import { resolveWorkspace } from "./workspace";
-import { Processes, removeTemp } from "./test-fixtures/main-test-support";
+import { Processes, bounded, removeTemp } from "./test-fixtures/main-test-support";
 import type { BackgroundTerminalsMockOptions, BackgroundTerminalSeed, BackgroundThreadScenario } from "../test-support/background-terminals-mock";
 
 const windows = process.platform === "win32";
@@ -18,12 +19,16 @@ let dir: string;
 let env: NodeJS.ProcessEnv;
 let processes: Processes;
 let connection: BrokerConnection | undefined;
+let broker: ChildProcess | undefined;
+let brokerClosed: Promise<void> | undefined;
 
 describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
   beforeEach(() => {
     dir = mkdtempSync((process.env.TEMP! + "/cxb-fx-stop-"));
     processes = new Processes();
     connection = undefined;
+    broker = undefined;
+    brokerClosed = undefined;
     for (const sub of ["mock", "ws", "profile", "codex-home", "cxb-home"]) mkdirSync(join(dir, sub));
     harness!.writeMockCodexScript(join(dir, "mock"), readFileSync(join(import.meta.dir, "test-fixtures/e2e-codex.ts"), "utf8"));
     env = Object.fromEntries(Object.entries(harness!.envWithPathPrefix(join(dir, "mock"))).filter(([key]) =>
@@ -38,11 +43,9 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     const errors: unknown[] = [];
     try { await connection?.rpc.request("broker/shutdown", {}, { timeoutMs: 5000 }); } catch (error) { errors.push(error); }
     try { await connection?.close(); } catch (error) { errors.push(error); }
-    const log = join(dir, "mock.log");
-    if (existsSync(log)) for (const line of readFileSync(log, "utf8").trim().split(/\r?\n/)) {
-      const entry = JSON.parse(line);
-      if (entry.kind === "boot") processes.add(entry.pid);
-    }
+    // 测试直接持有 serve 句柄；关闭其 Job 回收模拟服务器，避免长用例中旧 PID 被复用。
+    if (broker?.exitCode === null && broker.signalCode === null) broker.kill("SIGKILL");
+    try { if (brokerClosed) await bounded(brokerClosed, 10_000, "测试 broker 退出超时"); } catch (error) { errors.push(error); }
     try { await processes.cleanup(); } catch (error) { errors.push(error); }
     if (processes.allExited()) await removeTemp(dir);
     if (errors.length) throw new AggregateError(errors, "后台命令黑盒清理失败");
@@ -50,17 +53,24 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
 
   async function cli(...args: string[]) {
     const result = await processes.run(process.execPath, [join(import.meta.dir, "main.ts"), ...args, "-v", "-d", join(dir, "ws")],
-      { cwd: dir, env, limitMs: 65_000, onStderr: (chunk) => processes.log(chunk) });
+      { cwd: dir, env, limitMs: 65_000 }).finally(() => processes.pids.clear());
+    // run 已按 ChildProcess 句柄等到 close；不在 40 秒后的清理中再次使用这些旧 PID。
     const registry = join(resolveWorkspace(join(dir, "ws"), env).workspaceDir, "broker.json");
-    if (existsSync(registry)) processes.add(JSON.parse(readFileSync(registry, "utf8")).payload.pid);
+    if (existsSync(registry)) expect(JSON.parse(readFileSync(registry, "utf8")).payload.pid).toBe(broker!.pid);
     return { ...result, json: () => JSON.parse(result.stdout.trim().split(/\r?\n/).at(-1)!) };
   }
   async function start(options: BackgroundTerminalsMockOptions = { enabled: true, threads: { [PARENT]: { sessions } } }) {
     env.MOCK_BACKGROUND_TERMINALS = JSON.stringify(options);
+    const workspace = resolveWorkspace(join(dir, "ws"), env);
+    broker = spawn(harness!.BROKER_BIN, ["serve", "--endpoint", workspace.endpoint, "--cwd", workspace.root, "--idle-timeout", "60000"],
+      { cwd: workspace.root, env, windowsHide: true, stdio: ["ignore", "ignore", "ignore"] });
+    brokerClosed = new Promise<void>((resolve, reject) => { broker!.once("close", () => resolve()); broker!.once("error", reject); });
+    void brokerClosed.catch(() => {});
+    await harness!.waitForSocket(workspace.pipePath);
+    connection = await connectBroker({ workspace, brokerBin: harness!.BROKER_BIN,
+      expectedBrokerVersion: await brokerVersionOf(harness!.BROKER_BIN), timeoutMs: 15_000, env });
     const run = await cli("run", "--detach", "--json", "启动后台命令场景");
     expect(run.code, JSON.stringify(run)).toBe(0);
-    connection = await connectBroker({ workspace: resolveWorkspace(join(dir, "ws"), env), brokerBin: harness!.BROKER_BIN,
-      expectedBrokerVersion: await brokerVersionOf(harness!.BROKER_BIN), timeoutMs: 15_000, env });
     const result = run.json();
     expect(result.runId).toMatch(/^run-/);
     return result as { runId: string; threadId: string };
@@ -98,7 +108,7 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     await start({ enabled: true, threads: { [PARENT]: { sessions: sessions.map((s) => ({ ...s, termination })) } } });
     const stopped = await cli("stop", PARENT, "--json");
     expect(stopped.code, JSON.stringify(stopped)).toBe(0);
-    // 待对齐：fx-stop 尚未提交；字段来自其 2026-10-09 工作树实现。
+    // 协议字段按 fx-stop 提交 768f0a4 核对；这里只确认受管命令列表。
     expect(stopped.json()).toMatchObject({ stopOutcome: "confirmed", backgroundCleanup: { scope: "Codex 受管的后台命令",
       state: "confirmed", discovered: 2, remaining: [], terminationResults: { "21001": termination === "success", "21002": termination === "success" } } });
     expect(stopped.json().backgroundCleanup.lastVerifiedAt).toBeNumber();
@@ -164,7 +174,9 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     await set(CHILD, { sessions: [{ itemId: "child-command", processId: "31001", termination: "remaining" }] });
     const stopped = await cli("stop", PARENT, "--run", run.runId, "--json");
     expect(stopped.code, JSON.stringify(stopped)).toBe(3);
-    expect(stopped.json()).toMatchObject({ stopOutcome: "unconfirmed", childrenStop: { phase: "unconfirmed" } });
+    // 首次等待到期后后台复核仍可处于 pending；对外停止结果必须是 unconfirmed。
+    expect(stopped.json()).toMatchObject({ stopOutcome: "unconfirmed", childrenStop: { cleanupState: "active" } });
+    expect(stopped.json().childrenStop.phase).not.toBe("confirmed");
     expect(stopped.json().childrenStop.members[CHILD].backgroundCleanup.remaining).toEqual(["31001"]);
     const blocked = await cli("run", "--resume", PARENT, "--json", "屏障期间不能派单");
     expect(blocked.code, JSON.stringify(blocked)).toBe(8);

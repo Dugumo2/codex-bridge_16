@@ -882,20 +882,20 @@ export class TestClient {
     this.socket.write(JSON.stringify(msg) + "\n");
   }
 
-  async request(method: string, params?: unknown): Promise<unknown> {
+  async request(method: string, params?: unknown, timeoutMs = 10_000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       const msg: Record<string, unknown> = { id, method };
       if (params !== undefined) msg.params = params;
       this.pending.set(id, { resolve, reject });
       this.send(msg);
-      // 请求超时为 10 秒。
+      // 普通请求默认 10 秒；停止等有协议总期限的调用可显式覆盖。
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
           reject(new Error(`Request ${method} (id=${id}) timed out`));
         }
-      }, 10_000);
+      }, timeoutMs);
     });
   }
 

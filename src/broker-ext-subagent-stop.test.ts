@@ -47,8 +47,12 @@ describe.skipIf(!RUNNABLE)("broker-ext 子代理停止与门禁（SA-b）", () =
   }
   const notes = (client: Client, method: string) =>
     client.messages.filter((m) => m.method === method && m.id === undefined) as Array<{ params: any }>;
-  const startRun = async (client: Client) =>
-    await client.request("turn/start", { threadId: PARENT, input: [{ type: "text", text: "派生子代理" }] }) as { runId: string };
+  const startRun = async (client: Client) => {
+    const run = await client.request("turn/start", { threadId: PARENT, input: [{ type: "text", text: "派生子代理" }] }) as { runId: string };
+    // cxb 能力的 turn/start 先回运行句柄；本组场景需要真正开工后再派生和停止。
+    await until(async () => (await client.request("broker/threads/watch", { threadId: PARENT }) as any).thread.state === "running", 8_000);
+    return run;
+  };
   const spawnChild = (client: Client, child: string, version: "v1" | "v2" = "v1") =>
     client.request("fixture/spawnChild", { parentThreadId: PARENT, parentTurnId: PARENT_TURN, itemId: `spawn-${child}`,
       childThreadId: child, version, started: "now" }) as Promise<{ turnId: string }>;
@@ -96,11 +100,16 @@ describe.skipIf(!RUNNABLE)("broker-ext 子代理停止与门禁（SA-b）", () =
     try {
       const run = await startRun(owner);
       await spawnChild(owner, "child-1");
-      const stopping = other.request("broker/threads/stop", { threadId: PARENT }) as Promise<any>;
+      const stopping = other.request("broker/threads/stop", { threadId: PARENT }, 45_000) as Promise<any>;
       // 父线程的模拟中断不自带完成通知：等子线程被中断后补上父轮的结束。
       await until(async () => (await mockState(owner))["child-1"]!.interrupts.length > 0, 8_000);
       await finishParent(owner, "interrupted");
-      const reply = await stopping;
+      const reply = await stopping.catch(async (error) => {
+        const snapshot = await owner.request("broker/threads/watch", { threadId: PARENT });
+        const background = await owner.request("fixture/backgroundTerminals/state", {});
+        const calls = await owner.request("mock/state", {});
+        throw new Error(`整树停止未回复：${String(error)}；运行=${JSON.stringify(snapshot)}；后台=${JSON.stringify(background)}；调用=${JSON.stringify(calls)}`);
+      });
       expect(reply.runId).toBe(run.runId);
       expect(reply.alreadyStopped).toBe(false);
       expect(reply.childrenStop.trigger).toBe("userStop");

@@ -2393,7 +2393,7 @@ setInterval(() => {}, 1000);
       // workspace. Releasing the thread would let a retry start a second turn
       // beside it.
       const sockPath = testSocketPath(tempDir);
-      const mockDir = createMockCodex(tempDir, { startedThenError: true });
+      const mockDir = createMockCodex(tempDir, { startedThenError: true, backgroundTerminals: { enabled: true }, statusRead: { historyMode: "paged" } });
       const interruptLog = join(mockDir, "interrupts.log");
 
       const proc = spawnBroker(endpointFor(sockPath), mockDir);

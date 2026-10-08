@@ -91,6 +91,8 @@ export class Processes {
       const result = await bounded(completed, opts.limitMs ?? 20_000, "子进程退出或输出 EOF 超过期限");
       if (failure) throw failure;
       if (child.pid !== undefined) await until(() => !alive(child.pid!), 5000, "子进程退出后 PID 仍存活");
+      // 已按句柄收到 close 并确认退出，不把旧 PID 留到长时间 stop 之后再检查。
+      if (child.pid !== undefined) { this.pids.delete(child.pid); this.children.delete(child.pid); }
       return result;
     } catch (error) {
       const errors: unknown[] = [error];
@@ -112,7 +114,11 @@ export class Processes {
 
   async cleanup(): Promise<void> {
     const results = await Promise.allSettled([...this.pids].map(async (pid) => {
-      try { await until(() => !alive(pid), 10_000, `进程 ${pid} 未自然退出`); }
+      try {
+        await until(() => !alive(pid), 10_000, `进程 ${pid} 未自然退出`);
+        // Windows 会复用 PID；已确认结束的登记不能影响后续 allExited 核验。
+        this.pids.delete(pid);
+      }
       catch (error) {
         const errors = [error];
         try {
