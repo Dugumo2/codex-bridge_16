@@ -455,6 +455,7 @@ impl Machine {
                 in_flight_spawns: BTreeSet::new(),
                 revision: 0,
                 discovery: DiscoveryState {
+                    missing: Default::default(),
                     complete: false,
                     version: 0,
                     incomplete_reasons: Vec::new(),

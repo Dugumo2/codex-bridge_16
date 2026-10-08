@@ -1542,13 +1542,15 @@ fn 父线程新运行后子线程失联审查仍受保护并进入实际线程�
         } else {
             json!({"goal":null})
         };
-        (m, _) = claim::step(
+        let (next, follow) = claim::step(
             m,
             Event::Reply {
                 context,
                 result: Ok(result),
             },
         );
+        m = next;
+        crate::test_support::background::empty_background(&mut m, follow);
     }
     let confirmed = m.latest_run("子线程").unwrap();
     assert_eq!(confirmed.state, RunState::Lost);

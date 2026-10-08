@@ -72,6 +72,7 @@ pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
         children: Vec::new(),
         children_stop: None,
+        background_cleanup: None,
 
         run_id: id.into(),
         thread_id: thread.into(),

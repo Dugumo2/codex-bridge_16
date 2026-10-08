@@ -56,7 +56,7 @@ for (const legacyReview of [false, true]) test(`${legacyReview ? "legacy detache
 }, TEST_BUDGET);
 
 test("inline 审查运行中信号清理只停止父线程和本次运行", async () => {
-  const observer = await h.start({ hold: true });
+  const observer = await h.start({ hold: true, backgroundTerminals: { enabled: true } });
   const connection = await h.connect();
   const request = connection.rpc.request.bind(connection.rpc);
   const stops: unknown[] = [];

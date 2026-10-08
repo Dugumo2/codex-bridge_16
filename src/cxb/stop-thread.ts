@@ -27,10 +27,10 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  * runMismatch（带 runId 且不是这次运行）→ NOT_FOUND；shuttingDown 与连接问题 → BROKER_UNAVAILABLE。
  * `stopOutcome:"unconfirmed"` 不算错误，原样返回，由调用方决定退出码（stop 命令退出 3）。
  */
-export async function stopThread(rpc: BrokerRpc, args: { threadId: string; clear?: boolean; runId?: string },
+export async function stopThread(rpc: BrokerRpc, args: { threadId: string; clear?: boolean; runId?: string; abandon?: boolean },
   opts: { signal?: AbortSignal } = {}): Promise<StopReply> {
   const deadline = Date.now() + STOP_SETTLING_LIMIT_MS;
-  const params = { threadId: args.threadId, ...(args.clear ? { clear: true } : {}), ...(args.runId ? { runId: args.runId } : {}) };
+  const params = { ...(args.abandon ? { abandon: true } : {}), threadId: args.threadId, ...(args.clear ? { clear: true } : {}), ...(args.runId ? { runId: args.runId } : {}) };
   for (;;) {
     // 已取消就不再发：停止有副作用，bounded 只能拒绝等待，挡不住已发出的请求。
     if (opts.signal?.aborted) throw new CxbError("INTERRUPTED", "停止已取消", { id: args.threadId });

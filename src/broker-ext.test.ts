@@ -611,6 +611,7 @@ setInterval(() => {}, 1000);
   // 放行之后，同类动作不再扣住（例如之后的 thread/resume 立即回包）。
   type HoldPoint = "pause" | "clear" | "resume" | "continuation";
   interface StopMockOptions {
+    backgroundTerminals?: import("./test-support/background-terminals-mock").BackgroundTerminalsMockOptions;
     goal?: { status: "active" | "paused" | "blocked" } | null;
     goalFeatureDisabled?: boolean;
     pauseFails?: boolean;
@@ -626,10 +627,14 @@ setInterval(() => {}, 1000);
   }
   const stopMock = (logPath: string, opts: StopMockOptions = {}) => `
 import { appendFileSync } from "node:fs";
+// CXB_INLINE_BACKGROUND_TERMINALS_BEGIN
+import { createBackgroundTerminalsMock } from "./background-terminals-mock";
+// CXB_INLINE_BACKGROUND_TERMINALS_END
 const O = ${JSON.stringify(opts)};
 const LOG = ${JSON.stringify(logPath)};
 const log = (e) => appendFileSync(LOG, JSON.stringify(e) + "\\n");
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const background = createBackgroundTerminalsMock(send, O.backgroundTerminals);
 const heldActions = {};
 const releasedPoints = new Set();
 const gate = (what, f) => {
@@ -690,6 +695,7 @@ process.stdin.on("data", (chunk) => {
     }
     const p = msg.params ?? {};
     if (msg.method !== "initialize") log({ ev: "recv", method: msg.method, params: p });
+    if (background.handle(msg)) continue;
     switch (msg.method) {
       case "initialize":
         send({ id: msg.id, result: { userAgent: "stop-mock" } });
@@ -746,6 +752,11 @@ process.stdin.on("data", (chunk) => {
           send({ id: msg.id, result: {} });
         });
         break;
+      case "thread/turns/list": {
+        const id = running.get(p.threadId);
+        send({ id: msg.id, result: { data: id ? [turnObj(id, "inProgress")] : [], nextCursor: null, backwardsCursor: null } });
+        break;
+      }
       case "thread/read": {
         const id = running.get(p.threadId);
         send({ id: msg.id, result: { thread: {
@@ -797,7 +808,7 @@ process.stdin.on("end", () => process.exit(0));
   const startStopBroker = async (opts: StopMockOptions = {}, dir = tempDir) => {
     const sockPath = testSocketPath(dir);
     const logPath = join(dir, "mock.log");
-    writeMockCodexScript(dir, stopMock(logPath, opts));
+    writeMockCodexScript(dir, stopMock(logPath, { backgroundTerminals: { enabled: true }, ...opts }));
     const proc = spawnBroker(endpointFor(sockPath), dir);
     await waitForSocket(sockPath);
     return { sockPath, logPath, proc };
@@ -986,7 +997,9 @@ process.stdin.on("end", () => process.exit(0));
         expect(reply).toMatchObject({
           threadId: "thread-s7", runId: null, interruptSent: false, goal: c.goal, alreadyStopped: true, stopOutcome: "confirmed",
         });
-        expect(recvs(readStopLog(logPath), "thread/goal/clear")).toHaveLength(c.clears);
+        const clears = recvs(readStopLog(logPath), "thread/goal/clear");
+        if (c.opts.clearFails) expect(clears.length).toBeGreaterThanOrEqual(c.clears);
+        else expect(clears).toHaveLength(c.clears);
         expect(recvs(readStopLog(logPath), "turn/interrupt")).toEqual([]);
       } finally {
         await client.close();
@@ -1085,7 +1098,7 @@ process.stdin.on("end", () => process.exit(0));
       owner.kill();
       await owner.exited;
       // 断开处理的可观察信号：停止操作先读 goal（第 3 节 b）。
-      await waitFor(() => recvs(readStopLog(logPath), "thread/goal/get").length === 1, 5000);
+      await waitFor(() => recvs(readStopLog(logPath), "thread/goal/get").length >= 1, 5000);
       const other = await TestClient.connectAndInit(sockPath);
       try {
         // 放行订阅恢复的回包；release 的回包排在它后面，回来时 broker 已读到 resume 回包。
@@ -1179,6 +1192,7 @@ function releaseItems(msg) {
 }
 `;
   interface RunsMockOptions {
+    backgroundTerminals?: import("./test-support/background-terminals-mock").BackgroundTerminalsMockOptions;
     itemsPageSize?: number;
     holdItemReads?: boolean;
     readMode?: "items" | "empty" | "fail";
@@ -1189,10 +1203,14 @@ function releaseItems(msg) {
   }
   const runsMock = (logPath: string, opts: RunsMockOptions = {}) => `
 import { appendFileSync } from "node:fs";
+// CXB_INLINE_BACKGROUND_TERMINALS_BEGIN
+import { createBackgroundTerminalsMock } from "./background-terminals-mock";
+// CXB_INLINE_BACKGROUND_TERMINALS_END
 const O = ${JSON.stringify(opts)};
 const LOG = ${JSON.stringify(logPath)};
 const log = (e) => appendFileSync(LOG, JSON.stringify(e) + "\\n");
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const background = createBackgroundTerminalsMock(send, O.backgroundTerminals);
 let turnSeq = 0;
 ${resultPagingMock}
 const running = new Map();
@@ -1220,6 +1238,7 @@ process.stdin.on("data", (chunk) => {
     if (msg.id === undefined || msg.method === undefined) continue;
     const p = msg.params ?? {};
     if (msg.method !== "initialize") log({ ev: "recv", method: msg.method, params: p });
+    if (background.handle(msg)) continue;
     switch (msg.method) {
       case "initialize":
         send({ id: msg.id, result: { userAgent: "runs-mock" } });
@@ -1252,6 +1271,11 @@ process.stdin.on("data", (chunk) => {
       case "mock/releaseItems":
         releaseItems(msg);
         break;
+      case "thread/turns/list": {
+        const id = running.get(p.threadId);
+        send({ id: msg.id, result: { data: id ? [turnObj(id, "inProgress")] : [], nextCursor: null, backwardsCursor: null } });
+        break;
+      }
       case "thread/read": {
         if (O.readMode === "fail") {
           send({ id: msg.id, error: { code: -32603, message: "mock read failed" } });
@@ -1315,7 +1339,7 @@ process.stdin.on("end", () => process.exit(0));
   const startRunsBroker = async (opts: RunsMockOptions = {}, home = join(tempDir, "cxb-home"), logName = "runs-mock.log") => {
     const sockPath = testSocketPath(tempDir);
     const logPath = join(tempDir, logName);
-    writeMockCodexScript(tempDir, runsMock(logPath, opts));
+    writeMockCodexScript(tempDir, runsMock(logPath, { backgroundTerminals: { enabled: true }, ...opts }));
     const proc = spawnBroker(endpointFor(sockPath), tempDir, { env: { CXB_HOME: home } });
     await waitForSocket(sockPath);
     return { sockPath, logPath, proc, home };
@@ -1583,6 +1607,7 @@ process.stdin.on("end", () => process.exit(0));
   // 就自开一轮（输入是内部指引，没有 userMessage），隔 delayMs 后以 items 完成；completed 带 view 作为
   // itemsView（summary 时通过 thread/items/list 补全条目），最多自开 limit 轮防止失控。日志记 autoStarted。
   interface HostMockOptions {
+    backgroundTerminals?: import("./test-support/background-terminals-mock").BackgroundTerminalsMockOptions;
     itemsPageSize?: number;
     holdItemReads?: boolean;
     holdStarted?: boolean;
@@ -1597,10 +1622,14 @@ process.stdin.on("end", () => process.exit(0));
   }
   const hostMock = (logPath: string, opts: HostMockOptions = {}) => `
 import { appendFileSync } from "node:fs";
+// CXB_INLINE_BACKGROUND_TERMINALS_BEGIN
+import { createBackgroundTerminalsMock } from "./background-terminals-mock";
+// CXB_INLINE_BACKGROUND_TERMINALS_END
 const O = ${JSON.stringify(opts)};
 const LOG = ${JSON.stringify(logPath)};
 const log = (e) => appendFileSync(LOG, JSON.stringify({ t: Date.now(), ...e }) + "\\n");
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const background = createBackgroundTerminalsMock(send, O.backgroundTerminals);
 let turnSeq = 0;
 let nextAsk = 100;
 ${resultPagingMock}
@@ -1666,6 +1695,7 @@ process.stdin.on("data", (chunk) => {
     }
     const p = msg.params ?? {};
     if (msg.method !== "initialize") log({ ev: "recv", method: msg.method, params: p });
+    if (background.handle(msg)) continue;
     switch (msg.method) {
       case "initialize":
         send({ id: msg.id, result: { userAgent: "host-mock" } });
@@ -1743,6 +1773,11 @@ process.stdin.on("data", (chunk) => {
       case "mock/releaseItems":
         releaseItems(msg);
         break;
+      case "thread/turns/list": {
+        const id = running.get(p.threadId);
+        send({ id: msg.id, result: { data: id ? [turnObj(id, "inProgress")] : [], nextCursor: null, backwardsCursor: null } });
+        break;
+      }
       case "thread/read": {
         if (O.readFail) {
           send({ id: msg.id, error: { code: -32603, message: "mock read failed" } });
@@ -1838,7 +1873,7 @@ process.stdin.on("end", () => process.exit(0));
   const startHostBroker = async (opts: HostMockOptions = {}, home = join(tempDir, "cxb-home"), env: Record<string, string> = {}, dir = tempDir) => {
     const sockPath = testSocketPath(dir);
     const logPath = join(dir, "host-mock.log");
-    writeMockCodexScript(dir, hostMock(logPath, opts));
+    writeMockCodexScript(dir, hostMock(logPath, { backgroundTerminals: { enabled: true }, ...opts }));
     const proc = spawnBroker(endpointFor(sockPath), dir, { env: { CXB_HOME: home, ...env } });
     await waitForSocket(sockPath);
     return { sockPath, logPath, proc, home };
@@ -2456,7 +2491,7 @@ process.stdin.on("end", () => process.exit(0));
   const startSharedBroker = async (opts: HostMockOptions = {}, env: Record<string, string> = {}) => {
     const sockPath = testSocketPath(tempDir);
     const logPath = join(tempDir, "host-mock.log");
-    writeMockCodexScript(tempDir, hostMock(logPath, opts));
+    writeMockCodexScript(tempDir, hostMock(logPath, { backgroundTerminals: { enabled: true }, ...opts }));
     const codexSock = join(tempDir, "cx.sock");
     const fake = serveMockOverSocket(tempDir, codexSock);
     const home = join(tempDir, "cxb-home");

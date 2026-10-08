@@ -53,6 +53,7 @@ pub struct DerivedStopDone {
 pub enum DerivedStage {
     /// 排队等名额（协调器按 8 个在途名额放行）。
     Queued,
+    Background,
     /// 已发 thread/goal/get。
     GoalRead,
     /// 已发 goal 暂停或清除。
@@ -68,6 +69,9 @@ pub enum DerivedStage {
 /// 一个派生停止的内部状态（SA-b 内部登记，不属于冻结契约）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedOp {
+    pub background: super::background::Background,
+    pub last_verified_at: Option<u64>,
+    pub connection_epoch: u64,
     pub target: DerivedTarget,
     pub stage: DerivedStage,
     /// 当前在途请求（goal 读写、中断、状态读取）的轮次；回包轮次不符一律丢弃。
@@ -100,6 +104,9 @@ pub struct DerivedOp {
 impl DerivedOp {
     pub fn new(target: DerivedTarget, root: bool) -> Self {
         Self {
+            background: Default::default(),
+            last_verified_at: None,
+            connection_epoch: 0,
             target,
             stage: DerivedStage::Queued,
             request_round: 0,
@@ -133,7 +140,7 @@ impl DerivedOp {
             turn_ended: self.turn_ended,
             goal_braked: self.goal_ok(),
             settled: !self.slot,
-            verify_done: self.verified && !self.slot,
+            verify_done: self.verified && !self.slot && self.background.confirmed,
         }
     }
     /// 能写 goal：能力为 true，或能力未知但派生事件判定为 v1。
@@ -206,9 +213,16 @@ impl Machine {
             return;
         };
         let key = (*tree_op, thread.clone());
+        let authority = self.derived_background_authority(&key);
         let Some(op) = self.trees.aux.derived.get_mut(&key) else {
             return;
         };
+        if op.background.verifying
+            && (!authority || op.connection_epoch != self.relations.conn_epoch)
+        {
+            op.background
+                .fail("conflict", "后置核实期间授权或连接代际变化".into());
+        }
         if op.stage != DerivedStage::Verify
             || op.request_round != *round
             || op.read_id != Some(done.read_id)
@@ -216,6 +230,7 @@ impl Machine {
             return;
         }
         op.read_id = None;
+        op.last_verified_at = Some(self.clock.now_ms);
         op.verified = true;
         let now = self.clock.mono_ms;
         match done.result {
@@ -224,7 +239,16 @@ impl Machine {
                 op.conflicts.clear();
                 op.backoff = 0;
                 op.error = None;
-                op.stopped = op.goal_ok();
+                if op.goal_ok() && !op.background.verifying && !op.background.failed {
+                    self.derived_background_next(&key, actions);
+                    return;
+                }
+                op.stopped = op.goal_ok()
+                    && op.background.verifying
+                    && self.clock.mono_ms < op.background.deadline;
+                if op.stopped {
+                    op.background.finish();
+                }
                 if !op.stopped {
                     // goal 未制动或能力限制：15 秒后连同 goal 一起再核实。
                     op.goal_checked = false;
@@ -294,6 +318,21 @@ impl Machine {
             return;
         };
         op.slot = true;
+        op.target.authority_gen = self
+            .relations
+            .contexts
+            .get(&op.target.run_id)
+            .map_or(0, |c| c.gen);
+        op.background.invalidate();
+        op.background.deadline = self
+            .trees
+            .operations
+            .get(&key.0)
+            .map(|t| t.request.first_delivery_deadline_ms)
+            .filter(|d| *d > self.clock.mono_ms)
+            .unwrap_or(self.clock.mono_ms + TREE_VERIFY_MS);
+        op.connection_epoch = self.relations.conn_epoch;
+        op.goal_checked = false;
         op.retry_at_ms = None;
         if op.goal_checked {
             self.derived_verify(key, actions);
@@ -371,6 +410,26 @@ impl Machine {
         }
     }
 
+    pub(crate) fn derived_invalidate_background(
+        &mut self,
+        key: &(u64, String),
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(op) = self.trees.aux.derived.get_mut(key) else {
+            return;
+        };
+        let pending = op.background.busy || op.background.verifying;
+        op.background.invalidate();
+        if pending {
+            op.request_round += 1;
+            let read = op.read_id.take();
+            if let Some(read) = read {
+                self.cancel_status_read(read, actions);
+            }
+            self.derived_release_slot(key);
+        }
+    }
+
     pub(crate) fn derived_release_slot(&mut self, key: &(u64, String)) {
         let Some(op) = self.trees.aux.derived.get_mut(key) else {
             return;
@@ -429,6 +488,46 @@ impl Machine {
             return;
         };
         if op.target.generation != *generation {
+            return;
+        }
+        if context.method.starts_with("thread/backgroundTerminals/") {
+            if op.request_round != *round
+                || op.stage != DerivedStage::Background
+                || !op.background.busy
+            {
+                return;
+            }
+            let narrow = matches!(
+                self.trees.operations[tree_op].request.scope,
+                super::tree::TreeScope::Run { .. }
+            );
+            let runs = self.trees.aux.work[tree_op].runs.clone();
+            let allowed: BTreeSet<String> = self
+                .stops
+                .command_turns
+                .keys()
+                .filter(|(t, item)| t == thread && self.background_item_owned(thread, item, &runs))
+                .map(|(_, item)| item.clone())
+                .collect();
+            let authority = self.derived_background_authority(&key);
+            let op = self.trees.aux.derived.get_mut(&key).expect("派生停止存在");
+            if !authority
+                || op.connection_epoch != self.relations.conn_epoch
+                || self.clock.mono_ms >= op.background.deadline
+            {
+                op.background
+                    .fail("unknown", "所有权或连接代际变化，清理证据失效".into());
+            } else {
+                op.background.reply(result, self.clock.now_ms, |item| {
+                    !narrow || allowed.contains(item)
+                });
+            }
+            if op.background.verifying {
+                // 空列表之后重新读取 goal 和活动轮次，仍保留当前总期限。
+                self.derived_goal_read(&key, actions);
+            } else {
+                self.derived_background_next(&key, actions);
+            }
             return;
         }
         if context.method == "turn/interrupt" {
@@ -558,6 +657,72 @@ impl Machine {
         actions.push(Action::Request(context));
     }
 
+    fn derived_background_authority(&self, key: &(u64, String)) -> bool {
+        let Some(op) = self.trees.aux.derived.get(key) else {
+            return false;
+        };
+        self.trees
+            .operations
+            .get(&key.0)
+            .is_some_and(|t| !t.cancelled)
+            && self.claims.get(&key.1).is_none_or(|c| {
+                c.run_id.as_deref() == Some(&op.target.run_id) && !c.joined() && !c.settling()
+            })
+            && self.manage_context(&op.target.run_id).is_some_and(|c| {
+                c.authority != Authority::Revoked
+                    && c.gen == op.target.authority_gen
+                    && c.members.get(&key.1).is_none_or(|m| m.conflict.is_none())
+            })
+    }
+
+    fn derived_background_next(&mut self, key: &(u64, String), actions: &mut Vec<Action>) {
+        let narrow = self
+            .trees
+            .operations
+            .get(&key.0)
+            .is_some_and(|t| matches!(t.request.scope, super::tree::TreeScope::Run { .. }));
+        let item_owned = self
+            .trees
+            .aux
+            .derived
+            .get(key)
+            .and_then(|d| d.background.pending_item())
+            .is_none_or(|item| {
+                !narrow
+                    || self
+                        .trees
+                        .aux
+                        .work
+                        .get(&key.0)
+                        .is_some_and(|w| self.background_item_owned(&key.1, item, &w.runs))
+            });
+        let authorized = self.derived_background_authority(key) && item_owned;
+        let op = self.trees.aux.derived.get_mut(key).expect("派生停止存在");
+        if !authorized {
+            op.background.fail("conflict", "清理授权已失效".into());
+        }
+        if let Some((method, params)) = op.background.next(&key.1, self.clock.mono_ms) {
+            op.stage = DerivedStage::Background;
+            op.request_round += 1;
+            actions.push(Action::Request(derived_request(op, method, params)));
+        } else if op.background.failed {
+            op.error = op.background.report.failure_reason.clone();
+            if op.background.report.state == "conflict" {
+                op.conflicts.insert(
+                    op.error
+                        .clone()
+                        .unwrap_or_else(|| "后台命令归属冲突".into()),
+                );
+            }
+            op.capability_limited = op.background.report.state == "capabilityLimited";
+            op.retry_at_ms = Some(self.clock.mono_ms + TREE_VERIFY_MS);
+            op.stopped = false;
+            self.derived_release_slot(key);
+            self.derived_report(key, actions);
+            self.tree_pump(key.0, actions);
+        }
+    }
+
     /// 发 goal 写入前核对管理权：根线程看认领仍是本运行，子线程看运行没有撤权。
     fn derived_authority_ok(&self, key: &(u64, String)) -> bool {
         let Some(op) = self.trees.aux.derived.get(key) else {
@@ -592,6 +757,9 @@ impl Machine {
             TreePhase::Pending
         };
         let report = RootStopReport {
+            background_cleanup: op.background.report.clone(),
+            step: format!("{:?}", op.stage),
+            last_verified_at: op.last_verified_at,
             thread: key.1.clone(),
             phase,
             check: op.check(),

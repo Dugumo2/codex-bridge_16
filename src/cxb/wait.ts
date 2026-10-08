@@ -126,6 +126,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
       shortId: ref.shortId, runId, status: run.status, result: run.turns.at(-1)?.output ?? "", alreadyDone,
       ...(run.loopGuard ? { loopGuard: run.loopGuard } : {}),
       // 子代理停止报告与中断原因（subagentsUnfinished 等）原样带出；没有子代理时字段缺省，旧输出不变。
+      ...(run.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}),
       ...(run.childrenStop ? { interruptReason: run.interruptReason, childrenStop: run.childrenStop } : {}) });
     return code;
   } finally {

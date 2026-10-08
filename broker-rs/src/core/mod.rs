@@ -501,11 +501,20 @@ impl Core {
         self.next_tag += 1;
         let tag = self.next_tag;
         // 上游转发时缺省 params 为 {}（broker-server.ts 1814 行）。
-        let sent = self.app.request_ordered(
-            &context.method,
-            Some(context.params.clone().unwrap_or_else(|| json!({}))),
-            tag,
-        );
+        let sent = if context.method.starts_with("thread/backgroundTerminals/") {
+            self.app.inner.request_ordered(
+                &context.method,
+                context.params.clone(),
+                Some(5_000),
+                tag,
+            )
+        } else {
+            self.app.request_ordered(
+                &context.method,
+                Some(context.params.clone().unwrap_or_else(|| json!({}))),
+                tag,
+            )
+        };
         if let Some(thread) = context
             .params
             .as_ref()

@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { NO_RESPONSE } from "../rpc";
 import { until as untilAsync } from "./test-fixtures/run-harness";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { BROKER_BIN, writeMockCodexScript } from "../test-support/broker-harness";
 import { brokerVersionOf, connectBroker } from "./broker-conn";
@@ -73,7 +73,7 @@ function cliEnv(scenario: string): NodeJS.ProcessEnv {
     CXB_BROKER_BIN: BROKER_BIN, CXB_SERVER: "private",
     MOCK_E2E_LEGACY_REVIEW: legacyReview ? "1" : "",
     MOCK_E2E_REVIEW_INNER_TURN: innerReview ? "1" : "",
-    MOCK_E2E_SCENARIO: scenario, MOCK_E2E_LOG: join(sandbox, "mock.log"),
+    MOCK_BACKGROUND_TERMINALS: JSON.stringify({ enabled: true }), MOCK_E2E_SCENARIO: scenario, MOCK_E2E_LOG: join(sandbox, "mock.log"),
     MOCK_E2E_GATE_DIR: gateDir, MOCK_E2E_SERVER_DELETE_MODE_FILE: deleteModeFile,
     MOCK_E2E_BUSY: join(sandbox, "busy.flag"),
     MOCK_E2E_CONFIRM_INTERRUPT: scenario === "lost-stop" ? "1" : "",
@@ -250,7 +250,8 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     expect(blocker.threadId).toBe(legacyReview ? "review-e2e" : handle.threadId);
     expect(refused.stderr).toContain(`cxb stop ${blocker.threadId} --run ${childRunId}`);
 
-    writeFileSync(join(sandbox, "busy.flag"), "", "utf8");
+    // 夹具按文件是否存在报告活跃；清空内容仍表示活跃，必须移除标记。
+    unlinkSync(join(sandbox, "busy.flag"));
     const stopped = await cxb("lost-stop", "stop", "--json", blocker.threadId, "--run", childRunId);
     expect(stopped.code, JSON.stringify(stopped)).toBe(0);
     expect(json(stopped.stdout)).toMatchObject({ stopOutcome: "confirmed", runId: childRunId });

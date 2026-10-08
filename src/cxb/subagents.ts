@@ -3,7 +3,7 @@
 // broker 写的运行记录带 `children`（受管子线程）与 `childrenStop`（整树停止报告）；这里只读、只展示，
 // 不改已有 JSON 字段。文案按报告生成：未确认或有冲突时不能写「已停止它们」，屏障未解除时提示先 wait/stop 核实。
 import { sanitizeForTerminal } from "../questions";
-import { CxbError, rpcData, rpcFailure, type ChildrenStopReport, type ExitCode, type InboxItem, type RunResult } from "./contracts";
+import { CxbError, rpcData, rpcFailure, type BackgroundCleanup, type ChildrenStopReport, type ExitCode, type InboxItem, type RunResult } from "./contracts";
 import { readPendingInbox, readThreadIndex, type ThreadIndexEntry } from "./ledger";
 import type { CommandContext } from "./main";
 
@@ -14,6 +14,14 @@ export function subagentThreads(run: RunResult): string[] {
   return [...new Set((run.children ?? []).filter((child) => child.relationKind === "subagent").map((child) => child.threadId))];
 }
 
+/** API 只证明受管列表状态，不扩大为操作系统进程退出保证。 */
+export function backgroundLines(thread: string, report: BackgroundCleanup): string[] {
+  const states: Record<string, string> = { pending: "待核验", listing: "正在列举", terminating: "正在终止受管命令", verifying: "后置核验",
+    confirmed: "已核验为空", capabilityLimited: "能力受限", notLoaded: "线程未加载，无法核验", unknown: "未知", conflict: "归属冲突", unconfirmed: "尚未确认" };
+  return [`  ${safe(thread)}：${safe(report.scope)}，${states[report.state] ?? "未知"}（${safe(report.state)}）；发现 ${report.discovered}，剩余 ${report.remaining.map(safe).join("、") || "无"}`,
+    `    终止回包：${safe(JSON.stringify(report.terminationResults))}；最后核验：${report.lastVerifiedAt == null ? "尚未核验" : new Date(report.lastVerifiedAt).toISOString()}${report.failureReason ? `；${safe(report.failureReason)}` : ""}`];
+}
+
 /** 停止报告的一行摘要：「父线程已停；3 个子代理已停；1 个尚未确认」，冲突、失败与能力限制另起一行列出。 */
 export function stopReportLines(report: ChildrenStopReport): string[] {
   const parts = [report.root.phase === "confirmed" ? "父线程已停" : "父线程尚未确认停下"];
@@ -21,9 +29,15 @@ export function stopReportLines(report: ChildrenStopReport): string[] {
   if (report.unconfirmed.length) parts.push(`${report.unconfirmed.length} 个尚未确认`);
   if (report.failed.length) parts.push(`${report.failed.length} 个核实失败`);
   const lines = [parts.join("；")];
+  if (report.cleanupState === "abandoned") lines.push(`  清理已放弃：${safe(report.abandonReason ?? "显式放弃")}；可能仍有子代理或命令在运行，请换新线程，必要时换隔离工作目录。`);
+  for (const member of [report.root, ...Object.values(report.members ?? {})]) {
+    if (member.step || member.lastVerifiedAt != null || member.error) lines.push(`  成员 ${safe(member.thread)}：步骤 ${safe(member.step ?? "未知")}；检查 ${safe(JSON.stringify(member.check))}；最近核实 ${member.lastVerifiedAt == null ? "无" : new Date(member.lastVerifiedAt).toISOString()}${member.error ? `；错误 ${safe(member.error)}` : ""}`);
+    if (member.backgroundCleanup) lines.push(...backgroundLines(member.thread, member.backgroundCleanup));
+  }
+  for (const [thread, missing] of Object.entries(report.discovery.missing ?? {})) lines.push(`  缺证据：${safe(thread)}（${missing.map(safe).join("、")}）`);
   for (const conflict of report.conflicts) lines.push(`  冲突：子线程 ${safe(conflict.thread)}（${safe(conflict.reason)}），未中断`);
   for (const thread of report.capabilityLimited) {
-    lines.push(`  能力限制：子线程 ${safe(thread)} 不接受 goal 写入，目标仍可能 active${report.root.clearRequested ? "，未能清除" : ""}`);
+    lines.push(`  能力限制：子线程 ${safe(thread)} 存在能力限制，目标或受管后台命令尚未核验${report.root.clearRequested ? "，未能清除" : ""}`);
   }
   for (const thread of report.unconfirmed) lines.push(`  未确认：子线程 ${safe(thread)}`);
   for (const thread of report.failed) lines.push(`  核实失败：子线程 ${safe(thread)}`);
@@ -50,12 +64,13 @@ export function unfinishedNotice(run: RunResult, label: string): string[] {
     lines.push("部分子代理尚未确认停下，不能当作已经停下：");
   }
   lines.push(...stopReportLines(report));
-  if (report.phase !== "confirmed") lines.push(`子代理树的停止尚未确认，请先 cxb wait ${label} 或 cxb stop ${label} 核实，再决定是否继续。`);
+  if (report.phase !== "confirmed" && report.cleanupState !== "abandoned") lines.push(`子代理树的停止尚未确认，请先 cxb wait ${label} 或 cxb stop ${label} 核实，再决定是否继续。`);
   return lines;
 }
 
 /** `show P`、`wait`：子代理数量、待答数、未确认的停止明细；因子代理未完成而中断时显示说明。 */
 export function showSubagents(ctx: CommandContext, run: RunResult): void {
+  if (run.backgroundCleanup && !run.childrenStop) for (const line of backgroundLines(run.threadId, run.backgroundCleanup)) ctx.out.notice(line);
   const children = subagentThreads(run);
   const report = run.childrenStop;
   if (!children.length && !report && run.interruptReason !== "subagentsUnfinished") return;

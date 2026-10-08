@@ -196,7 +196,7 @@ test("detach 先托管再返回运行句柄；被占退出八并给 wait 提示"
 }, TEST_BUDGET);
 
 test("私有 goal 自动轮空转由真实 broker 刹车，退出九并输出种类与轮数", async () => {
-  const observer = await h.start({ hold: true });
+  const observer = await h.start({ hold: true, backgroundTerminals: { enabled: true } });
   const work = h.invoke(handler(), ["run", "中文", "--goal", "完成目标", "--budget", "10000", "--json"]);
   await until(async () => (await observer.rpc.request<any>("fixture/state")).calls.some((call: any) => call.method === "turn/start"));
   await observer.rpc.request("fixture/control", { action: "finish", threadId: "thread-1" });
@@ -237,7 +237,7 @@ test("标准输入不结束时按期限拒绝等待并自然退出", async () =>
 }, TEST_BUDGET);
 
 for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) test(`${signal} 经输出层清理机制先 stop 后退出 ${code}`, async () => {
-  const observer = await h.start({ hold: true });
+  const observer = await h.start({ hold: true, backgroundTerminals: { enabled: true } });
   const child = h.spawn([process.execPath, join(import.meta.dir, "test-fixtures/run-client.ts"), "run", "信号测试", "--json"],
     { ...h.env, RUN_FIXTURE_WORKSPACE: JSON.stringify(h.workspace), RUN_FIXTURE_SIGNAL: signal });
   child.child.stdin!.end();

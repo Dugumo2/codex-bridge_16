@@ -85,6 +85,7 @@ if (process.env.MOCK_PROXY_HANG === "1") {
 const INLINE_MODULES = [
   { marker: "RESUME_HISTORY", label: "恢复历史", file: "resume-history.ts", specifier: "../../test-support/resume-history" },
   { marker: "SUBAGENT_MOCK", label: "子代理模拟", file: "subagent-mock.ts", specifier: "../../test-support/subagent-mock" },
+  { marker: "BACKGROUND_TERMINALS", label: "后台命令模拟", file: "background-terminals-mock.ts", specifier: "./background-terminals-mock" },
   { marker: "STATUS_HISTORY", label: "状态历史", file: "status-history.ts", specifier: "../../test-support/status-history" },
 ] as const;
 
@@ -146,6 +147,7 @@ export function envWithPathPrefix(dir: string): Record<string, string> {
 
 /** 创建用于 codex app-server 的 JSON-RPC 模拟脚本，支持初始化、线程、轮次、审批和通知。 */
 export function createMockCodex(dir: string, opts?: {
+  backgroundTerminals?: import("./background-terminals-mock").BackgroundTerminalsMockOptions;
   subagents?: import("./subagent-mock").SubagentMockOptions;
   statusRead?: import("./subagent-mock").StatusReadMockOptions;
   /** 仅恢复未排除历史时返回约 12 MiB 历史，默认关闭。 */
@@ -237,7 +239,7 @@ if (args[0] !== "app-server") {
 const rawRespond = fixtureSender();
 const statusHistory = createStatusHistory(${JSON.stringify(opts?.statusRead ?? {})}, rawRespond, longResumeTurns);
 const respond = statusHistory.wrap(rawRespond);
-const subagents = createSubagentMock(respond, ${JSON.stringify(opts?.subagents ?? {})});
+const subagents = createSubagentMock(respond, ${JSON.stringify(opts?.subagents ?? {})}, ${JSON.stringify(opts?.backgroundTerminals ?? {})});
 
 let buffer = "";
 let approvalIdCounter = 1;
@@ -880,20 +882,20 @@ export class TestClient {
     this.socket.write(JSON.stringify(msg) + "\n");
   }
 
-  async request(method: string, params?: unknown): Promise<unknown> {
+  async request(method: string, params?: unknown, timeoutMs = 10_000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
       const msg: Record<string, unknown> = { id, method };
       if (params !== undefined) msg.params = params;
       this.pending.set(id, { resolve, reject });
       this.send(msg);
-      // 请求超时为 10 秒。
+      // 普通请求默认 10 秒；停止等有协议总期限的调用可显式覆盖。
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
           reject(new Error(`Request ${method} (id=${id}) timed out`));
         }
-      }, 10_000);
+      }, timeoutMs);
     });
   }
 

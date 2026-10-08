@@ -75,7 +75,7 @@ function cliEnv(scenario: string): NodeJS.ProcessEnv {
     CXB_SERVER: "private",
     MOCK_E2E_LEGACY_REVIEW: legacyReview ? "1" : "",
     MOCK_E2E_REVIEW_INNER_TURN: innerReview ? "1" : "",
-    MOCK_E2E_SCENARIO: scenario,
+    MOCK_BACKGROUND_TERMINALS: JSON.stringify({ enabled: true }), MOCK_E2E_SCENARIO: scenario,
     MOCK_E2E_LOG: join(sandbox, "mock.log"),
   };
 }

@@ -15,6 +15,8 @@
 //   MOCK_STATUS_READ：状态读取的分页与历史选项（JSON，StatusReadMockOptions），默认关闭；开启后由
 //                     test-support/status-history.ts 接管 thread/read、thread/turns/list、thread/items/list。
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
+// MOCK_BACKGROUND_TERMINALS：独立后台命令场景（JSON），默认关闭时三个接口均回 -32601。
+// MOCK_E2E_PENDING_METADATA=1：结果扣包时仍提供元数据和轮次分页，只有条目补读等待放行。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 // CXB_INLINE_RESUME_HISTORY_BEGIN
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
@@ -33,6 +35,7 @@ if (args[0] !== "app-server") {
 }
 const selectedScenario = process.env.MOCK_E2E_SCENARIO ?? "ask";
 const delayResult = selectedScenario.endsWith("-pending");
+const pendingMetadata = process.env.MOCK_E2E_PENDING_METADATA === "1";
 const scenario = selectedScenario.replace(/-pending$/, "");
 const logPath = process.env.MOCK_E2E_LOG;
 const trigger = process.env.MOCK_E2E_TRIGGER;
@@ -48,7 +51,7 @@ const statusReadOptions = JSON.parse(process.env.MOCK_STATUS_READ ?? "{}");
 const rawSend = fixtureSender();
 const statusHistory = createStatusHistory(statusReadOptions, rawSend, longResumeTurns);
 const send = statusHistory.wrap(rawSend);
-const subagents = createSubagentMock(send, JSON.parse(process.env.MOCK_SUBAGENTS ?? "{}"));
+const subagents = createSubagentMock(send, JSON.parse(process.env.MOCK_SUBAGENTS ?? "{}"), JSON.parse(process.env.MOCK_BACKGROUND_TERMINALS ?? "{}"));
 
 const waiting = new Map<string, (message: { result?: unknown; error?: unknown }) => void>();
 let serverRequestCounter = 0;
@@ -293,15 +296,21 @@ process.stdin.on("data", (chunk: string) => {
         send({ id: msg.id, result: { goal: null } });
         break;
       case "thread/read":
-        if (completedTurns.has(threadId) && !resultsReleased && delayResult) {
+        if (completedTurns.has(threadId) && !resultsReleased && delayResult && !(pendingMetadata && msg.params?.includeTurns !== true)) {
           heldReads.push({ id: msg.id, threadId });
           break;
         }
         send({ id: msg.id, result: { thread: { ...thread(threadId),
           ...(busy() ? { status: { type: "active", activeFlags: [] } } : {}),
-          turns: busy() ? [{ id: "turn-lost", items: [], status: "inProgress", error: null }] : completedTurns.get(threadId) ?? [] } } });
+          turns: pendingMetadata && msg.params?.includeTurns !== true ? []
+            : busy() ? [{ id: "turn-lost", items: [], status: "inProgress", error: null }] : completedTurns.get(threadId) ?? [] } } });
         break;
       case "thread/turns/list":
+        if (pendingMetadata && !busy()) {
+          send({ id: msg.id, result: { data: (completedTurns.get(threadId) ?? []).map((turn: any) => ({ ...turn, items: [], itemsView: "notLoaded" })),
+            nextCursor: null, backwardsCursor: null } });
+          break;
+        }
         if (!busy()) {
           send({ id: msg.id, error: { code: -32601, message: `模拟 codex 不支持 ${msg.method}` } });
           break;

@@ -46,12 +46,14 @@ function localResult(ctx: CommandContext, ref: ThreadRef) {
   resultNotice(ctx, run, ref.shortId ?? ref.threadId);
   if (run.state === "running" || run.state === "stopping" || last?.ready === "pending") {
     ctx.out.notice(`结果尚未就绪，请用 cxb wait ${ref.shortId ?? ref.threadId}`);
+    ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: "result", runId: run.runId, state: run.state,
+      stopOutcome: run.stopOutcome, childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup });
     return 5 as const;
   }
   ctx.out.result(last?.output ?? "");
   ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: "result", runId: run.runId, state: run.state,
     status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none",
-    interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
+    childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup, interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
   if (!last) {
     const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)
       ?.filter((line) => line.runId === run.runId && line.event === "启动失败").at(-1) : null;
