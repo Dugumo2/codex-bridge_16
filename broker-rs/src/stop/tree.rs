@@ -554,7 +554,7 @@ impl Machine {
         });
         // 第 2 步：根线程。
         if root_derived {
-            self.tree_root_derived(tree_op, BTreeSet::new(), false, actions);
+            self.tree_root_derived(tree_op, BTreeSet::new(), false);
         } else {
             self.tree_root_claim_stop(tree_op, actions);
         }
@@ -641,13 +641,7 @@ impl Machine {
     }
 
     /// 根线程走派生停止（结束快照或无认领）；`stopped` 为真表示根停止已成立、只等后续变化。
-    fn tree_root_derived(
-        &mut self,
-        tree_op: u64,
-        proven: BTreeSet<String>,
-        stopped: bool,
-        actions: &mut Vec<Action>,
-    ) {
+    fn tree_root_derived(&mut self, tree_op: u64, proven: BTreeSet<String>, stopped: bool) {
         let Some(op) = self.trees.operations.get(&tree_op) else {
             return;
         };
@@ -683,7 +677,8 @@ impl Machine {
             derived.verified = true;
             derived.stopped = true;
             self.trees.aux.derived.insert(key.clone(), derived);
-            self.derived_report(&key, actions);
+            // 这里只登记，不回调协调器。调用方复制完根的清理证据后再统一报告，
+            // 否则收尾复核会在交接未完成时重入，随后被旧的 confirmed 状态覆盖。
         } else {
             self.trees.aux.derived.insert(key.clone(), derived);
             self.derived_requeue(&key);
@@ -932,7 +927,7 @@ impl Machine {
                     work.root_stop_gen = None;
                 }
                 let proven = BTreeSet::new();
-                self.tree_root_derived(tree_op, proven, true, actions);
+                self.tree_root_derived(tree_op, proven, true);
                 let key = (tree_op, op.thread.clone());
                 if let Some(d) = self.trees.aux.derived.get_mut(&key) {
                     d.background = op.background.clone();
