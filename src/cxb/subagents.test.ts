@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ASK_INSTRUCTIONS, ASK_RULES, SUBAGENT_RULES, SUBAGENT_RULES_VERSION, askOverrides } from "./ask-instructions";
 import { continueRefusal } from "./continue-prompt";
-import { EXIT, type ChildrenStopReport, type RunResult } from "./contracts";
+import { EXIT, type ChildrenStopReport, type RunResult, type ServerRequestDeps } from "./contracts";
+import { executeRun } from "./run";
 import { ls } from "./ls";
 import { rm } from "./rm";
 import { show } from "./show";
@@ -16,6 +17,11 @@ import { context, ledger, reasonError, summary } from "./test-fixtures/n4a-unit"
 import { runResult } from "./test-fixtures/run-fakes";
 
 let dir: string;
+const fakeServerRequests = (): ServerRequestDeps => ({
+  attachServerRequests: () => () => {},
+  handover: async () => { throw new Error("本用例不应交接"); },
+  renderPending: () => { throw new Error("本用例不应等待人工回应"); },
+});
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-sab-")); });
 afterEach(async () => { await removeTemp(dir); }, 10_000);
 
@@ -69,6 +75,26 @@ describe("停止报告与中断说明", () => {
 });
 
 describe("子线程门禁的退出码", () => {
+  test.each(["已知", "未知", "空值"])("run 冷恢复 v2 子线程：%s能力在 resume 前拒绝并退出 1", async (known) => {
+    if (known !== "未知") ledger(dir, [], [summary({ threadId: "child-a", shortId: "c0ffee01", lastRunId: null,
+      ...{ parentThreadId: "parent-a", canAcceptDirectInput: known === "已知" ? false : null } as object })]);
+    const t = context(dir, ["run", "继续", "--resume", "child-a"]);
+    t.fake.handle = (m, p) => {
+      if (m === "broker/threads/list") return { threads: [] };
+      if (m === "thread/read") {
+        expect(p).toEqual({ threadId: "child-a" });
+        return { thread: { id: "child-a", canAcceptDirectInput: false,
+          source: { subAgent: { thread_spawn: { parent_thread_id: "parent-a" } } } } };
+      }
+      if (m === "thread/resume") throw reasonError("invalidRequest", -32600);
+      return {};
+    };
+    const error = await executeRun(t.ctx, fakeServerRequests(), { command: "run", sandbox: "workspace-write", prompt: "继续" }).catch(e => e);
+    expect(error.exitCode).toBe(1);
+    expect(error.message).toContain("cxb run --resume parent-a");
+    expect(t.fake.calls.some(c => c.method === "thread/read")).toBe(known !== "已知");
+    expect(t.fake.calls.some(c => ["thread/resume", "turn/start", "thread/goal/set"].includes(c.method))).toBe(false);
+  });
   test("不接受直接输入退出 1；占用与树停止未确认退出 8；续跑同样映射", () => {
     const refusal = subagentRefusal(reasonError("subagentNoDirectInput", -32000, { parentThreadId: "parent-1" }), "child");
     expect(refusal?.exitCode).toBe(EXIT.USAGE_OR_LOCAL_ERROR);
@@ -82,6 +108,53 @@ describe("子线程门禁的退出码", () => {
 });
 
 describe("命令展示", () => {
+  test.each(["畸形轮次", "重复游标", "不支持分页", "条目不完整", "协议错误"])("show C：%s必须失败，不能伪装成功", async (fault) => {
+    ledger(dir, [], [summary({ threadId: "child-a", shortId: "c0ffee01", lastRunId: null,
+      ...{ parentThreadId: "thread-test" } as object })]);
+    const t = context(dir, ["show", "c0ffee01", "--json"]);
+    t.fake.handle = (m) => {
+      if (m === "thread/turns/list") {
+        if (fault === "不支持分页") throw reasonError("unsupported", -32601);
+        if (fault === "协议错误") throw reasonError("invalidRequest", -32600);
+        const data = [{ id: "turn-c", status: "completed", items: [] }];
+        return fault === "畸形轮次" ? { data } : { data, nextCursor: null, backwardsCursor: null };
+      }
+      return { data: [{ turnId: fault === "条目不完整" ? "别的轮次" : "turn-c", item: { type: "agentMessage", text: "部分结果" } }], nextCursor: "重复" };
+    };
+    await expect(show(t.ctx)).rejects.toMatchObject({ code: "CODEX_FAILED", exitCode: 7 });
+    expect(t.json).toHaveLength(0);
+    expect(t.texts).toHaveLength(0);
+  });
+
+  test.each(["confirmed", "unconfirmed", "missing"])("run 子代理未完成退出 4：%s报告在普通输出和 JSON 中可见", async (phase) => {
+    for (const json of [false, true]) {
+      const t = context(dir, ["run", "任务", ...(json ? ["--json"] : [])]);
+      const tree = phase === "missing" ? undefined : report({ trigger: "parentFinishedEarly", phase: phase as "confirmed" | "unconfirmed",
+        ...(phase === "unconfirmed" ? { stopped: [], unconfirmed: ["child-a"], conflicts: [{ thread: "child-b", reason: "未绑定" }] } : {}) });
+      const run = runResult({ status: "interrupted", interruptReason: "subagentsUnfinished", childrenStop: tree,
+        stopOutcome: phase === "missing" ? null : phase as "confirmed" | "unconfirmed" });
+      t.fake.handle = m => {
+        if (m === "thread/start") return { thread: { id: "thread-test" } };
+        if (m === "broker/threads/annotate") return { shortId: "abcd1234" };
+        if (m === "turn/start") return { runId: "run-test" };
+        if (m === "broker/threads/watch") return { thread: summary(), run, pending: [] };
+        return {};
+      };
+      expect(await executeRun(t.ctx, fakeServerRequests(), { command: "run", sandbox: "workspace-write", prompt: "任务" })).toBe(4);
+      const notice = t.notices.join("\n");
+      expect(notice).toContain("运行已标为中断（子代理未完成）");
+      if (phase === "unconfirmed") {
+        expect(notice).toContain("尚未确认");
+        expect(notice).toContain("冲突");
+        expect(notice).not.toContain("已停止。");
+      } else if (phase === "confirmed") expect(notice).toContain("父线程已停；2 个子代理已停");
+      else expect(notice).toContain("停止报告不可用");
+      if (json) {
+        expect(t.json.at(-1)).toMatchObject({ interruptReason: "subagentsUnfinished", result: "中文结果" });
+        if (tree) expect(t.json.at(-1)).toMatchObject({ childrenStop: tree, stopOutcome: phase });
+      } else expect(t.texts.join("")).toBe("中文结果");
+    }
+  });
   test("stop 整树确认：输出「父线程已停；N 个子代理已停」，JSON 带 childrenStop，退出 0", async () => {
     ledger(dir);
     const t = context(dir, ["stop", "abcd1234"]);
@@ -133,7 +206,7 @@ describe("命令展示", () => {
     t.fake.handle = (m, p) => {
       if (m === "thread/turns/list") {
         expect(p.threadId).toBe("child-a");
-        return { data: [{ id: "turn-c", status: "completed", items: [] }] };
+        return { data: [{ id: "turn-c", status: "completed", items: [] }], nextCursor: null, backwardsCursor: null };
       }
       if (m === "thread/items/list") {
         return { data: [{ turnId: "turn-c", item: { type: "agentMessage", text: "子代理结果", phase: "final_answer" } }], nextCursor: null };

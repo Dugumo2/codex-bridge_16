@@ -58,7 +58,7 @@ export function unfinishedNotice(run: RunResult, label: string): string[] {
 export function showSubagents(ctx: CommandContext, run: RunResult): void {
   const children = subagentThreads(run);
   const report = run.childrenStop;
-  if (!children.length && !report) return;
+  if (!children.length && !report && run.interruptReason !== "subagentsUnfinished") return;
   const label = safe(run.shortId || run.threadId);
   if (children.length) {
     const pending = pendingCount(ctx, run);
@@ -102,7 +102,9 @@ export async function showChildThread(ctx: CommandContext, entry: ThreadIndexEnt
   if (entry.canAcceptDirectInput === false) ctx.out.notice(`继续工作请从父线程发起：cxb run --resume ${parent} <要求>`);
   if (readServer) {
     try { return await readServer(); } catch (error) {
-      if (error instanceof CxbError && error.code === "INTERRUPTED") throw error;
+      const { code, reason } = rpcFailure(error);
+      if (!(error instanceof CxbError && error.code === "BROKER_UNAVAILABLE"
+        && (code === null || reason === "shuttingDown"))) throw error;
       ctx.out.notice("无法从服务器读取子线程的结果");
     }
   }

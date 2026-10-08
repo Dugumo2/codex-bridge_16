@@ -30,6 +30,11 @@ fn 不接受直接输入的子线程拒绝resume与continue() {
     let mut s = Sim::new();
     finished_run(&mut s, "子乙", "v2");
     assert_eq!(s.m.thread_capability("子乙"), Some(false));
+    let (id, actions) = s.call(2, "thread/resume", json!({"threadId": "子乙"}));
+    assert_eq!(
+        s.response(&actions, id).unwrap()["error"]["data"]["reason"],
+        "subagentNoDirectInput"
+    );
     let (id, actions) = start_child(&mut s, "子乙");
     let error = s.response(&actions, id).unwrap()["error"].clone();
     assert_eq!(error["code"], code::GENERAL_ERROR);
@@ -49,6 +54,41 @@ fn 不接受直接输入的子线程拒绝resume与continue() {
         s.response(&actions, id).unwrap()["error"]["data"]["reason"],
         "subagentNoDirectInput"
     );
+}
+
+#[test]
+fn 未知父线程归档删除必须发现_有子树或发现失败拒绝() {
+    for method in [
+        "broker/threads/archive",
+        "thread/archive",
+        "thread/delete",
+        "broker/threads/purge",
+    ] {
+        for failed in [false, true] {
+            let mut s = Sim::new();
+            s.mock.register("冷父", None, "v1", false, false);
+            s.mock.register("冷子", Some("冷父"), "v2", false, false);
+            s.children.insert("冷父".into(), vec!["冷子".into()]);
+            s.list_fault = failed;
+            assert!(s.m.thread_relation("冷子").is_none());
+            let (id, actions) = s.call(
+                OWNER,
+                method,
+                json!({"threadId": "冷父", "serverDelete": true}),
+            );
+            let list = blockers(&s, &actions, id);
+            assert!(
+                list.iter().any(|b| b["reason"]
+                    == if failed {
+                        "discoveryIncomplete"
+                    } else {
+                        "hasSubtree"
+                    }),
+                "{list:?}"
+            );
+            assert!(!actions.iter().any(|a| matches!(a, Action::Request(c) if c.method == "thread/archive" || c.method == "thread/delete")));
+        }
+    }
 }
 
 #[test]

@@ -293,6 +293,25 @@ fn 线程流量学习删除和目标状态均接入() {
             client(request(1, 2, method, json!({"threadId":"线程"}))),
         );
         let mut a = a;
+        // 服务器删除、归档现在先证明子树为空；模拟完整的持久列表与已加载列表。
+        let mut pending: std::collections::VecDeque<_> = a.drain(..).collect();
+        while let Some(action) = pending.pop_front() {
+            if let Action::Request(c) = &action {
+                if matches!(c.operation, Operation::Discovery { .. }) {
+                    assert!(matches!(
+                        c.method.as_str(),
+                        "thread/list" | "thread/loaded/list"
+                    ));
+                    pending.extend(reply(
+                        &mut m,
+                        c,
+                        Ok(json!({"data": [], "nextCursor": null})),
+                    ));
+                    continue;
+                }
+            }
+            a.push(action);
+        }
         for _ in 0..2 {
             for action in &a {
                 if let Action::Store(crate::store::StoreOp::Lifecycle(work)) = action {

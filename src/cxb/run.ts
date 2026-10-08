@@ -17,7 +17,7 @@ import { resolveThreadViaBroker } from "./thread-ref";
 import type { CommandContext, CommandHandler } from "./main";
 import type { Output } from "./output";
 import { approvalPreflight, reportApprovalPreflight } from "./preflight";
-import { subagentRefusal } from "./subagents";
+import { childEntry, showSubagents, subagentRefusal } from "./subagents";
 import { bounded, exitCodeForRun, waitRun } from "./wait-run";
 
 /** 不把上游消息直接输出，防止错误文本回显提示词或凭据。 */
@@ -223,6 +223,19 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       const ref = await resolveThreadViaBroker({ request }, options.resume, { passThrough: true });
       threadId = ref.threadId;
       label = ref.shortId ?? options.resume;
+      const child = childEntry(ctx.workspace.workspaceDir, threadId);
+      let capability = child?.canAcceptDirectInput;
+      let parent = child?.parentThreadId;
+      if (capability == null) {
+        // 冷恢复 v2 子线程会被上游拒绝；先只读元数据，避免把能力拒绝误报为执行失败。
+        const metadata = await request<{ thread: { canAcceptDirectInput?: boolean; parentThreadId?: string;
+          source?: { subAgent?: { thread_spawn?: { parent_thread_id?: string } } } } }>(
+          "thread/read", { threadId });
+        capability = metadata.thread?.canAcceptDirectInput;
+        parent = metadata.thread?.parentThreadId ?? metadata.thread?.source?.subAgent?.thread_spawn?.parent_thread_id ?? parent;
+      }
+      if (capability === false) throw new CxbError("LOCAL_ERROR", `子代理线程 ${safe(label)} 不接受直接输入，请从父线程继续`
+        + (parent ? `：cxb run --resume ${safe(parent)} <要求>。` : "。"), { id: label });
     }
     type ThreadResponse = { thread: { id: string }; model?: string; reasoningEffort?: string };
     let response: ThreadResponse | undefined;
@@ -436,6 +449,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     }
     finished = true;
     const code = exitCodeForRun(result);
+    showSubagents(ctx, result);
     const last = result.turns.at(-1);
     if (result.loopGuard) out.notice(`自动续跑刹车：${result.loopGuard.kind === "noAction" ? "连续无动作" : "轮数上限"}，${result.loopGuard.count} 轮`);
     else if (result.interruptReason === "goalLoop") out.notice(`自动续跑刹车：goalLoop，${result.turnsTotal} 轮`);
@@ -458,6 +472,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     out.result(last?.output ?? "");
     const common = { ok: code === EXIT.OK, command: plan.command, thread: { id: result.threadId, shortId: result.shortId },
       runId: result.runId, status: result.status ?? result.state, result: last?.output ?? "",
+      ...(result.interruptReason ? { interruptReason: result.interruptReason } : {}),
+      ...(result.childrenStop ? { childrenStop: result.childrenStop, stopOutcome: result.stopOutcome } : {}),
       ...(result.loopGuard ? { loopGuard: result.loopGuard } : {}) };
     if (plan.command === "review") out.resultJson({ ...common, mode: plan.review!.mode, ref: plan.review!.ref, base: plan.review!.base });
     else out.resultJson({ ...common, model: response?.model ?? model ?? null, reasoning: response?.reasoningEffort ?? reasoning ?? null,

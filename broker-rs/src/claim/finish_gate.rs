@@ -135,6 +135,7 @@ impl Machine {
             return;
         };
         let key = (tree_op, thread.to_owned());
+        self.invalidate_finishing_root(tree_op, thread);
         if let Some(op) = self.trees.aux.derived.get_mut(&key) {
             if started && !turn.is_empty() {
                 // 结束快照持有线程：期间开始的轮次属于本运行，可以中断。
@@ -170,6 +171,7 @@ impl Machine {
             return;
         }
         let key = (tree_op, thread.to_owned());
+        self.invalidate_finishing_root(tree_op, thread);
         if let Some(op) = self.trees.aux.derived.get_mut(&key) {
             op.goal_checked = false;
             op.goal_braked = false;
@@ -177,6 +179,15 @@ impl Machine {
         }
         self.derived_requeue(&key);
         self.tree_drive(tree_op, actions);
+    }
+
+    fn invalidate_finishing_root(&mut self, tree_op: u64, thread: &str) {
+        if let Some(work) = self.trees.aux.work.get_mut(&tree_op) {
+            work.root_done = false;
+            if work.final_started {
+                work.final_pending.insert(thread.into());
+            }
+        }
     }
 
     fn finishing_tree_op(&self, thread: &str) -> Option<u64> {
@@ -192,7 +203,10 @@ impl Machine {
 
 /// 子线程的直接输入与新工作需要被门禁检查的方法。
 fn new_work(method: &str) -> bool {
-    matches!(method, "turn/start" | "review/start" | "turn/steer")
+    matches!(
+        method,
+        "thread/resume" | "turn/start" | "review/start" | "turn/steer"
+    )
 }
 
 impl Machine {
@@ -338,10 +352,15 @@ impl Machine {
             reject_blockers(request, &thread, blockers, actions);
             return true;
         }
-        if !self.lifecycle_needs_discovery(&thread) {
+        let server_effect = request.method != "broker/threads/purge"
+            || request
+                .params
+                .as_ref()
+                .is_some_and(|p| p["serverDelete"] == true);
+        if !server_effect && !self.lifecycle_needs_discovery(&thread) {
             return false;
         }
-        // 已知事实没有挡住、但目标是子代理或用过子代理：先按第 9 节发现它的子树，再判定。
+        // 本地没有血缘不等于服务器子树为空；有服务器副作用时必须先发现，再判定。
         self.lifecycle_discover(request.clone(), thread, 1, actions);
         true
     }
