@@ -196,6 +196,9 @@ fn 旧子线程在父新运行开始后才发事件不误绑_同一子代理被�
     let (mut m, mut mock) = setup(false);
     spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
     assert_eq!(bound(&m, C, "子轮1").as_deref(), Some(R));
+    // 子代理先完成（否则 SA-b 的自然结束门禁会暂缓释放并停树）。
+    let child_done = mock.turn_completed(C, "子轮1", "completed");
+    mock.inject(&mut m, child_done);
     // R 结束：父认领释放，运行上下文撤权。
     let parent_done = mock.turn_completed(P, T, "completed");
     mock.inject(&mut m, parent_done);

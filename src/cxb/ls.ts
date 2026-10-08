@@ -1,6 +1,7 @@
 import { sanitizeForTerminal } from "../questions";
 import { CxbError, type LifecycleInfo, type ThreadSummary } from "./contracts";
-import { readLifecycle, readRunRecord, readThreadIndex } from "./ledger";
+import { readLifecycle, readRunRecord, readThreadIndex, type ThreadIndexEntry } from "./ledger";
+import { derivedOnly } from "./subagents";
 import { lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
 import { commandSession } from "./command-session";
@@ -10,6 +11,8 @@ interface ListItem {
   updatedAt: number; model: string | null; preview: string | null; goal: string | null;
   /** 待核实的归档或删除（`--json` 原样带出）。 */
   lifecycle?: LifecycleInfo;
+  /** 默认隐藏的、只作为派生成员的子代理线程（父行显示数量，`--json` 带出 ID）。 */
+  subagents?: string[];
 }
 interface ServerThread {
   id: string; updatedAt: number; model?: string | null; preview?: string;
@@ -46,6 +49,20 @@ function localThreads(workspaceDir: string): LocalThread[] {
       model: null, preview: record.preview, meta: null, lifecycle: record });
   }
   return threads;
+}
+
+/** 隐藏只作为派生成员的子线程，并把它们记到父线程那一行（父线程不在列表里时照常列出子线程）。 */
+function foldSubagents(items: ListItem[], index: ThreadIndexEntry[]): ListItem[] {
+  const derived = new Map(index.filter((entry) => derivedOnly(entry)).map((entry) => [entry.threadId, entry.parentThreadId!]));
+  const present = new Set(items.map((item) => item.threadId));
+  const counts = new Map<string, string[]>();
+  const kept = items.filter((item) => {
+    const parent = derived.get(item.threadId);
+    if (!parent || !present.has(parent)) return true;
+    counts.set(parent, [...counts.get(parent) ?? [], item.threadId]);
+    return false;
+  });
+  return kept.map((item) => counts.has(item.threadId) ? { ...item, subagents: counts.get(item.threadId)!.sort() } : item);
 }
 
 export const ls: CommandHandler = async (ctx) => {
@@ -109,12 +126,16 @@ export const ls: CommandHandler = async (ctx) => {
         } finally { ctx.out.progress(`服务器发现 ${count} 条线程，耗时 ${Date.now() - started} 毫秒`); }
       }
     }
+    // SA1 第 11 节：只作为派生成员的子线程默认隐藏，父行显示数量；有独立 cxb 运行的子线程照常列出。
+    let index: ThreadIndexEntry[] = [];
+    try { index = readThreadIndex(ctx.workspace.workspaceDir); } catch { /* 索引不可读时不折叠，照常列出。 */ }
+    items = foldSubagents(items, index);
     const ranked = sorted(items);
     const truncated = more || ranked.length > limit;
     items = ctx.parsed.options.all ? ranked : ranked.slice(0, limit);
     ctx.out.progress(`共发现 ${ranked.length} 条线程，显示 ${items.length} 条`);
     ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL PREVIEW\n");
-    for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${item.model ?? "-"} ${item.preview ?? ""}\n`));
+    for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${item.model ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
     ctx.out.resultJson({ ok: true, command: "ls", workspace: ctx.workspace.root, source, items, truncated });
     return 0;
   } finally { session.dispose(); }

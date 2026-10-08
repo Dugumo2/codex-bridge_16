@@ -694,16 +694,24 @@ fn 运行收尾按run撤销子请求与收件箱事项_不答不dismiss() {
     let (forwarded_id, event) = mock.request(C, Some("子轮1"), None, APPROVAL);
     let actions = mock.inject(&mut m, event);
     assert_eq!(forwarded(&actions, 1).len(), 1);
-    // 父轮结束，认领自然释放（骨架门禁 Release）。
+    // 父轮结束：子请求待答算受管活动，SA-b 门禁暂缓释放并发起整树停止；停止开始即撤回已转发的子请求，
+    // 按清理策略进收件箱（不答、不 Dismiss），运行提交 ended 时再按 run 撤销（见 SA-b 的门禁用例）。
     let done = mock.turn_completed(P, T, "completed");
     let actions = mock.inject(&mut m, done);
-    assert!(!m.claims.contains_key(P));
+    assert!(matches!(
+        m.claims[P].state,
+        crate::claim::State::FinishingTree { .. }
+    ));
     assert!(upstream(&actions).is_empty());
     assert!(
         m.requests.pending.is_empty(),
         "已转发的子请求随运行收尾撤回"
     );
-    assert!(m.relations.requests.is_empty());
+    assert!(m
+        .relations
+        .requests
+        .values()
+        .all(|r| !matches!(r.stage, ChildRequestStage::Forwarded { .. })));
     assert_eq!(mock.answer_count(C, &forwarded_id), 0);
     // 收尾之后的新请求不再转给旧 owner。
     let (_, event) = mock.request(C, Some("子轮1"), None, APPROVAL);

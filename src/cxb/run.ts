@@ -17,6 +17,7 @@ import { resolveThreadViaBroker } from "./thread-ref";
 import type { CommandContext, CommandHandler } from "./main";
 import type { Output } from "./output";
 import { approvalPreflight, reportApprovalPreflight } from "./preflight";
+import { subagentRefusal } from "./subagents";
 import { bounded, exitCodeForRun, waitRun } from "./wait-run";
 
 /** 不把上游消息直接输出，防止错误文本回显提示词或凭据。 */
@@ -37,6 +38,9 @@ function decide(error: CxbError): CxbError { decided.add(error); return error; }
 function executionError(error: unknown, id?: string): CxbError {
   if (error instanceof CxbError && (error.code !== "BROKER_UNAVAILABLE" || decided.has(error))) return error;
   const detail = rpcDetail(error);
+  // 子线程能力门禁与子代理树屏障（SA1 接口第 10 节）：不接受直接输入退出 1，占用与未确认的树停止退出 8。
+  const subagent = subagentRefusal(error, safe(id ?? "<线程ID>"));
+  if (subagent) return subagent;
   // 归档、删除进行中或待核实的线程被 broker 门禁挡住（N7-A 2.3.6 节），提示完成核实的命令而不是 wait。
   if (detail.code === -32001 && rpcFailure(error).reason === "lifecyclePending") return lifecyclePendingError(error, safe(id ?? "<线程ID>"));
   if (detail.code === -32001) return new CxbError("THREAD_HELD", `线程被占用，可用 cxb wait ${safe(id ?? "<线程ID>")} 观察`, { id });
@@ -292,15 +296,20 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     } };
     disposers.push(rpc.onAnyRequest(async (method, params, id) => {
       // broker 可能在 review/start 回包前回放子线程请求，待响应确认子线程归属后再路由。
-      if (plan.command === "review" && (params as { threadId?: string })?.threadId !== threadId) {
+      // 带 cxbOrigin 的子代理请求已由 broker 标明逻辑根与运行，不等 review 回包（否则会卡住审批）。
+      const routed = params as { threadId?: string; cxbOrigin?: unknown } | undefined;
+      if (plan.command === "review" && routed?.threadId !== threadId && !routed?.cxbOrigin) {
         await bounded(reviewResponse, remaining(), controller.signal);
       }
       if (!active || handedOver || !routedHandler) return NO_RESPONSE;
       return routedHandler(method, params, id);
     }));
+    // 路由器保存本次运行的逻辑根；review 迁移只更新执行线程（重新登记时逻辑根不变）。
+    const logicalRoot = threadId;
     const attach = (id: string) => {
       detachRouter?.();
-      detachRouter = deps.attachServerRequests(routerRpc, { threadId: id, policy, onNeedsHuman(method) {
+      detachRouter = deps.attachServerRequests(routerRpc, { threadId: id, logicalRootThreadId: logicalRoot,
+        getRunId: () => runId || undefined, policy, onNeedsHuman(method) {
         // 仅记录方法名，不回显 params 或外部日志文本。
         out.progress(`需要回应的请求类型：${safe(method)}`);
         human();

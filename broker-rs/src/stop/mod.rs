@@ -1757,9 +1757,10 @@ impl Machine {
                         | Operation::LateGoal { .. }
                         | Operation::ContinueRead(_)
                         | Operation::GoalRestore(_)
+                        | Operation::DerivedStop { .. }
                 )
             {
-                // 续跑核实读与 goal 恢复读由乙路自己持有版本并核对，公共过滤不得吞掉它们的回包。
+                // 续跑核实读、goal 恢复读与派生停止的 goal 读由各自持有版本并核对，公共过滤不得吞掉它们的回包。
                 context.operation = Operation::GoalRead {
                     version: self.stops.version(&thread),
                     inner: Box::new(context.operation.clone()),

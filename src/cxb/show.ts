@@ -1,4 +1,4 @@
-import { showSubagents } from "./subagents";
+import { childEntry, showChildThread, showSubagents } from "./subagents";
 import { sanitizeForTerminal } from "../questions";
 import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type ThreadSummary, type TurnResult } from "./contracts";
 import { readRunLog, readRunRecord, readThreadIndex, listThreadRuns, type LogLine } from "./ledger";
@@ -313,6 +313,9 @@ export const show: CommandHandler = async (ctx) => {
       ctx.out.resultJson({ ok: true, command: "show", ...ref, mode: "tail", items, next: null });
       return 0;
     }
+    // SA1 第 11 节：没有 RunRecord 的子代理线程，说明血缘后从服务器读它的结果。
+    const child = childEntry(ctx.workspace.workspaceDir, ref.threadId);
+    if (child && !child.lastRunId) return await showChildThread(ctx, child, async () => serverResult(ctx, await session.connect(), ref));
     return localResult(ctx, ref);
   } finally { session.dispose(); }
 };

@@ -27,6 +27,10 @@ const BLOCKER_REASONS: Record<string, string> = {
   running: "运行中", stopping: "停止中", lostUnconfirmed: "失联且未确认停下", settling: "正在判定归属", stopInProgress: "停止操作进行中",
   joined: "属于其他客户端", reading: "正在补读结果", purgePending: "永久删除进行中", guardianPending: "有未处理的 gd_ 事项",
   externalTurn: "共享服务器上有别的客户端开始了新一轮",
+  // SA1 第 10 节：子代理树的安全检查集合。
+  hasSubtree: "有子代理子树（删除或归档会连带子树）", subagentInUse: "是子代理且正被运行使用",
+  discoveryIncomplete: "子代理发现不完整", treeStopUnconfirmed: "子代理树的停止尚未确认",
+  childRequestsPending: "子代理有待答事项", relationsChanged: "检查期间子代理关系变化",
 };
 
 /** 阻塞项的下一步：失联或停止中的历史运行按 runId 核实，运行中的先停，gd_ 事项先处理。 */
@@ -35,6 +39,9 @@ function blockerHint(blocker: LifecycleBlocker): string {
   if ((blocker.reason === "lostUnconfirmed" || blocker.reason === "stopping") && blocker.runId) return `cxb stop ${thread} --run ${safeLine(blocker.runId)}`;
   if (blocker.reason === "running") return `cxb stop ${thread}`;
   if (blocker.reason === "guardianPending") return "cxb inbox 处理 gd_ 事项";
+  if (blocker.reason === "hasSubtree") return "子代理线程随父线程保留，不能单独删除父线程";
+  if (blocker.reason === "subagentInUse" || blocker.reason === "treeStopUnconfirmed") return `cxb wait ${thread} 或 cxb stop ${thread}`;
+  if (blocker.reason === "childRequestsPending") return "cxb inbox 处理待答事项";
   return "稍后重试";
 }
 

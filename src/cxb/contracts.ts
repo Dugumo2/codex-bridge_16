@@ -356,9 +356,11 @@ export type Handover = (rpc: BrokerRpc, args: {
 }, opts?: { signal?: AbortSignal; timeoutMs?: number }) => Promise<HandoverResult>;
 
 export interface ServerRequestRouterOptions {
+  /** 本次运行的逻辑根线程（用户发起运行的线程）；review 迁移不改它。带 cxbOrigin 的子线程请求按它接受。 */
   logicalRootThreadId?: string;
+  /** 本次运行的 runId（启动回包或 run/started 之后才知道）；已知时还要与 cxbOrigin.runId 一致。 */
   getRunId?: () => string | undefined;
-  /** 只处理这个线程的请求；别的线程的请求不答（broker 不会转来，出现即记 -v 日志）。 */
+  /** 当前执行线程（review 迁移后是 review 线程）；别的线程只接受带 cxbOrigin 的本运行子线程请求，其余不答。 */
   threadId: string;
   policy: ApprovalPolicyName;
   /** 第一个需要人答的请求到达时调用一次（之后到达的同样不答，留给交接转进 inbox）。 */
@@ -414,6 +416,8 @@ export interface StopReply {
   alreadyStopped: boolean;
   stopOutcome: "confirmed" | "unconfirmed";
   run: RunResult | null;
+  /** 有受管子树时走整树停止，回包带子代理停止报告。 */
+  childrenStop?: ChildrenStopReport;
 }
 
 /**

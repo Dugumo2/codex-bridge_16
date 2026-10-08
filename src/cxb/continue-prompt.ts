@@ -4,6 +4,7 @@
 // 运行记录的读取在 ledger.ts（只读 broker 写的文件）；本文件不读写任何文件。
 
 import { CxbError, rpcFailure, type ProgressItem, type RunResult } from "./contracts";
+import { subagentRefusal } from "./subagents";
 
 /** 追溯原始要求的最大层数：防止损坏的记录成环或过长。 */
 export const MAX_CHAIN_DEPTH = 100;
@@ -77,7 +78,8 @@ export function continueRefusal(error: unknown, threadLabel: string): CxbError |
     case "shuttingDown":
       return new CxbError("BROKER_UNAVAILABLE", "broker 正在关闭，请稍后重试。", { ...opts, retryable: true });
     default:
-      return null;
+      // 子线程不接受直接输入（退出 1）、仍在活动或树停止未确认（退出 8）。
+      return subagentRefusal(error, threadLabel);
   }
 }
 

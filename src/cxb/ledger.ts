@@ -130,8 +130,25 @@ export function readThreadIndex(workspaceDir: string): ThreadIndexEntry[] {
       threadId: entry.threadId, shortId: entry.shortId, lastRunId: entry.lastRunId ?? null,
       updatedAt: Number(entry.updatedAt) || 0, model: entry.model ?? null, preview: entry.preview ?? null,
       cwd: entry.cwd ?? null, meta: entry.meta ?? null,
+      // SA1：子线程的血缘字段只在索引里有时带出（旧索引没有这些键）。
+      ...(typeof entry.parentThreadId === "string" ? { parentThreadId: entry.parentThreadId } : {}),
+      ...(typeof entry.relationKind === "string" ? { relationKind: entry.relationKind } : {}),
+      ...(typeof entry.canAcceptDirectInput === "boolean" ? { canAcceptDirectInput: entry.canAcceptDirectInput } : {}),
+      ...(typeof entry.agentVersion === "string" ? { agentVersion: entry.agentVersion } : {}),
     }))
     .sort((a, b) => b.updatedAt - a.updatedAt || a.threadId.localeCompare(b.threadId));
+}
+
+/** inbox.json 里仍未决（pending、resolving）的事项；文件不存在或无法解析时返回 null（只供展示，broker 不跨重启沿用）。 */
+export function readPendingInbox(workspaceDir: string): import("./contracts").InboxItem[] | null {
+  const path = join(workspaceDir, "inbox.json");
+  if (!existsSync(path)) return null;
+  try {
+    const items = (readPayload(path, "收件箱 inbox.json ") as { items?: unknown } | undefined)?.items;
+    if (!Array.isArray(items)) return null;
+    return items.filter((item): item is import("./contracts").InboxItem => isObject(item) && typeof item.id === "string"
+      && typeof item.threadId === "string" && (item.status === "pending" || item.status === "resolving"));
+  } catch { return null; }
 }
 
 /** 读一条运行记录；不存在返回 null，内容损坏或 runId 不符抛 LOCAL_ERROR。 */
