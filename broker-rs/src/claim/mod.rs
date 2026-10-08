@@ -542,6 +542,10 @@ pub enum Action {
     CancelAppReply {
         op: u64,
     },
+    /// 有界墓碑退役后释放 RPC 层的去重登记，不发送上游消息。
+    ForgetServerRequest {
+        request_key: String,
+    },
     /// 撤销带键的计时（见 [`TimerKey`]）；没有登记时什么都不做。
     Unschedule {
         key: TimerKey,
@@ -851,6 +855,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.prune_reclaims(&mut actions);
     state.lifecycle_drive(&mut actions);
     state.prune_goal_versions();
+    state.prune_contexts();
     // 资格代号只服务于产生它的那一次回包处理。
     state.grant_intent = None;
     #[cfg(test)]
@@ -2290,6 +2295,7 @@ impl Machine {
             if matches!(context.operation, Operation::Forward) {
                 if let Some(thread_id) = thread_id(&context.params) {
                     self.record(thread_id).subscribed = false;
+                    self.detach_evidence(thread_id);
                 }
             }
         } else if context.method == "thread/goal/get" || context.method == "thread/goal/set" {
@@ -2488,6 +2494,7 @@ impl Machine {
                 if self.closing
                     || self.claims.contains_key(&token.thread_id)
                     || self.tree_busy(Some(&token.thread_id))
+                    || self.relation_needs_subscription(&token.thread_id)
                 {
                     return;
                 }
@@ -2499,6 +2506,7 @@ impl Machine {
                         return;
                     }
                     record.subscribed = false;
+                    self.detach_evidence(&token.thread_id);
                     actions.push(Action::Request(RequestContext {
                         resume_retried: false,
                         stream_id: None,

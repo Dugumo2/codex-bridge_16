@@ -223,6 +223,11 @@ impl AppHandle {
         self.inner.cancel_reply(op);
     }
 
+    /// 关系墓碑已退役，释放对应的 RPC 去重键，不产生线上消息。
+    pub(crate) fn forget_server_request(&self, key: &str) {
+        self.inner.forget_server_request(key);
+    }
+
     /// 不回答某个服务端请求，把它移出「处理中」，同一请求再次到达时会重新交付（4.2 节第 1 条的「不答」）。
     pub fn dismiss(&self, id: &Value) {
         self.inner.dismiss(id)

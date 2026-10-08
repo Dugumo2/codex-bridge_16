@@ -407,3 +407,28 @@ fn 发现期限二十秒_迟到回包丢弃_关闭静默取消() {
     assert!(m.discovery_outcome(op).is_none());
     assert!(m.relations.aux.work.is_empty());
 }
+
+#[test]
+fn 修复6_发现完成退役登记且迟到回包无效() {
+    let (mut m, mut mock) = setup(false);
+    for _ in 0..MAX_RESULTS + 10 {
+        let (op, actions) = begin(&mut m);
+        let late = find(&actions, "thread/list", Some(false));
+        finish_simple(&mut m, &mut mock, &actions, vec![], vec![]);
+        assert!(!m.relations.discoveries.contains_key(&op));
+        let result = m.discovery_outcome(op).unwrap().clone();
+        reply(
+            &mut m,
+            &mut mock,
+            late,
+            Ok(json!({"data":[thread(C,P)],"nextCursor":null})),
+        );
+        assert_eq!(m.discovery_outcome(op), Some(&result));
+    }
+    assert!(m.relations.discoveries.is_empty());
+    assert!(m.relations.aux.work.is_empty());
+    assert_eq!(m.relations.aux.results.len(), MAX_RESULTS);
+    begin(&mut m);
+    m.relations_shutdown(&mut Vec::new());
+    assert!(m.relations.discoveries.is_empty());
+}

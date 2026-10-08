@@ -137,6 +137,7 @@ impl Machine {
                     "子线程请求回查队列已满，归属未知的请求 {} 不答",
                     key.1
                 )));
+                self.write_tombstone(key.clone(), actions);
                 return true;
             }
         }
@@ -164,6 +165,7 @@ impl Machine {
                 bytes,
                 from_held: false,
                 inbox_item: None,
+                revoke_requested: false,
             },
         );
         self.route_record(&key, actions);
@@ -188,7 +190,9 @@ impl Machine {
             .unwrap_or_default();
         if self.claims.contains_key(&record.source_thread_id) {
             // 来源线程后来有了自己的认领：交回现有逻辑。
-            self.forget_request(key);
+            // 请求仍然存活，RPC 去重登记随接手方结算，不进入关系墓碑。
+            self.relations.aux.request_meta.remove(key);
+            self.relations.requests.remove(key);
             let from_held = meta.is_some_and(|m| m.from_held);
             self.server_request(held(&record, forward_id), from_held, actions);
             return;
@@ -267,7 +271,7 @@ impl Machine {
                 } else {
                     // 已证明自有但 owner 不在线：按现有失败规则回错误。
                     let request = held(&record, forward_id);
-                    self.forget_request(key);
+                    self.forget_request(key, actions);
                     crate::requests::reject_no_client(request, actions);
                     self.refresh_member(
                         &run,
@@ -290,14 +294,19 @@ impl Machine {
         }
     }
 
-    fn forget_request(&mut self, key: &(u64, String)) -> Option<ChildRequest> {
+    fn forget_request(
+        &mut self,
+        key: &(u64, String),
+        actions: &mut Vec<Action>,
+    ) -> Option<ChildRequest> {
+        self.write_tombstone(key.clone(), actions);
         self.relations.aux.request_meta.remove(key);
         self.relations.requests.remove(key)
     }
 
     /// 确定不答：静默丢弃并记诊断，不发 Dismiss。
     fn drop_request(&mut self, key: &(u64, String), reason: &str, actions: &mut Vec<Action>) {
-        let Some(record) = self.forget_request(key) else {
+        let Some(record) = self.forget_request(key, actions) else {
             return;
         };
         actions.push(Action::Debug(format!(
@@ -365,7 +374,7 @@ impl Machine {
         let params = record.params.clone().unwrap_or_else(|| json!({}));
         match policy::decide(policy, &record.method, &params) {
             policy::Decision::Answer(result) => {
-                self.forget_request(key);
+                self.forget_request(key, actions);
                 actions.push(Action::ServerResult {
                     id: record.upstream_request_id.clone(),
                     result,
@@ -376,7 +385,7 @@ impl Machine {
                 return;
             }
             policy::Decision::MethodNotFound => {
-                self.forget_request(key);
+                self.forget_request(key, actions);
                 let forward_id = String::new();
                 crate::requests::method_not_found(held(&record, forward_id), actions);
             }
@@ -446,7 +455,7 @@ impl Machine {
             }
             // 容量已满时登记出口已按失败规则回答。
             None => {
-                self.forget_request(key);
+                self.forget_request(key, actions);
             }
         }
         self.refresh_member(
@@ -514,7 +523,7 @@ impl Machine {
             if policy.shared {
                 self.drop_request(key, "清理期间共享模式不接管动态工具", actions);
             } else {
-                self.forget_request(key);
+                self.forget_request(key, actions);
                 crate::requests::method_not_found(held(&record, String::new()), actions);
                 if let Some(run) = &record.run_id {
                     self.refresh_member(
@@ -664,7 +673,7 @@ impl Machine {
         self.refresh_members(run, MemberChange::Request, actions);
     }
 
-    /// 按运行撤销此前全部非 Writing 阶段的子请求与收件箱事项（不答、不 Dismiss）；Writing 按提交边界结算。
+    /// 按运行撤权；排队回答尝试取消，已写出的回答按提交边界结算一次。
     pub(super) fn routing_revoke_run(&mut self, run: &str, actions: &mut Vec<Action>) {
         let keys: Vec<(u64, String)> = self
             .relations
@@ -678,7 +687,15 @@ impl Machine {
                 continue;
             };
             match record.stage {
-                ChildRequestStage::Writing { .. } => continue,
+                ChildRequestStage::Writing { op, .. } => {
+                    if let Some(meta) = self.relations.aux.request_meta.get_mut(&key) {
+                        if !meta.revoke_requested {
+                            meta.revoke_requested = true;
+                            actions.push(Action::CancelAppReply { op });
+                        }
+                    }
+                    continue;
+                }
                 ChildRequestStage::Forwarded { forward_id, .. } => {
                     self.set_stage(&key, ChildRequestStage::Revoked);
                     self.take_forward(&forward_id, actions);
@@ -689,7 +706,7 @@ impl Machine {
                 }
                 _ => {}
             }
-            self.forget_request(&key);
+            self.forget_request(&key, actions);
             actions.push(Action::Debug(format!(
                 "运行 {run} 收尾，撤销子线程 {} 的请求 {}",
                 record.source_thread_id, key.1
@@ -804,7 +821,7 @@ impl Machine {
                 record.stage,
                 ChildRequestStage::Inbox { .. } | ChildRequestStage::Writing { .. }
             ) {
-                self.forget_request(&key);
+                self.forget_request(&key, actions);
             }
             if let Some(run) = &record.run_id {
                 self.refresh_member(
@@ -832,6 +849,9 @@ impl Machine {
                 .map(|(k, _)| k.clone())
             {
                 tombstones.remove(&oldest);
+                actions.push(Action::ForgetServerRequest {
+                    request_key: oldest.1.clone(),
+                });
                 actions.push(Action::Warn(format!(
                     "子线程请求墓碑达到上限 {MAX_TOMBSTONES}，淘汰最旧一条 {}",
                     oldest.1
@@ -882,7 +902,16 @@ impl Machine {
         }
         self.relations.aux.tombstone_timer = None;
         let now = self.clock.mono_ms;
-        self.relations.tombstones.retain(|_, at| *at > now);
+        self.relations.tombstones.retain(|key, at| {
+            if *at <= now {
+                actions.push(Action::ForgetServerRequest {
+                    request_key: key.1.clone(),
+                });
+                false
+            } else {
+                true
+            }
+        });
         self.schedule_tombstones(actions);
     }
 
@@ -903,7 +932,7 @@ impl Machine {
         let Some(key) = key else {
             return;
         };
-        let record = self.forget_request(&key).expect("子线程请求存在");
+        let record = self.forget_request(&key, actions).expect("子线程请求存在");
         if let Some(run) = &record.run_id {
             self.refresh_member(
                 run,
@@ -935,12 +964,12 @@ impl Machine {
         }
     }
 
-    /// 写入确认：Written 已提交（随后事项以 resolved 关闭）；失败或撤回回到收件箱阶段。
+    /// 写入确认：Written 已提交；撤权后的失败或取消关闭事项，其余失败才允许重试。
     pub(super) fn routing_reply_written(
         &mut self,
         op: u64,
         outcome: &crate::inbox::ReplyOutcome,
-        _actions: &mut Vec<Action>,
+        actions: &mut Vec<Action>,
     ) {
         if *outcome == crate::inbox::ReplyOutcome::Written {
             return;
@@ -961,7 +990,18 @@ impl Machine {
                 .get(&key)
                 .and_then(|m| m.inbox_item.clone())
                 .unwrap_or_default();
-            self.set_stage(&key, ChildRequestStage::Inbox { item_id });
+            if self
+                .relations
+                .aux
+                .request_meta
+                .get(&key)
+                .is_some_and(|m| m.revoke_requested)
+            {
+                // 写入结果已到达：清掉旧 op 后按普通撤销出口关闭，不能回到可重试状态。
+                self.inbox_cancel_child_reply(&item_id, actions);
+            } else {
+                self.set_stage(&key, ChildRequestStage::Inbox { item_id });
+            }
         }
     }
 
@@ -989,7 +1029,7 @@ impl Machine {
         let Some(key) = key else {
             return;
         };
-        let record = self.forget_request(&key).expect("子线程请求存在");
+        let record = self.forget_request(&key, actions).expect("子线程请求存在");
         if let Some(run) = &record.run_id {
             self.refresh_member(
                 run,
@@ -1195,7 +1235,7 @@ impl Machine {
             .map(|(k, _)| k.clone())
             .collect();
         for key in expired {
-            if let Some(record) = self.forget_request(&key) {
+            if let Some(record) = self.forget_request(&key, actions) {
                 actions.push(Action::Warn(format!(
                     "子线程 {} 的请求 {} 回查 {} 秒仍未证明归属，不答",
                     record.source_thread_id,
@@ -1241,14 +1281,14 @@ impl Machine {
             match record.stage {
                 // 已证明自有、暂存待定案的请求按关闭规则回错误。
                 ChildRequestStage::Held => {
-                    self.forget_request(&key);
+                    self.forget_request(&key, actions);
                     actions.push(Action::ServerError {
                         id: record.upstream_request_id,
                         error: crate::requests::handler_error(SHUTDOWN),
                     });
                 }
                 ChildRequestStage::Lookup => {
-                    self.forget_request(&key);
+                    self.forget_request(&key, actions);
                 }
                 // 转发与收件箱阶段由 shutdown_forwards、inbox_shutdown 按现有关闭规则结算。
                 _ => {}

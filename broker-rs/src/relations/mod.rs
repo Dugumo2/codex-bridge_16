@@ -111,6 +111,8 @@ pub struct RequestMeta {
     pub from_held: bool,
     /// 进收件箱后的事项编号（Writing 阶段失败时回到收件箱阶段用）。
     pub inbox_item: Option<String>,
+    /// 已请求撤权；写入失败或取消后不得恢复旧回答权。
+    pub revoke_requested: bool,
 }
 
 /// 等待归属结论的 Guardian 拒绝通知。
@@ -308,6 +310,7 @@ impl Machine {
     ) {
         self.facts_claim_settled(thread, claim_id, own, actions);
         self.reroute_held(thread, actions);
+        self.ensure_sweep(actions);
     }
     pub fn on_handoff(&mut self, run_id: &str, kind: HandoffKind, actions: &mut Vec<Action>) {
         self.routing_handoff(run_id, kind, actions)
@@ -563,11 +566,18 @@ impl Machine {
         let now = self.clock.mono_ms;
         let mut next: Option<u64> = None;
         let mut consider = |at: u64| next = Some(next.map_or(at, |n: u64| n.min(at)));
-        for meta in self.relations.aux.request_meta.values() {
-            consider(meta.lookup_deadline_ms);
+        for (key, meta) in &self.relations.aux.request_meta {
+            if self
+                .relations
+                .requests
+                .get(key)
+                .is_some_and(|r| r.stage == ChildRequestStage::Lookup)
+            {
+                consider(meta.lookup_deadline_ms);
+            }
         }
         for op in self.relations.operations.values() {
-            if op.outcome == EvidenceOutcome::Pending && !op.parent_ended {
+            if self.evidence_expirable(op) {
                 consider(op.expires_at_ms);
             }
         }

@@ -40,6 +40,15 @@ fn execute(client: &rpc::ClientHandle, actions: Vec<Action>) {
 
 #[tokio::test]
 async fn 关闭按原请求编号最多写一份回答() {
+    check_writer(false).await;
+}
+
+#[tokio::test]
+async fn 修复2_真实写任务撤权时取消排队项且只提交一次() {
+    check_writer(true).await;
+}
+
+async fn check_writer(revoke_child: bool) {
     for phase in ["排队", "写出中", "已写出尚未交付确认", "写入失败"] {
         let (_input, inbound) = mpsc::unbounded_channel();
         let (entered, mut entering) = mpsc::unbounded_channel();
@@ -56,7 +65,7 @@ async fn 关闭按原请求编号最多写一份回答() {
             None,
         );
         let mut m = machine();
-        own(&mut m, "t");
+        own(&mut m, if revoke_child { "父" } else { "t" });
         let app_id = json!("原服务端请求-7");
         let id = register(
             &mut m,
@@ -65,6 +74,40 @@ async fn 关闭按原请求编号最多写一份回答() {
             app_id.clone(),
             &mut Vec::new(),
         );
+        if revoke_child {
+            use crate::relations::{ChildRequest, ChildRequestStage, RequestMeta};
+            let key = (0, proto::request_id_key(&app_id));
+            m.ensure_context("run");
+            m.inbox.entries.get_mut(&id).unwrap().item.root_thread_id = Some("父".into());
+            m.relations.requests.insert(
+                key.clone(),
+                ChildRequest {
+                    conn_epoch: 0,
+                    upstream_request_id: app_id.clone(),
+                    method: "未来方法".into(),
+                    params: Some(json!({})),
+                    source_thread_id: "t".into(),
+                    source_turn_id: Some("turn".into()),
+                    run_id: Some("run".into()),
+                    received_at_ms: 0,
+                    deadline_ms: 100_000,
+                    stage: ChildRequestStage::Inbox {
+                        item_id: id.clone(),
+                    },
+                },
+            );
+            m.relations.aux.request_meta.insert(
+                key,
+                RequestMeta {
+                    forward_id: String::new(),
+                    lookup_deadline_ms: 30_000,
+                    bytes: 0,
+                    from_held: false,
+                    inbox_item: Some(id.clone()),
+                    revoke_requested: false,
+                },
+            );
+        }
         if phase == "排队" {
             client.notify("前置屏障", None);
             assert_eq!(
@@ -85,8 +128,15 @@ async fn 关闭按原请求编号最多写一份回答() {
         } else {
             None
         };
-        let (next, closing) = step(m, Event::Shutdown);
-        m = next;
+        let closing = if revoke_child {
+            let mut actions = Vec::new();
+            m.on_handoff("run", crate::relations::HandoffKind::External, &mut actions);
+            actions
+        } else {
+            let (next, actions) = step(m, Event::Shutdown);
+            m = next;
+            actions
+        };
         // 此处包含关闭之后的认领释放，必须保留待确认 op。
         assert_eq!(m.inbox.entries[&id].item.status, InboxStatus::Resolving);
         assert!(!closing
@@ -136,7 +186,7 @@ async fn 关闭按原请求编号最多写一份回答() {
             }
         }
         assert!(replies.len() <= 1, "阶段 {phase} 不得重复回答：{replies:?}");
-        if phase == "写入失败" {
+        if phase == "写入失败" || revoke_child && phase == "排队" {
             assert!(replies.is_empty());
         } else if phase == "排队" {
             assert_eq!(replies.len(), 1);
@@ -157,5 +207,11 @@ async fn 关闭按原请求编号最多写一份回答() {
             }
         );
         assert!(m.inbox.operations.is_empty());
+        if revoke_child {
+            assert!(m.relations.requests.is_empty());
+            assert!(!resolve(&mut m, 2, &id, json!({"回答":true}))
+                .iter()
+                .any(|a| matches!(a, Action::AppReplyAcked { .. })));
+        }
     }
 }
