@@ -143,6 +143,7 @@ impl Machine {
                 id: app,
                 payload: Ok(payload),
             });
+            self.child_inbox_writing(id, op);
         } else if answer["override"] == false {
             self.finish_inbox(id, InboxStatus::Resolved, None, actions);
             return;
