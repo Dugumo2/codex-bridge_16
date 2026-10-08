@@ -922,6 +922,8 @@ impl Machine {
     }
 
     pub(crate) fn lifecycle_drive(&mut self, actions: &mut Vec<Action>) {
+        // SA-b：rm、purge 的子树发现检查有结论时，先判定再交给下面的生命周期推进。
+        self.subagent_lifecycle_poll(actions);
         if self.closing || self.quiescing {
             for pending in std::mem::take(&mut self.lifecycle.history) {
                 response(

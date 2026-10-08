@@ -332,3 +332,46 @@ test("文件审批兼容实际 grantRoot 和缺路径请求，条目数组只展
   expect(output.text).toContain("src/文件.ts");
   expect(output.text).not.toContain("大段补丁正文");
 });
+
+// SA1 接口第 5 节：路由器保存逻辑根与执行线程，按 cxbOrigin 接受本次运行的子线程请求。
+const origin = (patch: Record<string, unknown> = {}) => ({ rootThreadId: "根线程", runId: "run-1", parentThreadId: "根线程",
+  relationKind: "subagent", sourceThreadId: "子线程", ...patch });
+
+test("子线程请求：cxbOrigin 的逻辑根与运行一致才接受，按策略回答", async () => {
+  let runId: string | undefined;
+  const needs: string[] = [];
+  disposers.push(attachServerRequests(rpc, { threadId: "根线程", logicalRootThreadId: "根线程", getRunId: () => runId,
+    policy: "never", onNeedsHuman: (method) => needs.push(method) }));
+  // 早于启动回包（runId 未知）到达的子请求照收。
+  const early = request("item/commandExecution/requestApproval", { threadId: "子线程", cxbOrigin: origin() });
+  await drain();
+  expect(messages.find((m) => m.id === early)?.result).toEqual({ decision: "accept" });
+  runId = "run-1";
+  const accepted = request("item/fileChange/requestApproval", { threadId: "子线程", cxbOrigin: origin() });
+  // 别的运行、别的逻辑根、来源线程不符、没有 cxbOrigin：都不答。
+  const otherRun = request("item/commandExecution/requestApproval", { threadId: "子线程", cxbOrigin: origin({ runId: "run-2" }) });
+  const otherRoot = request("item/commandExecution/requestApproval", { threadId: "子线程", cxbOrigin: origin({ rootThreadId: "别的根" }) });
+  const mismatch = request("item/commandExecution/requestApproval", { threadId: "别的线程", cxbOrigin: origin() });
+  const bare = request("item/commandExecution/requestApproval", { threadId: "子线程" });
+  await drain();
+  expect(messages.find((m) => m.id === accepted)?.result).toEqual({ decision: "accept" });
+  for (const id of [otherRun, otherRoot, mismatch, bare]) expect(messages.find((m) => m.id === id)).toBeUndefined();
+  // 需要人答的子请求同样触发交接。
+  request("item/tool/requestUserInput", { threadId: "子线程", cxbOrigin: origin() });
+  await drain();
+  expect(needs).toEqual(["item/tool/requestUserInput"]);
+});
+
+test("review 迁移只更新执行线程：逻辑根不变，孙代理的请求仍能到达", async () => {
+  // run.ts 在迁移时以新的执行线程重新登记，逻辑根仍是原线程。
+  disposers.push(attachServerRequests(rpc, { threadId: "审查线程", logicalRootThreadId: "根线程", getRunId: () => "run-1",
+    policy: "never", onNeedsHuman() {} }));
+  const own = request("item/commandExecution/requestApproval", { threadId: "审查线程" });
+  const grandchild = request("item/commandExecution/requestApproval", { threadId: "孙线程",
+    cxbOrigin: origin({ parentThreadId: "审查线程", sourceThreadId: "孙线程" }) });
+  const oldRoot = request("item/commandExecution/requestApproval", { threadId: "根线程" });
+  await drain();
+  expect(messages.find((m) => m.id === own)?.result).toEqual({ decision: "accept" });
+  expect(messages.find((m) => m.id === grandchild)?.result).toEqual({ decision: "accept" });
+  expect(messages.find((m) => m.id === oldRoot)).toBeUndefined();
+});

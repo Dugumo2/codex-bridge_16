@@ -4,7 +4,7 @@ import { questionSummary, sanitizeForTerminal } from "../questions";
 import { NO_RESPONSE } from "../rpc";
 import {
   CxbError, rpcFailure, type AttachServerRequests, type DecidePolicy, type ErrorCode,
-  type Handover, type HandoverResult, type InboxItem, type RenderPending,
+  type Handover, type HandoverResult, type InboxItem, type RenderPending, type ServerRequestRouterOptions,
 } from "./contracts";
 
 function object(value: unknown): Record<string, unknown> {
@@ -29,6 +29,24 @@ export const decidePolicy: DecidePolicy = (policy, method, params) => {
   }
 };
 
+/**
+ * 服务端请求属于本次运行的哪一部分（SA1 接口第 5 节）：`threadId` 等于当前执行线程照旧处理；
+ * 否则只接受 broker 标注的子线程请求——`cxbOrigin.rootThreadId` 等于本次运行的逻辑根，runId 已知时还要一致，
+ * 来源线程与请求的 threadId 相同。broker 只把子请求转给运行的 owner 连接，早于启动回包到达的也照收。
+ */
+export function requestOrigin(opts: Pick<ServerRequestRouterOptions, "threadId" | "logicalRootThreadId" | "getRunId">,
+  params: unknown): "execution" | "child" | null {
+  const p = object(params);
+  if (p.threadId === opts.threadId) return "execution";
+  const origin = object(p.cxbOrigin);
+  const root = opts.logicalRootThreadId;
+  if (!root || typeof origin.rootThreadId !== "string" || origin.rootThreadId !== root) return null;
+  if (typeof p.threadId !== "string" || origin.sourceThreadId !== p.threadId) return null;
+  const runId = opts.getRunId?.();
+  if (runId && origin.runId !== runId) return null;
+  return "child";
+}
+
 export const attachServerRequests: AttachServerRequests = (rpc, opts) => {
   let active = true;
   let needsHuman = false;
@@ -38,10 +56,12 @@ export const attachServerRequests: AttachServerRequests = (rpc, opts) => {
   const unsubscribe = rpc.onAnyRequest((method, params) => {
     // RPC 已排入微任务、但尚未调用处理器时撤销，也必须保持静默。
     if (!active) return NO_RESPONSE;
-    if (object(params).threadId !== opts.threadId) {
-      log("忽略不属于当前线程的服务端请求");
+    const origin = requestOrigin(opts, params);
+    if (!origin) {
+      log("忽略不属于当前运行的服务端请求");
       return NO_RESPONSE;
     }
+    if (origin === "child") log("服务端请求来自本次运行的子代理线程");
     const decision = decidePolicy(opts.policy, method, params);
     // 未知方法名也可能含任意数据，只记录白名单类别。
     const kind = method === "item/tool/requestUserInput" ? "提问"

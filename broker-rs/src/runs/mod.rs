@@ -170,6 +170,8 @@ pub struct Runs {
     read_queue: std::collections::VecDeque<u64>,
     /// 不同线程的历史存储可能不同，只抑制重复告警，不全局禁用分页。
     paging_fallback_logged: bool,
+    /// SA-b：树级停止未确认（或仍有清理屏障）的运行，内存淘汰时保留。
+    pub(crate) tree_retained: std::collections::HashSet<RunId>,
     phase: Phase,
     next_generation: u64,
     cleanup_scheduled: bool,
@@ -1332,11 +1334,102 @@ fn run_status(status: TurnStatus) -> RunStatus {
 
 impl Machine {
     /// SA-b：原子写报告和聚合停止账本，再唯一提交 ended；严禁调用普通终态映射。
+    /// 终态与原因由树协调器按第 8.4 节优先级算好（见 `stop::tree::commit_status`），这里只落账：
+    /// 同一次写盘里 childrenStop、stopOutcome/stopCheck 与 ended 一起出现，不存在「已 ended 而无报告」的记录。
     pub fn commit_tree_finish(
         &mut self,
-        _commit: crate::stop::tree::TreeFinishCommit,
+        commit: crate::stop::tree::TreeFinishCommit,
         actions: &mut Vec<Action>,
     ) {
-        actions.push(Action::Warn("SA 树结束提交尚未启用".into()));
+        self.runs.trace("commit_tree_finish");
+        if self.runs.phase != Phase::Open {
+            return;
+        }
+        let run = commit.snapshot.identity.run_id.clone();
+        let check = self.tree_check(commit.report.tree_op);
+        let owner = match &commit.snapshot.owner {
+            Some(crate::claim::Owner::Client(conn)) => {
+                let thread = &commit.snapshot.identity.execution_thread_id;
+                let gone = self.claims.get(thread).is_some_and(|c| c.owner_gone);
+                (!gone && self.live_conns.contains(conn)).then_some(*conn)
+            }
+            _ => None,
+        };
+        let Some(record) = self.runs.runs.get_mut(&run) else {
+            return;
+        };
+        if matches!(record.state, RunState::Ended | RunState::Lost) {
+            return;
+        }
+        let confirmed = commit.report.children.phase == crate::stop::tree::TreePhase::Confirmed;
+        self.runs.active.remove(&run);
+        record.children_stop = Some(commit.report.children.clone());
+        record.stop_outcome = Some(if confirmed {
+            StopOutcome::Confirmed
+        } else {
+            StopOutcome::Unconfirmed
+        });
+        record.stop_check = (!confirmed).then_some(check);
+        record.state = RunState::Ended;
+        record.status = Some(commit.status);
+        record.interrupt_reason = commit.interrupt_reason;
+        record.ended_at = Some(self.clock.now_ms);
+        let thread = record.thread_id.clone();
+        if confirmed {
+            self.runs.verifying_history.remove(&run);
+        }
+        self.runs.notices.push(RunNotice::RunEnded {
+            thread_id: thread,
+            run_id: run.clone(),
+            owner,
+        });
+        self.runs.put(&run, actions);
+        self.runs.touch(&run, self.clock.now_ms, actions);
+        let detail = format!(
+            "{run}（子代理树 {:?}，停止 {:?}）",
+            commit.report.children.trigger, commit.report.children.phase
+        );
+        self.runs
+            .log(&run, self.clock.now_ms, "运行结束", &detail, actions);
+        self.runs.evict();
+    }
+
+    /// SA-b：树停止报告更新（提交前与提交后的核实都走这里，不改 ended、不发 RunEnded）。
+    /// confirmed 时 stopOutcome=confirmed、stopCheck 清空；首次期限后未确认写 unconfirmed 与当前聚合检查；
+    /// pending 只保留当前检查，不宣告结论。
+    pub(crate) fn run_tree_report(
+        &mut self,
+        run: &str,
+        report: crate::stop::tree::ChildrenStopReport,
+        check: StopCheck,
+        actions: &mut Vec<Action>,
+    ) {
+        self.runs.trace("run_tree_report");
+        if self.runs.phase != Phase::Open {
+            return;
+        }
+        let Some(record) = self.runs.runs.get_mut(run) else {
+            return;
+        };
+        use crate::stop::tree::TreePhase;
+        let (outcome, stop_check) = match report.phase {
+            TreePhase::Confirmed => (Some(StopOutcome::Confirmed), None),
+            TreePhase::Unconfirmed => (Some(StopOutcome::Unconfirmed), Some(check)),
+            TreePhase::Pending => (record.stop_outcome, Some(check)),
+        };
+        if record.children_stop.as_ref() == Some(&report)
+            && record.stop_outcome == outcome
+            && record.stop_check == stop_check
+        {
+            return;
+        }
+        record.children_stop = Some(report);
+        record.stop_outcome = outcome;
+        record.stop_check = stop_check;
+        if outcome == Some(StopOutcome::Confirmed) {
+            self.runs.verifying_history.remove(run);
+        }
+        self.runs.updated.insert(run.into(), self.clock.now_ms);
+        self.runs.put(run, actions);
     }
 }

@@ -433,8 +433,8 @@ pub(crate) fn utc_timestamp(now: u64) -> String {
 }
 
 impl super::Runs {
-    /// SA-b：树未确认或仍有清理屏障时禁止淘汰。骨架不改变现有淘汰结果。
-    pub fn tree_retention_required(&self, _run_id: &str) -> bool {
-        false
+    /// SA-b：树未确认或仍有清理屏障时禁止淘汰（登记由树协调器在发起时加入、确认或取消时移除）。
+    pub fn tree_retention_required(&self, run_id: &str) -> bool {
+        self.tree_retained.contains(run_id)
     }
 }

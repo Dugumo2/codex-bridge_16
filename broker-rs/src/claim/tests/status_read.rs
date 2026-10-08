@@ -1334,14 +1334,6 @@ fn 完成按调用方分派到各处理函数() {
     // ContinueCheck、StopVerify、Reconcile、LateSettlement 已由 H2-b 实现，分派由各自的用例覆盖。
     for (caller, warning) in [
         (StatusCaller::Settlement { attempt: 0 }, "H2 调用点尚未迁移"),
-        (
-            StatusCaller::DerivedStopVerify {
-                tree_op: 1,
-                thread: T.into(),
-                round: 1,
-            },
-            "SA 派生核实回调尚未启用",
-        ),
     ] {
         let mut m = Machine::new(true);
         begin_with(&mut m, StatusQuery::Busy, caller.clone());
