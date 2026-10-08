@@ -89,6 +89,8 @@ export function writeMockCodexScript(dir: string, script: string): void {
     () => readFileSync(join(import.meta.dir, "resume-history.ts"), "utf8").replace(/^export /gm, ""));
   script = script.replace('import { createSubagentMock } from "../../test-support/subagent-mock";',
     () => readFileSync(join(import.meta.dir, "subagent-mock.ts"), "utf8").replace(/^export /gm, ""));
+  script = script.replace('import { createStatusHistory } from "../../test-support/status-history";',
+    () => readFileSync(join(import.meta.dir, "status-history.ts"), "utf8").replace(/^export /gm, ""));
   if (process.platform === "win32") {
     writeFileSync(join(dir, "codex-mock.ts"), script);
     writeFileSync(join(dir, "codex-proxy.ts"), MOCK_PROXY_SCRIPT);
@@ -197,6 +199,7 @@ export function createMockCodex(dir: string, opts?: {
 import { appendFileSync } from "node:fs";
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
 import { createSubagentMock } from "../../test-support/subagent-mock";
+import { createStatusHistory } from "../../test-support/status-history";
 // broker 测试使用的模拟 codex app-server。
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
@@ -204,7 +207,10 @@ if (args[0] !== "app-server") {
   process.exit(1);
 }
 
-const respond = fixtureSender();
+// 只有一个写出队列；状态历史从包装后的发送函数学习本模拟发出的轮次与条目。
+const rawRespond = fixtureSender();
+const statusHistory = createStatusHistory(${JSON.stringify(opts?.statusRead ?? {})}, rawRespond, longResumeTurns);
+const respond = statusHistory.wrap(rawRespond);
 const subagents = createSubagentMock(respond, ${JSON.stringify(opts?.subagents ?? {})});
 
 let buffer = "";
@@ -239,12 +245,13 @@ process.stdin.on("data", (chunk) => {
     }
 
     calls.push(msg.method);
+    if (statusHistory.handle(msg)) continue;
     switch (msg.method) {
       case "thread/resume":
         respond({ id: msg.id, result: {
           thread: { id: msg.params?.threadId || "thread-001", preview: "", modelProvider: "openai",
             createdAt: Date.now(), updatedAt: Date.now(), status: { type: "idle" }, path: null, cwd: "/tmp",
-            cliVersion: "0.1.0", source: "mock", name: null, agentNickname: null, agentRole: null, gitInfo: null, turns: ${opts?.longHistory ?? false} && msg.params?.excludeTurns !== true ? longResumeTurns() : [] },
+            cliVersion: "0.1.0", source: "mock", name: null, agentNickname: null, agentRole: null, gitInfo: null, turns: ${!!(opts?.longHistory || opts?.statusRead?.longHistory)} && msg.params?.excludeTurns !== true ? longResumeTurns() : [] },
           model: "gpt-5.3-codex", modelProvider: "openai", cwd: "/tmp", approvalPolicy: "never", sandbox: null,
         }});
         break;

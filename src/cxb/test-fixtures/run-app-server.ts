@@ -1,6 +1,7 @@
 import { writeFileSync, renameSync } from "node:fs";
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
 import { createSubagentMock } from "../../test-support/subagent-mock";
+import { createStatusHistory } from "../../test-support/status-history";
 
 // 仅甲路使用的 app-server 桩；所有时序由 fixture/control 显式放行。
 const pidFile = process.env.RUN_FIXTURE_PID!;
@@ -15,7 +16,10 @@ let nextThread = 0;
 let nextTurn = 0;
 let released = false;
 let pendingStart: { id: unknown; threadId: string; turn: any } | undefined;
-const send = fixtureSender();
+// 只有一个写出队列；状态历史从包装后的发送函数学习本桩发出的轮次与条目。
+const rawSend = fixtureSender();
+const statusHistory = createStatusHistory(scenario.statusRead, rawSend, longResumeTurns);
+const send = statusHistory.wrap(rawSend);
 const subagents = createSubagentMock(send, scenario.subagents);
 const reply = (id: unknown, result: unknown) => send({ id, result });
 const notify = (method: string, params: unknown) => send({ method, params });
@@ -56,6 +60,7 @@ process.stdin.on("data", (chunk) => {
     if (!msg.method) continue;
     const p = msg.params ?? {};
     calls.push({ method: msg.method, params: p });
+    if (statusHistory.handle(msg)) continue;
     switch (msg.method) {
       case "initialize": reply(msg.id, { userAgent: "甲路模拟 Codex" }); break;
       case "initialized": break;
@@ -70,7 +75,7 @@ process.stdin.on("data", (chunk) => {
         if (scenario.warnAsk) notify("configWarning", { summary: `忽略 ${key}`, details: "秘密不应回显" });
         const id = p.threadId ?? `thread-${++nextThread}`;
         if (id === "missing") { send({ id: msg.id, error: { code: -32000, message: "thread not found" } }); break; }
-        reply(msg.id, { thread: { ...thread(id), ...(scenario.longHistory && msg.method === "thread/resume" ? { turns: p.excludeTurns === true ? [] : longResumeTurns() } : {}) }, model: p.model ?? "mock-model", reasoningEffort: p.config?.model_reasoning_effort ?? "high", cwd: process.cwd(), sandbox: { type: p.sandbox === "read-only" ? "readOnly" : "workspaceWrite" }, approvalPolicy: p.approvalPolicy ?? "never" });
+        reply(msg.id, { thread: { ...thread(id), ...((scenario.longHistory || scenario.statusRead?.longHistory) && msg.method === "thread/resume" ? { turns: p.excludeTurns === true ? [] : longResumeTurns() } : {}) }, model: p.model ?? "mock-model", reasoningEffort: p.config?.model_reasoning_effort ?? "high", cwd: process.cwd(), sandbox: { type: p.sandbox === "read-only" ? "readOnly" : "workspaceWrite" }, approvalPolicy: p.approvalPolicy ?? "never" });
         break;
       }
       case "thread/memoryMode/set": reply(msg.id, {}); break;

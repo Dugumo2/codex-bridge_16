@@ -5,8 +5,8 @@ pub mod derived;
 pub mod tree;
 
 use crate::claim::{
-    Action, ClaimToken, ClientRequest, ConnId, Machine, Operation, RequestContext, State,
-    StopReason, TimerKind,
+    status_read::StatusCaller, Action, ClaimToken, ClientRequest, ConnId, Machine, Operation,
+    RequestContext, State, StopReason, TimerKind,
 };
 use crate::proto::{self, code};
 use crate::runs::{ReleaseKind, RunState, StopCheck, StopOutcome};
@@ -1883,6 +1883,35 @@ impl Machine {
         }
         if self.closing {
             self.apply_reply(context, Err(error), actions);
+            return;
+        }
+        if let Operation::StatusRead {
+            read_id,
+            generation,
+        } = context.operation
+        {
+            // H2：对账与迟到归属改用状态读取后，按 StatusCaller 识别，效果与原 Operation 判定相同。
+            let current_reconcile = match self.status_read_caller(read_id, generation) {
+                Some(StatusCaller::Reconcile { generation, round }) => self
+                    .stops
+                    .reconciliations
+                    .get(generation)
+                    .is_some_and(|reg| reg.round == *round),
+                Some(StatusCaller::LateSettlement { generation, round }) => {
+                    self.stops.late.iter().any(|reg| {
+                        reg.generation == *generation && reg.round == *round && reg.late_settling
+                    })
+                }
+                _ => false,
+            };
+            if current_reconcile && !self.app_server_unresponsive {
+                self.app_server_unresponsive = true;
+                actions.push(Action::Warn(
+                    "流式启动和后续对账读取均超时，Codex 无响应，暂停接收新的流式请求".into(),
+                ));
+            }
+            // 迟到回包仍由 RPC 登记交回，按代号丢弃；它带来的存活证据照常恢复熔断状态。
+            self.status_read_unresponsive(read_id, generation, actions);
             return;
         }
         if let Operation::GoalChange { id, .. } = &context.operation {
