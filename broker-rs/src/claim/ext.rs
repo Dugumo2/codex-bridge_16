@@ -170,7 +170,8 @@ impl Machine {
         true
     }
 
-    /// 仅三处内部恢复使用；已有顶层参数优先，不深合并客户端或调用点的 config。
+    /// 仅三处内部恢复使用，调用方只传自建对象，不接收客户端参数。
+    /// 已有顶层参数优先，唯独 excludeTurns 强制覆盖为 true；不深合并调用点的 config。
     pub(crate) fn resume_params(&self, thread: &str, mut params: Value) -> Value {
         params["excludeTurns"] = json!(true);
         if let Some(overrides) = self
@@ -1148,6 +1149,13 @@ mod n2_tests {
         );
         let existing = json!({"threadId":"线程","excludeTurns":true,"config":{"explicit":false},"developerInstructions":"已有指令","persistExtendedHistory":false});
         assert_eq!(m.resume_params("线程", existing.clone()), existing);
+        assert_eq!(
+            m.resume_params(
+                "线程",
+                json!({"threadId":"线程","excludeTurns":false,"config":{"explicit":false},"developerInstructions":"已有指令","persistExtendedHistory":false})
+            ),
+            existing
+        );
         call(&mut m, json!({"threadId":"线程","overrides":null}));
         assert!(m
             .runs

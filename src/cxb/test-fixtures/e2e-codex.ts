@@ -16,9 +16,15 @@
 //                     test-support/status-history.ts 接管 thread/read、thread/turns/list、thread/items/list。
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
+// CXB_INLINE_RESUME_HISTORY_BEGIN
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
+// CXB_INLINE_RESUME_HISTORY_END
+// CXB_INLINE_SUBAGENT_MOCK_BEGIN
 import { createSubagentMock } from "../../test-support/subagent-mock";
+// CXB_INLINE_SUBAGENT_MOCK_END
+// CXB_INLINE_STATUS_HISTORY_BEGIN
 import { createStatusHistory } from "../../test-support/status-history";
+// CXB_INLINE_STATUS_HISTORY_END
 
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
