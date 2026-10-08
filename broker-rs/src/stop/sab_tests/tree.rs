@@ -9,6 +9,38 @@ fn stop(s: &mut Sim, conn: u64, params: Value) -> (u64, Vec<Action>) {
 }
 
 #[test]
+fn 收尾发现一次失败后周期重查恢复且保留调用者期限() {
+    let mut s = Sim::new();
+    s.spawn_v1("子甲", "派生1", "子轮甲");
+    s.hold.push(("turn/interrupt".into(), "子甲".into()));
+    let (id, _) = stop(&mut s, OWNER, json!({"threadId": P}));
+    let tree = s.tree_op().unwrap();
+    let deadline = s.m.trees.operations[&tree]
+        .request
+        .first_delivery_deadline_ms;
+    let waiters = s.m.trees.operations[&tree].waiters.clone();
+    s.list_fault = true;
+    s.release("turn/interrupt", "子甲");
+    assert_eq!(s.m.trees.aux.work[&tree].final_complete, Some(false));
+    assert!(!s.m.trees.aux.work[&tree].final_started);
+    assert_eq!(
+        s.m.trees.operations[&tree]
+            .request
+            .first_delivery_deadline_ms,
+        deadline
+    );
+    assert_eq!(s.m.trees.operations[&tree].waiters, waiters);
+    assert!(s.response(&s.log, id).is_none());
+    s.list_fault = false;
+    s.advance(15_000);
+    assert!(s.tree_op().is_none(), "恢复后重新发现和核实，解除屏障");
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "confirmed"
+    );
+}
+
+#[test]
 fn 用户停止父线程_停整棵受管树并以根与子代理报告确认() {
     let mut s = Sim::new();
     s.spawn_v1("子甲", "派生1", "子轮甲");

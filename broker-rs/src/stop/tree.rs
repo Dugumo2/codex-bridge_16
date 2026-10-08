@@ -1199,6 +1199,10 @@ impl Machine {
             if slot {
                 work.final_discovery = None;
                 work.final_complete = Some(state.complete);
+                // 临时失败留给周期重查；原调用者期限与仍在途的核实保持不变。
+                if !state.complete {
+                    work.final_started = false;
+                }
             } else {
                 work.discovery = None;
             }
@@ -1340,6 +1344,13 @@ impl Machine {
         let work = &self.trees.aux.work[&tree_op];
         let op = &self.trees.operations[&tree_op];
         work.root_done
+            && (!work.root_derived
+                || self
+                    .trees
+                    .aux
+                    .derived
+                    .get(&(tree_op, work.root_thread.clone()))
+                    .is_some_and(|d| d.stopped && !d.slot))
             && members.keys().all(|t| {
                 self.trees
                     .aux
@@ -1353,6 +1364,7 @@ impl Machine {
             && work.final_started
             && work.final_pending.is_empty()
             && work.final_complete == Some(true)
+            && work.final_discovery.is_none()
             && work.discovery.is_none()
     }
 

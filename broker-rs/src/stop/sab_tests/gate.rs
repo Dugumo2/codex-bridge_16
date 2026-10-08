@@ -6,6 +6,66 @@ use crate::runs::{InterruptReason, RunState, RunStatus, StopOutcome};
 use crate::stop::tree::{commit_status, ReleaseSnapshot, TreePhase, TreeTrigger};
 
 #[test]
+fn 收尾发现返回前根迟到活动不能沿用旧停止结论() {
+    for goal_active in [false, true] {
+        let mut s = Sim::new();
+        s.spawn_v1("子甲", "派生1", "子轮1");
+        s.hold.push(("turn/interrupt".into(), "子甲".into()));
+        s.turn_completed(P, T, "completed");
+        s.hold.push(("thread/list".into(), "".into()));
+        s.release("turn/interrupt", "子甲");
+        let tree = s.tree_op().unwrap();
+        assert!(s.m.trees.aux.work[&tree].final_pending.is_empty());
+        assert!(s.m.trees.aux.work[&tree].root_done);
+        // 扣住新的核实，让收尾发现先返回。
+        s.hold.push(("thread/read".into(), P.into()));
+        if goal_active {
+            s.goals.insert(P.into(), goal(P, "active"));
+            s.notify(json!({"method": "thread/goal/updated", "params": {"threadId": P, "goal": goal(P, "active")}}));
+        } else {
+            s.turn_started(P, "迟到根轮");
+        }
+        assert!(
+            !s.m.trees.aux.work[&tree].root_done,
+            "活动立即撤销协调者根结论"
+        );
+        assert!(s.m.trees.aux.work[&tree].final_pending.contains(P));
+        s.release("thread/list", "");
+        assert_eq!(s.tree_op(), Some(tree));
+        assert!(s.finishing());
+        s.release("thread/read", P);
+        assert!(s.tree_op().is_none());
+        if goal_active {
+            assert_eq!(s.goals[P]["status"], "paused");
+        } else {
+            assert_eq!(s.interrupts(&s.log, P), 1);
+        }
+    }
+}
+
+#[test]
+fn 整树确认额外检查根派生停止与在途核实() {
+    let mut s = Sim::new();
+    s.spawn_v1("子甲", "派生1", "子轮1");
+    s.hold.push(("turn/interrupt".into(), "子甲".into()));
+    s.turn_completed(P, T, "completed");
+    s.hold.push(("thread/list".into(), "".into()));
+    s.release("turn/interrupt", "子甲");
+    let tree = s.tree_op().unwrap();
+    // 模拟协调摘要仍为旧值：确认门禁也必须独立检查根派生对象。
+    let members = s.m.tree_scope_members(tree);
+    s.m.trees.aux.work.get_mut(&tree).unwrap().final_complete = Some(true);
+    s.m.trees.aux.work.get_mut(&tree).unwrap().final_discovery = None;
+    assert!(s.m.tree_confirmable(tree, &members));
+    for (stopped, slot) in [(false, false), (true, true)] {
+        let root = s.m.trees.aux.derived.get_mut(&(tree, P.into())).unwrap();
+        root.stopped = stopped;
+        root.slot = slot;
+        assert!(!s.m.tree_confirmable(tree, &members));
+    }
+}
+
+#[test]
 fn 父线程完全不等子代理_门禁暂缓并停树_运行标子代理未完成() {
     let mut s = Sim::new();
     s.spawn_v1("子甲", "派生1", "子轮1");
