@@ -202,6 +202,113 @@ fn 迁移前后停止均选同一运行且未知子线程前不操作父线程()
 }
 
 #[test]
+fn 父先停且第二次在目标回包前到达仍合并同一操作() {
+    父子停止交错合并同一操作(true, false);
+}
+
+#[test]
+fn 子先停且第二次在目标回包前到达仍合并同一操作() {
+    父子停止交错合并同一操作(false, false);
+}
+
+#[test]
+fn 父先停且第二次在首条中断后到达仍合并同一操作() {
+    父子停止交错合并同一操作(true, true);
+}
+
+#[test]
+fn 子先停且第二次在首条中断后到达仍合并同一操作() {
+    父子停止交错合并同一操作(false, true);
+}
+
+fn 父子停止交错合并同一操作(parent_first: bool, after_interrupt: bool) {
+    let mut m = moved();
+    apply(&mut m, Event::Connected { conn: 2 });
+    let (first_thread, second_thread) = if parent_first {
+        ("线程", "子线程")
+    } else {
+        ("子线程", "线程")
+    };
+    let mut actions = client(
+        &mut m,
+        "broker/threads/stop",
+        90,
+        json!({"threadId":first_thread}),
+    );
+    assert_eq!(m.stops.operations.len(), 1);
+    let (first_key, first_op) = m.stops.operations.iter().next().unwrap();
+    let first_key = first_key.clone();
+    let first_generation = first_op.generation;
+    let get = req(&actions, "thread/goal/get");
+    assert!(requests(&actions, "turn/interrupt").is_empty());
+    if after_interrupt {
+        actions.extend(reply(&mut m, &get, Ok(json!({"goal":null}))));
+        assert_eq!(requests(&actions, "turn/interrupt").len(), 1);
+    }
+    actions.extend(apply(
+        &mut m,
+        Event::ClientRequest {
+            request: ClientRequest {
+                conn: 2,
+                id: json!(91),
+                method: "broker/threads/stop".into(),
+                params: Some(json!({"threadId":second_thread})),
+            },
+            run_id: None,
+        },
+    ));
+    assert_eq!(m.stops.operations.len(), 1);
+    let merged = m.stops.operations.get(&first_key).unwrap();
+    // 同一个运行键可能被新操作覆盖，必须同时核对代号与两个等待者。
+    assert_eq!(merged.generation, first_generation);
+    assert_eq!(merged.thread, "子线程");
+    assert_eq!(merged.run_id.as_deref(), Some("run-1"));
+    assert_eq!(merged.waiters.len(), 2);
+    assert_eq!(
+        merged
+            .waiters
+            .iter()
+            .map(|w| (w.request.conn, w.request.id.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, json!(90)), (2, json!(91))]
+    );
+    if !after_interrupt {
+        assert!(requests(&actions, "turn/interrupt").is_empty());
+        actions.extend(reply(&mut m, &get, Ok(json!({"goal":null}))));
+    }
+    let interrupts = requests(&actions, "turn/interrupt");
+    assert_eq!(interrupts.len(), if after_interrupt { 2 } else { 1 });
+    for interrupt in interrupts {
+        assert_eq!(
+            interrupt.params,
+            Some(json!({"threadId":"子线程","turnId":"审查轮"}))
+        );
+    }
+    only_child(&actions);
+    assert!(!actions.iter().any(
+        |a| matches!(a, Action::Send { message, .. } if message["id"] == 90 || message["id"] == 91)
+    ));
+    actions.extend(child_completed(&mut m));
+    for (conn, id) in [(1, 90), (2, 91)] {
+        let responses: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send { conn, message } if message["id"] == id => Some((conn, message)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert_eq!(*responses[0].0, conn);
+        let result = &responses[0].1["result"];
+        assert_eq!(result["runId"], "run-1");
+        assert_eq!(result["stopOutcome"], "confirmed");
+        assert_eq!(result["alreadyStopped"], false);
+        assert_eq!(result["interruptSent"], true);
+    }
+    assert!(m.stops.operations.is_empty());
+}
+
+#[test]
 fn 子停止合并父重试且清除只升每个等待者独立四十秒() {
     let mut m = moved();
     let first = client(

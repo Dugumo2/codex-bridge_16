@@ -370,12 +370,21 @@ for (const firstTarget of [parent, child]) test(`迁移通知与父子停止交�
     await client.request("n4/release");
     await reviewing;
     await until(() => { readTrace(); return stops.length === 2 && observed.some((r) => r.method === "turn/interrupt"); });
-    const interrupts = observed.filter((r) => r.method === "turn/interrupt");
-    expect(interrupts.map((r) => r.params)).toEqual([{ threadId: child, turnId: reviewTurn }]);
+    // 夹具不自动完成；手工注入完成通知前，父线程关联的运行仍在停止中。
     expect((await client.request("broker/threads/watch", { threadId: parent })).run.state).toBe("stopping");
     await complete(client);
     const replies = await bounded(Promise.all(stops), 50_000);
-    for (const reply of replies) expect(reply).toMatchObject({ runId: movedRun, stopOutcome: "confirmed" });
+    expect(movedRun).not.toBe("");
+    for (const reply of replies) expect(reply).toMatchObject({
+      runId: movedRun, stopOutcome: "confirmed", alreadyStopped: false, interruptSent: true,
+    });
+    await client.request("n4/state");
+    readTrace();
+    // 详细设计第 384 行允许显式 stop 重发中断；同步夹具排空此前出站消息后再计数。
+    const interrupts = observed.filter((r) => r.method === "turn/interrupt");
+    expect(interrupts.length).toBeGreaterThanOrEqual(1);
+    expect(interrupts.length).toBeLessThanOrEqual(2);
+    for (const request of interrupts) expect(request.params).toEqual({ threadId: child, turnId: reviewTurn });
     expect((await client.request("broker/threads/watch", { threadId: child })).run.state).toBe("ended");
   } finally { client.onNotification = undefined; }
 }, 60_000);
