@@ -15,6 +15,7 @@
 //! 检查顺序固定为：纯内存前提 → 服务器核实 → 必要时恢复订阅 → 再核实 → 开工前复查。
 //! 冷 resume 可能触发 active goal 自动开工，因此必须先核实服务器已停。
 
+use super::status_read::{StatusCaller, StatusQuery, StatusResult};
 use super::*;
 use crate::runs::{RunLookup, RunState};
 
@@ -43,10 +44,11 @@ pub enum CancelCause {
     ExternalTurn,
 }
 
-/// 预检的核实读（`thread/read{includeTurns:true}` 与 `thread/goal/get`）；回包按认领 token 与 round 核对。
+/// 预检的 goal 核实读（`thread/goal/get`）；回包按认领 token 与 round 核对。
+/// 线程是否在活动改由状态读取层的 Busy 查询核实（`StatusCaller::ContinueCheck`），回到
+/// [`Machine::continue_check_done`]。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContinueRead {
-    Thread { round: u64 },
     Goal { round: u64 },
 }
 
@@ -374,25 +376,25 @@ impl Machine {
         progress.thread_done = false;
         progress.goal_done = false;
         let round = progress.round;
-        for (method, read) in [
-            ("thread/read", ContinueRead::Thread { round }),
-            ("thread/goal/get", ContinueRead::Goal { round }),
-        ] {
-            actions.push(Action::Request(RequestContext {
-                resume_retried: false,
-                stream_id: None,
-                review_id: None,
-                client: None,
-                token: self.token(thread),
-                operation: Operation::ContinueRead(read),
-                method: method.into(),
-                params: Some(if method == "thread/read" {
-                    json!({"threadId":thread,"includeTurns":true})
-                } else {
-                    json!({"threadId":thread})
-                }),
-            }));
-        }
+        // H2：线程是否在活动只读元数据（Busy），不再发 `includeTurns:true` 的全量读。
+        let token = self.token(thread);
+        self.begin_status_read(
+            thread,
+            token.clone(),
+            StatusQuery::Busy,
+            StatusCaller::ContinueCheck { round },
+            actions,
+        );
+        actions.push(Action::Request(RequestContext {
+            resume_retried: false,
+            stream_id: None,
+            review_id: None,
+            client: None,
+            token,
+            operation: Operation::ContinueRead(ContinueRead::Goal { round }),
+            method: "thread/goal/get".into(),
+            params: Some(json!({"threadId":thread})),
+        }));
     }
 
     pub(crate) fn continue_resume_current(&self, context: &RequestContext) -> bool {
@@ -459,67 +461,56 @@ impl Machine {
                 self.continues.pending.get_mut(thread).unwrap().resumed = true;
                 self.continue_read(thread, false, actions);
             }
-            Operation::ContinueRead(read) if progress.phase == CheckPhase::Read => {
-                let (round, goal) = match read {
-                    ContinueRead::Thread { round } => (*round, false),
-                    ContinueRead::Goal { round } => (*round, true),
-                };
-                if round != progress.round
-                    || if goal {
-                        progress.goal_done
-                    } else {
-                        progress.thread_done
-                    }
-                {
+            Operation::ContinueRead(ContinueRead::Goal { round })
+                if progress.phase == CheckPhase::Read =>
+            {
+                if *round != progress.round || progress.goal_done {
                     return;
                 }
                 if self.stops.versions.get(thread).copied().unwrap_or(0) != progress.version {
                     self.continue_read(thread, true, actions);
                     return;
                 }
-                let reason = if goal {
-                    match goal_status(&result) {
-                        Some(Some("active")) => Some(STOPPING),
-                        Some(_) => None,
-                        None => Some(RESUME_CHECK_FAILED),
-                    }
-                } else {
-                    match crate::stop::strict_active(&result) {
-                        Some(active) if active.is_empty() => None,
-                        Some(_)
-                            if self
-                                .latest_run(thread)
-                                .is_some_and(|r| r.state == RunState::Lost) =>
-                        {
-                            Some(STOPPING)
-                        }
-                        Some(_) => Some(THREAD_BUSY),
-                        None => Some(RESUME_CHECK_FAILED),
-                    }
+                let reason = match goal_status(&result) {
+                    Some(Some("active")) => Some(STOPPING),
+                    Some(_) => None,
+                    None => Some(RESUME_CHECK_FAILED),
                 };
                 self.learn_traffic(context, &result, actions);
-                if let Some(reason) = reason {
-                    self.continue_fail(thread, Some(reason), actions);
-                    return;
-                }
-                let version = self.stops.versions.get(thread).copied().unwrap_or(0);
-                let progress = self.continues.pending.get_mut(thread).unwrap();
-                // 自己刚学习的 goal 事实不使同一轮另一份快照失效。
-                progress.version = version;
-                if goal {
-                    progress.goal_done = true;
-                } else {
-                    progress.thread_done = true;
-                }
-                if progress.thread_done && progress.goal_done {
-                    if !progress.resumed {
-                        self.continue_resume(thread, actions);
-                    } else {
-                        self.continue_commit(thread, actions);
-                    }
-                }
+                self.continue_checked(thread, true, reason, actions);
             }
             _ => {}
+        }
+    }
+
+    /// 一份核实读（线程 Busy 或 goal）已按本轮版本得出结论：失败即定案，否则两份都齐后
+    /// 恢复订阅（恢复前预检）或开工（恢复后预检）。
+    fn continue_checked(
+        &mut self,
+        thread: &str,
+        goal: bool,
+        reason: Option<&str>,
+        actions: &mut Vec<Action>,
+    ) {
+        if let Some(reason) = reason {
+            self.continue_fail(thread, Some(reason), actions);
+            return;
+        }
+        let version = self.stops.versions.get(thread).copied().unwrap_or(0);
+        let progress = self.continues.pending.get_mut(thread).unwrap();
+        // 自己刚学习的 goal 事实不使同一轮另一份快照失效。
+        progress.version = version;
+        if goal {
+            progress.goal_done = true;
+        } else {
+            progress.thread_done = true;
+        }
+        if progress.thread_done && progress.goal_done {
+            if !progress.resumed {
+                self.continue_resume(thread, actions);
+            } else {
+                self.continue_commit(thread, actions);
+            }
         }
     }
 
@@ -1097,11 +1088,58 @@ impl Machine {
 }
 
 impl Machine {
+    /// 续跑预检的线程核实（H2 Busy 查询）完成。有效性沿用原核实读的口径：认领仍是当前的预检、
+    /// 阶段是核实读、round 是当前轮且本轮线程核实尚未完成；否则是旧轮或已定案的迟到结果，丢弃。
+    ///
+    /// - `NotBusy`：线程不在活动，本份核实通过；
+    /// - `Busy`：最新运行已丢失（Lost）报 `stopping`，否则报 `threadBusy`。元数据为 active 即拒绝，
+    ///   比旧的「历史里有 inProgress 轮次」更保守（active 但轮次尚未投影时不会误放行）；
+    /// - 其余（含 `Unknown` 的任何原因）报 `resumeCheckFailed`。
     pub fn continue_check_done(
         &mut self,
-        _done: crate::claim::status_read::StatusDone,
+        done: crate::claim::status_read::StatusDone,
         actions: &mut Vec<Action>,
     ) {
-        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+        let StatusCaller::ContinueCheck { round } = done.caller else {
+            return;
+        };
+        let Some(token) = done.token else {
+            return;
+        };
+        let thread = token.thread_id.as_str();
+        let current = done.thread == thread
+            && self.current(&token)
+            && self.claims.get(thread).is_some_and(Claim::precheck);
+        let Some(version) = self
+            .continues
+            .pending
+            .get(thread)
+            .filter(|p| current && p.claim_id == token.claim_id)
+            .filter(|p| p.phase == CheckPhase::Read && p.round == round && !p.thread_done)
+            .map(|p| p.version)
+        else {
+            return;
+        };
+        if self.closing || self.quiescing {
+            self.continue_cancel(thread, CancelCause::Shutdown, actions);
+            return;
+        }
+        if self.stops.versions.get(thread).copied().unwrap_or(0) != version {
+            self.continue_read(thread, true, actions);
+            return;
+        }
+        let reason = match done.result {
+            StatusResult::NotBusy => None,
+            StatusResult::Busy
+                if self
+                    .latest_run(thread)
+                    .is_some_and(|r| r.state == RunState::Lost) =>
+            {
+                Some(STOPPING)
+            }
+            StatusResult::Busy => Some(THREAD_BUSY),
+            _ => Some(RESUME_CHECK_FAILED),
+        };
+        self.continue_checked(thread, false, reason, actions);
     }
 }

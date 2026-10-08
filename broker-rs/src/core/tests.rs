@@ -1217,7 +1217,11 @@ async fn 核心停止四十秒与十五秒核实按操作代号处理() {
     let goal = h.outgoing().await;
     assert_eq!(read["method"], "thread/read");
     assert_eq!(goal["method"], "thread/goal/get");
-    h.answer(&read, Ok(json!({"thread":{"turns":[]}}))).await;
+    h.answer(
+        &read,
+        Ok(json!({"thread":{"id":"线程","status":{"type":"idle"}}})),
+    )
+    .await;
     assert!(h.core.machine.claims.contains_key("线程"));
     h.answer(&goal, Ok(json!({"goal":null}))).await;
     assert!(h.core.machine.claims.is_empty());
@@ -1328,7 +1332,11 @@ async fn 核心启动超时对账与迟到回包真实经过有序通道() {
     assert!(h.incoming_client().await.get("error").is_some());
     let read = h.outgoing().await;
     assert_eq!(read["method"], "thread/read");
-    h.answer(&read, Ok(json!({"thread":{"turns":[]}}))).await;
+    h.answer(
+        &read,
+        Ok(json!({"thread":{"id":"线程","status":{"type":"idle"}}})),
+    )
+    .await;
     assert!(h.core.machine.claims.is_empty());
     h.pump_until(|msg| {
         matches!(
@@ -1405,7 +1413,11 @@ async fn 核心延迟处理超时仍使用原截止且到期同步清理审查�
         deadline
     );
     let read = h.outgoing().await;
-    h.answer(&read, Ok(json!({"thread":{"turns":[]}}))).await;
+    h.answer(
+        &read,
+        Ok(json!({"thread":{"id":"线程","status":{"type":"idle"}}})),
+    )
+    .await;
     h.notification(
         "turn/started",
         json!({"threadId":"子线程","turn":{"id":"子轮"}}),
@@ -1559,7 +1571,13 @@ async fn 核心线回包已接收转发延迟且旧本地截止先到仍处理�
         .clone();
     let read: Value = serde_json::from_str(&output.recv().await.unwrap()).unwrap();
     input
-        .send(proto::response_ok(read["id"].clone(), json!({"thread":{"turns":[]}})).to_string())
+        .send(
+            proto::response_ok(
+                read["id"].clone(),
+                json!({"thread":{"id":"线程","status":{"type":"idle"}}}),
+            )
+            .to_string(),
+        )
         .unwrap();
     core.handle(CoreMsg::App(events.recv().await.unwrap()));
     assert!(core.machine.claims.is_empty());
@@ -1906,7 +1924,13 @@ async fn 核心迟到处理晚于线上截止新收尾截止先到暂停回包�
     let read: Value = serde_json::from_str(&output.recv().await.unwrap()).unwrap();
     core.machine.records.get_mut("线程").unwrap().subscribed = false;
     input
-        .send(proto::response_ok(read["id"].clone(), json!({"thread":{"turns":[]}})).to_string())
+        .send(
+            proto::response_ok(
+                read["id"].clone(),
+                json!({"thread":{"id":"线程","status":{"type":"idle"}}}),
+            )
+            .to_string(),
+        )
         .unwrap();
     core.handle(CoreMsg::App(events.recv().await.unwrap()));
     // 截止前 RPC 收下启动回包，业务转发在原截止五秒以后才继续。

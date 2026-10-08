@@ -1,5 +1,6 @@
 //! M7 预算与共享关闭边界；每个事件后核对字节守恒。
 use super::*;
+use crate::test_support::status_read::meta;
 
 fn invariant(m: &Machine) {
     m.assert_held_accounting();
@@ -1015,8 +1016,9 @@ fn 取消订阅屏障与对账无turn均清缓冲() {
                     deadline: Instant::now(),
                 },
             );
+            // 对账经状态读取层：元数据非 active 即 Idle，没有活动轮次。
             let read = request(&actions, "thread/read");
-            reply(&mut m, &read, Ok(json!({"thread":{"turns":[]}})));
+            reply(&mut m, &read, Ok(meta("t", "idle")));
         }
         invariant(&m);
         assert_eq!(m.settling_bytes, 0);
@@ -1164,7 +1166,7 @@ fn 关闭等待暂停时其他预检屏障和恢复读均不再开工() {
             &mut m,
             context,
             Ok(if context.method == "thread/read" {
-                json!({"thread":{"turns":[]}})
+                meta("continue", "idle")
             } else {
                 json!({"goal":{"status":"paused"}})
             }),

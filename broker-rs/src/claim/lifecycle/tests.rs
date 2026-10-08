@@ -1381,8 +1381,10 @@ fn 历史失联按编号读取核实后写回且较新运行保持不变() {
     let mut all = vec![];
     for c in contexts {
         assert_eq!(c.params.as_ref().unwrap()["threadId"], "C");
+        // 丢失运行的停止核实经状态读取层：元数据非 active 即 Idle。
         let result = if c.method == "thread/read" {
-            json!({"thread":{"turns":[]}})
+            assert!(c.params.as_ref().unwrap().get("includeTurns").is_none());
+            json!({"thread":{"id":"C","status":{"type":"idle"}}})
         } else {
             json!({"goal":null})
         };

@@ -307,14 +307,6 @@ pub enum Operation {
         original_error: Value,
     },
     Stop(crate::stop::StopTag, crate::stop::StopRequest),
-    Reconcile {
-        generation: u64,
-        round: u64,
-    },
-    LateSettlement {
-        generation: u64,
-        round: u64,
-    },
     LateInterrupt {
         generation: u64,
     },
@@ -1374,12 +1366,6 @@ impl Machine {
             }
             Operation::Stop(tag, request) => {
                 self.stop_reply(tag.clone(), request.clone(), result, actions)
-            }
-            Operation::Reconcile { generation, round } => {
-                self.reconcile_reply(&context, *generation, *round, result, actions)
-            }
-            Operation::LateSettlement { generation, round } => {
-                self.late_settlement_reply(*generation, *round, result, actions)
             }
             Operation::LateInterrupt { generation } => {
                 self.late_interrupt_reply(*generation, result, actions)

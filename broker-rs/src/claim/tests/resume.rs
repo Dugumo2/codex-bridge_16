@@ -1,6 +1,7 @@
 //! 固定先核实再恢复订阅，覆盖预检、目标事实与迟到收尾，不依赖固定睡眠。
 use super::*;
 use crate::runs::{InterruptReason, RunState, StopOutcome};
+use crate::test_support::status_read::{meta, turns_page};
 
 const OLD: &str = "run-原运行";
 const NEW: &str = "run-续跑";
@@ -88,8 +89,10 @@ fn requests(actions: &[Action]) -> Vec<RequestContext> {
 fn normal_result(context: &RequestContext) -> Value {
     match context.method.as_str() {
         "thread/resume" => json!({"thread":{"id":"线程"}}),
+        // H2：续跑预检只读元数据（Busy），不再带 includeTurns。
         "thread/read" => {
-            json!({"thread":{"id":"线程","turns":[{"id":"历史轮","status":"completed"}]}})
+            assert_eq!(context.params, Some(json!({"threadId":"线程"})));
+            json!({"thread":{"id":"线程","status":{"type":"idle"}}})
         }
         "thread/goal/get" => json!({"goal":{"status":"paused"}}),
         _ => panic!("不应自动回答开工请求"),
@@ -108,7 +111,9 @@ fn pump(machine: &mut Machine, initial: Vec<Action>) -> (Vec<Action>, usize, usi
             .filter(|c| {
                 matches!(
                     c.operation,
-                    Operation::ContinueResume | Operation::ContinueRead(_)
+                    Operation::ContinueResume
+                        | Operation::ContinueRead(_)
+                        | Operation::StatusRead { .. }
                 )
             })
             .collect();
@@ -393,7 +398,7 @@ fn 服务器拒绝与从严解析矩阵() {
         let (method, result, expected) = match case {
             0 | 1 => (
                 "thread/read",
-                Ok(json!({"thread":{"turns":[{"id":"活动轮","status":"inProgress"}]}})),
+                Ok(json!({"thread":{"id":"线程","status":{"type":"active","activeFlags":[]}}})),
                 if case == 0 { "threadBusy" } else { "stopping" },
             ),
             2 => (
@@ -874,12 +879,18 @@ fn 预检停止必须重查原丢失或停止中运行() {
         assert!(!sends(&actions)
             .iter()
             .any(|(_, v)| v["id"] == 88 && v.get("result").is_some()));
+        // 丢失运行的停止核实经状态读取层（Activity）：元数据 active，再分页找到活动轮次。
         let read = reads.iter().find(|c| c.method == "thread/read").unwrap();
-        let mut next = response(
+        let mut next = response(&mut machine, read, Ok(meta("线程", "active")));
+        let page = requests(&next)
+            .into_iter()
+            .find(|c| c.method == "thread/turns/list")
+            .expect("活动线程继续分页");
+        next.extend(response(
             &mut machine,
-            read,
-            Ok(json!({"thread":{"turns":[{"id":"仍在跑","status":"inProgress"}]}})),
-        );
+            &page,
+            Ok(turns_page(&[("仍在跑", "inProgress")], None)),
+        ));
         for goal in reads.iter().filter(|c| c.method == "thread/goal/get") {
             next.extend(response(&mut machine, goal, Ok(json!({"goal":null}))));
         }
@@ -1045,6 +1056,8 @@ fn 预检控制请求超时均有失败出口() {
             },
         );
         assert_eq!(reason(&actions).as_deref(), Some("resumeCheckFailed"));
+        // 续跑预检不是对账：读取无响应只按失败定案，不触发熔断。
+        assert!(!machine.app_server_unresponsive);
         no_run(&machine);
         let late = step_raw(
             &mut machine,
@@ -1315,7 +1328,7 @@ fn 恢复订阅之后必须复核并拒绝期间变化() {
                 let result = match (case, context.method.as_str()) {
                     (0, "thread/goal/get") => json!({"goal":{"status":"active"}}),
                     (1, "thread/read") => {
-                        json!({"thread":{"turns":[{"id":"外部轮","status":"inProgress"}]}})
+                        json!({"thread":{"id":"线程","status":{"type":"active","activeFlags":[]}}})
                     }
                     (2, "thread/read") => json!({"thread":{}}),
                     _ => normal_result(&context),
@@ -1666,5 +1679,120 @@ fn 条件续跑无覆盖仍排除历史() {
     assert_eq!(
         context.params,
         Some(json!({"threadId":"线程","excludeTurns":true}))
+    );
+}
+
+/// H2：线程核实是 Busy 查询，只读一次元数据、不分页；元数据 active 即拒绝（比旧的「历史里有
+/// inProgress」更保守），非 active 的三种状态放行，其余一律按核实失败。
+#[test]
+fn 续跑预检线程核实只读元数据并按状态定案() {
+    let active = json!({"thread":{"id":"线程","status":{"type":"active","activeFlags":["waitingOnApproval"]}}});
+    let cases = [
+        (active.clone(), false, Some("threadBusy")),
+        (active, true, Some("stopping")),
+        (
+            json!({"thread":{"id":"线程","status":{"type":"idle"}}}),
+            false,
+            None,
+        ),
+        (
+            json!({"thread":{"id":"线程","status":{"type":"notLoaded"}}}),
+            false,
+            None,
+        ),
+        (
+            json!({"thread":{"id":"线程","status":{"type":"systemError"}}}),
+            false,
+            None,
+        ),
+        (
+            json!({"thread":{"id":"线程","status":{"type":"未知"}}}),
+            false,
+            Some("resumeCheckFailed"),
+        ),
+        (
+            json!({"thread":{"id":"别的线程","status":{"type":"idle"}}}),
+            false,
+            Some("resumeCheckFailed"),
+        ),
+        (
+            json!({"thread":{"id":"线程","turns":[]}}),
+            false,
+            Some("resumeCheckFailed"),
+        ),
+    ];
+    for (value, lost, expected) in cases {
+        let mut machine = fixture(true);
+        if lost {
+            machine.runs.runs.get_mut(OLD).unwrap().state = RunState::Lost;
+        }
+        let controls = read_batch(&mut machine);
+        let thread = controls.iter().find(|c| c.method == "thread/read").unwrap();
+        assert_eq!(thread.params, Some(json!({"threadId":"线程"})));
+        let mut actions = response(&mut machine, thread, Ok(value.clone()));
+        assert!(
+            !requests(&actions)
+                .iter()
+                .any(|c| c.method == "thread/turns/list" || c.method == "thread/read"),
+            "Busy 不分页、不重读：{value}"
+        );
+        let goal = controls
+            .iter()
+            .find(|c| c.method == "thread/goal/get")
+            .unwrap();
+        actions.extend(response(&mut machine, goal, Ok(normal_result(goal))));
+        assert_eq!(reason(&actions).as_deref(), expected, "{value}");
+        assert_eq!(
+            requests(&actions).iter().any(|c| c.method == "turn/start"),
+            expected.is_none(),
+            "{value}"
+        );
+    }
+    // 错误回包（含 -32601）都是未知，不当作不在活动。
+    for error in [
+        json!({"code":-32601,"message":"method not found"}),
+        json!({"code":-32000,"message":"读失败"}),
+    ] {
+        let mut machine = fixture(true);
+        let controls = read_batch(&mut machine);
+        let thread = controls.iter().find(|c| c.method == "thread/read").unwrap();
+        let actions = response(&mut machine, thread, Err(error));
+        assert_eq!(reason(&actions).as_deref(), Some("resumeCheckFailed"));
+        no_run(&machine);
+    }
+}
+
+/// 预检取消后迟到的线程核实结果（含旧轮次）不得复活预检或开工。
+#[test]
+fn 续跑预检旧轮次线程核实结果被丢弃() {
+    let mut machine = fixture(true);
+    let batch = read_batch(&mut machine);
+    let thread = batch.iter().find(|c| c.method == "thread/read").unwrap();
+    // goal 事实版本变化触发重读：上一轮的线程核实结果按 round 丢弃。
+    step_raw(
+        &mut machine,
+        notify(
+            "thread/goal/updated",
+            json!({"threadId":"线程","goal":{"status":"paused"}}),
+        ),
+    );
+    let goal = batch
+        .iter()
+        .find(|c| c.method == "thread/goal/get")
+        .unwrap();
+    let actions = response(&mut machine, goal, Ok(normal_result(goal)));
+    let reread = requests(&actions);
+    assert_eq!(reread.len(), 2, "版本变化后整轮重读");
+    let before = machine.continues.clone();
+    let stale = response(&mut machine, thread, Ok(normal_result(thread)));
+    assert!(requests(&stale).is_empty());
+    assert_eq!(machine.continues, before);
+    let (actions, _, _, _) = pump(&mut machine, actions);
+    assert_eq!(
+        requests(&actions)
+            .iter()
+            .filter(|c| c.method == "turn/start")
+            .count(),
+        1
     );
 }
