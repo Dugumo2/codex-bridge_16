@@ -134,7 +134,7 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
   }, 90_000);
 
   test("整树停止：父线程与 v2 子线程的会话全部清空才 confirmed", async () => {
-    await start();
+    const run = await start();
     await commandEvents(PARENT, "turn-001", sessions);
     await child();
     const stopped = await cli("stop", PARENT, "--json");
@@ -145,6 +145,16 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     const snapshot = await state();
     order(snapshot, PARENT, sessions.map((s) => s.processId));
     order(snapshot, CHILD, ["31001"]);
+    // 已结束的树仍可能出现残留；第二次停止必须重新取得每个成员的清理证据。
+    const before = snapshot.calls.length;
+    await set(PARENT, { sessions });
+    await set(CHILD, { sessions: [{ itemId: "child-command", processId: "31001" }] });
+    const repeated = await cli("stop", PARENT, "--run", run.runId, "--json");
+    expect(repeated.code, JSON.stringify(repeated)).toBe(0);
+    expect(repeated.json()).toMatchObject({ stopOutcome: "confirmed", childrenStop: { phase: "confirmed" } });
+    const after = await state();
+    order({ ...after, calls: after.calls.slice(before) }, PARENT, sessions.map((s) => s.processId));
+    order({ ...after, calls: after.calls.slice(before) }, CHILD, ["31001"]);
   }, 90_000);
 
   test("树停止 unconfirmed 后 --abandon：保留诊断、解除屏障且可再派单", async () => {
@@ -163,6 +173,8 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     expect(abandoned.json()).toMatchObject({ stopOutcome: "unconfirmed", actionApplied: true,
       childrenStop: { cleanupState: "abandoned", phase: "unconfirmed" } });
     expect(abandoned.stderr).toContain("可能仍有子代理或命令在运行");
+    const watched = await rpc("broker/threads/watch", { threadId: PARENT });
+    expect(watched.run).toMatchObject({ runId: run.runId, stopOutcome: "unconfirmed", childrenStop: { cleanupState: "abandoned" } });
     const before = (await state()).calls.length;
     const repeated = await cli("stop", PARENT, "--run", run.runId, "--json");
     expect(repeated.code).toBe(3);
