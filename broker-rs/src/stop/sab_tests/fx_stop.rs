@@ -589,3 +589,73 @@ fn fx_后台终止沿用树名额最多八个() {
     assert_eq!(s.held.iter().filter(|c| c.method == TERMINATE).count(), 8);
     assert_eq!(s.m.trees.operations[&tree].in_flight, 8);
 }
+
+#[test]
+fn fx_父轮晚于子线程结束时根交接不能覆盖已经启动的收尾复核() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    // 与黑盒一致：中断父轮仅回包，先让子线程完成清理，再单独送达父轮结束通知。
+    s.never.insert(P.into());
+    let id = stop(&mut s, false);
+    let tree = s.tree_op().unwrap();
+    let deadline = s.m.trees.operations[&tree]
+        .request
+        .first_delivery_deadline_ms;
+    assert!(s.m.trees.aux.derived[&(tree, "子".into())].stopped);
+    assert!(!s.log.iter().any(|a| matches!(a, Action::Request(c)
+        if c.method == LIST && c.params.as_ref().unwrap()["threadId"] == P)));
+    assert!(s.response(&s.log, id).is_none());
+
+    s.turn_completed(P, T, "interrupted");
+    let reply = s.response(&s.log, id).unwrap_or_else(|| {
+        panic!(
+            "未推进首次期限内的确认：{:?}",
+            s.m.trees.aux.derived.get(&(tree, P.into()))
+        )
+    });
+    assert_eq!(reply["result"]["stopOutcome"], "confirmed");
+    assert_eq!(
+        reply["result"]["childrenStop"]["root"]["check"]["settled"],
+        true
+    );
+    assert_eq!(
+        reply["result"]["childrenStop"]["root"]["check"]["verifyDone"],
+        true
+    );
+    assert!(
+        s.m.clock.mono_ms < deadline,
+        "不推进时钟，不依赖 40 秒或后续 15 秒计时器"
+    );
+    assert!(s.tree_op().is_none());
+    assert_eq!(s.run_ended(&s.log), 1);
+    let lists = s
+        .log
+        .iter()
+        .filter(|a| {
+            matches!(a, Action::Request(c)
+        if c.method == LIST && c.params.as_ref().unwrap()["threadId"] == P)
+        })
+        .count();
+    assert_eq!(lists, 2, "根单线程清理和树收尾各自从头核验一次");
+}
+
+#[test]
+fn fx_单线程结束事件立即推进后台清理与后置复核无需等期限() {
+    let mut s = Sim::new();
+    s.never.insert(P.into());
+    command(&mut s, P, T, "晚结束命令");
+    let id = stop(&mut s, false);
+    assert!(s.response(&s.log, id).is_none());
+    assert!(!s
+        .log
+        .iter()
+        .any(|a| matches!(a, Action::Request(c) if c.method == LIST)));
+    let now = s.m.clock.mono_ms;
+    s.turn_completed(P, T, "interrupted");
+    let reply = s.response(&s.log, id).expect("结束通知应立即驱动清理");
+    assert_eq!(reply["result"]["stopOutcome"], "confirmed");
+    assert_eq!(reply["result"]["backgroundCleanup"]["state"], "confirmed");
+    assert!(s.background[P].is_empty());
+    assert_eq!(s.m.clock.mono_ms, now);
+    assert!(s.m.stops.operations.is_empty());
+}
