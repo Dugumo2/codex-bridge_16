@@ -905,7 +905,8 @@ fn 门禁期间审查回包照常迁移认领并撤销生命周期意图() {
     m.live_conns.insert(1);
     m.records.entry("Q".into()).or_default().subscribed = true;
     let mut req = request("review/start", 8);
-    req.params = Some(json!({"threadId":"Q"}));
+    // 显式 legacy 服务器夹具，后续注入独立审查子线程。
+    req.params = Some(json!({"threadId":"Q","delivery":"detached"}));
     let (mut m, a) = step(
         m,
         Event::ClientRequest {

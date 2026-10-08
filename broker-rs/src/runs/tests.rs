@@ -48,6 +48,8 @@ fn n4_内联与非开放阶段及非活动运行不发迁移通知() {
             !a.iter().any(|a| matches!(a, Action::Send { .. })),
             "阶段 {phase:?}"
         );
+        assert!(m.runs.runs["审查"].review_thread_id.is_none());
+        assert!(m.runs.runs["审查"].review_short_id.is_none());
     }
 }
 use super::*;
@@ -1806,7 +1808,12 @@ fn 审查子线程继承父恢复覆盖且已有登记优先() {
                     "父指令"
                 })
             );
-            assert!(index_puts(&actions) > 0);
+            if child == "parent" {
+                assert!(actions.is_empty());
+                assert!(m.runs.runs["review"].review_thread_id.is_none());
+            } else {
+                assert!(index_puts(&actions) > 0);
+            }
             let roundtrip: ThreadIndexFile =
                 serde_json::from_slice(&serde_json::to_vec(&m.runs.index).unwrap()).unwrap();
             assert_eq!(roundtrip.threads, m.runs.index.threads);

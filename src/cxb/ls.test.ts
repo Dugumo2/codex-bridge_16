@@ -15,6 +15,16 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-n4a-ls-")); });
 afterEach(async () => { await removeTemp(dir); }, 10_000);
 
 describe("ls", () => {
+  for (const [state, status, expected] of [
+    ["running", null, "running"], ["stopping", null, "stopping"],
+    ["lost", null, "lost"], ["ended", "completed", "completed"],
+  ] as const) test(`local 运行状态 ${state} 显示 ${expected}`, async () => {
+    ledger(dir, [runResult({ state, status })]);
+    const t = context(dir, ["ls", "--local", "--json"]);
+    t.ctx.connect = async () => { throw new Error("本地列表不应连接 broker"); };
+    expect(await ls(t.ctx)).toBe(0);
+    expect(t.json[0].items[0].status).toBe(expected);
+  });
   test("local 从不连接 broker，按最近运行显示状态、清洗预览并截断 Unicode 字符", async () => {
     ledger(dir, [runResult({ status: "interrupted" })], [summary({ preview: "\u001b\n" + "😀".repeat(130) })]);
     const t = context(dir, ["ls", "--local", "--json"]);

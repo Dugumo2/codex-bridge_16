@@ -2248,6 +2248,7 @@ setInterval(() => {}, 1000);
       const sockPath = testSocketPath(tempDir);
       const endpoint = endpointFor(sockPath);
       const mockDir = createMockCodex(tempDir, {
+        legacyReview: true,
         sendTurnCompleted: false,
         reviewDelay: 200, // window for the client to disconnect mid-flight
       });
@@ -2261,6 +2262,7 @@ setInterval(() => {}, 1000);
 
         // Fire-and-forget so we can close before the response lands.
         void client1.request("review/start", {
+          delivery: "detached",
           threadId: "thread-parent",
           target: { type: "uncommittedChanges" },
         }).catch(() => undefined);
@@ -2335,6 +2337,7 @@ setInterval(() => {}, 1000);
       const endpoint = endpointFor(sockPath);
       // Use a long turn-completed delay so stream stays active during the test
       const mockDir = createMockCodex(tempDir, {
+        legacyReview: true,
         sendTurnCompleted: true,
         turnCompletedDelay: 5000,
       });
@@ -2348,6 +2351,7 @@ setInterval(() => {}, 1000);
 
         // Client 1 starts a review (streaming method)
         const reviewResult = await client1.request("review/start", {
+          delivery: "detached",
           threadId: "thread-001",
           target: { type: "uncommittedChanges" },
         }) as { turn: { id: string }; reviewThreadId: string };
@@ -2518,7 +2522,7 @@ setInterval(() => {}, 1000);
       }
     }, 15_000);
 
-    test("a review's completion reaches the client even after an inner turn is announced", async () => {
+    for (const legacyReview of [false, true]) test(`${legacyReview ? "legacy detached" : "inline"} 审查内层轮次之后仍交付外层完成`, async () => {
       // Real Codex (0.147.0) runs a review as: review/start responds naming
       // turn A, an inner turn B announces itself, then turn A completes.
       // turn/started refreshes the thread's recorded turn id to B, so a
@@ -2528,6 +2532,7 @@ setInterval(() => {}, 1000);
       const sockPath = testSocketPath(tempDir);
       const mockDir = createMockCodex(tempDir, {
         reviewInnerTurn: true,
+        legacyReview,
         sendTurnCompleted: true,
         turnCompletedDelay: 300,
       });
@@ -2536,13 +2541,15 @@ setInterval(() => {}, 1000);
       await waitForSocket(sockPath);
 
       try {
-        const client = await TestClient.connectAndInit(sockPath);
+        const client = await TestClient.connectAndInit(sockPath, { cxb: true });
         const notifications = collectNotifications(client);
 
-        await client.request("review/start", {
+        const review = await client.request("review/start", {
+          delivery: legacyReview ? "detached" : "inline",
           threadId: "thread-001",
           target: { type: "uncommittedChanges" },
-        });
+        }) as { runId: string; reviewThreadId: string };
+        expect(review.reviewThreadId).toBe(legacyReview ? "review-thread-001" : "thread-001");
 
         const reviewCompleted = () => notifications.some((n) =>
           n.method === "turn/completed" &&
@@ -2552,6 +2559,16 @@ setInterval(() => {}, 1000);
         // review simply takes longer, which must not read as a failure.
         await waitFor(reviewCompleted).catch(() => { /* assert below reports it */ });
         expect(reviewCompleted()).toBe(true);
+        await waitFor(() => notifications.some((n) => n.method === "broker/run/ended"));
+        const snapshot = await client.request("broker/threads/watch", { threadId: "thread-001" }) as any;
+        expect(snapshot.run.runId).toBe(review.runId);
+        expect(snapshot.run.reviewThreadId).toBe(legacyReview ? "review-thread-001" : null);
+        expect(snapshot.run.turns).toHaveLength(1);
+        expect(snapshot.run.turnsTotal).toBe(1);
+        expect(snapshot.run.turns[0]).toMatchObject({ turnId: "review-turn-001", output: "审查完成" });
+        expect(notifications.some((n) => n.method === "turn/started" && (n.params as any)?.turn?.id === "review-inner-001")).toBe(true);
+        expect(notifications.filter((n) => n.method === "broker/run/ended")).toHaveLength(1);
+        expect(notifications.some((n) => n.method === "broker/run/moved")).toBe(legacyReview);
 
         await client.close();
       } finally {

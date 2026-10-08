@@ -667,7 +667,10 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         self.runs.trace("run_review_moved");
-        if self.runs.phase != Phase::Open || !self.runs.active.contains_key(run) {
+        if self.runs.phase != Phase::Open
+            || !self.runs.active.contains_key(run)
+            || self.runs.runs[run].thread_id == child
+        {
             return;
         }
         if let Some(previous) = self.runs.runs[run].review_thread_id.as_deref() {

@@ -121,7 +121,7 @@ fn 暂存定案回包及审查回包均附加运行编号() {
         .1;
     assert_eq!(result["result"]["runId"], "run-测试-000001");
     assert!(result["result"].get("absorbedBy").is_some());
-    let (mut m, context) = start(false, "review/start");
+    let (mut m, context) = start_legacy_review(false);
     connected(&mut m, 1, true);
     let actions = reply(
         &mut m,
@@ -612,7 +612,7 @@ fn 关闭拒绝变更但允许查询且停止中的在线所有者仍显示客�
 }
 #[test]
 fn 审查排队交接后子线程继承托管且父子观察者结果去重() {
-    let (mut m, context) = start(true, "review/start");
+    let (mut m, context) = start_legacy_review(true);
     connected(&mut m, 1, true);
     connected(&mut m, 2, true);
     watch(&mut m, 2, "线程");
@@ -773,7 +773,7 @@ fn 关闭封口将待补读结算不可用且迟到回包无新通知() {
 
 #[test]
 fn 审查回包后用父线程交接实际子线程且断开不会停止托管运行() {
-    let (mut m, context) = start(false, "review/start");
+    let (mut m, context) = start_legacy_review(false);
     connected(&mut m, 1, true);
     reply(
         &mut m,
@@ -816,7 +816,7 @@ fn 审查回包后用父线程交接实际子线程且断开不会停止托管�
 
 #[test]
 fn 审查交接后以父线程重试返回子线程当前快照且不改变父线程新认领() {
-    let (mut m, context) = start(false, "review/start");
+    let (mut m, context) = start_legacy_review(false);
     connected(&mut m, 1, true);
     connected(&mut m, 2, true);
     reply(

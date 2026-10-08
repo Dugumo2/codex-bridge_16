@@ -3,8 +3,63 @@
 use super::*;
 
 #[test]
+fn inline_缺省空值显式及非法模式不跟踪子线程且正常完成() {
+    for delivery in [
+        None,
+        Some(Value::Null),
+        Some(json!("inline")),
+        Some(json!("其他值")),
+        Some(json!(17)),
+    ] {
+        for same_thread in [false, true] {
+            let mut params = json!({"threadId":"线程"});
+            if let Some(value) = &delivery {
+                params["delivery"] = value.clone();
+            }
+            let (mut machine, context) = start_params(false, "review/start", params.clone());
+            assert_eq!(context.params, Some(params));
+            assert_eq!(machine.pending_reviews, 0, "delivery={delivery:?}");
+            assert!(context.review_id.is_none());
+            apply(
+                &mut machine,
+                notify(
+                    "turn/started",
+                    json!({"threadId":"无关线程","turn":{"id":"无关轮"}}),
+                ),
+            );
+            assert!(machine.unclaimed.is_empty());
+            apply(&mut machine, Event::Connected { conn: 1 });
+            apply(&mut machine, Event::Initialized { conn: 1, cxb: true });
+            let mut response = json!({"turn":{"id":"审查轮"}});
+            if same_thread {
+                response["reviewThreadId"] = json!("线程");
+            }
+            let actions = reply(&mut machine, &context, Ok(response));
+            assert!(sends(&actions)
+                .iter()
+                .all(|(_, message)| message["method"] != "broker/run/moved"));
+            assert_eq!(machine.claims.len(), 1);
+            assert!(machine.claims.contains_key("线程"));
+            let run = &machine.runs.runs["run-测试-000001"];
+            assert!(run.review_thread_id.is_none());
+            assert!(run.review_short_id.is_none());
+            let actions = apply(&mut machine, turn("turn/completed", "审查轮"));
+            assert!(machine.claims.is_empty());
+            assert_eq!(
+                sends(&actions)
+                    .iter()
+                    .filter(|(_, message)| message["method"] == "broker/run/ended")
+                    .count(),
+                1
+            );
+            assert_eq!(machine.runs.runs["run-测试-000001"].turns.len(), 1);
+        }
+    }
+}
+
+#[test]
 fn 子线程早到完成只提交一次且回放会释放认领() {
-    let (mut machine, context) = start(false, "review/start");
+    let (mut machine, context) = start_legacy_review(false);
     let actions = apply(
         &mut machine,
         notify(
@@ -38,7 +93,7 @@ fn 子线程早到完成只提交一次且回放会释放认领() {
 
 #[test]
 fn 父子转移不结束运行且子线程分配新认领代号() {
-    let (mut machine, context) = start(false, "review/start");
+    let (mut machine, context) = start_legacy_review(false);
     let parent_id = machine.claims["线程"].claim_id;
     reply(
         &mut machine,
@@ -61,7 +116,7 @@ fn 父子转移不结束运行且子线程分配新认领代号() {
 
 #[test]
 fn 审查内层轮次不吞掉外层完成通知() {
-    let (mut machine, context) = start(false, "review/start");
+    let (mut machine, context) = start_legacy_review(false);
     reply(
         &mut machine,
         &context,
@@ -100,7 +155,7 @@ fn 内联审查完成先于回包不会重建认领() {
 
 #[test]
 fn 断开后的审查回包停止子线程且完成前保留() {
-    let (mut machine, context) = start(false, "review/start");
+    let (mut machine, context) = start_legacy_review(false);
     apply(&mut machine, Event::Disconnected { conn: 1 });
     let actions = reply(
         &mut machine,
@@ -116,11 +171,16 @@ fn 断开后的审查回包停止子线程且完成前保留() {
 
 #[test]
 fn 并行审查缓冲不泄漏给其他拥有者() {
-    let (mut machine, first) = start(false, "review/start");
+    let (mut machine, first) = start_legacy_review(false);
     machine.record("父二").subscribed = true;
     let actions = apply(
         &mut machine,
-        client(request(2, 99, "review/start", json!({"threadId": "父二"}))),
+        client(request(
+            2,
+            99,
+            "review/start",
+            json!({"threadId": "父二", "delivery": "detached"}),
+        )),
     );
     let second = first_request(&actions);
     apply(
@@ -150,7 +210,7 @@ fn 并行审查缓冲不泄漏给其他拥有者() {
 
 #[test]
 fn 审查缓冲总计五百条且计数归零清空() {
-    let (mut machine, context) = start(false, "review/start");
+    let (mut machine, context) = start_legacy_review(false);
     for i in 0..510 {
         apply(
             &mut machine,
@@ -168,7 +228,7 @@ fn 审查缓冲总计五百条且计数归零清空() {
 
 #[test]
 fn 子线程记录不覆盖父线程元数据() {
-    let (mut machine, context) = start(false, "review/start");
+    let (mut machine, context) = start_legacy_review(false);
     machine
         .record("线程")
         .pending_meta
@@ -194,7 +254,7 @@ fn 子线程记录不覆盖父线程元数据() {
 
 #[test]
 fn 早到审查完成后的同批输出仍转发且不进入目标续跑() {
-    let (mut machine, context) = start(false, "review/start");
+    let (mut machine, context) = start_legacy_review(false);
     apply(
         &mut machine,
         notify(
@@ -274,7 +334,7 @@ fn 共享模式内联审查完成先于回包时恰好记账一次且不重建�
 
 #[test]
 fn 父认领换代后迟到的审查回包仍认领子线程且不动新父认领() {
-    let (mut machine, review) = start(false, "review/start");
+    let (mut machine, review) = start_legacy_review(false);
     apply(&mut machine, Event::Connected { conn: 1 });
     // 审查请求还没回包时父线程的认领被一个完成通知释放，随后另一个连接在父线程上开了新一轮。
     apply(&mut machine, turn("turn/completed", "父轮"));
@@ -321,7 +381,7 @@ fn 父认领换代后迟到的审查回包仍认领子线程且不动新父认�
 
 #[test]
 fn 父认领过期且原连接已断开时子线程认领立即进入停止操作() {
-    let (mut machine, review) = start(false, "review/start");
+    let (mut machine, review) = start_legacy_review(false);
     apply(&mut machine, Event::Connected { conn: 1 });
     apply(&mut machine, turn("turn/completed", "父轮"));
     apply(&mut machine, Event::Disconnected { conn: 1 });
@@ -340,7 +400,7 @@ fn 父认领过期且原连接已断开时子线程认领立即进入停止操�
 
 #[test]
 fn 关闭后迟到的审查回包不再认领子线程() {
-    let (mut machine, review) = start(false, "review/start");
+    let (mut machine, review) = start_legacy_review(false);
     apply(&mut machine, Event::Connected { conn: 1 });
     apply(&mut machine, Event::Shutdown);
     assert!(machine.claims.is_empty());

@@ -1369,7 +1369,11 @@ async fn 核心延迟处理超时仍使用原截止且到期同步清理审查�
         .entry("线程".into())
         .or_default()
         .subscribed = true;
-    h.client(1, "review/start", json!({"threadId":"线程"}));
+    h.client(
+        1,
+        "review/start",
+        json!({"threadId":"线程","delivery":"detached"}),
+    );
     h.outgoing().await;
     tokio::time::sleep(Duration::from_secs(5)).await;
     let message = loop {
@@ -1430,7 +1434,11 @@ async fn 核心审查冲突操作不锁别的认领完成后条件关闭成功()
         .entry("线程".into())
         .or_default()
         .subscribed = true;
-    h.client(1, "review/start", json!({"threadId":"线程"}));
+    h.client(
+        1,
+        "review/start",
+        json!({"threadId":"线程","delivery":"detached"}),
+    );
     let review = h.outgoing().await;
     let mut child = h.core.machine.claims["线程"].clone();
     child.claim_id = 99;
@@ -1595,7 +1603,7 @@ async fn 核心线回包已接收转发延迟且旧本地截止先到仍处理�
 #[tokio::test(start_paused = true)]
 async fn 核心普通审查超时迟到不提前结算另一审查且早到子线程完成释放() {
     let mut h = Harness::new(false);
-    h.client(1, "review/start", json!({}));
+    h.client(1, "review/start", json!({"delivery":"detached"}));
     let forwarded = h.outgoing().await;
     let forwarded_tag = h.core.next_tag;
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1605,7 +1613,11 @@ async fn 核心普通审查超时迟到不提前结算另一审查且早到子�
         .entry("线程".into())
         .or_default()
         .subscribed = true;
-    h.client(2, "review/start", json!({"threadId":"线程"}));
+    h.client(
+        2,
+        "review/start",
+        json!({"threadId":"线程","delivery":"detached"}),
+    );
     let normal = h.outgoing().await;
     assert_eq!(h.core.machine.pending_reviews, 2);
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1753,7 +1765,11 @@ async fn 核心最后审查对账过期旧消息排空后独立试探恢复接�
         .entry("线程".into())
         .or_default()
         .subscribed = true;
-    h.client(1, "review/start", json!({"threadId":"线程"}));
+    h.client(
+        1,
+        "review/start",
+        json!({"threadId":"线程","delivery":"detached"}),
+    );
     h.outgoing().await;
     let original_tag = h.core.next_tag;
     tokio::time::sleep(Duration::from_secs(5)).await;

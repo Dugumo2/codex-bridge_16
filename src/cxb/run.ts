@@ -350,7 +350,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     disposers.push(rpc.onClose(() => disconnected(new CxbError("BROKER_UNAVAILABLE", "等待续跑定案时 broker 连接断开", { retryable: true }))));
     const startMethod = plan.command === "review" ? "review/start" : "turn/start";
     const startParams = plan.command === "review"
-      ? { threadId, target: plan.review!.target, delivery: "detached" }
+      ? { threadId, target: plan.review!.target, delivery: "inline" }
       : { threadId, input: [{ type: "text", text: continued ? continued.prompt : plan.prompt!, text_elements: [] }], clientUserMessageId: randomUUID(),
         sandboxPolicy: sandboxPolicyFor(plan.sandbox), ...(model ? { model } : {}), ...(reasoning ? { effort: reasoning } : {}), ...approval,
         // 条件请求：broker 在开工那一刻核实原运行仍可续，不满足就不开工（详细设计 2.3 节「续跑的条件请求」）。
@@ -361,7 +361,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       throw refusal ? decide(refusal) : error;
     }).then((reply) => {
       if (!active) return reply;
-      if (reply.reviewThreadId) { executionThread = reply.reviewThreadId; attach(executionThread); }
+      if (reply.reviewThreadId && reply.reviewThreadId !== threadId) { executionThread = reply.reviewThreadId; attach(executionThread); }
       reviewReady();
       if (!runId && reply.runId) { runId = reply.runId; shortId = reply.shortId ?? shortId; started(runId); }
       if (!runId) throw new CxbError("BROKER_UNAVAILABLE", "broker 未返回运行标识");

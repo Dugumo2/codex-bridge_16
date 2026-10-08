@@ -54,7 +54,7 @@ fn 首次溢出裁剪已经持有的生命周期也会触发核实() {
 #[test]
 fn 溢出审查丢失生命周期后只核实实际子线程() {
     let mut m = Machine::new(true);
-    let review = review(&mut m);
+    let review = legacy_review(&mut m);
     overflow(&mut m, "parent");
     for _ in 0..OVERFLOW_LIFECYCLE_ITEMS {
         notify(&mut m, "parent", "turn/future", json!({}));
@@ -231,6 +231,15 @@ fn 已落定或其他线程的客户端goal写入不触发本线程额外暂停(
 }
 
 fn review(m: &mut Machine) -> RequestContext {
+    review_fixture(m, false)
+}
+
+/// 显式 legacy detached 服务器夹具，子线程回包由用例注入。
+fn legacy_review(m: &mut Machine) -> RequestContext {
+    review_fixture(m, true)
+}
+
+fn review_fixture(m: &mut Machine, legacy: bool) -> RequestContext {
     m.record("parent").subscribed = true;
     m.live_conns.insert(1);
     m.cxb_conns.insert(1);
@@ -241,7 +250,9 @@ fn review(m: &mut Machine) -> RequestContext {
                 conn: 1,
                 id: json!(7),
                 method: "review/start".into(),
-                params: Some(json!({"threadId":"parent"})),
+                params: Some(
+                    json!({"threadId":"parent","delivery":if legacy { "detached" } else { "inline" }}),
+                ),
             },
             run_id: Some("review-run".into()),
         },
@@ -257,7 +268,7 @@ fn completed_turn() -> Value {
 fn 溢出审查迁移joined子线程且早到或晚到completed都结束运行() {
     for early in [false, true] {
         let mut m = Machine::new(true);
-        let review = review(&mut m);
+        let review = legacy_review(&mut m);
         overflow(&mut m, "parent");
         if early {
             notify(
@@ -327,7 +338,7 @@ fn 溢出审查不抢占已有子线程且断开不停止joined审查() {
             None
         };
         m.shared = true;
-        let review = review(&mut m);
+        let review = legacy_review(&mut m);
         overflow(&mut m, "parent");
         if !occupied {
             apply(&mut m, Event::Disconnected { conn: 1 });

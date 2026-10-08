@@ -145,17 +145,17 @@ async function rpcError(promise: Promise<unknown>): Promise<unknown> {
   throw new Error("应收到 RPC 错误");
 }
 async function start(): Promise<{ client: Rpc; exited: Promise<void> }> {
-  const mock = createMockCodex(dir, { sendTurnCompleted: false });
+  const mock = createMockCodex(dir, { sendTurnCompleted: false, legacyReview: true });
   baseObserver ||= readFileSync(join(dir, "observe.ts"), "utf8");
   writeFileSync(join(dir, "observe.ts"), baseObserver + transportObserver);
   // 只调整临时启动器，mock 源文件保持 createMockCodex 生成的原样。
   writeFileSync(join(mock, "codex.cmd"), `@echo off\r\n"${process.execPath}" --preload "%~dp0observe.ts" "%~dp0codex-mock.ts" %*\r\n`);
   const env = Object.fromEntries(Object.entries(envWithPathPrefix(mock)).filter(([key]) => {
     const name = key.toUpperCase();
-    return !["CXB_HOME", "CODEX_HOME", "CXB_SERVER"].includes(name)
+    return !["CXB_HOME", "CODEX_HOME", "USERPROFILE", "HOME", "CXB_SERVER"].includes(name)
       && !/SOCKET|ENDPOINT/.test(name) && !name.startsWith("MOCK_");
   }));
-  Object.assign(env, { CXB_HOME: join(dir, "data"), CODEX_HOME: join(dir, "codex-home"), CXB_SERVER: "private" });
+  Object.assign(env, { CXB_HOME: join(dir, "data"), CODEX_HOME: join(dir, "codex-home"), USERPROFILE: join(dir, "profile"), HOME: join(dir, "profile"), CXB_SERVER: "private" });
   const path = testSocketPath(dir);
   const child = spawn(BROKER_BIN, ["serve", "--cwd", dir, "--endpoint", endpointFor(path), "--idle-timeout", "60000"], {
     env, cwd: dir, windowsHide: true, stdio: "ignore",

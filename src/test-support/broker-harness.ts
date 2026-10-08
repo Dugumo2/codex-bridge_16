@@ -157,6 +157,8 @@ export function createMockCodex(dir: string, opts?: {
   startedThenError?: boolean;
   /** 模拟 Codex 0.147.0 的审查内部轮次：review/start 返回轮次 A，随后宣布轮次 B，再完成 A；不能把 A 的完成误判为其他轮次。 */
   reviewInnerTurn?: boolean;
+  /** 仅显式 legacy 夹具接受 detached；缺省与 inline 始终留在请求线程。 */
+  legacyReview?: boolean;
   /** turn/interrupt 拒绝与指定标识不同的 turnId，模拟运行期间轮次更换后的不匹配错误。 */
   activeTurnId?: string;
 }): string {
@@ -489,8 +491,13 @@ process.stdin.on("data", (chunk) => {
 
       case "review/start": {
         const threadId = msg.params?.threadId || "thread-001";
-        const reviewThreadId = "review-thread-001";
+        if (msg.params?.delivery === "detached" && !${opts?.legacyReview ?? false}) {
+          respond({ id: msg.id, error: { code: -32600, message: "paginated threads do not support detached review" } });
+          break;
+        }
+        const reviewThreadId = msg.params?.delivery === "detached" ? "review-thread-001" : threadId;
         setTimeout(() => {
+          if (reviewThreadId !== threadId) respond({ method: "thread/started", params: { thread: { id: reviewThreadId } } });
           respond({ id: msg.id, result: {
             turn: { id: "review-turn-001", items: [], status: "inProgress", error: null },
             reviewThreadId: reviewThreadId,
@@ -514,7 +521,7 @@ process.stdin.on("data", (chunk) => {
               method: "turn/completed",
               params: {
                 threadId: reviewThreadId,
-                turn: { id: "review-turn-001", items: [], status: "completed", error: null },
+                turn: { id: "review-turn-001", items: [{ id: "review-result", type: "exitedReviewMode", review: "审查完成" }], itemsView: "full", status: "completed", error: null },
               },
             });
           }, ${turnCompletedDelay});

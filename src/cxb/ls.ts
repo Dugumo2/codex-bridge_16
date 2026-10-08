@@ -28,7 +28,7 @@ function localItems(ctx: CommandContext, threads: LocalThread[]): ListItem[] {
     const run = !thread.lifecycle && (!thread.state || thread.state === "idle") && thread.lastRunId
       ? readRunRecord(ctx.workspace.workspaceDir, thread.lastRunId) : null;
     const status = thread.lifecycle ? lifecycleLabel(thread.lifecycle) : thread.state && thread.state !== "idle" ? thread.state
-      : run?.state === "lost" ? "lost" : run?.status ?? "idle";
+      : run?.state === "running" || run?.state === "stopping" || run?.state === "lost" ? run.state : run?.status ?? "idle";
     return { ...thread, status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
   });
 }

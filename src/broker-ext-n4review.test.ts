@@ -143,7 +143,7 @@ async function rpcError(promise: Promise<unknown>): Promise<unknown> {
   throw new Error("应收到 RPC 错误");
 }
 async function start(): Promise<{ client: Rpc; exited: Promise<void> }> {
-  const mock = createMockCodex(dir, { sendTurnCompleted: false });
+  const mock = createMockCodex(dir, { sendTurnCompleted: false, legacyReview: true });
   baseObserver ||= readFileSync(join(dir, "observe.ts"), "utf8");
   writeFileSync(join(dir, "observe.ts"), baseObserver + transportObserver);
   // 只调整临时启动器，mock 源文件保持 createMockCodex 生成的原样。
@@ -244,7 +244,7 @@ test("迁移仅通知父扩展所有者与观察者，子事件和事项仍独�
   await owner.request("broker/threads/watch",{threadId:parent});
   await watcher.request("broker/threads/watch",{threadId:parent});
   await legacy.request("broker/threads/watch",{threadId:parent});
-  const review = await owner.request("review/start",{threadId:parent,target:{type:"uncommittedChanges"}});
+  const review = await owner.request("review/start",{ delivery: "detached",threadId:parent,target:{type:"uncommittedChanges"}});
   const snapshot = await watcher.request("broker/threads/watch",{threadId:parent});
   const runId = snapshot.run.runId;
   await until(()=>movedNotices(owner).length>0 && movedNotices(watcher).length>0);
@@ -283,7 +283,7 @@ for (const managed of [false,true]) {
   test(`父线程停止${managed ? "托管" : "客户端"}审查只中断子线程并等待完成证据`,async()=> {
     const {client}=await start();
     await client.request("thread/start");
-    await client.request("review/start",{threadId:parent,target:{type:"uncommittedChanges"}});
+    await client.request("review/start",{ delivery: "detached",threadId:parent,target:{type:"uncommittedChanges"}});
     const runId=(await client.request("broker/threads/watch",{threadId:parent})).run.runId;
     if (managed) await client.request("broker/threads/detach",{threadId:child,runId,policy:"auto"});
     await client.request("n4/goal");
@@ -308,7 +308,7 @@ test("停止先于迁移回包时不操作父线程，迁移后合并同一运�
   const {client}=await start();
   await client.request("thread/start");
   await client.request("n4/hold");
-  const reviewing=client.request("review/start",{threadId:parent,target:{type:"uncommittedChanges"}});
+  const reviewing=client.request("review/start",{ delivery: "detached",threadId:parent,target:{type:"uncommittedChanges"}});
   void reviewing.catch(()=>{});
   await until(async()=> (await client.request("n4/state")).held===1);
   const stopping=client.request("broker/threads/stop",{threadId:parent});
@@ -327,7 +327,7 @@ test("停止先于迁移回包时不操作父线程，迁移后合并同一运�
 for (const detachFirst of [true, false]) test(`同批交接与停止：${detachFirst ? "交接先到" : "停止先到"}仍只停止活动 review 子线程`, async () => {
   const { client } = await start();
   await client.request("thread/start");
-  await client.request("review/start", { threadId: parent, target: { type: "uncommittedChanges" } });
+  await client.request("review/start", { delivery: "detached", threadId: parent, target: { type: "uncommittedChanges" } });
   const runId = (await client.request("broker/threads/watch", { threadId: parent })).run.runId;
   let transferred!: Promise<any>;
   let stopping!: Promise<any>;
@@ -352,7 +352,7 @@ for (const firstTarget of [parent, child]) test(`迁移通知与父子停止交�
   const { client } = await start();
   await client.request("thread/start");
   await client.request("n4/hold");
-  const reviewing = client.request("review/start", { threadId: parent, target: { type: "uncommittedChanges" } });
+  const reviewing = client.request("review/start", { delivery: "detached", threadId: parent, target: { type: "uncommittedChanges" } });
   void reviewing.catch(() => {});
   await until(async () => (await client.request("n4/state")).held === 1);
   let stops: Promise<any>[] = [];

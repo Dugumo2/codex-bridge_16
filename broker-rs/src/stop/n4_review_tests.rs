@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 fn 迁移登记保留未订阅父线程的真实所有者() {
-    let (mut m, review) = started(false, "review/start");
+    let (mut m, review) = started_legacy_review(false);
     apply(&mut m, Event::Initialized { conn: 1, cxb: true });
     assert!(m.records["线程"].watchers.is_empty());
     let a = reply(
@@ -87,7 +87,7 @@ fn 父停止四十秒到期后迟到完成收尾不重复回包() {
 }
 
 fn moved() -> Machine {
-    let (mut m, review) = started(false, "review/start");
+    let (mut m, review) = started_legacy_review(false);
     reply(
         &mut m,
         &review,
@@ -178,7 +178,7 @@ fn 父空闲停止客户端与托管审查仅操作子线程并等待唯一判�
 #[test]
 fn 迁移前后停止均选同一运行且未知子线程前不操作父线程() {
     for before in [false, true] {
-        let (mut m, review) = started(false, "review/start");
+        let (mut m, review) = started_legacy_review(false);
         if before {
             let a = stop(&mut m, 90, false);
             assert!(requests(&a, "thread/goal/get").is_empty());
@@ -273,7 +273,7 @@ fn 子线程冲突外来停止与归属未定均拒绝() {
                 }
             }
             "settling" => {
-                m.claims.get_mut("子线程").unwrap().state = started(true, "review/start")
+                m.claims.get_mut("子线程").unwrap().state = started_legacy_review(true)
                     .0
                     .claims
                     .remove("线程")

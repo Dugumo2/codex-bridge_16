@@ -93,17 +93,26 @@ fn reply(
 }
 
 fn start(shared: bool, method: &str) -> (Machine, RequestContext) {
+    start_params(
+        shared,
+        method,
+        json!({"threadId": "线程", "input": [{"type": "text", "text": "  本次输入  "}]}),
+    )
+}
+
+/// 显式 legacy 服务器夹具：调用方注入 detached 子线程通知与回包。
+fn start_legacy_review(shared: bool) -> (Machine, RequestContext) {
+    start_params(
+        shared,
+        "review/start",
+        json!({"threadId": "线程", "delivery": "detached"}),
+    )
+}
+
+fn start_params(shared: bool, method: &str, params: Value) -> (Machine, RequestContext) {
     let mut machine = Machine::new(shared);
     machine.record("线程").subscribed = true;
-    let actions = apply(
-        &mut machine,
-        client(request(
-            1,
-            42,
-            method,
-            json!({"threadId": "线程", "input": [{"type": "text", "text": "  本次输入  "}]}),
-        )),
-    );
+    let actions = apply(&mut machine, client(request(1, 42, method, params)));
     (machine, first_request(&actions))
 }
 

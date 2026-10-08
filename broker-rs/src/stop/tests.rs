@@ -64,15 +64,27 @@ fn turn(m: &mut Machine, method: &str, id: &str) -> Vec<Action> {
     )
 }
 fn started(shared: bool, method: &str) -> (Machine, RequestContext) {
+    started_params(
+        shared,
+        method,
+        json!({"threadId":"线程","input":[{"type":"text","text":"本次输入"}]}),
+    )
+}
+
+/// 显式 legacy 服务器夹具：用例手工注入 detached 子线程回包。
+fn started_legacy_review(shared: bool) -> (Machine, RequestContext) {
+    started_params(
+        shared,
+        "review/start",
+        json!({"threadId":"线程","delivery":"detached"}),
+    )
+}
+
+fn started_params(shared: bool, method: &str, params: Value) -> (Machine, RequestContext) {
     let mut m = Machine::new(shared);
     apply(&mut m, Event::Connected { conn: 1 });
     m.records.entry("线程".into()).or_default().subscribed = true;
-    let a = client(
-        &mut m,
-        method,
-        1,
-        json!({"threadId":"线程","input":[{"type":"text","text":"本次输入"}]}),
-    );
+    let a = client(&mut m, method, 1, params);
     (m, req(&a, method))
 }
 fn running() -> Machine {
@@ -839,7 +851,7 @@ fn 过期代号计时器与旧轮次回包无效() {
 }
 #[test]
 fn 审查断开随子线程迁移且不碰父线程() {
-    let (mut m, c) = started(false, "review/start");
+    let (mut m, c) = started_legacy_review(false);
     let a = disconnected(&mut m);
     assert!(requests(&a, "thread/goal/get").is_empty());
     let a = reply(
@@ -1580,7 +1592,7 @@ fn 关闭后暂停与清除成功迟到都不改变状态() {
 
 #[test]
 fn 审查子线程冲突保留停止等待期限且不触碰别的认领() {
-    let (mut m, c) = started(false, "review/start");
+    let (mut m, c) = started_legacy_review(false);
     let initial = stop(&mut m, 2, false);
     let mut occupied = running().claims.remove("线程").unwrap();
     occupied.claim_id = 99;
@@ -1618,7 +1630,7 @@ fn 审查子线程冲突保留停止等待期限且不触碰别的认领() {
 
 #[test]
 fn 旧审查父认领回包不迁移新认领的停止操作() {
-    let (mut m, c) = started(false, "review/start");
+    let (mut m, c) = started_legacy_review(false);
     turn(&mut m, "turn/completed", "父轮");
     let a = client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
     reply(
@@ -2014,7 +2026,7 @@ fn 转向请求超时只释放且迟到成功也不能取得中断权限() {
 }
 #[test]
 fn 审查超时活动父轮次不授予停止权限迟到回包确定子线程才停() {
-    let (mut m, c) = started(false, "review/start");
+    let (mut m, c) = started_legacy_review(false);
     let a = apply(
         &mut m,
         Event::TimedOut {
@@ -2314,7 +2326,7 @@ fn 已受理停止转加入统一回复全部等待者并清理不报告确认()
 #[test]
 fn 审查超时跟踪迟到失败过期淘汰与关闭各结算一次计数() {
     for exit in ["失败", "过期", "淘汰", "关闭"] {
-        let (mut m, c) = started(false, "review/start");
+        let (mut m, c) = started_legacy_review(false);
         let a = apply(
             &mut m,
             Event::TimedOut {
@@ -2428,9 +2440,14 @@ fn 线上等待截止不延长回包消费后另给收尾期() {
 
 #[test]
 fn 审查跟踪重复清理不减少另一在途审查计数() {
-    let (mut m, c) = started(false, "review/start");
+    let (mut m, c) = started_legacy_review(false);
     m.records.entry("其他线程".into()).or_default().subscribed = true;
-    let a = client(&mut m, "review/start", 9, json!({"threadId":"其他线程"}));
+    let a = client(
+        &mut m,
+        "review/start",
+        9,
+        json!({"threadId":"其他线程","delivery":"detached"}),
+    );
     let other = req(&a, "review/start");
     assert_eq!(m.pending_reviews, 2);
     let a = apply(
@@ -2468,7 +2485,7 @@ fn 审查跟踪重复清理不减少另一在途审查计数() {
 
 #[test]
 fn 审查超时父线程没有活动也继续等子线程权威回包() {
-    let (mut m, c) = started(false, "review/start");
+    let (mut m, c) = started_legacy_review(false);
     let a = apply(
         &mut m,
         Event::TimedOut {
@@ -2548,7 +2565,7 @@ fn 共享迟到轮次与新认领重合时不按旧请求停止新任务() {
 
 #[test]
 fn 审查未知子线程的旧父轮通知也不能触发迟到中断() {
-    let (mut m, c) = started(false, "review/start");
+    let (mut m, c) = started_legacy_review(false);
     turn(&mut m, "turn/started", "父轮");
     apply(
         &mut m,
@@ -2779,7 +2796,7 @@ fn 等待线回包的旧本地截止不清理登记或未知目标变更() {
 }
 #[test]
 fn 迟到回包已到但定案失败超过六十四条仍限额并结算审查计数() {
-    let (mut m, review) = started(true, "review/start");
+    let (mut m, review) = started_legacy_review(true);
     apply(
         &mut m,
         Event::TimedOut {
@@ -2849,8 +2866,11 @@ fn 迟到回包已到但定案失败超过六十四条仍限额并结算审查�
 
 #[test]
 fn 普通审查超时迟到错误不清掉另一审查早到完成缓冲() {
-    for params in [json!({}), json!({"threadId":17})] {
-        let (mut m, normal) = started(false, "review/start");
+    for params in [
+        json!({"delivery":"detached"}),
+        json!({"threadId":17,"delivery":"detached"}),
+    ] {
+        let (mut m, normal) = started_legacy_review(false);
         let a = client(&mut m, "review/start", 8, params);
         let forwarded = req(&a, "review/start");
         assert_eq!(forwarded.operation, Operation::Forward);
@@ -2899,7 +2919,7 @@ fn 普通审查超时迟到错误不清掉另一审查早到完成缓冲() {
 fn 普通审查复用客户端编号时旧回包不结算新请求() {
     let mut m = Machine::default();
     apply(&mut m, Event::Connected { conn: 1 });
-    let a = client(&mut m, "review/start", 8, json!({}));
+    let a = client(&mut m, "review/start", 8, json!({"delivery":"detached"}));
     let old = req(&a, "review/start");
     apply(
         &mut m,
@@ -2911,7 +2931,7 @@ fn 普通审查复用客户端编号时旧回包不结算新请求() {
         },
     );
     assert_eq!(m.pending_reviews, 0);
-    let a = client(&mut m, "review/start", 8, json!({}));
+    let a = client(&mut m, "review/start", 8, json!({"delivery":"detached"}));
     let new = req(&a, "review/start");
     assert_ne!(old.review_id, new.review_id);
     assert_eq!(m.pending_reviews, 1);
@@ -3364,7 +3384,7 @@ fn 迟到登记淘汰后未知暂停屏障保留至结果落定或十分钟截�
 #[test]
 fn 最后审查对账清理后熔断仍有独立试探且恢复接单() {
     for result in [Ok(json!({"data":[]})), Err(err())] {
-        let (mut m, c) = started(false, "review/start");
+        let (mut m, c) = started_legacy_review(false);
         let a = begin_unresolved(&mut m, &c, 62);
         let a = begin_unresolved(&mut m, &req(&a, "thread/read"), 63);
         let old_timer = timer(&a, |kind| matches!(kind, TimerKind::Reconcile { .. }));
@@ -4115,7 +4135,7 @@ fn 按运行停止拒绝换代和未知认领且旧终态不影响新运行() {
 
 #[test]
 fn 按运行停止审查由父标识定位子认领() {
-    let (mut m, review) = started(false, "review/start");
+    let (mut m, review) = started_legacy_review(false);
     reply(
         &mut m,
         &review,

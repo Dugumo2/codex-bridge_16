@@ -209,7 +209,7 @@ fn 客户端加入与启动失败各记一次() {
 
 #[test]
 fn 审查子线程每条缓冲条目和完成只交付一次() {
-    let (mut m, context) = start(false, "review/start");
+    let (mut m, context) = start_legacy_review(false);
     for method in [
         "turn/started",
         "item/started",

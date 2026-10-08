@@ -1307,6 +1307,12 @@ impl Machine {
                     .filter(|_| context.method == "review/start")
                     .and_then(|v| v.get("reviewThreadId"))
                     .and_then(Value::as_str)
+                    .filter(|child| {
+                        context
+                            .token
+                            .as_ref()
+                            .is_some_and(|token| token.thread_id != *child)
+                    })
                     .map(str::to_owned);
                 if let (Some(child), Ok(value)) = (review_child, &result) {
                     self.review_reply(
@@ -1718,6 +1724,12 @@ impl Machine {
                 continue;
             };
             if context.method == "review/start"
+                && context
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("delivery"))
+                    .and_then(Value::as_str)
+                    == Some("detached")
                 && context.client.is_some()
                 && context.review_id.is_none()
             {

@@ -8,6 +8,7 @@ const scenario = JSON.parse(process.env.RUN_FIXTURE_OPTIONS ?? "{}");
 const calls: Array<{ method: string; params: any }> = [];
 const threads = new Map<string, { turns: any[]; goal: any }>();
 const reads: Array<{ id: unknown; threadId: string }> = [];
+const reviewTurns = new Set<string>();
 let nextThread = 0;
 let nextTurn = 0;
 let released = false;
@@ -35,7 +36,7 @@ function finish(id: string, interrupted = false) {
   turn.status = interrupted ? "interrupted" : scenario.fail ? "failed" : "completed";
   turn.error = scenario.fail ? { message: "模拟 Codex 失败" } : null;
   turn.items = [{ id: `answer-${turn.id}`, type: "agentMessage", phase: "final_answer", text: scenario.output ?? "完整中文结果" }];
-  if (id.startsWith("review-")) turn.items = [{ id: "review-result", type: "exitedReviewMode", review: scenario.output ?? "完整中文审查" }];
+  if (reviewTurns.has(turn.id)) turn.items = [{ id: "review-result", type: "exitedReviewMode", review: scenario.output ?? "完整中文审查" }];
   notify("turn/completed", { threadId: id, turn: scenario.pendingResult && !released ? { ...turn, items: [], itemsView: "notLoaded" } : turn });
 }
 process.stdin.setEncoding("utf8");
@@ -65,7 +66,7 @@ process.stdin.on("data", (chunk) => {
         if (scenario.warnAsk) notify("configWarning", { summary: `忽略 ${key}`, details: "秘密不应回显" });
         const id = p.threadId ?? `thread-${++nextThread}`;
         if (id === "missing") { send({ id: msg.id, error: { code: -32000, message: "thread not found" } }); break; }
-        reply(msg.id, { thread: thread(id), model: p.model ?? "mock-model", reasoningEffort: p.config?.model_reasoning_effort ?? "high", cwd: process.cwd() });
+        reply(msg.id, { thread: thread(id), model: p.model ?? "mock-model", reasoningEffort: p.config?.model_reasoning_effort ?? "high", cwd: process.cwd(), sandbox: { type: p.sandbox === "read-only" ? "readOnly" : "workspaceWrite" }, approvalPolicy: p.approvalPolicy ?? "never" });
         break;
       }
       case "thread/memoryMode/set": reply(msg.id, {}); break;
@@ -92,8 +93,14 @@ process.stdin.on("data", (chunk) => {
         break;
       }
       case "review/start": {
-        const id = `review-${++nextThread}`;
+        if (p.delivery === "detached" && !scenario.legacyReview) {
+          send({ id: msg.id, error: { code: -32600, message: "paginated threads do not support detached review" } });
+          break;
+        }
+        const id = p.delivery === "detached" ? `review-${++nextThread}` : p.threadId;
+        if (p.delivery === "detached") notify("thread/started", { thread: thread(id) });
         const turn = begin(id);
+        reviewTurns.add(turn.id);
         reply(msg.id, { turn, reviewThreadId: id });
         if (scenario.reviewQuestion) send({ id: "review-question", method: "item/tool/requestUserInput", params: {
           threadId: id, turnId: turn.id, isBlocking: false, questions: [{ id: "choice", question: "审查范围由用户确认" }] } });

@@ -4,7 +4,7 @@
 //                      early-ask（turn/start 回包前就提问）、ask-cancel（提问后等触发文件，发 serverRequest/resolved 撤销再完成）、
 //                      hold（本进程第一轮一直运行到 turn/interrupt，之后各轮立即完成）、complete（每轮立即完成）、
 //                      ask-big（提问，答后以远大于 64 KiB 的中文结果完成）；thread/archive、thread/delete 回成功，thread/list 回空；
-//                      review/start 不分场景：迁到子线程 review-e2e，在子线程上先后提问两次，答完以审查结论完成；
+//                      review/start 默认 inline；显式 MOCK_E2E_LEGACY_REVIEW 才允许 detached，在审查线程上先后提问两次，答完以审查结论完成；
 //   MOCK_E2E_LOG：每条收到的请求、对服务端请求的回包各追加一行 JSON，供用例断言载荷与「恰好一次」；启动时记一行 boot（含 pid）；
 //   MOCK_E2E_TRIGGER：ask-cancel 场景里出现该文件即撤销提问；
 //   MOCK_E2E_BUSY：该文件存在时 thread/read 报告一个 inProgress 的 turn（模拟 broker 重启后核实不通过）。
@@ -148,19 +148,24 @@ async function runTurn(threadId: string, turnId: string, early: Promise<{ result
   }
 }
 
-/** review/start 迁到的子线程（详细设计 3.5 节：运行随响应里的 reviewThreadId 转到子线程）。 */
+/** 仅 legacy detached 互操作夹具使用独立子线程。 */
 const REVIEW_THREAD = process.env.MOCK_E2E_REVIEW_THREAD || "review-e2e";
 
-function reviewDone(turnId: string, text: string): void {
+function reviewDone(threadId: string, turnId: string, text: string): void {
   const item = { type: "exitedReviewMode", id: "review-exit", review: text };
-  send({ method: "item/completed", params: { threadId: REVIEW_THREAD, turnId, item } });
-  send({ method: "turn/completed", params: { threadId: REVIEW_THREAD, turn: { id: turnId, items: [item],
-    status: interruptedTurns.has(turnId) ? "interrupted" : "completed", error: null } } });
+  send({ method: "item/completed", params: { threadId, turnId, item } });
+  const turn = { id: turnId, items: [item], itemsView: "full",
+    status: interruptedTurns.has(turnId) ? "interrupted" : "completed", error: null };
+  completedTurns.set(threadId, [turn]);
+  const completed = { method: "turn/completed", params: { threadId,
+    turn: process.env.MOCK_E2E_REVIEW_INNER_TURN === "1" ? { ...turn, items: [], itemsView: "notLoaded" } : turn } };
+  send(completed);
+  if (process.env.MOCK_E2E_REVIEW_INNER_TURN === "1") send(completed);
 }
 
-/** 子线程上先后提问两次（第二次在 CLI 交接、broker 托管之后到达），答完以审查结论完成；
+/** 审查线程上先后提问两次（第二次在 CLI 交接、broker 托管之后到达），答完以审查结论完成；
  *  被 turn/interrupt 时撤销在等的提问（serverRequest/resolved）并以 interrupted 结束。 */
-async function runReview(turnId: string): Promise<void> {
+async function runReview(threadId: string, turnId: string): Promise<void> {
   for (const n of [1, 2]) {
     const id = `srv-${++serverRequestCounter}`;
     const answered = new Promise<{ result?: unknown } | null>((resolve) => {
@@ -170,17 +175,18 @@ async function runReview(turnId: string): Promise<void> {
       });
       holds.set(turnId, () => {
         waiting.delete(id);
-        send({ method: "serverRequest/resolved", params: { threadId: REVIEW_THREAD, requestId: id } });
+        send({ method: "serverRequest/resolved", params: { threadId, requestId: id } });
         log({ kind: "cancelled", id });
+        reviewDone(threadId, turnId, "审查已中断");
         resolve(null);
       });
     });
-    send({ id, method: "item/tool/requestUserInput", params: { ...questionParams(REVIEW_THREAD, turnId), itemId: `review-ask-${n}` } });
+    send({ id, method: "item/tool/requestUserInput", params: { ...questionParams(threadId, turnId), itemId: `review-ask-${n}` } });
     const reply = await answered;
     holds.delete(turnId);
-    if (!reply) { reviewDone(turnId, "审查已中断"); return; }
+    if (!reply) return;
   }
-  reviewDone(turnId, "审查结论：没有问题");
+  reviewDone(threadId, turnId, "审查结论：没有问题");
 }
 
 const thread = (id: string) => ({
@@ -216,7 +222,7 @@ process.stdin.on("data", (chunk: string) => {
       case "thread/start":
       case "thread/resume":
         send({ id: msg.id, result: { thread: thread(msg.method === "thread/start" ? "thread-e2e" : threadId),
-          model: "gpt-mock", modelProvider: "openai", cwd: "D:\\", approvalPolicy: "never", sandbox: null } });
+          model: "gpt-mock", modelProvider: "openai", cwd: "D:\\", approvalPolicy: msg.params?.approvalPolicy ?? "never", sandbox: { type: msg.params?.sandbox === "read-only" ? "readOnly" : "workspaceWrite" } } });
         break;
       case "thread/memoryMode/set":
         send({ id: msg.id, result: {} });
@@ -277,11 +283,21 @@ process.stdin.on("data", (chunk: string) => {
         break;
       }
       case "review/start": {
+        if (msg.params?.delivery === "detached" && process.env.MOCK_E2E_LEGACY_REVIEW !== "1") {
+          send({ id: msg.id, error: { code: -32600, message: "paginated threads do not support detached review" } });
+          break;
+        }
+        const reviewThreadId = msg.params?.delivery === "detached" ? REVIEW_THREAD : threadId;
+        if (reviewThreadId !== threadId) send({ method: "thread/started", params: { thread: thread(reviewThreadId) } });
         const turnId = `review-turn-${String(++turnCounter).padStart(3, "0")}`;
         const turn = { id: turnId, items: [], status: "inProgress", error: null };
-        send({ id: msg.id, result: { turn, reviewThreadId: REVIEW_THREAD } });
-        send({ method: "turn/started", params: { threadId: REVIEW_THREAD, turn } });
-        void runReview(turnId);
+        completedTurns.set(reviewThreadId, [turn]);
+        send({ id: msg.id, result: { turn, reviewThreadId } });
+        send({ method: "turn/started", params: { threadId: reviewThreadId, turn } });
+        if (process.env.MOCK_E2E_REVIEW_INNER_TURN === "1") {
+          send({ method: "turn/started", params: { threadId: reviewThreadId, turn: { ...turn, id: `${turnId}-inner` } } });
+        }
+        void runReview(reviewThreadId, turnId);
         break;
       }
       case "turn/start": {

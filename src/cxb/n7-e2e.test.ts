@@ -3,6 +3,8 @@
  * 本文件只写测试和测试夹具；所有等待都有期限，所有子进程按句柄登记并在收尾回收。
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { NO_RESPONSE } from "../rpc";
+import { until as untilAsync } from "./test-fixtures/run-harness";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { BROKER_BIN, writeMockCodexScript } from "../test-support/broker-harness";
@@ -21,8 +23,12 @@ let gateDir = "";
 let deleteModeFile = "";
 let processes: Processes;
 let connection: BrokerConnection | null = null;
+let legacyReview = false;
+let innerReview = false;
 
 beforeEach(() => {
+  legacyReview = false;
+  innerReview = false;
   sandbox = mkdtempSync(join(process.env.TEMP ?? process.env.TEMP!, "cxb-n7e2e-"));
   gateDir = join(sandbox, "gates");
   deleteModeFile = join(gateDir, "delete-mode");
@@ -65,6 +71,8 @@ function cliEnv(scenario: string): NodeJS.ProcessEnv {
     USERPROFILE: join(sandbox, "profile"), HOME: join(sandbox, "profile"),
     CXB_HOME: join(sandbox, "cxb-home"), CODEX_HOME: join(sandbox, "codex-home"),
     CXB_BROKER_BIN: BROKER_BIN, CXB_SERVER: "private",
+    MOCK_E2E_LEGACY_REVIEW: legacyReview ? "1" : "",
+    MOCK_E2E_REVIEW_INNER_TURN: innerReview ? "1" : "",
     MOCK_E2E_SCENARIO: scenario, MOCK_E2E_LOG: join(sandbox, "mock.log"),
     MOCK_E2E_GATE_DIR: gateDir, MOCK_E2E_SERVER_DELETE_MODE_FILE: deleteModeFile,
     MOCK_E2E_BUSY: join(sandbox, "busy.flag"),
@@ -89,6 +97,7 @@ async function cxb(scenario: string, command: string, ...args: string[]): Promis
 }
 
 async function attach(scenario: string): Promise<BrokerConnection> {
+  if (connection) return connection;
   const env = cliEnv(scenario);
   const workspace = resolveWorkspace(join(sandbox, "ws"), env);
   if (existsSync(brokerJsonPath()) && alive(brokerPid())) processes.add(brokerPid());
@@ -127,9 +136,10 @@ async function completedRun(scenario = "complete"): Promise<any> {
 }
 
 describe("N7-A 辛路：日志与生命周期真实入口", () => {
-  test("同线程运行日志按 runId 分段，review 写父日志，follow 与丢行标记可读", async () => {
+  for (const legacy of [false, true]) test(`${legacy ? "legacy broker 互操作" : "inline CLI"} 审查日志按 runId 分段与 follow`, async () => {
+    legacyReview = legacy;
     const first = await completedRun();
-    const review = await cxb("complete", "review", "--json", "请审查当前改动");
+    const review = await startReview(first.threadId);
     expect(review.code).toBe(5);
     const waiting = json(review.stdout);
     expect(waiting).toMatchObject({ threadId: first.threadId, status: "waiting" });
@@ -145,7 +155,7 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     }
     expect(next).toBeDefined();
     expect((await cxb("complete", "reply", next.id, "b.txt")).code).toBe(0);
-    await until(() => mockLog().some((entry) => entry.kind === "request" && entry.method === "thread/archive"), 10_000, "review 未结束").catch(() => undefined);
+    expect((await cxb("complete", "wait", "--json", first.threadId)).code).toBe(0);
 
     const logPath = join(workspaceDir(), "runs", `${first.shortId}.log`);
     await until(() => existsSync(logPath), 10_000, "线程日志未落盘");
@@ -172,17 +182,26 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     expect(followedLines.filter((item) => typeof item.text === "string").every((item) => !item.text.includes("undefined"))).toBe(true);
   }, TEST_LIMIT_MS);
 
-  test("review 子线程运行时 rm 便利停止后归档成功，并记录停止确认", async () => {
+  for (const legacy of [false, true]) test(`${legacy ? "legacy broker 互操作" : "inline CLI"} review 的 rm 便利停止并归档`, async () => {
+    legacyReview = legacy;
     const first = await completedRun();
-    const review = await cxb("complete", "review", "--json", "请审查当前改动");
+    const review = await startReview(first.threadId);
     expect(review.code).toBe(5);
     const pending = json(review.stdout);
     const runId = pending.pending?.[0]?.runId;
     expect(runId).toMatch(/^run-/);
-    await until(() => existsSync(join(workspaceDir(), "runs", `${runId}.json`)), 10_000, "review 子运行记录未落盘");
-    const removed = await cxb("complete", "rm", "--json", first.shortId);
-    expect(removed.code).toBe(0);
-    expect(json(removed.stdout)).toMatchObject({ mode: "archive", stopped: true, archived: true, localIndex: "removed", recoverable: true });
+    await until(() => existsSync(join(workspaceDir(), "runs", `${runId}.json`)), 10_000, "review 运行记录未落盘");
+    let removed = await cxb("complete", "rm", "--json", first.shortId);
+    const deferred = removed.code === 8;
+    if (deferred) {
+      // 停止确认后自动退订仍可能在途；生命周期门禁此时合法拒绝，等服务器屏障后再归档。
+      expect(json(removed.stdout).blockers).toEqual([{ threadId: first.threadId, runId: null, reason: "reading" }]);
+      const conn = await attach("complete");
+      await conn.rpc.request("thread/read", { threadId: first.threadId, includeTurns: false }, { timeoutMs: 5000 });
+      removed = await cxb("complete", "rm", "--json", first.shortId);
+    }
+    expect(removed.code, JSON.stringify(removed)).toBe(0);
+    expect(json(removed.stdout)).toMatchObject({ mode: "archive", stopped: !deferred, archived: true, localIndex: "removed", recoverable: true });
     const record = JSON.parse(readFileSync(join(workspaceDir(), "runs", `${runId}.json`), "utf8"));
     const payload = record.payload ?? record;
     expect(payload.state).not.toBe("running");
@@ -191,15 +210,16 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     const interruptAt = log.findIndex((entry) => entry.kind === "request" && entry.method === "turn/interrupt");
     const archiveAt = log.findIndex((entry) => entry.kind === "request" && entry.method === "thread/archive");
     expect(interruptAt).toBeGreaterThanOrEqual(0);
-    expect(log[interruptAt]!.params?.threadId).toBe("review-e2e");
+    expect(log[interruptAt]!.params?.threadId).toBe(legacyReview ? "review-e2e" : first.threadId);
     expect(interruptAt).toBeLessThan(archiveAt);
     const threads = JSON.parse(readFileSync(join(workspaceDir(), "threads.json"), "utf8"));
     expect(Object.values((threads.payload ?? threads).threads ?? {}).some((entry: any) => entry.threadId === first.threadId)).toBe(false);
   }, TEST_LIMIT_MS);
 
-  test("失联未确认的 review 子线程阻止 rm，按提示 stop --run 核实后才能归档", async () => {
+  for (const legacy of [false, true]) test(`${legacy ? "legacy broker 关系闭包" : "inline CLI"} 失联审查阻止归档直到指定运行停止`, async () => {
+    legacyReview = legacy;
     const parent = await completedRun();
-    const started = await cxb("lost-stop", "review", "--json", "请审查并保持运行");
+    const started = await startReview(parent.threadId);
     expect(started.code).toBe(5);
     const waiting = json(started.stdout);
     const handle = { threadId: parent.threadId, shortId: parent.shortId };
@@ -211,25 +231,28 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     process.kill(oldPid, "SIGKILL");
     await until(() => !alive(oldPid), 10_000, "强杀 broker 后仍存活");
 
+    await connection?.close();
+    connection = null;
     // 用已发出但未结算的归档意图重现重启后的 outcomeUnknown；该意图要求 rm 跳过便利停止，直接走生命周期门禁。
-    writeFileSync(join(workspaceDir(), "lifecycle.json"), JSON.stringify({ epoch: 1, revision: 1, payload: { records: {
+    if (legacyReview) writeFileSync(join(workspaceDir(), "lifecycle.json"), JSON.stringify({ epoch: 1, revision: 1, payload: { records: {
       [handle.threadId]: { operationId: "seed-outcome-unknown", kind: "archive", threadId: handle.threadId,
         shortId: handle.shortId, preview: "", phase: "forwarded", attempts: [{ attempt: 1, settled: false, serverKind: "private", instance: null }],
         createdAt: Date.now(), updatedAt: Date.now() },
     } } }), "utf8");
 
-    const refused = await cxb("lost-stop", "rm", "--json", handle.shortId);
+    // inline 用 purge 直接验证阻塞门禁；原线程有归档意图时 stop 本身也被门禁拒绝。
+    const refused = await cxb("lost-stop", "rm", "--json", ...(legacyReview ? [] : ["--purge"]), handle.shortId);
     expect(refused.code).toBe(8);
     const refusedJson = json(refused.stdout);
     expect(refusedJson.blockers).toEqual(expect.arrayContaining([expect.objectContaining({ runId: childRunId, reason: "lostUnconfirmed" })]));
-    // 阻塞项的线程是 review 子线程（编号由首个 broker 的模拟服务器决定），提示要指向它而不是父线程。
+    // inline 审查的阻塞项与 stop 提示都定位原线程。
     const blocker = refusedJson.blockers.find((b: any) => b.runId === childRunId);
-    expect(blocker.threadId).not.toBe(handle.threadId);
+    expect(blocker.threadId).toBe(legacyReview ? "review-e2e" : handle.threadId);
     expect(refused.stderr).toContain(`cxb stop ${blocker.threadId} --run ${childRunId}`);
 
     writeFileSync(join(sandbox, "busy.flag"), "", "utf8");
     const stopped = await cxb("lost-stop", "stop", "--json", blocker.threadId, "--run", childRunId);
-    expect(stopped.code).toBe(0);
+    expect(stopped.code, JSON.stringify(stopped)).toBe(0);
     expect(json(stopped.stdout)).toMatchObject({ stopOutcome: "confirmed", runId: childRunId });
     const removed = await cxb("lost-stop", "rm", "--json", handle.shortId);
     expect(removed.code).toBe(0);
@@ -307,3 +330,19 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     expect(failedOut.deleted.some((item: string) => item.startsWith("runs/") || item === "threads.json")).toBe(true);
   }, TEST_LIMIT_MS);
 });
+
+/** legacy 用例直接模拟其他 broker 客户端；CLI 生产请求仍始终为 inline。 */
+async function startReview(parent?: string): Promise<{ code: number | null; stdout: string }> {
+  if (!legacyReview) return cxb("complete", "review", ...(parent ? ["--resume", parent] : []), "--json", "请审查");
+  const conn = await attach("complete");
+  conn.rpc.onAnyRequest(() => NO_RESPONSE);
+  if (!parent) parent = (await conn.rpc.request<any>("thread/start", { sandbox: "read-only", approvalPolicy: "never" }, { timeoutMs: 5000 })).thread.id;
+  const run = await conn.rpc.request<any>("review/start", { threadId: parent, delivery: "detached", target: { type: "uncommittedChanges" } }, { timeoutMs: 5000 });
+  await conn.rpc.request("broker/threads/detach", { threadId: parent, runId: run.runId, policy: "never" }, { timeoutMs: 5000 });
+  let pending: any[] = [];
+  await untilAsync(async () => {
+    pending = (await conn.rpc.request<any>("broker/inbox/list", { threadId: run.reviewThreadId }, { timeoutMs: 5000 })).items;
+    return pending.length > 0;
+  }, 10_000);
+  return { code: 5, stdout: JSON.stringify({ threadId: parent, status: "waiting", pending }) };
+}
