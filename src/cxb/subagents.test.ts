@@ -133,7 +133,7 @@ describe("命令展示", () => {
     t.fake.handle = (m, p) => {
       if (m === "thread/turns/list") {
         expect(p.threadId).toBe("child-a");
-        return { data: [{ id: "turn-c", status: "completed", items: [] }] };
+        return { data: [{ id: "turn-c", status: "completed", items: [] }], nextCursor: null, backwardsCursor: null };
       }
       if (m === "thread/items/list") {
         return { data: [{ turnId: "turn-c", item: { type: "agentMessage", text: "子代理结果", phase: "final_answer" } }], nextCursor: null };
