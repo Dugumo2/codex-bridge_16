@@ -580,6 +580,12 @@ async fn 超过六十四_mib_的索引可缩小写回并清除_dirty() {
     large.threads.insert(
         "t".into(),
         crate::runs::types::ThreadIndexEntry {
+            parent_thread_id: None,
+            relation_kind: None,
+            source_summary: None,
+            can_accept_direct_input: None,
+            agent_version: None,
+
             resume_overrides: None,
             thread_id: "t".into(),
             short_id: "t".into(),

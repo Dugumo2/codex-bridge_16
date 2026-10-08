@@ -10,6 +10,11 @@ import { CxbError, type LifecycleInfo, type RunMeta, type RunResult } from "./co
 
 /** threads.json 里的一项（Rust runs::types::ThreadIndexEntry，只取 CLI 用到的字段）。 */
 export interface ThreadIndexEntry {
+  parentThreadId?: string;
+  relationKind?: import("./contracts").RelationKind;
+  sourceSummary?: unknown;
+  canAcceptDirectInput?: boolean;
+  agentVersion?: import("./contracts").AgentVersion;
   threadId: string;
   shortId: string;
   lastRunId: string | null;

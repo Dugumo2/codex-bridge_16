@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 mod ext;
+pub mod finish_gate;
 pub mod lifecycle;
 pub mod loop_guard;
 #[cfg(test)]
@@ -18,6 +19,7 @@ mod m7_tests;
 pub mod resume;
 mod settling;
 pub mod shutdown;
+pub mod status_read;
 #[cfg(test)]
 mod tests;
 
@@ -126,6 +128,17 @@ pub enum State {
         turn_id: String,
         joined: bool,
     },
+    /// SA-b 持有父轮结束快照；迟到事件不得把它恢复为 Running。
+    FinishingTree {
+        owner: Owner,
+        turn_id: Option<String>,
+        parent_status: Option<crate::runs::TurnStatus>,
+        goal_status: Option<String>,
+        identity: crate::relations::RunIdentity,
+        gen: u64,
+        tree_op: u64,
+        release_kind: ReleaseKind,
+    },
     AwaitingContinuation {
         owner: Owner,
     },
@@ -167,13 +180,16 @@ impl Claim {
         match &self.state {
             State::Starting { owner, .. }
             | State::Running { owner, .. }
+            | State::FinishingTree { owner, .. }
             | State::AwaitingContinuation { owner } => Some(owner),
             State::Idle => None,
         }
     }
     pub fn turn_id(&self) -> Option<&str> {
         match &self.state {
-            State::Starting { turn_id, .. } => turn_id.as_deref(),
+            State::Starting { turn_id, .. } | State::FinishingTree { turn_id, .. } => {
+                turn_id.as_deref()
+            }
             State::Running { turn_id, .. } => Some(turn_id),
             _ => None,
         }
@@ -239,6 +255,32 @@ pub struct ClaimToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
+    /// H2-a 接读取分派；本批只保留未启用分支。
+    StatusRead {
+        read_id: u64,
+        generation: u64,
+    },
+    RelationLookup {
+        op_id: u64,
+        generation: u64,
+        thread: String,
+    },
+    Discovery {
+        op_id: u64,
+        generation: u64,
+    },
+    DerivedStop {
+        tree_op: u64,
+        generation: u64,
+        thread: String,
+        round: u64,
+    },
+    AttachThread {
+        op_id: u64,
+        generation: u64,
+        thread: String,
+    },
+
     Lifecycle {
         thread: String,
         operation: String,
@@ -325,6 +367,29 @@ pub struct RequestContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
+    LookupDeadline {
+        op_id: u64,
+        generation: u64,
+    },
+    DiscoveryDeadline {
+        op_id: u64,
+        generation: u64,
+    },
+    TreeStopWait {
+        tree_op: u64,
+        waiter: Option<u64>,
+        generation: u64,
+    },
+    TreeStopVerify {
+        tree_op: u64,
+        round: u64,
+        generation: u64,
+    },
+    TombstoneExpire {
+        conn_epoch: u64,
+        generation: u64,
+    },
+
     Lifecycle,
     Unsubscribe,
     SettlementRetry {
@@ -362,6 +427,14 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    LookupDeadline(u64),
+    DiscoveryDeadline(u64),
+    TreeStopWait {
+        tree_op: u64,
+        waiter: Option<u64>,
+    },
+    TreeStopVerify(u64),
+    TombstoneExpire(u64),
     /// inbox 事项的过期与已关闭项的清理共用一个键（甲路）。
     InboxItem(String),
     /// `broker/inbox/wait` 等待者的超时（甲路）。
@@ -376,6 +449,18 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::LookupDeadline { op_id, .. } => Some(TimerKey::LookupDeadline(*op_id)),
+            TimerKind::DiscoveryDeadline { op_id, .. } => Some(TimerKey::DiscoveryDeadline(*op_id)),
+            TimerKind::TreeStopWait {
+                tree_op, waiter, ..
+            } => Some(TimerKey::TreeStopWait {
+                tree_op: *tree_op,
+                waiter: *waiter,
+            }),
+            TimerKind::TreeStopVerify { tree_op, .. } => Some(TimerKey::TreeStopVerify(*tree_op)),
+            TimerKind::TombstoneExpire { conn_epoch, .. } => {
+                Some(TimerKey::TombstoneExpire(*conn_epoch))
+            }
             TimerKind::Inbox(crate::inbox::InboxTimer::Expiry { id, .. }) => {
                 Some(TimerKey::InboxItem(id.clone()))
             }
@@ -581,6 +666,8 @@ pub struct Clock {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Machine {
+    pub relations: crate::relations::Relations,
+    pub trees: crate::stop::tree::Trees,
     pub lifecycle: crate::claim::lifecycle::Lifecycle,
     /// core 按线上编号登记仍可回写线程事实的请求；超时保留到迟到处理退役。
     pub purge_inflight: HashMap<u64, String>,
@@ -736,6 +823,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             }
         }
         Event::AppReplyWritten { op, outcome } => {
+            state.child_reply_written(op, &outcome, &mut actions);
             state.inbox_reply_written(op, outcome, &mut actions)
         }
         Event::Restore { index, runs, inbox } => {
@@ -878,6 +966,11 @@ impl Machine {
         run_id: Option<RunId>,
         actions: &mut Vec<Action>,
     ) {
+        if self.subagent_work_gate(&request, actions)
+            || self.subagent_lifecycle_gate(&request, actions)
+        {
+            return;
+        }
         let thread_id = thread_id(&request.params).map(str::to_owned);
         match request.method.as_str() {
             "broker/threads/archive" | "thread/archive" => {
@@ -1245,6 +1338,13 @@ impl Machine {
             self.learn_traffic(&context, &result, actions);
         }
         match &context.operation {
+            Operation::StatusRead { .. } => {
+                actions.push(Action::Warn("H2 状态读取分派尚未启用".into()))
+            }
+            Operation::RelationLookup { .. }
+            | Operation::Discovery { .. }
+            | Operation::AttachThread { .. } => self.relation_reply(&context, result, actions),
+            Operation::DerivedStop { .. } => self.tree_reply(&context, result, actions),
             Operation::BreakerProbe { generation } => {
                 self.breaker_probe_reply(*generation, actions)
             }
@@ -1452,7 +1552,9 @@ impl Machine {
                 }
             },
             // #9：完成已进入空窗或下一轮，迟到响应只清 pending。
-            State::Running { .. } | State::AwaitingContinuation { .. } => {}
+            State::Running { .. }
+            | State::AwaitingContinuation { .. }
+            | State::FinishingTree { .. } => {}
             State::Idle => actions.push(Action::Warn("启动回包与认领阶段不匹配".into())),
         }
         let gone = claim.owner_gone;
@@ -1746,6 +1848,7 @@ impl Machine {
 
     /// #5 的到达阶段先于 completed 查重与 goal 学习。
     fn arrive_notification(&mut self, event: HeldNotification, actions: &mut Vec<Action>) {
+        self.on_relation_notification(&event, actions);
         if self.closing {
             return;
         }
@@ -1821,6 +1924,11 @@ impl Machine {
             }
         }
         let has_claim = self.claims.contains_key(thread_id);
+        if !has_claim && event.method == "turn/completed" {
+            if let Some(turn) = notification_turn_id(&event.params) {
+                self.on_unclaimed_turn(thread_id, turn, false, actions);
+            }
+        }
         let (owner, gone) = self
             .claims
             .get(thread_id)
@@ -1987,6 +2095,17 @@ impl Machine {
     }
 
     pub(crate) fn started(&mut self, thread_id: &str, id: &str, actions: &mut Vec<Action>) {
+        if self
+            .claims
+            .get(thread_id)
+            .is_some_and(|c| matches!(c.state, State::FinishingTree { .. }))
+        {
+            self.finishing_tree_turn(thread_id, id, true, actions);
+            return;
+        }
+        if !self.claims.contains_key(thread_id) {
+            self.on_unclaimed_turn(thread_id, id, true, actions);
+        }
         self.late_started(thread_id, id, actions);
         let Some(claim) = self.claims.get_mut(thread_id) else {
             return;
@@ -2002,6 +2121,7 @@ impl Machine {
                     joined: false,
                 }
             }
+            State::FinishingTree { .. } => return,
             State::Idle => {
                 actions.push(Action::Warn("启动通知与认领阶段不匹配".into()));
                 return;
@@ -2028,6 +2148,36 @@ impl Machine {
     }
 
     fn completed(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
+        if let Some(claim) = self
+            .claims
+            .get(thread_id)
+            .filter(|c| matches!(c.state, State::FinishingTree { .. }))
+        {
+            let turn = claim.turn_id().unwrap_or_default().to_owned();
+            self.finishing_tree_turn(thread_id, &turn, false, actions);
+            return;
+        }
+        let parent_status = self
+            .claims
+            .get(thread_id)
+            .and_then(|c| c.run_id.as_ref())
+            .and_then(|run| self.runs.runs.get(run))
+            .and_then(|r| r.turns.last())
+            .map(|t| t.status);
+        let goal_status = self
+            .records
+            .get(thread_id)
+            .and_then(|r| r.goal_status.clone());
+        let exceptional = matches!(
+            parent_status,
+            Some(crate::runs::TurnStatus::Failed | crate::runs::TurnStatus::Interrupted)
+        );
+        if exceptional
+            && self.natural_release_gate(thread_id, goal_status.as_deref(), parent_status, actions)
+                == finish_gate::ReleaseDecision::Hold
+        {
+            return;
+        }
         if self.stop_busy(thread_id) {
             self.stop_completed(thread_id, actions);
             return;
@@ -2041,6 +2191,16 @@ impl Machine {
                 claim.state = State::AwaitingContinuation { owner };
             }
         } else {
+            if !exceptional
+                && self.natural_release_gate(
+                    thread_id,
+                    goal_status.as_deref(),
+                    parent_status,
+                    actions,
+                ) == finish_gate::ReleaseDecision::Hold
+            {
+                return;
+            }
             self.release(thread_id, actions);
         }
     }
@@ -2072,6 +2232,14 @@ impl Machine {
     pub(crate) fn learn_goal(&mut self, thread_id: &str, active: bool, actions: &mut Vec<Action>) {
         self.record(thread_id).goal_active = active;
         self.observe_goal(thread_id, active);
+        if self
+            .claims
+            .get(thread_id)
+            .is_some_and(|c| matches!(c.state, State::FinishingTree { .. }))
+        {
+            self.finishing_tree_goal(thread_id, active, actions);
+            return;
+        }
         if !active
             && !self.stop_busy(thread_id)
             && self
@@ -2079,7 +2247,22 @@ impl Machine {
                 .get(thread_id)
                 .is_some_and(|c| matches!(c.state, State::AwaitingContinuation { .. }))
         {
-            self.release(thread_id, actions);
+            let goal = self
+                .records
+                .get(thread_id)
+                .and_then(|r| r.goal_status.clone());
+            let status = self
+                .claims
+                .get(thread_id)
+                .and_then(|c| c.run_id.as_ref())
+                .and_then(|run| self.runs.runs.get(run))
+                .and_then(|r| r.turns.last())
+                .map(|t| t.status);
+            if self.natural_release_gate(thread_id, goal.as_deref(), status, actions)
+                == finish_gate::ReleaseDecision::Release
+            {
+                self.release(thread_id, actions);
+            }
         }
     }
 
@@ -2185,6 +2368,14 @@ impl Machine {
                 self.continue_cancel(&thread_id, resume::CancelCause::Disconnected, actions);
                 continue;
             }
+            if let Some(run) = self.claims.get(&thread_id).and_then(|c| c.run_id.clone()) {
+                let kind = if self.claims[&thread_id].joined() {
+                    crate::relations::HandoffKind::Joined
+                } else {
+                    crate::relations::HandoffKind::OwnerGone
+                };
+                self.on_handoff(&run, kind, actions);
+            }
             // #26a'：本连接排队的交接撤销（运行日志记一行，不回包）。
             self.detach_disconnected(&thread_id, conn, actions);
             let claim = self.claims.get_mut(&thread_id).expect("断开事件中的认领");
@@ -2231,6 +2422,9 @@ impl Machine {
         kind: ReleaseKind,
         actions: &mut Vec<Action>,
     ) {
+        if self.tree_release_gate(thread_id, kind, actions) {
+            return;
+        }
         let owner = self.owner_conn(thread_id);
         let Some(mut claim) = self.claims.remove(thread_id) else {
             return;
@@ -2286,6 +2480,12 @@ impl Machine {
             return;
         }
         match kind {
+            TimerKind::LookupDeadline { .. }
+            | TimerKind::DiscoveryDeadline { .. }
+            | TimerKind::TombstoneExpire { .. } => self.relation_timer(kind, actions),
+            TimerKind::TreeStopWait { .. } | TimerKind::TreeStopVerify { .. } => {
+                self.tree_timer(kind, actions)
+            }
             TimerKind::Lifecycle => self.lifecycle_tick(),
             TimerKind::JoinedCheckRetry { attempt } => {
                 self.joined_check_retry(&token, attempt, actions)
@@ -2303,7 +2503,10 @@ impl Machine {
                 self.detach_deadline(token, generation, actions)
             }
             TimerKind::Unsubscribe => {
-                if self.closing || self.claims.contains_key(&token.thread_id) {
+                if self.closing
+                    || self.claims.contains_key(&token.thread_id)
+                    || self.tree_busy(Some(&token.thread_id))
+                {
                     return;
                 }
                 if let Some(record) = self.records.get_mut(&token.thread_id) {
@@ -2340,6 +2543,8 @@ impl Machine {
             return;
         }
         self.closing = true;
+        self.relations_shutdown(actions);
+        self.trees_shutdown(actions);
         self.shutdown_stops.clear();
         self.shutdown_runs(actions);
         self.shutdown_stops(actions);
@@ -2451,6 +2656,7 @@ impl Machine {
                 let run = claim.run_id.clone();
                 let turn = claim.turn_id().map(str::to_owned);
                 if let Some(run) = run {
+                    self.on_handoff(&run, crate::relations::HandoffKind::External, actions);
                     self.run_settled(&run, true, actions);
                     self.notify_run_settled(&thread_id, &run, turn.clone(), actions);
                     if let Some(turn) = turn {

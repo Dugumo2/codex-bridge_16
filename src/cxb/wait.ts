@@ -1,3 +1,4 @@
+import { showSubagents } from "./subagents";
 import { CxbError, EXIT, rpcFailure, type BrokerRpc, type InboxItem, type InboxWaitReply, type RunResult, type ThreadSummary } from "./contracts";
 import { presentItem, safeLine } from "./inbox";
 import { commandSession } from "./command-session";
@@ -118,6 +119,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure]);
     if ("items" in winner) return outputPending(winner.items);
     const run = winner.run;
+    showSubagents(ctx, run);
     const code = exitCodeForRun(run);
     ctx.out.result(run.turns.at(-1)?.output ?? "");
     ctx.out.resultJson({ ok: code === EXIT.OK, command: "wait", waitFor: "thread", threadId: ref.threadId,

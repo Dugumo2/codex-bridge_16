@@ -70,6 +70,9 @@ impl Drop for Temp {
 
 pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
+        children: Vec::new(),
+        children_stop: None,
+
         run_id: id.into(),
         thread_id: thread.into(),
         short_id: format!("short-{thread}"),
@@ -338,6 +341,12 @@ async fn 从运行恢复索引_删除标记_review_任意_pending_与损坏文�
     index.threads.insert(
         old.short_id.clone(),
         ThreadIndexEntry {
+            parent_thread_id: None,
+            relation_kind: None,
+            source_summary: None,
+            can_accept_direct_input: None,
+            agent_version: None,
+
             resume_overrides: None,
             thread_id: old.thread_id.clone(),
             short_id: old.short_id.clone(),
@@ -566,6 +575,12 @@ async fn 同毫秒编号逆序恢复保留索引指向的后受理运行() {
     index.threads.insert(
         new.short_id.clone(),
         ThreadIndexEntry {
+            parent_thread_id: None,
+            relation_kind: None,
+            source_summary: None,
+            can_accept_direct_input: None,
+            agent_version: None,
+
             resume_overrides: None,
             thread_id: new.thread_id.clone(),
             short_id: new.short_id.clone(),
@@ -787,6 +802,9 @@ fn inbox_读出完整快照且损坏时跳过() {
     let temp = Temp::new();
     let disk = temp.disk();
     let item = crate::inbox::InboxItem {
+        root_thread_id: None,
+        parent_thread_id: None,
+
         id: "qu_0123456789abcdef".into(),
         kind: crate::inbox::InboxKind::Question,
         thread_id: "t".into(),

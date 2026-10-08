@@ -61,6 +61,11 @@ pub enum InboxStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+
     pub id: String,
     pub kind: InboxKind,
     pub thread_id: String,
@@ -336,7 +341,9 @@ impl Machine {
     }
 
     pub(crate) fn inbox_busy(&self) -> bool {
-        self.inbox.entries.values().any(Entry::active) || !self.inbox.waiters.is_empty()
+        self.tree_busy(None)
+            || self.inbox.entries.values().any(Entry::active)
+            || !self.inbox.waiters.is_empty()
     }
     pub(crate) fn inbox_pending(&self, thread_id: &str) -> Vec<InboxItem> {
         let mut items: Vec<_> = self
@@ -506,6 +513,9 @@ impl Machine {
         };
         let entry = Entry {
             item: InboxItem {
+                root_thread_id: None,
+                parent_thread_id: None,
+
                 id,
                 kind,
                 thread_id: origin.thread_id,
@@ -589,6 +599,9 @@ impl Machine {
         }
         let entry = Entry {
             item: InboxItem {
+                root_thread_id: None,
+                parent_thread_id: None,
+
                 id,
                 kind: InboxKind::Guardian,
                 thread_id: thread_id.into(),

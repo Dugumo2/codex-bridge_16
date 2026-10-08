@@ -67,6 +67,7 @@ fn owner_mut(claim: &mut Claim) -> Option<&mut Owner> {
     match &mut claim.state {
         State::Starting { owner, .. }
         | State::Running { owner, .. }
+        | State::FinishingTree { owner, .. }
         | State::AwaitingContinuation { owner } => Some(owner),
         State::Idle => None,
     }
@@ -383,12 +384,12 @@ impl Machine {
                 self.watcher_activity(thread, actions);
                 ok(
                     &request,
-                    json!({"thread":self.thread_summary(thread),
+                    self.child_watch_snapshot(thread, run_id.as_deref(), json!({"thread":self.thread_summary(thread),
                     "run":if self.lifecycle_only(thread) {None} else {match &run_id {
                         Some(id) => self.thread_run(thread, id),
                         None => self.latest_run(thread),
                     }},
-                    "pending":self.inbox_pending(thread),"lifecycle":self.lifecycle_projection(thread)}),
+                    "pending":self.inbox_pending(thread),"lifecycle":self.lifecycle_projection(thread)})),
                     actions,
                 );
             }
@@ -538,6 +539,9 @@ impl Machine {
             owned_at: self.clock.mono_ms,
             last_watcher_at: self.clock.mono_ms,
         };
+        if let Some(run) = &origin.run_id {
+            self.on_handoff(run, crate::relations::HandoffKind::Detach, actions);
+        }
         let ids: Vec<_> = self
             .requests
             .pending
@@ -913,6 +917,7 @@ impl Machine {
             match claim.map(|c| &c.state) {
                 Some(State::Starting { .. }) => SummaryState::Starting,
                 Some(State::Running { .. }) => SummaryState::Running,
+                Some(State::FinishingTree { .. }) => SummaryState::Stopping,
                 Some(State::AwaitingContinuation { .. }) => SummaryState::Awaiting,
                 _ => SummaryState::Idle,
             }

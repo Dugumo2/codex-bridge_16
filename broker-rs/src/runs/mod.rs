@@ -286,6 +286,9 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                children: Vec::new(),
+                children_stop: None,
+
                 run_id: run_id.clone(),
                 thread_id: open.thread_id,
                 short_id,
@@ -1307,5 +1310,16 @@ fn run_status(status: TurnStatus) -> RunStatus {
         TurnStatus::Completed => RunStatus::Completed,
         TurnStatus::Interrupted => RunStatus::Interrupted,
         TurnStatus::Failed => RunStatus::Failed,
+    }
+}
+
+impl Machine {
+    /// SA-b：原子写报告和聚合停止账本，再唯一提交 ended；严禁调用普通终态映射。
+    pub fn commit_tree_finish(
+        &mut self,
+        _commit: crate::stop::tree::TreeFinishCommit,
+        actions: &mut Vec<Action>,
+    ) {
+        actions.push(Action::Warn("SA 树结束提交尚未启用".into()));
     }
 }

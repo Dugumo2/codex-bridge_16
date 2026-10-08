@@ -1288,6 +1288,9 @@ fn 事项编号解析后按实际线程拒绝含守护事项() {
         m.inbox_restore(
             Some(InboxFile {
                 items: vec![InboxItem {
+                    root_thread_id: None,
+                    parent_thread_id: None,
+
                     id: id.into(),
                     kind,
                     thread_id: "P".into(),

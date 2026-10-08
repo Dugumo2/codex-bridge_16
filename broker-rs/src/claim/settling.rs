@@ -265,6 +265,12 @@ impl Machine {
         let claim_id = claim.claim_id;
         let settled_run = claim.run_id.clone();
         self.claims.insert(thread_id.into(), claim);
+        self.on_claim_settled(thread_id, claim_id, !joined, actions);
+        if joined {
+            if let Some(run) = &settled_run {
+                self.on_handoff(run, crate::relations::HandoffKind::Joined, actions);
+            }
+        }
         // 认领放回之后再发定案通知（owner_conn 要从表里查），并先于回放。
         if let Some(run) = &settled_run {
             let absorbed_by = if joined { target.clone() } else { None };
@@ -932,4 +938,21 @@ fn carries_input(turn: &Value, input: &[String]) -> bool {
                 .iter()
                 .any(|wanted| !wanted.trim().is_empty() && text.trim() == wanted.trim())
         })
+}
+
+impl Machine {
+    pub fn settlement_status_done(
+        &mut self,
+        _done: crate::claim::status_read::StatusDone,
+        actions: &mut Vec<Action>,
+    ) {
+        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+    }
+    pub fn joined_check_done(
+        &mut self,
+        _done: crate::claim::status_read::StatusDone,
+        actions: &mut Vec<Action>,
+    ) {
+        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+    }
 }

@@ -102,6 +102,7 @@ const INTERRUPT_TEXT: Record<NonNullable<RunResult["interruptReason"]>, string> 
   stop: "用户执行了停止",
   brokerLost: "broker 重启，未能跟踪到结束",
   goalLoop: "自动续跑空转，被刹车暂停",
+  subagentsUnfinished: "父线程结束时子代理尚未完成",
 };
 
 function bullet(items: ProgressItem[]): string[] {

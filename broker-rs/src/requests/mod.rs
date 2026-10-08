@@ -46,6 +46,9 @@ impl Machine {
         from_held: bool,
         actions: &mut Vec<Action>,
     ) {
+        if self.route_child_request(&request, actions) {
+            return;
+        }
         let thread_id = request
             .params
             .as_ref()
@@ -151,6 +154,7 @@ impl Machine {
             .checked_add(1)
             .expect("转发代号已耗尽");
         let generation = self.requests.next_generation;
+        let forwarded_params = self.child_forward_params(target, &thread_id, &request.params);
         let forward_id = request.forward_id;
         self.requests.pending.insert(
             forward_id.clone(),
@@ -170,7 +174,7 @@ impl Machine {
             message: proto::request(
                 Value::String(forward_id.clone()),
                 &request.method,
-                request.params,
+                forwarded_params,
             ),
         });
         actions.push(Action::ScheduleForward {

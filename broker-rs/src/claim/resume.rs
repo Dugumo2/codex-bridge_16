@@ -1095,3 +1095,13 @@ impl Machine {
         );
     }
 }
+
+impl Machine {
+    pub fn continue_check_done(
+        &mut self,
+        _done: crate::claim::status_read::StatusDone,
+        actions: &mut Vec<Action>,
+    ) {
+        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+    }
+}

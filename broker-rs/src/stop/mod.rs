@@ -1,6 +1,9 @@
 //! 停止操作与启动超时对账：与认领、服务端请求共用一次纯函数迁移。
 //! 只有 confirmed 判断函数可以确认停止；中断回包从不提供完成证据。
 
+pub mod derived;
+pub mod tree;
+
 use crate::claim::{
     Action, ClaimToken, ClientRequest, ConnId, Machine, Operation, RequestContext, State,
     StopReason, TimerKind,
@@ -382,6 +385,9 @@ impl Machine {
         clear: bool,
         actions: &mut Vec<Action>,
     ) -> Option<String> {
+        if self.tree_stop_gate(thread, reason, clear, actions) {
+            return None;
+        }
         if self.closing {
             return None;
         }
@@ -505,6 +511,9 @@ impl Machine {
     }
 
     pub(crate) fn client_stop(&mut self, request: ClientRequest, actions: &mut Vec<Action>) {
+        if self.tree_client_stop(&request, actions) {
+            return;
+        }
         let thread = request
             .params
             .as_ref()
@@ -924,6 +933,9 @@ impl Machine {
                 }
                 // clear 的执行结果要先回来，报告值与停止证据分别保存。
                 if !op.goal_busy && (!op.clear || op.clear_done) && self.confirmed(&op) {
+                    if self.root_stop_report(&op, tree::RootStopStage::Confirmed, actions) {
+                        continue;
+                    }
                     if !op.already_stopped {
                         if let Some(run) = &op.run_id {
                             self.run_stop_confirmed(run, actions);
@@ -1407,7 +1419,9 @@ impl Machine {
             }
         }
         if op.verifying && op.read_done && op.goal_read_done {
-            if (!self.confirmed(&op) || op.goal_busy || (op.clear && !op.clear_done))
+            let tree_owned = self.root_stop_report(&op, tree::RootStopStage::Verified, actions);
+            if !tree_owned
+                && (!self.confirmed(&op) || op.goal_busy || (op.clear && !op.clear_done))
                 && !op.already_stopped
             {
                 if let Some(run) = &op.run_id {
@@ -1456,7 +1470,8 @@ impl Machine {
                     return;
                 }
                 op.outcome = Outcome::Unconfirmed;
-                if !op.already_stopped {
+                let tree_owned = self.root_stop_report(&op, tree::RootStopStage::Deadline, actions);
+                if !tree_owned && !op.already_stopped {
                     if let Some(run) = &op.run_id {
                         self.run_stop_check(run, self.stop_check(&op), actions);
                     }
@@ -1467,7 +1482,11 @@ impl Machine {
                     delay_ms: VERIFY_MS,
                 });
             }
-            StopTimer::Waiter(id) => self.answer_waiters(&mut op, Some(id), "unconfirmed", actions),
+            StopTimer::Waiter(id) => {
+                if !self.root_stop_report(&op, tree::RootStopStage::WaiterDeadline(id), actions) {
+                    self.answer_waiters(&mut op, Some(id), "unconfirmed", actions);
+                }
+            }
             StopTimer::Verify => {
                 if tag.round != op.verify_timer || op.outcome != Outcome::Unconfirmed {
                     self.stops.operations.insert(tag.id, op);
@@ -3056,5 +3075,29 @@ fn reconcile_delay(previous: &mut u64, failed: bool) -> u64 {
     } else {
         *previous = 0;
         VERIFY_MS
+    }
+}
+
+impl Machine {
+    pub fn stop_verify_done(
+        &mut self,
+        _done: crate::claim::status_read::StatusDone,
+        actions: &mut Vec<Action>,
+    ) {
+        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+    }
+    pub fn reconcile_status_done(
+        &mut self,
+        _done: crate::claim::status_read::StatusDone,
+        actions: &mut Vec<Action>,
+    ) {
+        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+    }
+    pub fn late_settlement_status_done(
+        &mut self,
+        _done: crate::claim::status_read::StatusDone,
+        actions: &mut Vec<Action>,
+    ) {
+        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
     }
 }

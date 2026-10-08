@@ -163,6 +163,12 @@ impl Runs {
         self.index.threads.insert(
             short.clone(),
             ThreadIndexEntry {
+                parent_thread_id: None,
+                relation_kind: None,
+                source_summary: None,
+                can_accept_direct_input: None,
+                agent_version: None,
+
                 resume_overrides: None,
                 thread_id: thread.into(),
                 short_id: short.clone(),
@@ -341,7 +347,8 @@ impl Runs {
                     self.notices.iter().any(|n| match n {
                         RunNotice::TurnResult { run_id, .. }
                         | RunNotice::RunEnded { run_id, .. } => run_id == &r.run_id,
-                    }) || self.verifying_history.contains(&r.run_id)
+                    }) || self.tree_retention_required(&r.run_id)
+                        || self.verifying_history.contains(&r.run_id)
                         || matches!(r.state, RunState::Running | RunState::Stopping)
                         || self.reads.values().any(|read| {
                             read.read.run_id == r.run_id && read.phase != reads::ReadPhase::Done
@@ -423,4 +430,11 @@ pub(crate) fn utc_timestamp(now: u64) -> String {
         seconds % 60,
         now % 1000
     )
+}
+
+impl super::Runs {
+    /// SA-b：树未确认或仍有清理屏障时禁止淘汰。骨架不改变现有淘汰结果。
+    pub fn tree_retention_required(&self, _run_id: &str) -> bool {
+        false
+    }
 }

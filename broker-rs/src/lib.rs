@@ -17,10 +17,13 @@ pub mod launch;
 pub mod logging;
 pub mod policy;
 pub mod proto;
+pub mod relations;
 pub mod requests;
 pub mod results;
 pub mod runs;
 pub mod serve;
 pub mod stop;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod watchdog;

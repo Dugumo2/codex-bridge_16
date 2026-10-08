@@ -35,6 +35,7 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InterruptReason {
+    SubagentsUnfinished,
     ClientDisconnected,
     Stop,
     BrokerLost,
@@ -181,6 +182,11 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<crate::relations::ChildRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub children_stop: Option<crate::stop::tree::ChildrenStopReport>,
+
     pub run_id: RunId,
     pub thread_id: String,
     pub short_id: ShortId,
@@ -214,6 +220,17 @@ pub struct RunRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadIndexEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_kind: Option<crate::relations::RelationKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_summary: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_accept_direct_input: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version: Option<crate::relations::AgentVersion>,
+
     pub thread_id: String,
     pub short_id: ShortId,
     pub last_run_id: Option<RunId>,

@@ -678,6 +678,12 @@ pub(super) fn rebuild_entry(
         return;
     }
     let mut entry = old.cloned().unwrap_or_else(|| ThreadIndexEntry {
+        parent_thread_id: None,
+        relation_kind: None,
+        source_summary: None,
+        can_accept_direct_input: None,
+        agent_version: None,
+
         resume_overrides: None,
         thread_id: thread.to_owned(),
         short_id: short_id.clone(),

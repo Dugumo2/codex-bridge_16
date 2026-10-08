@@ -703,6 +703,7 @@ impl Core {
         }) || !self.machine.claims.is_empty()
             || !self.machine.requests.pending.is_empty()
             || self.machine.stops_busy()
+            || self.machine.tree_busy(None)
             || self.machine.app_server_unresponsive
             || self.machine.inbox_busy()
             || self.machine.watched_results_pending()

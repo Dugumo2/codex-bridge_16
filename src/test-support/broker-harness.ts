@@ -87,6 +87,8 @@ export function writeMockCodexScript(dir: string, script: string): void {
   // 复制后的夹具保持自包含，避免模块加载期间预加载观测器提前排空握手。
   script = script.replace('import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";',
     () => readFileSync(join(import.meta.dir, "resume-history.ts"), "utf8").replace(/^export /gm, ""));
+  script = script.replace('import { createSubagentMock } from "../../test-support/subagent-mock";',
+    () => readFileSync(join(import.meta.dir, "subagent-mock.ts"), "utf8").replace(/^export /gm, ""));
   if (process.platform === "win32") {
     writeFileSync(join(dir, "codex-mock.ts"), script);
     writeFileSync(join(dir, "codex-proxy.ts"), MOCK_PROXY_SCRIPT);
@@ -122,6 +124,8 @@ export function envWithPathPrefix(dir: string): Record<string, string> {
 
 /** 创建用于 codex app-server 的 JSON-RPC 模拟脚本，支持初始化、线程、轮次、审批和通知。 */
 export function createMockCodex(dir: string, opts?: {
+  subagents?: import("./subagent-mock").SubagentMockOptions;
+  statusRead?: import("./subagent-mock").StatusReadMockOptions;
   /** 仅恢复未排除历史时返回约 12 MiB 历史，默认关闭。 */
   longHistory?: boolean;
   /** 响应 turn/start 前的延迟，单位为毫秒。 */
@@ -192,6 +196,7 @@ export function createMockCodex(dir: string, opts?: {
   const script = `#!/usr/bin/env bun
 import { appendFileSync } from "node:fs";
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
+import { createSubagentMock } from "../../test-support/subagent-mock";
 // broker 测试使用的模拟 codex app-server。
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
@@ -200,6 +205,7 @@ if (args[0] !== "app-server") {
 }
 
 const respond = fixtureSender();
+const subagents = createSubagentMock(respond, ${JSON.stringify(opts?.subagents ?? {})});
 
 let buffer = "";
 let approvalIdCounter = 1;
@@ -219,6 +225,7 @@ process.stdin.on("data", (chunk) => {
     if (!line) continue;
     let msg;
     try { msg = JSON.parse(line); } catch { continue; }
+    if (subagents.handle(msg)) continue;
 
     // 没有 id 的消息是通知。
     if (msg.id === undefined) continue;

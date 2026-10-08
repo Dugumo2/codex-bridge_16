@@ -1,3 +1,4 @@
+import { showSubagents } from "./subagents";
 import { sanitizeForTerminal } from "../questions";
 import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type ThreadSummary, type TurnResult } from "./contracts";
 import { readRunLog, readRunRecord, readThreadIndex, listThreadRuns, type LogLine } from "./ledger";
@@ -28,10 +29,11 @@ function printLine(ctx: CommandContext, line: { ts: string; kind: string; text: 
 }
 
 function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
+  showSubagents(ctx, run);
   if (run.state === "lost" || run.stopOutcome === "unconfirmed") {
     ctx.out.notice(`停止中（未确认），先 cxb stop ${id} 核实`);
   } else if (run.status === "interrupted") {
-    const reasons = { clientDisconnected: "客户端断开", stop: "主动停止", brokerLost: "broker 失联", goalLoop: "空转刹车" };
+    const reasons = { clientDisconnected: "客户端断开", stop: "主动停止", brokerLost: "broker 失联", goalLoop: "空转刹车", subagentsUnfinished: "子代理未完成" };
     ctx.out.notice(`已中断（${run.interruptReason ? reasons[run.interruptReason] : "服务器中断"}），可继续：cxb run --resume ${id} --continue`);
   }
 }

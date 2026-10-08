@@ -1,5 +1,6 @@
 import { writeFileSync, renameSync } from "node:fs";
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
+import { createSubagentMock } from "../../test-support/subagent-mock";
 
 // 仅甲路使用的 app-server 桩；所有时序由 fixture/control 显式放行。
 const pidFile = process.env.RUN_FIXTURE_PID!;
@@ -15,6 +16,7 @@ let nextTurn = 0;
 let released = false;
 let pendingStart: { id: unknown; threadId: string; turn: any } | undefined;
 const send = fixtureSender();
+const subagents = createSubagentMock(send, scenario.subagents);
 const reply = (id: unknown, result: unknown) => send({ id, result });
 const notify = (method: string, params: unknown) => send({ method, params });
 function state(id: string) {
@@ -50,6 +52,7 @@ process.stdin.on("data", (chunk) => {
     input = input.slice(end + 1);
     if (!line.trim()) continue;
     const msg = JSON.parse(line);
+    if (subagents.handle(msg)) continue;
     if (!msg.method) continue;
     const p = msg.params ?? {};
     calls.push({ method: msg.method, params: p });

@@ -252,6 +252,8 @@ export interface LoopGuardReport {
 }
 
 export interface RunResult {
+  children?: ChildRecord[];
+  childrenStop?: ChildrenStopReport;
   runId: string;
   threadId: string;
   shortId: string;
@@ -265,7 +267,7 @@ export interface RunResult {
   reviewShortId?: string | null;
   input: string;
   continuedFrom: string | null;
-  interruptReason: "clientDisconnected" | "stop" | "brokerLost" | "goalLoop" | null;
+  interruptReason: "clientDisconnected" | "stop" | "brokerLost" | "goalLoop" | "subagentsUnfinished" | null;
   stopOutcome: "confirmed" | "unconfirmed" | null;
   stopCheck?: unknown;
   loopGuard?: LoopGuardReport;
@@ -278,6 +280,8 @@ export interface RunResult {
 export type InboxKind = "approval" | "question" | "mcp" | "guardian";
 
 export interface InboxItem {
+  rootThreadId?: string;
+  parentThreadId?: string;
   /** typed ID：ap_、qu_、mc_、gd_ 前缀（命令面规格第 7 节）。 */
   id: string;
   kind: InboxKind;
@@ -352,6 +356,8 @@ export type Handover = (rpc: BrokerRpc, args: {
 }, opts?: { signal?: AbortSignal; timeoutMs?: number }) => Promise<HandoverResult>;
 
 export interface ServerRequestRouterOptions {
+  logicalRootThreadId?: string;
+  getRunId?: () => string | undefined;
   /** 只处理这个线程的请求；别的线程的请求不答（broker 不会转来，出现即记 -v 日志）。 */
   threadId: string;
   policy: ApprovalPolicyName;
@@ -463,3 +469,33 @@ export interface InboxWaitReply {
 /** 运行终态 → 退出码：completed 0；interrupted 4（interruptReason goalLoop 为 9）；failed 7；goalBlocked 9；
  *  loopGuard 存在（含共享模式 pauseGoal 而 status 为 completed）一律 9。 */
 export type ExitCodeForRun = (run: RunResult) => ExitCode;
+
+// SA1a 共用线上声明；消费与展示由 SA-b 实现，缺省字段保持旧协议输出。
+export type RelationKind = "reviewExecution" | "subagent" | "fork";
+export type AgentVersion = "v1" | "v2" | "unknown";
+export type ChildActivity = "starting" | "running" | "settled" | "unknown";
+export interface ChildRecord {
+  threadId: string; parentThreadId: string; relationKind: RelationKind;
+  turnIds: string[]; evidence: "v1Spawn" | "v1Message" | "v2Started" | "v2Interacted" | "inherited";
+  finalState: ChildActivity;
+}
+export interface DiscoveryState { complete: boolean; version: number; incompleteReasons: string[] }
+export type TreePhase = "pending" | "confirmed" | "unconfirmed";
+export interface RootStopReport {
+  thread: string; phase: TreePhase; check: { ownership: boolean; turnEnded: boolean; goalBraked: boolean; settled: boolean; verifyDone: boolean };
+  clearRequested: boolean; clearConfirmed: boolean; error: string | null;
+}
+export interface ChildrenStopReport {
+  trigger: "userStop" | "ownerGone" | "parentFinishedEarly" | "loopGuard" | "parentFailed" | "parentInterrupted";
+  phase: TreePhase; version: number; root: RootStopReport;
+  stopped: string[]; unconfirmed: string[]; failed: string[];
+  conflicts: Array<{ thread: string; reason: string }>; capabilityLimited: string[];
+  discovery: DiscoveryState; unsettledSpawns: number;
+}
+export interface CxbOrigin {
+  rootThreadId: string; runId: string; parentThreadId: string; relationKind: RelationKind; sourceThreadId: string;
+}
+export interface ChildChanged {
+  runId: string; rootThreadId: string; threadId: string | null; parentThreadId?: string;
+  relationKind?: RelationKind; activity?: ChildActivity; pendingCount?: number; revision: number; stopPhase?: TreePhase;
+}

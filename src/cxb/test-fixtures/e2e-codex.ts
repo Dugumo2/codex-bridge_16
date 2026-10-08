@@ -12,6 +12,7 @@
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
+import { createSubagentMock } from "../../test-support/subagent-mock";
 
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
@@ -31,6 +32,7 @@ function log(entry: unknown): void {
 }
 log({ kind: "boot", pid: process.pid });
 const send = fixtureSender();
+const subagents = createSubagentMock(send, JSON.parse(process.env.MOCK_SUBAGENTS ?? "{}"));
 
 const waiting = new Map<string, (message: { result?: unknown; error?: unknown }) => void>();
 let serverRequestCounter = 0;
@@ -207,6 +209,7 @@ process.stdin.on("data", (chunk: string) => {
     buffer = buffer.slice(idx + 1);
     if (!line) continue;
     const msg = JSON.parse(line);
+    if (subagents.handle(msg)) continue;
     if (msg.id === undefined) continue;
     if (msg.method === undefined) {
       const waiter = waiting.get(String(msg.id));
