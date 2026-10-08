@@ -1,4 +1,7 @@
-/** SA-a 子代理控制面。三个夹具共用；未启用时不消费消息、不改变历史行为。 */
+// CXB_INLINE_BACKGROUND_TERMINALS_BEGIN
+import { createBackgroundTerminalsMock, type BackgroundTerminalsMockOptions } from "./background-terminals-mock";
+// CXB_INLINE_BACKGROUND_TERMINALS_END
+/** SA-a 子代理控制面。三个夹具共用；未启用时不消费子代理消息、不改变历史行为。 */
 export interface SubagentMockOptions {
   enabled?: boolean;
   version?: "v1" | "v2";
@@ -49,8 +52,9 @@ export interface SubagentMock {
  * - 中断父线程不影响子线程；v2 子线程拒绝 turn/start、turn/steer 与 goal 写入，允许 turn/interrupt。
  * - autoAttach=missing 时子线程的通知与请求不发给本连接，直到收到该子线程的 thread/resume（附着请求）。
  */
-export function createSubagentMock(send: (message: unknown) => unknown, options: SubagentMockOptions = {}): SubagentMock {
-  if (!options.enabled) return { handle: () => false, state: () => ({}) };
+export function createSubagentMock(send: (message: unknown) => unknown, options: SubagentMockOptions = {}, backgroundOptions: BackgroundTerminalsMockOptions = {}): SubagentMock {
+  const background = createBackgroundTerminalsMock(send, backgroundOptions);
+  if (!options.enabled) return { handle: (message) => background.handle(message), state: () => ({}) };
   type Child = {
     parent: string | null; version: "v1" | "v2"; archived: boolean; loaded: boolean; attached: boolean;
     turns: Array<{ id: string; status: string }>; turnCounter: number; goal: unknown;
@@ -386,6 +390,7 @@ export function createSubagentMock(send: (message: unknown) => unknown, options:
 
   return {
     handle(message: FixtureMessage): boolean {
+      if (background.handle(message)) return true;
       if (message.method === undefined) {
         // 对模拟主动请求的回答：记下实际收到的回答与次数。
         return message.id !== undefined && record(message.id, message);

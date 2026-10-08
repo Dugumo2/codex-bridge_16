@@ -15,6 +15,7 @@
 //   MOCK_STATUS_READ：状态读取的分页与历史选项（JSON，StatusReadMockOptions），默认关闭；开启后由
 //                     test-support/status-history.ts 接管 thread/read、thread/turns/list、thread/items/list。
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
+// MOCK_BACKGROUND_TERMINALS：独立后台命令场景（JSON），默认关闭时三个接口均回 -32601。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 // CXB_INLINE_RESUME_HISTORY_BEGIN
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
@@ -48,7 +49,7 @@ const statusReadOptions = JSON.parse(process.env.MOCK_STATUS_READ ?? "{}");
 const rawSend = fixtureSender();
 const statusHistory = createStatusHistory(statusReadOptions, rawSend, longResumeTurns);
 const send = statusHistory.wrap(rawSend);
-const subagents = createSubagentMock(send, JSON.parse(process.env.MOCK_SUBAGENTS ?? "{}"));
+const subagents = createSubagentMock(send, JSON.parse(process.env.MOCK_SUBAGENTS ?? "{}"), JSON.parse(process.env.MOCK_BACKGROUND_TERMINALS ?? "{}"));
 
 const waiting = new Map<string, (message: { result?: unknown; error?: unknown }) => void>();
 let serverRequestCounter = 0;
