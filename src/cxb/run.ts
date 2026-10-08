@@ -229,7 +229,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
         fromRunId: plan.continue.fromRunId, supplement: plan.continue.supplement });
     } else {
       const method = threadId ? "thread/resume" : "thread/start";
-      const params = { ...(threadId ? { threadId } : { ephemeral: false }), cwd: ctx.workspace.root,
+      const params = { ...(threadId ? { threadId, excludeTurns: true } : { ephemeral: false }), cwd: ctx.workspace.root,
         ...(model ? { model } : {}), sandbox: plan.sandbox, ...approval };
       try { response = await request<ThreadResponse>(method, { ...params, ...overrides }); } catch (error) {
         const detail = rpcDetail(error);

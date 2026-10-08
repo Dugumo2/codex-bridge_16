@@ -3,7 +3,7 @@
  */
 
 import net from "node:net";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, delimiter, join } from "node:path";
 import type { FileSink, Subprocess } from "bun";
 
@@ -84,6 +84,9 @@ if (process.env.MOCK_PROXY_HANG === "1") {
 /** 在 PATH 目录中创建模拟 codex。Unix 使用可执行脚本；Windows 使用 codex-mock.ts 和 codex.cmd，
  *  `codex app-server proxy …` 分派到 {@link MOCK_PROXY_SCRIPT}。必须关闭命令回显，避免污染 stdout 上的 JSON-RPC。 */
 export function writeMockCodexScript(dir: string, script: string): void {
+  // 复制后的夹具保持自包含，避免模块加载期间预加载观测器提前排空握手。
+  script = script.replace('import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";',
+    () => readFileSync(join(import.meta.dir, "resume-history.ts"), "utf8").replace(/^export /gm, ""));
   if (process.platform === "win32") {
     writeFileSync(join(dir, "codex-mock.ts"), script);
     writeFileSync(join(dir, "codex-proxy.ts"), MOCK_PROXY_SCRIPT);
@@ -119,6 +122,8 @@ export function envWithPathPrefix(dir: string): Record<string, string> {
 
 /** 创建用于 codex app-server 的 JSON-RPC 模拟脚本，支持初始化、线程、轮次、审批和通知。 */
 export function createMockCodex(dir: string, opts?: {
+  /** 仅恢复未排除历史时返回约 12 MiB 历史，默认关闭。 */
+  longHistory?: boolean;
   /** 响应 turn/start 前的延迟，单位为毫秒。 */
   turnDelay?: number;
   /** 是否在 turn/start 响应之后发送 turn/completed 通知。 */
@@ -186,6 +191,7 @@ export function createMockCodex(dir: string, opts?: {
   const interruptLog = join(dir, "interrupts.log");
   const script = `#!/usr/bin/env bun
 import { appendFileSync } from "node:fs";
+import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
 // broker 测试使用的模拟 codex app-server。
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
@@ -193,7 +199,7 @@ if (args[0] !== "app-server") {
   process.exit(1);
 }
 
-function respond(obj) { process.stdout.write(JSON.stringify(obj) + "\\n"); }
+const respond = fixtureSender();
 
 let buffer = "";
 let approvalIdCounter = 1;
@@ -231,7 +237,7 @@ process.stdin.on("data", (chunk) => {
         respond({ id: msg.id, result: {
           thread: { id: msg.params?.threadId || "thread-001", preview: "", modelProvider: "openai",
             createdAt: Date.now(), updatedAt: Date.now(), status: { type: "idle" }, path: null, cwd: "/tmp",
-            cliVersion: "0.1.0", source: "mock", name: null, agentNickname: null, agentRole: null, gitInfo: null, turns: [] },
+            cliVersion: "0.1.0", source: "mock", name: null, agentNickname: null, agentRole: null, gitInfo: null, turns: ${opts?.longHistory ?? false} && msg.params?.excludeTurns !== true ? longResumeTurns() : [] },
           model: "gpt-5.3-codex", modelProvider: "openai", cwd: "/tmp", approvalPolicy: "never", sandbox: null,
         }});
         break;

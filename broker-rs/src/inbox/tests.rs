@@ -1373,7 +1373,7 @@ fn 守护审批恢复带覆盖并保留历史选项() {
     assert_eq!(
         resume.params,
         Some(
-            json!({"threadId":"t","persistExtendedHistory":false,"config":{"features.default_mode_request_user_input":true},"developerInstructions":"提问指令"})
+            json!({"threadId":"t","excludeTurns":true,"persistExtendedHistory":false,"config":{"features.default_mode_request_user_input":true},"developerInstructions":"提问指令"})
         )
     );
 }
@@ -1409,6 +1409,12 @@ fn 守护恢复未知键降级一次并保留历史参数() {
         })
         .unwrap();
     let mut actions = Vec::new();
+    assert_eq!(
+        context.params,
+        Some(
+            json!({"threadId":"t","excludeTurns":true,"persistExtendedHistory":false,"config":{"bad.key":true,"keep.key":1},"developerInstructions":"指令"})
+        )
+    );
     m.apply_reply(context,Err(json!({"code":-32600,"message":"failed to load configuration: unknown configuration field `bad.key` in -c/--config override"})),&mut actions);
     let retry = actions
         .iter()
@@ -1420,7 +1426,7 @@ fn 守护恢复未知键降级一次并保留历史参数() {
     assert_eq!(
         retry.params,
         Some(
-            json!({"threadId":"t","persistExtendedHistory":false,"config":{"keep.key":1},"developerInstructions":"指令"})
+            json!({"threadId":"t","excludeTurns":true,"persistExtendedHistory":false,"config":{"keep.key":1},"developerInstructions":"指令"})
         )
     );
     actions.clear();
@@ -1498,4 +1504,28 @@ fn 删除前守护恢复的迟到成功不重建索引或清除标记() {
     assert!(!actions
         .iter()
         .any(|a| matches!(a,Action::Request(r) if r.method=="thread/approveGuardianDeniedAction")));
+}
+
+#[test]
+fn 守护恢复无覆盖仍排除历史并保留持久化选项() {
+    let mut m = machine();
+    own(&mut m, "t");
+    let id = guardian(&mut m, "r", json!("denied"), &mut Vec::new());
+    let actions = resolve(
+        &mut m,
+        1,
+        &id,
+        json!({"override":true,"event":{"review_id":"r"}}),
+    );
+    let context = actions
+        .iter()
+        .find_map(|a| match a {
+            Action::Request(r) if r.method == "thread/resume" => Some(r),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        context.params,
+        Some(json!({"threadId":"t","excludeTurns":true,"persistExtendedHistory":false}))
+    );
 }

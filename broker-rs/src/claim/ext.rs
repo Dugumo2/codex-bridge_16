@@ -171,6 +171,7 @@ impl Machine {
 
     /// 仅三处内部恢复使用；已有顶层参数优先，不深合并客户端或调用点的 config。
     pub(crate) fn resume_params(&self, thread: &str, mut params: Value) -> Value {
+        params["excludeTurns"] = json!(true);
         if let Some(overrides) = self
             .runs
             .index
@@ -1131,12 +1132,12 @@ mod n2_tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::Store(crate::store::StoreOp::PutThreads(_)))));
-        let expected = json!({"threadId":"线程","config":overrides["config"],"developerInstructions":overrides["developerInstructions"]});
+        let expected = json!({"threadId":"线程","excludeTurns":true,"config":overrides["config"],"developerInstructions":overrides["developerInstructions"]});
         assert_eq!(
             m.resume_params("线程", json!({"threadId":"线程"})),
             expected
         );
-        let existing = json!({"threadId":"线程","config":{"explicit":false},"developerInstructions":"已有指令","persistExtendedHistory":false});
+        let existing = json!({"threadId":"线程","excludeTurns":true,"config":{"explicit":false},"developerInstructions":"已有指令","persistExtendedHistory":false});
         assert_eq!(m.resume_params("线程", existing.clone()), existing);
         call(&mut m, json!({"threadId":"线程","overrides":null}));
         assert!(m
@@ -1147,7 +1148,7 @@ mod n2_tests {
             .all(|entry| entry.resume_overrides.is_none()));
         assert_eq!(
             m.resume_params("线程", json!({"threadId":"线程"})),
-            json!({"threadId":"线程"})
+            json!({"threadId":"线程","excludeTurns":true})
         );
         m.closing = true;
         assert_eq!(
@@ -1193,7 +1194,9 @@ mod n2_tests {
             .unwrap();
         assert_eq!(
             barrier.params,
-            Some(json!({"threadId":"线程","config":{"开关":true},"developerInstructions":"指令"}))
+            Some(
+                json!({"threadId":"线程","excludeTurns":true,"config":{"开关":true},"developerInstructions":"指令"})
+            )
         );
     }
 }

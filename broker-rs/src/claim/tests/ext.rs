@@ -952,6 +952,12 @@ fn 恢复屏障严格区分未知登记键与其他错误() {
             client(request(1, 42, "turn/start", json!({"threadId":"线程"}))),
         );
         let context = first_request(&actions);
+        assert_eq!(
+            context.params,
+            Some(
+                json!({"threadId":"线程","excludeTurns":true,"config":{"bad.key":true,"keep.key":7},"developerInstructions":"保持指令"})
+            )
+        );
         let message = match case { 1 => "failed to load configuration", 2 => "failed to load configuration: unknown configuration field `outside.key` in -c/--config override", 3 => "failed to load configuration: unknown configuration field `bad.key` in config.toml", _ => "failed to load configuration: unknown configuration field `bad.key` in -c/--config override" };
         if case == 5 {
             m.runs
@@ -988,7 +994,7 @@ fn 恢复屏障严格区分未知登记键与其他错误() {
             assert_eq!(
                 resumes[0].params,
                 Some(
-                    json!({"threadId":"线程","config":{"keep.key":7},"developerInstructions":"保持指令"})
+                    json!({"threadId":"线程","excludeTurns":true,"config":{"keep.key":7},"developerInstructions":"保持指令"})
                 )
             );
             assert!(actions
@@ -999,4 +1005,19 @@ fn 恢复屏障严格区分未知登记键与其他错误() {
             assert_eq!(first_request(&next).method, "turn/start");
         }
     }
+}
+
+#[test]
+fn 恢复屏障无覆盖仍排除历史() {
+    let mut m = Machine::new(false);
+    let actions = apply(
+        &mut m,
+        client(request(1, 42, "turn/start", json!({"threadId":"线程"}))),
+    );
+    let context = first_request(&actions);
+    assert_eq!(context.method, "thread/resume");
+    assert_eq!(
+        context.params,
+        Some(json!({"threadId":"线程","excludeTurns":true}))
+    );
 }

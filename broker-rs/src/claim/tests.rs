@@ -582,7 +582,10 @@ fn 订阅屏障等待回包且恢复失败仍转发() {
             client(request(1, 42, "turn/start", json!({"threadId": "线程"}))),
         );
         let resume = first_request(&actions);
-        assert_eq!(resume.params, Some(json!({"threadId": "线程"})));
+        assert_eq!(
+            resume.params,
+            Some(json!({"threadId": "线程", "excludeTurns": true}))
+        );
         assert!(machine.claims["线程"].pending_start.is_some());
         let result = if ok {
             Ok(json!({}))

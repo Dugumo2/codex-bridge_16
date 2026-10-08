@@ -1,4 +1,5 @@
 import { writeFileSync, renameSync } from "node:fs";
+import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
 
 // 仅甲路使用的 app-server 桩；所有时序由 fixture/control 显式放行。
 const pidFile = process.env.RUN_FIXTURE_PID!;
@@ -13,7 +14,7 @@ let nextThread = 0;
 let nextTurn = 0;
 let released = false;
 let pendingStart: { id: unknown; threadId: string; turn: any } | undefined;
-const send = (value: unknown) => process.stdout.write(JSON.stringify(value) + "\n");
+const send = fixtureSender();
 const reply = (id: unknown, result: unknown) => send({ id, result });
 const notify = (method: string, params: unknown) => send({ method, params });
 function state(id: string) {
@@ -66,7 +67,7 @@ process.stdin.on("data", (chunk) => {
         if (scenario.warnAsk) notify("configWarning", { summary: `忽略 ${key}`, details: "秘密不应回显" });
         const id = p.threadId ?? `thread-${++nextThread}`;
         if (id === "missing") { send({ id: msg.id, error: { code: -32000, message: "thread not found" } }); break; }
-        reply(msg.id, { thread: thread(id), model: p.model ?? "mock-model", reasoningEffort: p.config?.model_reasoning_effort ?? "high", cwd: process.cwd(), sandbox: { type: p.sandbox === "read-only" ? "readOnly" : "workspaceWrite" }, approvalPolicy: p.approvalPolicy ?? "never" });
+        reply(msg.id, { thread: { ...thread(id), ...(scenario.longHistory && msg.method === "thread/resume" ? { turns: p.excludeTurns === true ? [] : longResumeTurns() } : {}) }, model: p.model ?? "mock-model", reasoningEffort: p.config?.model_reasoning_effort ?? "high", cwd: process.cwd(), sandbox: { type: p.sandbox === "read-only" ? "readOnly" : "workspaceWrite" }, approvalPolicy: p.approvalPolicy ?? "never" });
         break;
       }
       case "thread/memoryMode/set": reply(msg.id, {}); break;

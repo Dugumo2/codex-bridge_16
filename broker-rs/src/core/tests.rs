@@ -811,7 +811,10 @@ async fn 核心真实恢复屏障阻止提前启动并拒绝空闲关闭() {
     harness.client(1, "turn/start", json!({"threadId": "线程"}));
     let resume = harness.outgoing().await;
     assert_eq!(resume["method"], "thread/resume");
-    assert_eq!(resume["params"], json!({"threadId": "线程"}));
+    assert_eq!(
+        resume["params"],
+        json!({"threadId": "线程", "excludeTurns": true})
+    );
     assert!(harness.app_output.try_recv().is_err());
     harness.client(2, "turn/start", json!({"threadId": "线程"}));
     assert_eq!(harness.incoming_client().await["error"]["code"], -32001);

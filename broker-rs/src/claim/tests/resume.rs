@@ -1591,7 +1591,7 @@ fn 续跑恢复补传已登记覆盖() {
     assert_eq!(
         resume.params,
         Some(
-            json!({"threadId":"线程","config":{"features.default_mode_request_user_input":true},"developerInstructions":"需要用户决定时提问"})
+            json!({"threadId":"线程","excludeTurns":true,"config":{"features.default_mode_request_user_input":true},"developerInstructions":"需要用户决定时提问"})
         )
     );
 }
@@ -1612,6 +1612,12 @@ fn 条件续跑未知配置只删命中键且最多重试一次() {
         .unwrap(),
     );
     let context = resume_barrier(&mut m);
+    assert_eq!(
+        context.params,
+        Some(
+            json!({"threadId":"线程","excludeTurns":true,"config":{"bad.key":true,"keep.key":7},"developerInstructions":"保持指令"})
+        )
+    );
     let error = json!({"code":-32600,"message":"failed to load configuration: unknown configuration field `bad.key` in -c/--config override"});
     let actions = response(&mut m, &context, Err(error));
     let retry = requests(&actions)
@@ -1620,7 +1626,9 @@ fn 条件续跑未知配置只删命中键且最多重试一次() {
         .expect("必须重试恢复");
     assert_eq!(
         retry.params,
-        Some(json!({"threadId":"线程","config":{"keep.key":7},"developerInstructions":"保持指令"}))
+        Some(
+            json!({"threadId":"线程","excludeTurns":true,"config":{"keep.key":7},"developerInstructions":"保持指令"})
+        )
     );
     assert!(retry.resume_retried);
     let actions = response(
@@ -1648,4 +1656,15 @@ fn 条件续跑未知配置只删命中键且最多重试一次() {
         .as_ref()
         .unwrap()
         .contains_key("keep.key"));
+}
+
+#[test]
+fn 条件续跑无覆盖仍排除历史() {
+    let mut m = fixture(false);
+    let context = resume_barrier(&mut m);
+    assert_eq!(context.method, "thread/resume");
+    assert_eq!(
+        context.params,
+        Some(json!({"threadId":"线程","excludeTurns":true}))
+    );
 }

@@ -148,7 +148,7 @@ async function start(): Promise<{ client: Rpc; exited: Promise<void> }> {
     return !["CXB_HOME", "CODEX_HOME", "CXB_SERVER"].includes(name)
       && !/SOCKET|ENDPOINT/.test(name) && !name.startsWith("MOCK_");
   }));
-  Object.assign(env, { CXB_HOME: join(dir, "data"), CODEX_HOME: join(dir, "codex-home"), CXB_SERVER: "private" });
+  Object.assign(env, { USERPROFILE: dir, HOME: dir, CXB_HOME: join(dir, "data"), CODEX_HOME: join(dir, "codex-home"), CXB_SERVER: "private" });
   const path = testSocketPath(dir);
   const child = spawn(BROKER_BIN, ["serve", "--cwd", dir, "--endpoint", endpointFor(path), "--idle-timeout", "60000"], {
     env, cwd: dir, windowsHide: true, stdio: "ignore",
@@ -206,7 +206,7 @@ test("恢复覆盖登记后重启，条件续跑补传开关指令，转发与�
   readTrace();
   const resumes = observed.slice(before).filter(frame => frame.method === "thread/resume");
   expect(resumes).toHaveLength(1);
-  expect(resumes[0]!.params).toEqual({ threadId: "thread-001", ...overrides });
+  expect(resumes[0]!.params).toEqual({ threadId: "thread-001", excludeTurns: true, ...overrides });
   await instance.client.request("thread/resume", { threadId: "thread-001", persistExtendedHistory: true });
   readTrace();
   expect(observed.filter(frame => frame.method === "thread/resume").at(-1)!.params).toEqual({ threadId: "thread-001", persistExtendedHistory: true });
@@ -223,5 +223,15 @@ test("恢复覆盖拒绝未知线程和错误参数", async () => {
   for (const overrides of [[], { config: null }, { config: [] }, { developerInstructions: 1 }, { unknown: true }]) {
     expect(await rpcError(instance.client.request("broker/threads/resumeOverrides", { threadId: "thread-001", overrides }))).toMatchObject({ code: -32602 });
   }
+  await shutdown(instance);
+}, 60_000);
+
+for (const excludeTurns of [undefined, false, true]) test(`外部恢复原样透传 excludeTurns=${excludeTurns}`, async () => {
+  const instance = await start();
+  const params = { threadId: "thread-001", persistExtendedHistory: true,
+    ...(excludeTurns === undefined ? {} : { excludeTurns }) };
+  await instance.client.request("thread/resume", params);
+  readTrace();
+  expect(observed.filter(frame => frame.method === "thread/resume").at(-1)!.params).toEqual(params);
   await shutdown(instance);
 }, 60_000);
