@@ -10,7 +10,7 @@ renameSync(`${pidFile}.tmp`, pidFile);
 const scenario = JSON.parse(process.env.RUN_FIXTURE_OPTIONS ?? "{}");
 const calls: Array<{ method: string; params: any }> = [];
 const threads = new Map<string, { turns: any[]; goal: any }>();
-const reads: Array<{ id: unknown; threadId: string }> = [];
+const reads: Array<{ id: unknown; threadId: string; turnId?: string }> = [];
 const reviewTurns = new Set<string>();
 let nextThread = 0;
 let nextTurn = 0;
@@ -30,6 +30,12 @@ function state(id: string) {
 }
 function thread(id: string) {
   return { id, cwd: process.cwd(), turns: state(id).turns, status: { type: state(id).turns.at(-1)?.status === "inProgress" ? "active" : "idle" } };
+}
+/** 结果补读的条目分页一页给完；找不到轮次时回错误。 */
+function sendItems(id: unknown, threadId: string, turnId: string) {
+  const turn = state(threadId).turns.find((t) => t.id === turnId);
+  if (!turn) { send({ id, error: { code: -32600, message: `turn not found: ${turnId}` } }); return; }
+  reply(id, { data: turn.items.map((item: unknown) => ({ turnId, item, startedAtMs: null, completedAtMs: null })), nextCursor: null, backwardsCursor: null });
 }
 function begin(id: string) {
   const turn = { id: `turn-${++nextTurn}`, status: "inProgress", items: [], itemsView: "full", error: null };
@@ -120,6 +126,12 @@ process.stdin.on("data", (chunk) => {
         if (scenario.pendingResult && !released && p.includeTurns) reads.push({ id: msg.id, threadId: p.threadId });
         else reply(msg.id, { thread: thread(p.threadId) });
         break;
+      case "thread/items/list":
+        // 结果补读的条目分页只在 pendingResult 场景提供，放行前扣住；其余场景仍回 -32601。
+        if (!scenario.pendingResult) send({ id: msg.id, error: { code: -32601, message: "模拟方法不存在" } });
+        else if (!released) reads.push({ id: msg.id, threadId: p.threadId, turnId: p.turnId });
+        else sendItems(msg.id, p.threadId, p.turnId);
+        break;
       case "thread/unsubscribe": reply(msg.id, { status: "unsubscribed" }); break;
       case "turn/interrupt": finish(p.threadId, true); reply(msg.id, {}); break;
       case "fixture/state": reply(msg.id, { calls, threads: [...threads.entries()], pendingReads: reads.length, pid: process.pid }); break;
@@ -128,7 +140,10 @@ process.stdin.on("data", (chunk) => {
         if (p.action === "next") { begin(p.threadId); finish(p.threadId); }
         if (p.action === "release") {
           released = true;
-          for (const read of reads.splice(0)) reply(read.id, { thread: thread(read.threadId) });
+          for (const read of reads.splice(0)) {
+            if (read.turnId === undefined) reply(read.id, { thread: thread(read.threadId) });
+            else sendItems(read.id, read.threadId, read.turnId);
+          }
           if (pendingStart) { reply(pendingStart.id, { turn: pendingStart.turn }); pendingStart = undefined; }
         }
         reply(msg.id, {});

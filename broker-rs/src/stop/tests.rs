@@ -438,12 +438,27 @@ fn 共享归属未定先不动目标且自有定案后处理() {
 fn 共享加入定案与加入认领断开只释放() {
     let (mut m, c) = started(true, "turn/start");
     disconnected(&mut m);
-    let a = reply(&mut m, &c, Ok(json!({"turn":{"id":"本轮"}})));
-    let read = req(&a, "thread/read");
-    let a = reply(
+    reply(&mut m, &c, Ok(json!({"turn":{"id":"本轮"}})));
+    // 吸收判定经 H2 状态读取层：线程活动，第一个活动轮次是其他轮 → 加入。
+    let (a, _) = crate::test_support::status_read::drive_status(
         &mut m,
-        &read,
-        Ok(json!({"thread":{"turns":[{"id":"其他轮","status":"inProgress"}]}})),
+        vec![
+            crate::test_support::status_read::StatusStep::Reply(
+                crate::test_support::status_read::expect(
+                    crate::test_support::status_read::StatusPhase::Metadata,
+                ),
+                Ok(crate::test_support::status_read::meta("线程", "active")),
+            ),
+            crate::test_support::status_read::StatusStep::Reply(
+                crate::test_support::status_read::expect(
+                    crate::test_support::status_read::StatusPhase::Turns,
+                ),
+                Ok(crate::test_support::status_read::turns_page(
+                    &[("其他轮", "inProgress")],
+                    None,
+                )),
+            ),
+        ],
     );
     assert!(m.claims.is_empty());
     assert!(m.stops.operations.is_empty());
@@ -2323,12 +2338,30 @@ fn 已受理停止转加入统一回复全部等待者并清理不报告确认()
             {
                 *settling = true;
             }
-            let a = reply(&mut m, &c, Ok(json!({"turn":{"id":"本轮"}})));
-            reply(
+            let mut a = reply(&mut m, &c, Ok(json!({"turn":{"id":"本轮"}})));
+            // 吸收判定经 H2 状态读取层：线程活动，第一个活动轮次是别人轮 → 加入。
+            let (driven, _) = crate::test_support::status_read::drive_status(
                 &mut m,
-                &req(&a, "thread/read"),
-                Ok(json!({"thread":{"turns":[{"id":"别人轮","status":"inProgress"}]}})),
-            )
+                vec![
+                    crate::test_support::status_read::StatusStep::Reply(
+                        crate::test_support::status_read::expect(
+                            crate::test_support::status_read::StatusPhase::Metadata,
+                        ),
+                        Ok(crate::test_support::status_read::meta("线程", "active")),
+                    ),
+                    crate::test_support::status_read::StatusStep::Reply(
+                        crate::test_support::status_read::expect(
+                            crate::test_support::status_read::StatusPhase::Turns,
+                        ),
+                        Ok(crate::test_support::status_read::turns_page(
+                            &[("别人轮", "inProgress")],
+                            None,
+                        )),
+                    ),
+                ],
+            );
+            a.extend(driven);
+            a
         } else {
             client(
                 &mut m,

@@ -1,6 +1,7 @@
 //! M7 预算与共享关闭边界；每个事件后核对字节守恒。
 use super::*;
-use crate::test_support::status_read::meta;
+use crate::claim::status_read::StatusCaller;
+use crate::test_support::status_read::{meta, status_requests, turns_page, StatusPhase};
 
 fn invariant(m: &Machine) {
     m.assert_held_accounting();
@@ -46,9 +47,8 @@ fn 首次溢出裁剪已经持有的生命周期也会触发核实() {
     );
     assert_eq!(held(&m, "t"), OVERFLOW_LIFECYCLE_ITEMS);
     let actions = reply(&mut m, &start, Ok(json!({"turn":{"id":"target"}})));
-    let read = request(&actions, "thread/read");
-    assert!(matches!(read.operation, Operation::JoinedCheckRead { .. }));
-    reply(&mut m, &read, Ok(json!({"thread":{"turns":[]}})));
+    let read = joined_read(&m, &actions, "t", 0);
+    absent(&mut m, &read, "t");
     assert!(m.claims.is_empty());
 }
 
@@ -71,10 +71,9 @@ fn 溢出审查丢失生命周期后只核实实际子线程() {
         &review,
         Ok(json!({"reviewThreadId":"child","turn":{"id":"review-turn"}})),
     );
-    let read = request(&actions, "thread/read");
-    assert_eq!(read.params.as_ref().unwrap()["threadId"], "child");
+    let read = joined_read(&m, &actions, "child", 0);
     assert!(!m.claims.contains_key("parent"));
-    reply(&mut m, &read, Ok(json!({"thread":{"turns":[]}})));
+    absent(&mut m, &read, "child");
     assert!(m.claims.is_empty());
     assert!(m.joined_checks.is_empty());
     assert_eq!(
@@ -410,11 +409,7 @@ fn lost_completed(m: &mut Machine, byte_limit: bool) -> RequestContext {
     );
     assert_eq!(m.settling_bytes, bytes, "完成通知必须因预算未保存");
     let actions = reply(m, &start, Ok(json!({"turn":{"id":"target"}})));
-    let read = request(&actions, "thread/read");
-    assert!(matches!(
-        read.operation,
-        Operation::JoinedCheckRead { attempt: 0 }
-    ));
+    let read = joined_read(m, &actions, "t", 0);
     assert!(m.claims["t"].joined());
     assert_eq!(m.settling_bytes, 0);
     read
@@ -426,12 +421,32 @@ fn 目标完成因条数或字节丢失后补读已结束或找不到均释放()
         for found in [false, true] {
             let mut m = Machine::new(true);
             let read = lost_completed(&mut m, byte_limit);
-            let turns = if found {
-                json!([{"id":"target","status":"completed","items":[]}])
+            let actions = if found {
+                reply(
+                    &mut m,
+                    &read,
+                    Ok(turns_page(&[("target", "completed")], None)),
+                )
             } else {
-                json!([])
+                absent(&mut m, &read, "t")
             };
-            reply(&mut m, &read, Ok(json!({"thread":{"turns":turns}})));
+            // 释放不等结果补读：找到终态时补读刚发出、认领已经释放。
+            let result_reads: Vec<_> = actions
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Request(c) if matches!(c.operation, Operation::ResultRead(_)) => {
+                        Some(c.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if found {
+                assert_eq!(result_reads.len(), 1);
+                assert_eq!(result_reads[0].method, "thread/items/list");
+            } else {
+                assert!(result_reads.is_empty());
+            }
+            assert_no_full_read(&actions);
             assert!(m.claims.is_empty());
             assert!(m.joined_checks.is_empty());
             assert!(m.stream_slots.is_empty());
@@ -448,7 +463,7 @@ fn 生命周期补读目标仍运行就保持joined并等待新completed() {
     let actions = reply(
         &mut m,
         &read,
-        Ok(json!({"thread":{"turns":[{"id":"target","status":"inProgress"}]}})),
+        Ok(turns_page(&[("target", "inProgress")], None)),
     );
     assert!(m.claims["t"].joined());
     assert!(m.joined_checks.is_empty());
@@ -478,11 +493,7 @@ fn 生命周期核实超时或坏快照重试十次后告警释放且重复事�
                 },
             )
         } else {
-            reply(
-                &mut m,
-                &read,
-                Ok(json!({"thread":{"turns":[{"id":"target","status":"未知"}]}})),
-            )
+            reply(&mut m, &read, Ok(turns_page(&[("target", "未知")], None)))
         };
         assert!(!reply(&mut m, &read, Err(json!({"message":"重复"})))
             .iter()
@@ -512,7 +523,7 @@ fn 生命周期核实超时或坏快照重试十次后告警释放且重复事�
                     kind: kind.clone(),
                 },
             );
-            read = request(&actions, "thread/read");
+            read = joined_read(&m, &actions, "t", attempt as u8 + 1);
             assert!(!apply(&mut m, Event::Timer { token, kind })
                 .iter()
                 .any(|a| matches!(a, Action::Request(_))));
@@ -550,7 +561,7 @@ fn 生命周期核实期间完成释放或关闭后旧回包和期限不影响�
         }
         assert!(m.joined_checks.is_empty());
         let claims = m.claims.clone();
-        reply(&mut m, &read, Ok(json!({"thread":{"turns":[]}})));
+        reply(&mut m, &read, Ok(turns_page(&[], None)));
         let actions = apply(&mut m, Event::Timer { token, kind });
         assert!(!actions.iter().any(|a| matches!(a, Action::Request(_))));
         assert_eq!(m.claims, claims);
@@ -572,6 +583,45 @@ fn request(actions: &[Action], method: &str) -> RequestContext {
             _ => None,
         })
         .unwrap_or_else(|| panic!("没有 {method} 请求：{actions:?}"))
+}
+
+/// joined 核实经 H2 状态读取层的 Turn 查询发出：第一步就是 notLoaded 轮次页，不发全量读。
+fn joined_read(m: &Machine, actions: &[Action], thread: &str, attempt: u8) -> RequestContext {
+    assert_no_full_read(actions);
+    let requests = status_requests(actions);
+    assert_eq!(requests.len(), 1, "只发一个核实请求：{actions:?}");
+    let read = &requests[0];
+    assert_eq!(read.phase, StatusPhase::Turns);
+    let params = read.params.as_ref().unwrap();
+    assert_eq!(params["threadId"], thread);
+    assert_eq!(params["itemsView"], "notLoaded");
+    assert_eq!(
+        m.status_reads.reads[&read.read_id].caller,
+        StatusCaller::JoinedCheck { attempt }
+    );
+    read.context.clone()
+}
+
+/// 遍历完未找到目标，再读元数据确认线程不活动：Turn 查询返回 Absent。
+fn absent(m: &mut Machine, read: &RequestContext, thread: &str) -> Vec<Action> {
+    let mut actions = reply(m, read, Ok(turns_page(&[], None)));
+    let metadata = request(&actions, "thread/read");
+    assert!(metadata
+        .params
+        .as_ref()
+        .unwrap()
+        .get("includeTurns")
+        .is_none());
+    actions.extend(reply(m, &metadata, Ok(meta(thread, "idle"))));
+    actions
+}
+
+fn assert_no_full_read(actions: &[Action]) {
+    assert!(
+        !actions.iter().any(|a| matches!(a, Action::Request(c)
+            if c.params.as_ref().is_some_and(|p| p.get("includeTurns").is_some()))),
+        "不得发全量读取：{actions:?}"
+    );
 }
 
 fn reply(m: &mut Machine, context: &RequestContext, result: Result<Value, Value>) -> Vec<Action> {
@@ -1319,4 +1369,193 @@ fn 暂停期间同代认领改为joined后不得中断外部轮次() {
         .iter()
         .any(|a| matches!(a,Action::Request(c) if c.method=="turn/interrupt")));
     assert_eq!(m.shutdown_stops_pending(), 0);
+}
+
+// ─── H2-c：joined 核实经 Turn 查询 ───────────────────────────────
+
+#[test]
+fn joined核实目标在第二页以后照样找到() {
+    for status in ["inProgress", "completed"] {
+        let mut m = Machine::new(true);
+        let read = lost_completed(&mut m, false);
+        let first: Vec<(String, &str)> = (0..100)
+            .map(|i| (format!("新轮{i}"), "completed"))
+            .collect();
+        let first: Vec<(&str, &str)> = first.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+        // 第一页未命中不等于目标不存在：继续翻页，不读元数据、不释放。
+        let actions = reply(&mut m, &read, Ok(turns_page(&first, Some("第二页"))));
+        assert!(m.claims["t"].joined());
+        let next = request(&actions, "thread/turns/list");
+        assert_eq!(next.params.as_ref().unwrap()["cursor"], "第二页");
+        let actions = reply(
+            &mut m,
+            &next,
+            Ok(turns_page(
+                &[("更早", "completed"), ("target", status)],
+                None,
+            )),
+        );
+        assert_no_full_read(&actions);
+        if status == "inProgress" {
+            assert!(
+                m.claims["t"].joined(),
+                "目标仍在跑：保持 joined 等新的 completed"
+            );
+            assert!(m.joined_checks.is_empty());
+        } else {
+            assert!(m.claims.is_empty());
+            assert!(m.joined_checks.is_empty());
+        }
+    }
+}
+
+#[test]
+fn joined核实遍历完未找到但线程活动时不释放() {
+    let mut m = Machine::new(true);
+    let read = lost_completed(&mut m, false);
+    let actions = reply(
+        &mut m,
+        &read,
+        Ok(turns_page(&[("别轮", "completed")], Some("下一页"))),
+    );
+    let next = request(&actions, "thread/turns/list");
+    let actions = reply(
+        &mut m,
+        &next,
+        Ok(turns_page(&[("更早", "completed")], None)),
+    );
+    let metadata = request(&actions, "thread/read");
+    // 分页线程的活动轮次可能还没持久化：线程 active 时不能按目标缺失释放。
+    let actions = reply(&mut m, &metadata, Ok(meta("t", "active")));
+    assert!(m.claims["t"].joined(), "不得释放");
+    assert_eq!(m.joined_checks.len(), 1);
+    let (token, kind) = actions
+        .iter()
+        .find_map(|a| match a {
+            Action::Schedule {
+                token,
+                kind: kind @ TimerKind::JoinedCheckRetry { attempt: 1 },
+                delay_ms: 1000,
+            } => Some((token.clone(), kind.clone())),
+            _ => None,
+        })
+        .expect("按有界重试再核实");
+    let actions = apply(&mut m, Event::Timer { token, kind });
+    let retry = joined_read(&m, &actions, "t", 1);
+    // 重试时目标出现在存储页里且已完成，才释放。
+    reply(
+        &mut m,
+        &retry,
+        Ok(turns_page(&[("target", "completed")], None)),
+    );
+    assert!(m.claims.is_empty());
+}
+
+#[test]
+fn joined核实找到终态时释放认领不等结果补读且旧服务器不发全量读() {
+    let mut m = Machine::new(true);
+    let read = lost_completed(&mut m, false);
+    let mut actions = reply(
+        &mut m,
+        &read,
+        Ok(
+            json!({"data":[{"id":"target","status":"failed","items":[{"type":"agentMessage","text":"服务器忽略了 notLoaded"}],
+            "itemsView":"full","error":{"message":"上游错误"}}],"nextCursor":null}),
+        ),
+    );
+    assert!(m.claims.is_empty(), "释放认领不等结果补读");
+    let turn = m.runs.runs["run-t"].turns.last().unwrap().clone();
+    assert_eq!(turn.turn_id, "target");
+    assert_eq!(turn.status, crate::runs::TurnStatus::Failed);
+    assert_eq!(turn.error, Some(json!({"message":"上游错误"})));
+    assert_eq!(
+        turn.ready,
+        crate::runs::Ready::Pending,
+        "壳是 notLoaded，由补读接上"
+    );
+    let result_read = request(&actions, "thread/items/list");
+    assert!(matches!(result_read.operation, Operation::ResultRead(_)));
+    // legacy：条目分页不支持 → 标 unavailable，不发整线程读取。
+    actions = reply(
+        &mut m,
+        &result_read,
+        Err(json!({"code":-32601,"message":"Method not found"})),
+    );
+    assert_no_full_read(&actions);
+    assert!(!actions.iter().any(|a| matches!(a, Action::Request(_))));
+    let turn = m.runs.runs["run-t"].turns.last().unwrap().clone();
+    assert_eq!(turn.ready, crate::runs::Ready::Unavailable);
+}
+
+#[test]
+fn joined核实畸形回包与无法确认都不释放() {
+    for (stage, value) in [
+        (
+            "turns",
+            json!({"data":[{"id":"target","status":"未知"}],"nextCursor":null}),
+        ),
+        (
+            "turns",
+            json!({"data":[{"id":"","status":"completed"}],"nextCursor":null}),
+        ),
+        ("turns", json!({"data":{"id":"target"},"nextCursor":null})),
+        ("turns", json!({"data":[],"nextCursor":"空页带游标"})),
+        (
+            "turns",
+            json!({"data":[{"id":"别轮","status":"completed"}]}),
+        ),
+        ("metadata", json!({"thread":{"id":"t"}})),
+        (
+            "metadata",
+            json!({"thread":{"id":"t","status":{"type":"未来状态"}}}),
+        ),
+        (
+            "metadata",
+            json!({"thread":{"id":"别的线程","status":{"type":"idle"}}}),
+        ),
+    ] {
+        let mut m = Machine::new(true);
+        let read = lost_completed(&mut m, false);
+        let actions = if stage == "turns" {
+            reply(&mut m, &read, Ok(value.clone()))
+        } else {
+            let actions = reply(&mut m, &read, Ok(turns_page(&[], None)));
+            let metadata = request(&actions, "thread/read");
+            reply(&mut m, &metadata, Ok(value.clone()))
+        };
+        assert!(m.claims["t"].joined(), "畸形不得释放：{value}");
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Schedule {
+                kind: TimerKind::JoinedCheckRetry { attempt: 1 },
+                ..
+            }
+        )));
+    }
+}
+
+#[test]
+fn joined核实只认当前读取且版本变化不当作目标缺失() {
+    let mut m = Machine::new(true);
+    let read = lost_completed(&mut m, false);
+    // 读取期间来了别的轮次的启动：读取层从第一页重读，旧页的回包按代号丢弃。
+    notify(
+        &mut m,
+        "t",
+        "turn/started",
+        json!({"turn":{"id":"他轮","status":"inProgress","items":[]}}),
+    );
+    let actions = reply(&mut m, &read, Ok(turns_page(&[], None)));
+    let reread = request(&actions, "thread/turns/list");
+    assert!(m.claims["t"].joined());
+    assert!(reply(&mut m, &read, Ok(turns_page(&[], None)))
+        .iter()
+        .all(|a| !matches!(a, Action::Request(_))));
+    reply(
+        &mut m,
+        &reread,
+        Ok(turns_page(&[("target", "inProgress")], None)),
+    );
+    assert!(m.claims["t"].joined());
+    assert!(m.joined_checks.is_empty(), "目标仍在跑，取消核实");
 }

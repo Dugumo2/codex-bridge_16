@@ -9,6 +9,8 @@
 //   MOCK_E2E_TRIGGER：ask-cancel 场景里出现该文件即撤销提问；
 //   MOCK_E2E_BUSY：该文件存在时 thread/read 报告一个 inProgress 的 turn（模拟 broker 重启后核实不通过），元数据状态为 active；
 //                  未启用 MOCK_STATUS_READ 时 thread/turns/list 也只给出这一轮（broker 的状态读取层先读元数据、再分页）。
+//   结果补读的条目分页 thread/items/list 只在 -pending 场景与 MOCK_E2E_REVIEW_INNER_TURN=1 时提供（一页给完已完成轮次的条目，
+//                     -pending 时与 thread/read 一样扣到 fixture/releaseResult）；其余场景仍回 -32601。
 //   MOCK_E2E_LONG_HISTORY=1：独立开关，仅恢复未排除历史时回约 12 MiB 历史，不改变场景选择。
 //   MOCK_STATUS_READ：状态读取的分页与历史选项（JSON，StatusReadMockOptions），默认关闭；开启后由
 //                     test-support/status-history.ts 接管 thread/read、thread/turns/list、thread/items/list。
@@ -48,11 +50,25 @@ const interruptedTurns = new Set<string>();
 const holds = new Map<string, () => void>();
 const completedTurns = new Map<string, unknown[]>();
 const heldReads: Array<{ id: unknown; threadId: string }> = [];
+const heldItemReads: Array<{ id: unknown; threadId: string; turnId: string }> = [];
 let resultsReleased = false;
+/** 只有完成通知不带完整条目的场景才需要结果补读的条目分页。 */
+const itemPaging = delayResult || process.env.MOCK_E2E_REVIEW_INNER_TURN === "1";
 const heldLifecycle: Array<{ id: unknown; method: string; threadId: string }> = [];
 
 function busy(): boolean {
   return !!busyFlag && existsSync(busyFlag);
+}
+
+/** 已完成轮次的条目，按 thread/items/list 的包装一页给完；找不到轮次时回错误。 */
+function sendItems(id: unknown, threadId: string, turnId: string): void {
+  const turn = (completedTurns.get(threadId) ?? []).find((t) => (t as { id?: string }).id === turnId) as { items?: unknown[] } | undefined;
+  if (!turn) {
+    send({ id, error: { code: -32600, message: `turn not found: ${turnId}` } });
+    return;
+  }
+  send({ id, result: { data: (turn.items ?? []).map((item) => ({ turnId, item, startedAtMs: null, completedAtMs: null })),
+    nextCursor: null, backwardsCursor: null } });
 }
 
 function gate(name: string): boolean {
@@ -287,9 +303,23 @@ process.stdin.on("data", (chunk: string) => {
         send({ id: msg.id, result: { data: [{ id: "turn-lost", items: [], itemsView: "notLoaded", status: "inProgress", error: null }],
           nextCursor: null, backwardsCursor: null } });
         break;
+      case "thread/items/list": {
+        if (!itemPaging) {
+          send({ id: msg.id, error: { code: -32601, message: `模拟 codex 不支持 ${msg.method}` } });
+          break;
+        }
+        const turnId = String(msg.params?.turnId ?? "");
+        if (completedTurns.has(threadId) && !resultsReleased && delayResult) {
+          heldItemReads.push({ id: msg.id, threadId, turnId });
+          break;
+        }
+        sendItems(msg.id, threadId, turnId);
+        break;
+      }
       case "fixture/releaseResult":
         resultsReleased = true;
         for (const read of heldReads.splice(0)) send({ id: read.id, result: { thread: { ...thread(read.threadId), turns: completedTurns.get(read.threadId) ?? [] } } });
+        for (const read of heldItemReads.splice(0)) sendItems(read.id, read.threadId, read.turnId);
         send({ id: msg.id, result: {} });
         break;
       case "thread/unsubscribe":

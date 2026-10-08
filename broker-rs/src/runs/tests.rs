@@ -400,17 +400,10 @@ fn complete_view(m: &mut Machine, turn: &str, view: Option<Value>, items: Value)
     m.run_turn_completed("线程", Some("运行"), &value, &mut actions);
     actions
 }
-fn read_with(read: &ResultRead, view: Option<&str>, items: Value) -> Result<Value, Value> {
-    if view == Some("full") || view.is_none() {
-        return Ok(
-            json!({"data":items.as_array().unwrap().iter().map(|item| json!({"turnId":read.turn_id,"item":item})).collect::<Vec<_>>(),"nextCursor":null,"backwardsCursor":null}),
-        );
-    }
-    let mut turn = json!({"id":read.turn_id,"items":items,"status":"completed","error":null});
-    if let Some(view) = view {
-        turn["itemsView"] = json!(view);
-    }
-    Ok(json!({"thread":{"id":read.thread_id,"turns":[turn]}}))
+fn read_with(read: &ResultRead, items: Value) -> Result<Value, Value> {
+    Ok(
+        json!({"data":items.as_array().unwrap().iter().map(|item| json!({"turnId":read.turn_id,"item":item})).collect::<Vec<_>>(),"nextCursor":null,"backwardsCursor":null}),
+    )
 }
 
 #[test]
@@ -455,7 +448,7 @@ fn summary_completion_reads_full_turn_and_keeps_notification_status() {
         {"type":"commandExecution","command":"构建"},
         message("答案二")
     ]);
-    let done = reply(&mut m, read.clone(), read_with(&read, Some("full"), full));
+    let done = reply(&mut m, read.clone(), read_with(&read, full));
     assert_eq!(puts(&done), 1);
     let turn = last(&m, "运行");
     assert_eq!(turn.ready, Ready::Ready);
@@ -483,34 +476,29 @@ fn summary_review_completion_reads_review_text() {
         {"type":"exitedReviewMode","review":"审查报告全文"},
         message("收尾")
     ]);
-    reply(&mut m, read.clone(), read_with(&read, Some("full"), full));
+    reply(&mut m, read.clone(), read_with(&read, full));
     assert_eq!(last(&m, "运行").output, "审查报告全文");
     assert_eq!(last(&m, "运行").output_source, OutputSource::Review);
 }
 
 #[test]
-fn read_reply_that_is_still_summary_is_not_evidence() {
-    for view in ["summary", "notLoaded"] {
-        let mut m = machine();
-        open(&mut m, "运行", "线程");
-        let read = reads(&complete_view(
-            &mut m,
-            "轮",
-            Some(json!("summary")),
-            json!([message("摘要")]),
-        ))
-        .remove(0);
-        let fallback = reply(&mut m, read, Err(json!({"code":-32601})));
-        let read = reads(&fallback).remove(0);
-        let actions = reply(
-            &mut m,
-            read.clone(),
-            read_with(&read, Some(view), json!([message("摘要")])),
-        );
-        assert_eq!(timers(&actions).len(), 1, "itemsView={view}");
-        assert_eq!(puts(&actions), 0);
-        assert_eq!(last(&m, "运行").ready, Ready::Pending);
-    }
+fn unsupported_paging_keeps_summary_as_unavailable_without_full_read() {
+    // H2：条目分页不支持时不再回退整线程读取，摘要只作降级快照，不是完整结果。
+    let mut m = machine();
+    open(&mut m, "运行", "线程");
+    let read = reads(&complete_view(
+        &mut m,
+        "轮",
+        Some(json!("summary")),
+        json!([message("摘要")]),
+    ))
+    .remove(0);
+    let actions = reply(&mut m, read, Err(json!({"code":-32601})));
+    assert!(reads(&actions).is_empty());
+    assert!(timers(&actions).is_empty());
+    assert_eq!(puts(&actions), 1);
+    assert_eq!(last(&m, "运行").ready, Ready::Unavailable);
+    assert_eq!(last(&m, "运行").output, "摘要");
 }
 
 #[test]

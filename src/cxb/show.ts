@@ -73,39 +73,81 @@ export function serverOutput(items: ServerItem[]): { output: string; outputSourc
   return { output: agents.map((item) => item.text!).join("\n"), outputSource: agents.length ? "accumulated" : "none" };
 }
 
+const TURN_STATUSES = new Set(["inProgress", "completed", "failed", "interrupted"]);
+/** 轮次分页的一页：data 必须是数组；空页不得带续页游标；轮次要有非空 id 与四种状态之一。 */
+function checkedTurn(page: { data?: unknown; nextCursor?: unknown }): ServerTurn | undefined {
+  if (!Array.isArray(page?.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")
+    || (page.data.length === 0 && page.nextCursor !== null)) throw new CxbError("CODEX_FAILED", "服务器轮次分页回包损坏");
+  const turn = page.data[0] as ServerTurn | undefined;
+  if (turn !== undefined && (typeof turn?.id !== "string" || !turn.id || !TURN_STATUSES.has(turn.status))) {
+    throw new CxbError("CODEX_FAILED", "服务器轮次分页回包损坏");
+  }
+  return turn;
+}
+
+/** 最新一轮的全部条目：按 turnId 分页到 nextCursor 为 null；畸形或游标不前进都明确失败，不交付部分结果。 */
+async function turnItems(rpc: BrokerRpc, threadId: string, turnId: string): Promise<ServerItem[]> {
+  const items: ServerItem[] = [];
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  do {
+    const page: { data: Array<{ turnId: string; item: ServerItem }>; nextCursor: string | null } = await rpc.request("thread/items/list", {
+      threadId, turnId, cursor, limit: 64, sortDirection: "asc",
+    });
+    if (!Array.isArray(page.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")
+      || page.data.some((entry) => entry.turnId !== turnId || !entry.item || typeof entry.item.type !== "string")) {
+      throw new CxbError("CODEX_FAILED", "服务器条目分页回包损坏");
+    }
+    items.push(...page.data.map((entry) => entry.item));
+    cursor = page.nextCursor;
+    if (cursor !== null && (!cursor || seen.has(cursor) || !page.data.length)) throw new CxbError("CODEX_FAILED", "服务器条目分页游标没有前进");
+    if (cursor !== null) seen.add(cursor);
+  } while (cursor !== null);
+  return items;
+}
+
+/**
+ * 条目分页不支持（legacy 线程）时的单轮兼容读：同一请求改要 full 视图，只取最新一轮并核对编号。
+ * 单轮仍可能很大，但不再整线程回退（H2 接口第 6 节）。
+ */
+async function legacyTurnItems(rpc: BrokerRpc, threadId: string, turnId: string): Promise<ServerItem[]> {
+  const page = await rpc.request<{ data?: unknown; nextCursor?: unknown }>("thread/turns/list", {
+    threadId, cursor: null, limit: 1, sortDirection: "desc", itemsView: "full",
+  });
+  const turn = checkedTurn(page) as (ServerTurn & { itemsView?: unknown }) | undefined;
+  if (!turn || turn.id !== turnId) throw new CxbError("CODEX_FAILED", "服务器最新轮次在读取期间变化，请重试");
+  if (turn.itemsView !== "full" || !Array.isArray(turn.items)
+    || turn.items.some((item) => !item || typeof item.type !== "string")) {
+    throw new CxbError("CODEX_FAILED", "服务器没有给出最新轮次的完整条目");
+  }
+  return turn.items;
+}
+
+/**
+ * `show --server`：从服务器读最新一轮。首个轮次请求只要 notLoaded 元数据；条目经 items/list 分页。
+ * 轮次分页与条目分页的能力分开降级：轮次分页不支持（旧服务器，或无法证明的第一轮前）明确失败；
+ * 只有条目分页不支持时改用单轮完整读。拿不到结果时明确失败，不伪装成空结果，也不整线程回退。
+ */
 async function serverResult(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef) {
   let turn: ServerTurn | undefined;
   try {
-    const page = await rpc.request<{ data: ServerTurn[] }>("thread/turns/list", {
-      threadId: ref.threadId, cursor: null, limit: 1, sortDirection: "desc", itemsView: "summary",
-    });
-    if (!Array.isArray(page.data)) throw new CxbError("CODEX_FAILED", "服务器轮次分页回包损坏");
-    turn = page.data[0];
-    if (turn) {
-      const items: ServerItem[] = [];
-      const seen = new Set<string>();
-      let cursor: string | null = null;
-      do {
-        const page: { data: Array<{ turnId: string; item: ServerItem }>; nextCursor: string | null } = await rpc.request("thread/items/list", {
-          threadId: ref.threadId, turnId: turn.id, cursor, limit: 64, sortDirection: "asc",
-        });
-        if (!Array.isArray(page.data) || !(page.nextCursor === null || typeof page.nextCursor === "string")
-          || page.data.some((entry) => entry.turnId !== turn!.id || !entry.item || typeof entry.item.type !== "string")) {
-          throw new CxbError("CODEX_FAILED", "服务器条目分页回包损坏");
-        }
-        items.push(...page.data.map((entry) => entry.item));
-        cursor = page.nextCursor;
-        if (cursor !== null && (!cursor || seen.has(cursor) || !page.data.length)) throw new CxbError("CODEX_FAILED", "服务器条目分页游标没有前进");
-        if (cursor !== null) seen.add(cursor);
-      } while (cursor !== null);
-      turn = { ...turn, items };
-    }
+    turn = checkedTurn(await rpc.request("thread/turns/list", {
+      threadId: ref.threadId, cursor: null, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
+    }));
   } catch (error) {
     if (!unsupported(error)) throw error;
-    ctx.out.progress("服务器不支持分页，改用完整线程读取");
-    const reply = await rpc.request<{ thread: { turns: ServerTurn[] } }>("thread/read", { threadId: ref.threadId, includeTurns: true });
-    if (!Array.isArray(reply.thread?.turns)) throw new CxbError("CODEX_FAILED", "服务器线程回包损坏");
-    turn = reply.thread.turns.at(-1);
+    throw new CxbError("CODEX_FAILED", "服务器不支持轮次分页（thread/turns/list），无法从服务器读取结果；去掉 --server 可查看本地结果");
+  }
+  if (turn) {
+    let items: ServerItem[];
+    try {
+      items = await turnItems(rpc, ref.threadId, turn.id);
+    } catch (error) {
+      if (!unsupported(error)) throw error;
+      ctx.out.progress("服务器不支持条目分页，改用单轮完整读取");
+      items = await legacyTurnItems(rpc, ref.threadId, turn.id);
+    }
+    turn = { ...turn, items };
   }
   const result = serverOutput(turn?.items ?? []);
   ctx.out.result(result.output);

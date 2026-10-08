@@ -216,6 +216,7 @@ const subagents = createSubagentMock(respond, ${JSON.stringify(opts?.subagents ?
 let buffer = "";
 let approvalIdCounter = 1;
 let turnCounter = 0;
+let predecessorSent = false;
 // 记录供清理行为测试通过 mock/state 读取的状态。
 const unsubscribed = [];
 const calls = [];
@@ -569,7 +570,11 @@ process.stdin.on("data", (chunk) => {
         break;
         ` : ""}
         ${predecessorDuringRead ? `
-        respond({ method: "turn/completed", params: { threadId: msg.params?.threadId || "thread-001", turn: { id: "turn-000", items: [], status: "completed", error: null } } });
+        // 上一轮的完成只在首次读取期间到达一次（吸收判定经 H2 状态读取层会因此重读）。
+        if (!predecessorSent) {
+          predecessorSent = true;
+          respond({ method: "turn/completed", params: { threadId: msg.params?.threadId || "thread-001", turn: { id: "turn-000", items: [], status: "completed", error: null } } });
+        }
         setTimeout(() => respond({ id: msg.id, result: { thread: {
           id: msg.params?.threadId || "thread-001", preview: "", modelProvider: "openai", createdAt: Date.now(), updatedAt: Date.now(),
           status: { type: "active" }, path: null, cwd: "/tmp", cliVersion: "0.1.0", source: "mock", name: null,
@@ -582,13 +587,23 @@ process.stdin.on("data", (chunk) => {
           thread: {
             id: msg.params?.threadId || "thread-001", preview: "",
             modelProvider: "openai", createdAt: Date.now(), updatedAt: Date.now(),
-            status: { type: "idle" }, path: null, cwd: "/tmp",
+            status: { type: ${absorbedStart ? '"active"' : '"idle"'} }, path: null, cwd: "/tmp",
             cliVersion: "0.1.0", source: "mock", name: null,
             agentNickname: null, agentRole: null, gitInfo: null,
             turns: ${absorbedStart ? '[{ id: "theirs-1", status: "inProgress", items: [], error: null }]' : '[]'},
           },
         }});
         break;
+
+      ${absorbedStart || predecessorDuringRead ? `
+      case "thread/turns/list":
+        // 吸收判定经 H2 状态读取层分页读轮次（场景数据）：与 thread/read 报告的活动轮次一致，一页给完，不带条目。
+        respond({ id: msg.id, result: {
+          data: [{ id: ${absorbedStart ? '"theirs-1"' : '"turn-001"'}, status: "inProgress", items: [], itemsView: "notLoaded", error: null }],
+          nextCursor: null, backwardsCursor: null,
+        }});
+        break;
+      ` : ""}
 
       case "thread/list":
         respond({ id: msg.id, result: { data: [], nextCursor: null } });

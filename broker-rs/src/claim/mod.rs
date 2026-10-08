@@ -295,13 +295,6 @@ pub enum Operation {
     Stream {
         run_id: Option<RunId>,
     },
-    SettlementRead {
-        attempt: u8,
-    },
-    /// 溢出丢失生命周期证据后，只核实 joined 目标是否仍在运行，不重新授予所有权。
-    JoinedCheckRead {
-        attempt: u8,
-    },
     Unsubscribe,
     InterruptRetry {
         original_error: Value,
@@ -1313,10 +1306,6 @@ impl Machine {
         // 乙路：续跑核实读与 goal 恢复先核对自己持有的版本、认领与阶段，再由处理函数自己调用
         // `learn_traffic` 学习事实（回包自身会推进 goal 版本，先学习会把本次读数误判为过期）。
         match &context.operation {
-            Operation::JoinedCheckRead { attempt } => {
-                self.joined_check_reply(&context, result, *attempt, actions);
-                return;
-            }
             Operation::ContinueRead(_) => {
                 self.continue_reply(&context, result, actions);
                 return;
@@ -1352,9 +1341,7 @@ impl Machine {
             Operation::Lifecycle { .. } => unreachable!("生命周期回包已分派"),
             Operation::ResultRead(read) => self.run_result_reply(read.clone(), result, actions),
             Operation::ContinueResume => self.continue_reply(&context, result, actions),
-            Operation::ContinueRead(_)
-            | Operation::GoalRestore(_)
-            | Operation::JoinedCheckRead { .. } => {
+            Operation::ContinueRead(_) | Operation::GoalRestore(_) => {
                 unreachable!("乙路的读回包已在学习事实之前分派")
             }
             Operation::Inbox(rpc) => self.inbox_rpc_reply(rpc.clone(), result, actions),
@@ -1427,13 +1414,6 @@ impl Machine {
                 }
                 if context.method == "review/start" {
                     self.finish_review(context.review_id);
-                }
-            }
-            Operation::SettlementRead { attempt } => {
-                if current {
-                    self.settlement_read(&context, result, *attempt, actions);
-                } else {
-                    actions.push(Action::Warn("丢弃过期认领的吸收判定读回包".into()));
                 }
             }
             Operation::InterruptRetry { original_error } => self.deliver(

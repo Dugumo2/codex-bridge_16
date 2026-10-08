@@ -189,15 +189,17 @@ test("多页补读完整且按已知轮次定位，不读取长线程全历史",
   await client.request("broker/shutdown");
 }, 35_000);
 
-test("不支持分页则全历史回退，整个 broker 只告警一次", async () => {
+test("不支持条目分页时不回退全历史：降级为摘要快照并标 unavailable，整个 broker 只告警一次", async () => {
   const { client, exited } = await start("paging-unsupported");
   for (let turn = 0; turn < 2; turn++) {
     const result = await run(client);
-    expect(result.turns.at(-1).ready).toBe("ready");
-    expect(result.turns.at(-1).output).toBe("分页一 中文\n分页二 中文");
+    expect(result.turns.at(-1).ready).toBe("unavailable");
+    expect(result.turns.at(-1).output).toBe("分页二 中文");
   }
   const { calls } = await client.request("fixture/state");
-  expect(calls.filter((call: any) => call.method === "thread/read" && call.params.includeTurns).length).toBe(2);
+  // 每轮只试一次条目分页，不重试、不发整线程读取。
+  expect(calls.filter((call: any) => call.method === "thread/items/list").length).toBe(2);
+  expect(calls.filter((call: any) => call.method === "thread/read")).toEqual([]);
   await client.request("broker/shutdown");
   await bounded(exited, 10_000, "正常退出");
   expect(stderr.match(/上游不支持条目分页/g)?.length).toBe(1);

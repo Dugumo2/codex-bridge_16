@@ -1,7 +1,7 @@
 //! 路由、回包、定案和撤销的纯逻辑验证（详细设计 1.2、3.3、3.4、4.1、4.2 节）。
 
 use super::*;
-use crate::claim::{self, Claim, ClientRequest, Event, Operation, ReqKind, RequestContext, State};
+use crate::claim::{self, Claim, ClientRequest, Event, ReqKind, State};
 use serde_json::json;
 
 const APPROVAL: &str = "item/commandExecution/requestApproval";
@@ -775,28 +775,26 @@ fn settling() -> Machine {
     machine
 }
 
+/// 经 H2 状态读取层驱动吸收判定：线程活动、第一个活动轮次是本轮（自有）或外轮（加入）。
 fn settle(machine: &mut Machine, joined: bool) -> Vec<Action> {
-    apply(
+    use crate::test_support::status_read::{
+        drive_status, expect, meta, turns_page, StatusPhase, StatusStep,
+    };
+    let mut actions = Vec::new();
+    machine.begin_settlement("线程", 0, &mut actions);
+    let active = if joined { "外轮" } else { "本轮" };
+    let (driven, _) = drive_status(
         machine,
-        Event::Reply {
-            context: RequestContext {
-                resume_retried: false,
-                stream_id: None,
-                review_id: None,
-                client: None,
-                token: Some(crate::claim::ClaimToken {
-                    thread_id: "线程".into(),
-                    claim_id: 1,
-                }),
-                operation: Operation::SettlementRead { attempt: 0 },
-                method: "thread/read".into(),
-                params: None,
-            },
-            result: Ok(
-                json!({"thread": {"turns": [{"id": if joined { "外轮" } else { "本轮" }, "status": "inProgress"}]}}),
+        vec![
+            StatusStep::Reply(expect(StatusPhase::Metadata), Ok(meta("线程", "active"))),
+            StatusStep::Reply(
+                expect(StatusPhase::Turns),
+                Ok(turns_page(&[(active, "inProgress")], None)),
             ),
-        },
-    )
+        ],
+    );
+    actions.extend(driven);
+    actions
 }
 
 #[test]
@@ -919,7 +917,11 @@ fn 断开后定案自有按类别拒绝而旁观静默() {
 
 #[test]
 fn 关闭时尚未定案的请求静默清理且迟到定案不转发() {
+    use crate::test_support::status_read::{meta, reply_status, status_requests};
     let mut machine = settling();
+    let mut started = Vec::new();
+    machine.begin_settlement("线程", 0, &mut started);
+    let read = status_requests(&started).remove(0);
     apply(
         &mut machine,
         request(
@@ -932,9 +934,12 @@ fn 关闭时尚未定案的请求静默清理且迟到定案不转发() {
     let actions = apply(&mut machine, Event::Shutdown);
     assert_eq!(upstream(&actions), vec![&Action::Dismiss { id: json!(7) }]);
     assert!(machine.claims.is_empty());
-    assert!(settle(&mut machine, false)
-        .iter()
-        .all(|a| !matches!(a, Action::Send { .. } | Action::ScheduleForward { .. })));
+    // 关闭时在途的吸收判定读取被静默取消；迟到回包不得定案或转发。
+    assert!(
+        reply_status(&mut machine, &read, Ok(meta("线程", "active")))
+            .iter()
+            .all(|a| !matches!(a, Action::Send { .. } | Action::ScheduleForward { .. }))
+    );
 }
 
 #[test]

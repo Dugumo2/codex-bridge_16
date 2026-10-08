@@ -906,7 +906,7 @@ fn 共享定案先于回放且恰好一次并保留来源() {
             machine.record("线程").watchers = vec![1, 2, 3];
             machine.cxb_conns.insert(2);
             let mut actions = response(&mut machine, &stream, Ok(json!({"turn":{"id":"新轮"}})));
-            let settlement = first_request(&actions);
+            let settlement = super::settlement::settlement_request(&actions).context;
             if undecided {
                 actions = response(
                     &mut machine,
@@ -920,18 +920,30 @@ fn 共享定案先于回放且恰好一次并保留来源() {
             if !joined {
                 actions = step_raw(&mut machine, turn("turn/started", "新轮"));
                 if !undecided {
+                    // 本轮启动推进了活动版本：读取返回已变化，回调先查 own_started，按自有定案。
                     actions.extend(response(
                         &mut machine,
                         &settlement,
-                        Ok(json!({"thread":{"turns":[{"id":"新轮","status":"inProgress"}]}})),
+                        Ok(json!({"thread":{"id":"线程","status":{"type":"active"}}})),
                     ));
                 }
             } else {
-                actions = response(
-                    &mut machine,
-                    &settlement,
-                    Ok(json!({"thread":{"turns":[{"id":"别人的轮","status":"inProgress"}]}})),
-                );
+                if undecided {
+                    // 待定后的下一次读取由一秒重试计时发起。
+                    let (token, kind) = actions
+                        .iter()
+                        .find_map(|a| match a {
+                            Action::Schedule {
+                                token,
+                                kind: kind @ TimerKind::SettlementRetry { .. },
+                                ..
+                            } => Some((token.clone(), kind.clone())),
+                            _ => None,
+                        })
+                        .expect("待定后安排重试");
+                    step_raw(&mut machine, Event::Timer { token, kind });
+                }
+                actions = super::settlement::settle_active(&mut machine, &["别人的轮"]);
             }
             let notices: Vec<_> = sends(&actions)
                 .into_iter()

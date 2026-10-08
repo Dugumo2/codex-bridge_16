@@ -118,11 +118,23 @@ async fn m7溢出丢失目标completed后补读释放并允许if_idle关闭() {
     )
     .await;
     h.answer(&start, Ok(json!({"turn":{"id":"目标轮"}}))).await;
+    // joined 核实经 H2 状态读取层的 Turn 查询：先分页找目标，遍历完未找到再读元数据确认不活动。
     let check = h.outgoing().await;
-    assert_eq!(check["method"], "thread/read");
+    assert_eq!(check["method"], "thread/turns/list");
     assert_eq!(check["params"]["threadId"], "线程");
+    assert_eq!(check["params"]["itemsView"], "notLoaded");
     assert!(h.core.is_busy());
-    h.answer(&check, Ok(json!({"thread":{"turns":[]}}))).await;
+    h.answer(&check, Ok(json!({"data":[],"nextCursor":null})))
+        .await;
+    let metadata = h.outgoing().await;
+    assert_eq!(metadata["method"], "thread/read");
+    assert_eq!(metadata["params"], json!({"threadId":"线程"}));
+    assert!(h.core.is_busy());
+    h.answer(
+        &metadata,
+        Ok(json!({"thread":{"id":"线程","status":{"type":"idle"}}})),
+    )
+    .await;
     assert!(h.core.machine.claims.is_empty());
     assert!(!h.core.is_busy());
     h.client(99, "broker/shutdown", json!({"ifIdle":true}));
@@ -875,12 +887,10 @@ async fn 核心吸收判定实际读服务器且计时器会再次发读请求()
     harness
         .answer(&start, Ok(json!({"turn": {"id": "本轮"}})))
         .await;
+    // 吸收判定经 H2 状态读取层：第一步只读元数据，不发全量读。
     let read = harness.outgoing().await;
     assert_eq!(read["method"], "thread/read");
-    assert_eq!(
-        read["params"],
-        json!({"threadId": "线程", "includeTurns": true})
-    );
+    assert_eq!(read["params"], json!({"threadId": "线程"}));
     harness
         .answer(&read, Err(proto::error_object(-32000, "读失败", None)))
         .await;

@@ -2,7 +2,13 @@
 //!
 //! 先核对提交后的 started，再读服务器；读期间的证据也会重新核对。
 //! held 的完成通知仅在定案后的提交阶段记账。
+//!
+//! 服务器读取经 H2 状态读取层（`status_read.rs`）：吸收判定用 Settlement 组合查询，
+//! joined 核实用 Turn 查询；都不发 `includeTurns:true` 的全量读。
 
+use super::status_read::{
+    StatusCaller, StatusDone, StatusQuery, StatusResult, StatusTurn, StatusUnknown,
+};
 use super::*;
 
 /// 与 held 顺序一致的通知字节、按转发编号登记的请求字节，以及本次认领的告警状态。
@@ -14,6 +20,10 @@ pub(super) struct HeldAccounting {
     request_warned: bool,
     /// 只转发过未保存的 turn 生命周期，定案后必须核实目标的存活状态。
     lifecycle_incomplete: bool,
+    /// 本次 settling 当前有效的吸收判定读取编号；只认这一次读取的完成，被取代的读取结果丢弃。
+    settlement_read: u64,
+    /// 本次 settling 因活动版本变化（`Unknown(Changed)`）立即重发的次数，不计入 attempt。
+    settlement_changed: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,9 +32,15 @@ pub(super) struct JoinedCheck {
     turn_id: String,
     attempt: u8,
     in_flight: bool,
+    /// 在途核实读取的编号；只认这一次读取的完成。
+    read_id: u64,
 }
 
 const JOINED_CHECK_RETRIES: u8 = 10;
+/// 吸收判定的普通失败重试上限：每秒一次，用尽按 joined 保守定案。
+const SETTLEMENT_RETRIES: u8 = 10;
+/// 同一次 settling 中，活动版本变化后立即重算候选并重发的上限；超过按普通失败计。
+const SETTLEMENT_CHANGED_REISSUES: u8 = 3;
 
 /// 序列化到计数器，避免为估算再分配一份完整 JSON；每条收下的消息只计算一次。
 fn message_bytes(method: &str, params: &Option<Value>) -> usize {
@@ -85,104 +101,56 @@ impl Machine {
             self.settle(thread_id, false, turn_id, actions);
             return;
         }
-        actions.push(Action::Request(RequestContext {
-            resume_retried: false,
-            stream_id: None,
-            review_id: None,
-            client: None,
-            token: self.token(thread_id),
-            operation: Operation::SettlementRead { attempt },
-            method: "thread/read".into(),
-            params: Some(json!({"threadId": thread_id, "includeTurns": true})),
-        }));
+        // 候选每次发起时都用最新的 held 重算（版本变化后的重发也走这里）。
+        let query = StatusQuery::Settlement {
+            candidates: settlement_candidates(claim),
+            input: claim.submitted_input.clone(),
+        };
+        let token = self.token(thread_id);
+        let read_id = self.begin_status_read(
+            thread_id,
+            token,
+            query,
+            StatusCaller::Settlement { attempt },
+            actions,
+        );
+        // 读取层从不同步回调，登记编号之后才可能收到完成。
+        self.settling_accounting
+            .entry(thread_id.into())
+            .or_default()
+            .settlement_read = read_id;
     }
 
-    pub(super) fn settlement_read(
-        &mut self,
-        context: &RequestContext,
-        result: Result<Value, Value>,
-        attempt: u8,
-        actions: &mut Vec<Action>,
-    ) {
-        let Some(token) = &context.token else { return };
+    /// 吸收判定的普通失败出口（含 NotVisible、超时、无响应、版本变化重发用尽）：
+    /// 第一次失败后先把回包交给客户端（undecided），每秒重试一次；第十次仍失败按 joined 保守定案。
+    fn settlement_failed(&mut self, token: &ClaimToken, attempt: u8, actions: &mut Vec<Action>) {
         let thread_id = &token.thread_id;
-        let Some(claim) = self.claims.get(thread_id) else {
-            return;
-        };
-        if !claim.settling() {
-            actions.push(Action::Debug("丢弃定案之后才到达的吸收判定读结果".into()));
-            return;
-        }
-        let turn_id = claim.turn_id().map(str::to_owned);
-        // 读取期间可能来了本 turn 的 started，其优先级高于服务器快照。
-        if own_started(claim) {
-            self.settle(thread_id, false, turn_id, actions);
+        if attempt >= SETTLEMENT_RETRIES {
+            actions.push(Action::Warn(
+                "吸收判定重试十次仍失败，按 joined 定案".into(),
+            ));
+            let turn_id = self
+                .claims
+                .get(thread_id)
+                .and_then(|c| c.turn_id().map(str::to_owned));
+            self.settle(thread_id, true, turn_id, actions);
             return;
         }
-        match result {
-            Ok(value) => {
-                let turns = value
-                    .get("thread")
-                    .and_then(|t| t.get("turns"))
-                    .and_then(Value::as_array);
-                let active = turns
-                    .into_iter()
-                    .flatten()
-                    .find(|t| t.get("status").and_then(Value::as_str) == Some("inProgress"))
-                    .and_then(|t| t.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                if let Some(active) = active {
-                    let joined = turn_id.as_deref() != Some(active.as_str());
-                    self.settle(thread_id, joined, Some(active), actions);
-                    return;
-                }
-                let carriers: Vec<&str> = turns
-                    .into_iter()
-                    .flatten()
-                    .filter(|turn| carries_input(turn, &claim.submitted_input))
-                    .filter_map(|turn| turn.get("id").and_then(Value::as_str))
-                    .collect();
-                let candidate = match &claim.state {
-                    State::Starting {
-                        held, submitted_at, ..
-                    } => held
-                        .iter()
-                        .skip(*submitted_at)
-                        .filter(|n| n.method == "turn/completed")
-                        .filter_map(|n| notification_turn_id(&n.params))
-                        .find(|id| Some(*id) != turn_id.as_deref() && carriers.contains(id))
-                        .map(str::to_owned),
-                    _ => None,
-                };
-                let joined = candidate.is_some();
-                self.settle(thread_id, joined, candidate.or(turn_id), actions);
+        if let Some(claim) = self.claims.get_mut(thread_id) {
+            if let State::Starting { undecided, .. } = &mut claim.state {
+                *undecided = Some(attempt);
             }
-            Err(_) => {
-                if attempt >= 10 {
-                    actions.push(Action::Warn(
-                        "吸收判定重试十次仍失败，按 joined 定案".into(),
-                    ));
-                    self.settle(thread_id, true, turn_id, actions);
-                    return;
-                }
-                if let Some(claim) = self.claims.get_mut(thread_id) {
-                    if let State::Starting { undecided, .. } = &mut claim.state {
-                        *undecided = Some(attempt);
-                    }
-                    if let Some((context, result)) = claim.settlement_reply.take() {
-                        self.deliver(&context, Ok(result), actions);
-                    }
-                }
-                actions.push(Action::Schedule {
-                    token: token.clone(),
-                    kind: TimerKind::SettlementRetry {
-                        attempt: attempt + 1,
-                    },
-                    delay_ms: 1000,
-                });
+            if let Some((context, result)) = claim.settlement_reply.take() {
+                self.deliver(&context, Ok(result), actions);
             }
         }
+        actions.push(Action::Schedule {
+            token: token.clone(),
+            kind: TimerKind::SettlementRetry {
+                attempt: attempt + 1,
+            },
+            delay_ms: 1000,
+        });
     }
 
     /// #8、#25：先完成归属更新，再按 ownStart 或 joined 的规则逐条回放。
@@ -749,6 +717,7 @@ impl Machine {
                 turn_id,
                 attempt: 0,
                 in_flight: false,
+                read_id: 0,
             },
         );
         self.joined_check_retry(&self.token(thread).expect("joined 认领存在"), 0, actions);
@@ -771,86 +740,17 @@ impl Machine {
             return;
         };
         check.in_flight = true;
-        actions.push(Action::Request(RequestContext {
-            resume_retried: false,
-            stream_id: None,
-            review_id: None,
-            client: None,
-            token: Some(token.clone()),
-            operation: Operation::JoinedCheckRead { attempt },
-            method: "thread/read".into(),
-            params: Some(json!({"threadId":token.thread_id,"includeTurns":true})),
-        }));
-    }
-
-    pub(super) fn joined_check_reply(
-        &mut self,
-        context: &RequestContext,
-        result: Result<Value, Value>,
-        attempt: u8,
-        actions: &mut Vec<Action>,
-    ) {
-        let Some(token) = &context.token else { return };
-        let thread = &token.thread_id;
-        let Some(check) = self
-            .joined_checks
-            .get(thread)
-            .filter(|c| {
-                self.current(token)
-                    && c.claim_id == token.claim_id
-                    && c.attempt == attempt
-                    && c.in_flight
-            })
-            .cloned()
-        else {
-            return;
-        };
-        let turns = result
-            .as_ref()
-            .ok()
-            .and_then(|v| v.get("thread"))
-            .and_then(|t| t.get("turns"))
-            .and_then(Value::as_array);
-        // 缺数组、缺编号、未知状态都不是停止证据，走同一个有界失败出口。
-        if let Some(turns) = turns.filter(|turns| {
-            turns
-                .iter()
-                .all(|t| t.get("id").and_then(Value::as_str).is_some())
-        }) {
-            let target = turns
-                .iter()
-                .find(|t| t.get("id").and_then(Value::as_str) == Some(check.turn_id.as_str()));
-            let status = target.and_then(|t| t.get("status")).and_then(Value::as_str);
-            if status == Some("inProgress") {
-                self.cancel_joined_check(thread, actions);
-                return;
-            }
-            if target.is_none() || matches!(status, Some("completed" | "failed" | "interrupted")) {
-                if let Some(turn) = target {
-                    let run = self.claims[thread].run_id.clone();
-                    self.run_turn_completed(thread, run.as_deref(), turn, actions);
-                    self.mark_ended(thread, &check.turn_id);
-                }
-                self.release_with_kind(thread, ReleaseKind::Joined, actions);
-                return;
-            }
-        }
-        if attempt >= JOINED_CHECK_RETRIES {
-            actions.push(Action::Warn(format!(
-                "线程 {thread} 的 joined 生命周期核实重试十次仍失败，保守释放认领"
-            )));
-            self.release_with_kind(thread, ReleaseKind::Joined, actions);
-        } else {
-            let check = self.joined_checks.get_mut(thread).expect("核实登记存在");
-            check.attempt += 1;
-            check.in_flight = false;
-            actions.push(Action::Schedule {
-                token: token.clone(),
-                kind: TimerKind::JoinedCheckRetry {
-                    attempt: attempt + 1,
-                },
-                delay_ms: 1000,
-            });
+        let target = check.turn_id.clone();
+        let read_id = self.begin_status_read(
+            &token.thread_id,
+            Some(token.clone()),
+            StatusQuery::Turn { target },
+            StatusCaller::JoinedCheck { attempt },
+            actions,
+        );
+        // 读取层从不同步回调，登记编号之后才可能收到完成。
+        if let Some(check) = self.joined_checks.get_mut(&token.thread_id) {
+            check.read_id = read_id;
         }
     }
 
@@ -919,40 +819,164 @@ fn own_started(claim: &Claim) -> bool {
     }
 }
 
-fn carries_input(turn: &Value, input: &[String]) -> bool {
-    turn.get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("userMessage"))
-        .flat_map(|item| {
-            item.get("content")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|part| part.get("text").and_then(Value::as_str))
-        .any(|text| {
-            input
-                .iter()
-                .any(|wanted| !wanted.trim().is_empty() && text.trim() == wanted.trim())
-        })
+/// Settlement 的候选：`held[submitted_at..]` 中 `turn/completed` 的轮次，排除本次回包的轮次，
+/// 保持通知原顺序；同一轮次重复完成只列一次（重复项不会改变结果，只会占用候选上限）。
+fn settlement_candidates(claim: &Claim) -> Vec<String> {
+    let State::Starting {
+        held,
+        submitted_at,
+        turn_id,
+        ..
+    } = &claim.state
+    else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<String> = Vec::new();
+    for id in held
+        .iter()
+        .skip(*submitted_at)
+        .filter(|n| n.method == "turn/completed")
+        .filter_map(|n| notification_turn_id(&n.params))
+    {
+        if Some(id) != turn_id.as_deref() && !candidates.iter().any(|c| c == id) {
+            candidates.push(id.to_owned());
+        }
+    }
+    candidates
 }
 
 impl Machine {
-    pub fn settlement_status_done(
-        &mut self,
-        _done: crate::claim::status_read::StatusDone,
-        actions: &mut Vec<Action>,
-    ) {
-        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+    /// Settlement 读取完成（H2 接口第 6 节）。先核对认领与读取编号，再检查 own_started：
+    /// `FirstActive` 按原逻辑定案，`Carrier` 按 joined、`NoCarrier` 按自有定案；
+    /// `Unknown(Changed)` 立即用最新 held 重算候选重发，不计 attempt，每次 settling 最多 3 次；
+    /// 其余 `Unknown`（含 NotVisible）走有界失败重试，用尽按 joined 保守定案。
+    pub fn settlement_status_done(&mut self, done: StatusDone, actions: &mut Vec<Action>) {
+        let StatusCaller::Settlement { attempt } = done.caller else {
+            return;
+        };
+        let Some(token) = done.token else { return };
+        if !self.current(&token) {
+            actions.push(Action::Warn("丢弃过期认领的吸收判定读结果".into()));
+            return;
+        }
+        let thread_id = token.thread_id.clone();
+        let claim = &self.claims[&thread_id];
+        if !claim.settling() {
+            actions.push(Action::Debug("丢弃定案之后才到达的吸收判定读结果".into()));
+            return;
+        }
+        let progress = self.settling_accounting.get(&thread_id);
+        if progress.is_none_or(|p| p.settlement_read != done.read_id) {
+            actions.push(Action::Debug(format!(
+                "丢弃已被取代的吸收判定读取 {}",
+                done.read_id
+            )));
+            return;
+        }
+        let turn_id = claim.turn_id().map(str::to_owned);
+        // 读取期间可能来了本 turn 的 started，其优先级高于服务器结果。
+        if own_started(claim) {
+            self.settle(&thread_id, false, turn_id, actions);
+            return;
+        }
+        match done.result {
+            StatusResult::FirstActive(active) => {
+                let joined = turn_id.as_deref() != Some(active.as_str());
+                self.settle(&thread_id, joined, Some(active), actions);
+            }
+            StatusResult::Carrier(carrier) => {
+                self.settle(&thread_id, true, Some(carrier), actions);
+            }
+            StatusResult::NoCarrier => self.settle(&thread_id, false, turn_id, actions),
+            StatusResult::Unknown(StatusUnknown::Changed)
+                if progress.is_some_and(|p| p.settlement_changed < SETTLEMENT_CHANGED_REISSUES) =>
+            {
+                let progress = self
+                    .settling_accounting
+                    .get_mut(&thread_id)
+                    .expect("已核对读取登记");
+                progress.settlement_changed += 1;
+                actions.push(Action::Debug(format!(
+                    "线程 {thread_id} 吸收判定期间活动版本变化，第 {} 次重算候选并重发",
+                    progress.settlement_changed
+                )));
+                self.begin_settlement(&thread_id, attempt, actions);
+            }
+            other => {
+                actions.push(Action::Debug(format!(
+                    "线程 {thread_id} 吸收判定第 {attempt} 次读取无法确认：{other:?}"
+                )));
+                self.settlement_failed(&token, attempt, actions);
+            }
+        }
     }
-    pub fn joined_check_done(
-        &mut self,
-        _done: crate::claim::status_read::StatusDone,
-        actions: &mut Vec<Action>,
-    ) {
-        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+
+    /// JoinedCheck 读取完成（H2 接口第 6 节）：`Found{inProgress}` 取消核实；`Found{终态}` 把 notLoaded
+    /// 壳交给 `run_turn_completed`（条目由结果补读接上），随即释放认领，不等补读；`Absent` 沿用
+    /// 「目标缺失则释放」；其余 `Unknown` 走有界重试，用尽保守释放。
+    pub fn joined_check_done(&mut self, done: StatusDone, actions: &mut Vec<Action>) {
+        let StatusCaller::JoinedCheck { attempt } = done.caller else {
+            return;
+        };
+        let Some(token) = &done.token else { return };
+        let thread = &token.thread_id;
+        let Some(check) = self
+            .joined_checks
+            .get(thread)
+            .filter(|c| {
+                self.current(token)
+                    && c.claim_id == token.claim_id
+                    && c.attempt == attempt
+                    && c.in_flight
+                    && c.read_id == done.read_id
+            })
+            .cloned()
+        else {
+            actions.push(Action::Debug(format!(
+                "丢弃已失效的 joined 核实读取 {}",
+                done.read_id
+            )));
+            return;
+        };
+        match done.result {
+            StatusResult::Found {
+                status: StatusTurn::InProgress,
+                ..
+            } => {
+                self.cancel_joined_check(thread, actions);
+                return;
+            }
+            StatusResult::Found { shell, .. } => {
+                let run = self.claims[thread].run_id.clone();
+                self.run_turn_completed(thread, run.as_deref(), &shell, actions);
+                self.mark_ended(thread, &check.turn_id);
+                self.release_with_kind(thread, ReleaseKind::Joined, actions);
+                return;
+            }
+            StatusResult::Absent => {
+                self.release_with_kind(thread, ReleaseKind::Joined, actions);
+                return;
+            }
+            other => actions.push(Action::Debug(format!(
+                "线程 {thread} 的 joined 核实第 {attempt} 次无法确认：{other:?}"
+            ))),
+        }
+        if attempt >= JOINED_CHECK_RETRIES {
+            actions.push(Action::Warn(format!(
+                "线程 {thread} 的 joined 生命周期核实重试十次仍失败，保守释放认领"
+            )));
+            self.release_with_kind(thread, ReleaseKind::Joined, actions);
+        } else {
+            let check = self.joined_checks.get_mut(thread).expect("核实登记存在");
+            check.attempt += 1;
+            check.in_flight = false;
+            actions.push(Action::Schedule {
+                token: token.clone(),
+                kind: TimerKind::JoinedCheckRetry {
+                    attempt: attempt + 1,
+                },
+                delay_ms: 1000,
+            });
+        }
     }
 }
