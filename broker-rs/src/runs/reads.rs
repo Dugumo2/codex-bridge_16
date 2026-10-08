@@ -1,7 +1,7 @@
 //! 结果补读的有界状态机：每次尝试只消费一次，队列和重试共用 256 个等待名额。
 use super::*;
 use crate::claim::{ClaimToken, Operation, RequestContext};
-use crate::results::{full_items, ItemOutput, Snapshot};
+use crate::results::{ItemOutput, Snapshot};
 use state::{schedule, Phase};
 
 const PAGE_SIZE: usize = 64;
@@ -11,7 +11,6 @@ const MAX_CURSOR_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Pages {
-    legacy: bool,
     cursor: Option<String>,
     cursors: std::collections::HashSet<String>,
     count: usize,
@@ -181,20 +180,11 @@ impl Runs {
         }
     }
 
+    /// 只发条目分页；不支持分页时不回退整线程读取（H2 接口第 6 节），由回包处理降级。
     fn request_page(pending: &PendingRead, actions: &mut Vec<Action>) {
         let read = pending.read.clone();
-        let (method, params) = if pending.pages.legacy {
-            (
-                "thread/read",
-                serde_json::json!({"threadId":read.thread_id,"includeTurns":true}),
-            )
-        } else {
-            (
-                "thread/items/list",
-                serde_json::json!({"threadId":read.thread_id,"turnId":read.turn_id,
-                "cursor":pending.pages.cursor,"limit":PAGE_SIZE,"sortDirection":"asc"}),
-            )
-        };
+        let params = serde_json::json!({"threadId":read.thread_id,"turnId":read.turn_id,
+            "cursor":pending.pages.cursor,"limit":PAGE_SIZE,"sortDirection":"asc"});
         actions.push(Action::Request(RequestContext {
             resume_retried: false,
             stream_id: None,
@@ -204,7 +194,7 @@ impl Runs {
                 thread_id: read.thread_id.clone(),
                 claim_id: 0,
             }),
-            method: method.into(),
+            method: "thread/items/list".into(),
             params: Some(params),
             operation: Operation::ResultRead(read),
         }));
@@ -261,40 +251,31 @@ impl Runs {
             self.pump_reads(actions);
             return;
         }
-        if !pending.pages.legacy && result.as_ref().is_err_and(unsupported) {
+        if result.as_ref().is_err_and(unsupported) {
+            // 不再回退整线程读取：降级为已有快照并标 unavailable，活动证据记为未知
+            // （缺少条目不能当作没有活动）。重试也拿不到条目，所以不重试。
             if !self.paging_fallback_logged {
                 self.paging_fallback_logged = true;
                 actions.push(Action::Warn(
-                    "上游不支持条目分页，结果补读回退全历史读取；仍可能超过传输上限".into(),
+                    "上游不支持条目分页，结果补读不回退整线程读取，相关轮次标记 unavailable 并使用降级快照（只提示一次）"
+                        .into(),
                 ));
             }
-            pending.pages = Pages {
-                legacy: true,
-                ..Pages::default()
-            };
-            if self.phase == Phase::Open {
-                self.next_page(pending, actions);
-                return;
+            self.fill_output(&read, Ready::Unavailable, pending.snapshot.output());
+            if !pending.guard_sent {
+                self.guard_evidence
+                    .push((read.run_id.clone(), read.turn_id.clone(), None));
             }
+            self.updated.insert(read.run_id.clone(), now);
+            self.put(&read.run_id, actions);
+            self.pump_reads(actions);
+            self.evict();
+            return;
         }
-        let complete = result.as_ref().ok().and_then(|value| {
-            if !pending.pages.legacy {
-                return pending.pages.accept(value, &read.turn_id);
-            }
-            let thread = value.get("thread")?;
-            // 缺失或不同的线程身份不是本轮的证据。
-            if thread.get("id")?.as_str()? != read.thread_id {
-                return None;
-            }
-            let turn = thread
-                .get("turns")?
-                .as_array()?
-                .iter()
-                .find(|t| t.get("id").and_then(Value::as_str) == Some(&read.turn_id))?;
-            // 读回的轮次若仍是摘要或未加载，同样不是完整证据，按失败重试或降级。
-            pending.pages.output.extend(full_items(turn)?);
-            Some(true)
-        });
+        let complete = result
+            .as_ref()
+            .ok()
+            .and_then(|value| pending.pages.accept(value, &read.turn_id));
         if complete == Some(false) && self.phase == Phase::Open {
             self.next_page(pending, actions);
             return;
@@ -322,10 +303,7 @@ impl Runs {
         {
             let delay_ms = RESULT_RETRY_MS[usize::from(read.attempt)];
             pending.read.attempt += 1;
-            pending.pages = Pages {
-                legacy: pending.pages.legacy,
-                ..Pages::default()
-            };
+            pending.pages = Pages::default();
             pending.phase = ReadPhase::RetryScheduled;
             schedule(
                 &read.thread_id,
@@ -612,58 +590,91 @@ mod tests {
     }
 
     #[test]
-    fn 不支持才回退且摘要仍须重试告警仅一次() {
+    fn 不支持条目分页时降级为快照并标不可用且不发全量读取() {
         for error in [
             json!({"code":-32601}),
             json!({"code":-32000,"message":"thread/items/list is not implemented"}),
             json!({"code":-32000,"message":"Not implemented"}),
             json!({"code":-32000,"message":"尚未实现"}),
         ] {
-            for view in ["summary", "notLoaded", "未知", "full"] {
-                let (mut m, first) = begin();
-                let actions = answer(&mut m, &first, Err(error.clone()));
-                assert_eq!(
-                    actions
-                        .iter()
-                        .filter(|a| matches!(a, Action::Warn(_)))
-                        .count(),
-                    1
-                );
-                let legacy = request(&actions);
-                assert_eq!(legacy.method, "thread/read");
-                assert_eq!(
-                    legacy.params,
-                    Some(json!({"threadId":"线程","includeTurns":true}))
-                );
-                let actions = answer(
-                    &mut m,
-                    &legacy,
-                    Ok(
-                        json!({"thread":{"id":"线程","turns":[{"id":"别轮","items":[msg("不选")],"itemsView":"full"},
-                    {"id":"轮","items":[msg("兼容结果")],"itemsView":view}]}}),
-                    ),
-                );
-                if view == "full" {
-                    assert_eq!(m.runs.runs["运行"].turns[0].output, "兼容结果");
-                } else {
-                    assert!(m.runs.guard_evidence.is_empty());
-                    assert_eq!(retry(&mut m, &actions, 1000).method, "thread/read");
-                }
-                // 另一轮仍探测分页；旧式存储的不支持不能禁用新式线程的分页。
-                let mut next = Vec::new();
-                m.run_turn_completed(
-                    "线程",
-                    Some("运行"),
-                    &json!({"id":"另一轮","status":"completed","items":[]}),
-                    &mut next,
-                );
-                let next = request(&next);
-                assert_eq!(next.method, "thread/items/list");
-                let actions = answer(&mut m, &next, Err(error.clone()));
-                assert_eq!(request(&actions).method, "thread/read");
-                assert!(!actions.iter().any(|a| matches!(a, Action::Warn(_))));
-            }
+            let (mut m, first) = begin();
+            let actions = answer(&mut m, &first, Err(error.clone()));
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::Warn(_)))
+                    .count(),
+                1
+            );
+            // 不回退整线程读取，也不重试：重试同样拿不到条目。
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::Request(_) | Action::Schedule { .. })));
+            let turn = &m.runs.runs["运行"].turns[0];
+            assert_eq!(
+                (turn.ready, turn.output.as_str()),
+                (Ready::Unavailable, "降级摘要")
+            );
+            assert_eq!(turn.status, TurnStatus::Failed);
+            // 缺少条目不能当作没有活动：活动证据记为未知。
+            assert_eq!(
+                m.runs.guard_evidence,
+                vec![("运行".into(), "轮".into(), None)]
+            );
+            assert!(!m.result_reads_pending());
+            // 另一轮仍先探测分页；不支持不缓存成整台服务器不支持，告警只提示一次。
+            let mut next = Vec::new();
+            m.run_turn_completed(
+                "线程",
+                Some("运行"),
+                &json!({"id":"另一轮","status":"completed","items":[]}),
+                &mut next,
+            );
+            let next = request(&next);
+            assert_eq!(next.method, "thread/items/list");
+            let actions = answer(&mut m, &next, Err(error.clone()));
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::Request(_) | Action::Warn(_))));
+            assert_eq!(m.runs.runs["运行"].turns[1].ready, Ready::Unavailable);
+            // 迟到的重复回包不再改动结果。
+            answer(&mut m, &next, Ok(json!({"data":[],"nextCursor":null})));
+            assert_eq!(m.runs.runs["运行"].turns[1].ready, Ready::Unavailable);
         }
+    }
+
+    #[test]
+    fn 不支持条目分页后释放名额并推进排队的补读() {
+        let (mut m, first) = begin();
+        let mut queued = Vec::new();
+        for i in 0..MAX_RESULT_READS {
+            m.run_turn_completed(
+                "线程",
+                Some("运行"),
+                &json!({"id":format!("轮{i}"),"status":"completed","items":[]}),
+                &mut queued,
+            );
+        }
+        // 第一轮之外又发出 15 个，最后一个排队等名额。
+        let sent = queued
+            .iter()
+            .filter(|a| matches!(a, Action::Request(_)))
+            .count();
+        assert_eq!(sent, MAX_RESULT_READS - 1);
+        let actions = answer(&mut m, &first, Err(json!({"code":-32601})));
+        let pumped: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Request(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pumped.len(), 1, "腾出的名额交给排队的补读");
+        assert_eq!(pumped[0].method, "thread/items/list");
+        assert_eq!(
+            pumped[0].params.as_ref().unwrap()["turnId"],
+            format!("轮{}", MAX_RESULT_READS - 1)
+        );
     }
 
     #[test]
@@ -788,21 +799,6 @@ mod tests {
                 .any(|a| matches!(a, Action::Request(_) | Action::Schedule { .. })));
             assert_eq!(m.runs.runs["运行"].turns[0].ready, Ready::Unavailable);
             assert_eq!(m.runs.runs["运行"].turns[0].output, "降级摘要");
-        }
-    }
-
-    #[test]
-    fn 回退读拒绝错误线程轮次或畸形条目() {
-        for value in [
-            json!({"thread":{"id":"别线程","turns":[{"id":"轮","items":[msg("不选")]}]}}),
-            json!({"thread":{"id":"线程","turns":[{"id":"别轮","items":[msg("不选")]}]}}),
-            json!({"thread":{"id":"线程","turns":[{"id":"轮","items":null}]}}),
-        ] {
-            let (mut m, c) = begin();
-            let fallback = request(&answer(&mut m, &c, Err(json!({"code":-32601}))));
-            let actions = answer(&mut m, &fallback, Ok(value));
-            assert!(m.runs.guard_evidence.is_empty());
-            assert_eq!(retry(&mut m, &actions, 1000).method, "thread/read");
         }
     }
 

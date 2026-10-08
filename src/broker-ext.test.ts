@@ -1756,6 +1756,21 @@ process.stdin.on("data", (chunk) => {
         send({ id: msg.id, result: { thread: { id: p.threadId, preview: "", cwd: "/work", status: { type: id ? "active" : "idle" }, turns } } });
         break;
       }
+      case "thread/turns/list": {
+        // H2 状态读取层的轮次分页：与 thread/read 一致，倒序（最新在前）一页给完；notLoaded 时不带条目。
+        if (O.readFail) {
+          send({ id: msg.id, error: { code: -32603, message: "mock read failed" } });
+          break;
+        }
+        const id = running.get(p.threadId);
+        const view = p.itemsView === "notLoaded" ? "notLoaded" : undefined;
+        const data = [
+          ...(id ? [turnObj(id, "inProgress", [], view)] : []),
+          ...[...(finished.get(p.threadId) ?? [])].reverse().map((t) => turnObj(t.id, "completed", view ? [] : t.items, view)),
+        ];
+        send({ id: msg.id, result: { data, nextCursor: null, backwardsCursor: null } });
+        break;
+      }
       case "mock/ask":
         send({ id: msg.id, result: { id: ask(p.threadId, p.method, p.params ?? {}) } });
         break;

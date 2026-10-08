@@ -108,12 +108,12 @@ fn 门控与开工动作顺序覆盖三种流式请求及恢复屏障() {
 fn 暂存定案回包及审查回包均附加运行编号() {
     let (mut m, context) = start(true, "turn/start");
     connected(&mut m, 1, true);
-    let read = first_request(&reply(&mut m, &context, Ok(json!({"turn":{"id":"本轮"}}))));
-    let actions = reply(
+    super::settlement::settlement_request(&reply(
         &mut m,
-        &read,
-        Ok(json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"}]}})),
-    );
+        &context,
+        Ok(json!({"turn":{"id":"本轮"}})),
+    ));
+    let actions = super::settlement::settle_active(&mut m, &["本轮"]);
     let result = sends(&actions)
         .into_iter()
         .find(|(_, v)| v["id"] == 42)
@@ -877,7 +877,7 @@ fn 声明切换后的暂存回包(initial: bool, final_cxb: bool) {
         connected(&mut m, 1, initial);
         let upstream = json!({"turn":{"id":"本轮"},"保留字段":{"值":1}});
         let received = reply(&mut m, &context, Ok(upstream.clone()));
-        let read = first_request(&received);
+        let read = super::settlement::settlement_request(&received);
         assert!(!sends(&received).iter().any(|(_, v)| v["id"] == 42));
         assert_eq!(
             m.claims["线程"].settlement_reply.as_ref().unwrap().1,
@@ -891,17 +891,13 @@ fn 声明切换后的暂存回包(initial: bool, final_cxb: bool) {
             },
         );
         let actions = match exit {
-            "own" => reply(
+            "own" => super::settlement::settle_active(&mut m, &["本轮"]),
+            "joined" => super::settlement::settle_active(&mut m, &["外轮"]),
+            "undecided" => reply(
                 &mut m,
-                &read,
-                Ok(json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"}]}})),
+                &read.context,
+                Err(json!({"code":-1,"message":"核实失败"})),
             ),
-            "joined" => reply(
-                &mut m,
-                &read,
-                Ok(json!({"thread":{"turns":[{"id":"外轮","status":"inProgress"}]}})),
-            ),
-            "undecided" => reply(&mut m, &read, Err(json!({"code":-1,"message":"核实失败"}))),
             _ => apply(&mut m, Event::Shutdown),
         };
         let replies: Vec<_> = sends(&actions)

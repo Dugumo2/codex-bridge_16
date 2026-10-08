@@ -1042,15 +1042,14 @@ fn 设置期间缓冲的通知在回放时不重复推进版本() {
     );
     m = next;
     assert!(m.claims[T].settling(), "共享模式回包后进入 settling");
-    let settlement_read = actions
-        .iter()
-        .find_map(|a| match a {
-            Action::Request(c) if matches!(c.operation, Operation::SettlementRead { .. }) => {
-                Some(c.clone())
-            }
-            _ => None,
-        })
-        .expect("吸收判定读");
+    // H2-c 之后 settling 经本层发起 Settlement 读取（不再发全量读）。
+    assert_bounded(&actions);
+    let settlement = status_requests(&actions)
+        .into_iter()
+        .next()
+        .expect("吸收判定读取")
+        .read_id;
+    // 另一个读取保持在途，使版本号在吸收判定读取结束后仍然登记、可以观察回放。
     begin(&mut m, StatusQuery::Busy);
     let before = m.status_reads.version(T);
     drive(
@@ -1061,15 +1060,38 @@ fn 设置期间缓冲的通知在回放时不重复推进版本() {
         ],
     );
     assert_eq!(m.status_reads.version(T), before + 2, "到达时各推进一次");
-    let (next, _) = step(
-        std::mem::take(&mut m),
-        Event::Reply {
-            context: settlement_read,
-            result: Ok(json!({"thread": {"turns": [{"id": "本轮", "status": "inProgress"}]}})),
-        },
+    // 吸收判定读取发现版本变化 → 已变化 → settling 用最新 held 立即重发。
+    drive(
+        &mut m,
+        vec![StatusStep::Reply(
+            expect(StatusPhase::Metadata).of(settlement),
+            Ok(meta(T, "active")),
+        )],
     );
-    m = next;
+    assert!(m.claims[T].settling());
+    let reissued = *m
+        .status_reads
+        .reads
+        .iter()
+        .find(|(_, r)| matches!(r.caller, StatusCaller::Settlement { .. }))
+        .expect("重发的吸收判定读取在途")
+        .0;
+    assert_ne!(reissued, settlement);
+    drive(
+        &mut m,
+        vec![
+            StatusStep::Reply(
+                expect(StatusPhase::Metadata).of(reissued),
+                Ok(meta(T, "active")),
+            ),
+            StatusStep::Reply(
+                expect(StatusPhase::Turns).of(reissued),
+                Ok(turns_page(&[("本轮", "inProgress")], None)),
+            ),
+        ],
+    );
     assert!(!m.claims[T].settling(), "定案后回放缓冲");
+    assert!(m.status_reads.tracks(T), "Busy 读取仍在途，版本继续登记");
     assert_eq!(m.status_reads.version(T), before + 2, "回放不再推进");
 }
 
@@ -1336,7 +1358,6 @@ fn 完成按调用方分派到各处理函数() {
             StatusCaller::ContinueCheck { round: 1 },
             "H2 调用点尚未迁移",
         ),
-        (StatusCaller::Settlement { attempt: 0 }, "H2 调用点尚未迁移"),
         (
             StatusCaller::DerivedStopVerify {
                 tree_op: 1,

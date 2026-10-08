@@ -154,7 +154,7 @@ describe("show 服务器与跟随", () => {
     const t = context(dir, ["show", "server-only", "--server", "--json"]);
     t.fake.handle = (method, p) => {
       if (method === "broker/threads/list") return { threads: [] };
-      if (method === "thread/turns/list") { expect(p).toEqual({ threadId: "server-only", cursor: null, limit: 1, sortDirection: "desc", itemsView: "summary" }); return { data: [{ id: "last", status: "completed" }] }; }
+      if (method === "thread/turns/list") { expect(p).toEqual({ threadId: "server-only", cursor: null, limit: 1, sortDirection: "desc", itemsView: "notLoaded" }); return { data: [{ id: "last", status: "completed", items: [], itemsView: "notLoaded" }], nextCursor: "更早" }; }
       expect(p).toEqual({ threadId: "server-only", turnId: "last", cursor: p.cursor, limit: 64, sortDirection: "asc" });
       return { data: [{ turnId: "last", item: p.cursor ? { type: "exitedReviewMode", review: "审查结果" } : { type: "agentMessage", text: "最终回答", phase: "final_answer" } }], nextCursor: p.cursor ? null : "第二页" };
     };
@@ -166,24 +166,66 @@ describe("show 服务器与跟随", () => {
     expect(serverOutput([{ type: "agentMessage", text: "甲" }, { type: "agentMessage", text: "乙" }]).output).toBe("甲\n乙");
     expect(serverOutput([]).outputSource).toBe("none");
   });
-  test("分页不支持才回退完整读取最后轮次；普通错误不回退", async () => {
-    for (const code of [-32601, -32603]) {
+  test("轮次分页不支持（旧服务器或第一轮前）明确失败，不整线程回退、不伪装成空结果", async () => {
+    for (const code of [-32601, -32603] as const) {
+      const message = code === -32601 ? "list_turns is not supported yet" : "失败";
       const t = context(dir, ["show", "abcd", "--server", "--json"]);
       t.fake.handle = (method) => {
         if (method === "broker/threads/list") return { threads: [summary()] };
-        if (method === "thread/turns/list") throw wireError(code, "失败");
-        return { thread: { turns: [{ items: [{ type: "agentMessage", text: "旧轮" }] }, { items: [{ type: "agentMessage", text: "末轮" }] }] } };
+        if (method === "thread/turns/list") throw wireError(code, message);
+        return { thread: { turns: [{ items: [{ type: "agentMessage", text: "末轮" }] }] } };
       };
-      if (code === -32601) { expect(await show(t.ctx)).toBe(0); expect(t.json[0].result).toBe("末轮"); }
-      else { await expect(show(t.ctx)).rejects.toMatchObject({ exitCode: 7 }); expect(t.fake.calls.some((c) => c.method === "thread/read")).toBe(false); }
+      await expect(show(t.ctx)).rejects.toMatchObject({ exitCode: 7 });
+      expect(t.fake.calls.map((c) => c.method)).toEqual(["broker/threads/list", "thread/turns/list"]);
+      expect(t.json).toEqual([]);
+      expect(t.texts).toEqual([]);
     }
+  });
+  test("只有条目分页不支持时改用单轮完整读取，并核对最新轮次没有变化", async () => {
+    for (const mode of ["正常", "轮次变化", "非完整视图", "完整读也不支持"] as const) {
+      const t = context(dir, ["show", "abcd", "--server", "--json"]);
+      t.fake.handle = (method, p) => {
+        if (method === "broker/threads/list") return { threads: [summary()] };
+        if (method === "thread/items/list") throw wireError(-32601, "Method not found: thread/items/list");
+        if (p.itemsView === "notLoaded") return { data: [{ id: "last", status: "completed", items: [], itemsView: "notLoaded" }], nextCursor: null };
+        expect(p).toEqual({ threadId: "thread-test", cursor: null, limit: 1, sortDirection: "desc", itemsView: "full" });
+        if (mode === "完整读也不支持") throw wireError(-32601, "Method not found");
+        return { data: [{ id: mode === "轮次变化" ? "新轮" : "last", status: "completed", itemsView: mode === "非完整视图" ? "summary" : "full",
+          items: [{ type: "agentMessage", text: "过程" }, { type: "agentMessage", text: "单轮结果", phase: "final_answer" }] }], nextCursor: "更早" };
+      };
+      if (mode === "正常") {
+        expect(await show(t.ctx)).toBe(0);
+        expect(t.json[0]).toMatchObject({ result: "单轮结果", outputSource: "finalAnswer", status: "completed" });
+        expect(t.progress.join()).toContain("单轮完整读取");
+      } else {
+        await expect(show(t.ctx)).rejects.toMatchObject({ exitCode: 7 });
+        expect(t.json).toEqual([]);
+      }
+      expect(t.fake.calls.some((c) => c.method === "thread/read")).toBe(false);
+      expect(t.fake.calls.filter((c) => c.method === "thread/turns/list").map((c) => (c.params as any).itemsView)).toEqual(["notLoaded", "full"]);
+    }
+  });
+  test("轮次页畸形明确失败且不读条目；合法空历史才是空结果", async () => {
+    for (const page of [{ data: [{ id: "last" }], nextCursor: null }, { data: [{ id: "", status: "completed" }], nextCursor: null },
+      { data: [{ id: "last", status: "未知" }], nextCursor: null }, { data: { id: "last" }, nextCursor: null },
+      { data: [], nextCursor: "空页带游标" }, { data: [{ id: "last", status: "completed" }] }, null]) {
+      const t = context(dir, ["show", "abcd", "--server", "--json"]);
+      t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] } : page;
+      await expect(show(t.ctx)).rejects.toMatchObject({ exitCode: 7 });
+      expect(t.fake.calls.some((c) => c.method === "thread/items/list")).toBe(false);
+      expect(t.json).toEqual([]);
+    }
+    const t = context(dir, ["show", "abcd", "--server", "--json"]);
+    t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] } : { data: [], nextCursor: null, backwardsCursor: null };
+    expect(await show(t.ctx)).toBe(0);
+    expect(t.json[0]).toMatchObject({ result: "", status: null, outputSource: "none" });
   });
   test("--server 查询待核实的线程：提示状态与核实命令，JSON 带出生命周期记录（N7-A 5.5 节）", async () => {
     const lifecycle = { operationId: "op-1", kind: "archive", phase: "outcomeUnknown", shortId: "abcd1234", preview: null };
     const t = context(dir, ["show", "abcd", "--server", "--json"]);
     t.fake.handle = (method, p) => {
       if (method === "broker/threads/list") return { threads: [summary({ lifecycle } as any)] };
-      if (method === "thread/turns/list") return { data: [{ id: "last", status: "completed" }] };
+      if (method === "thread/turns/list") return { data: [{ id: "last", status: "completed" }], nextCursor: null };
       return { data: [{ turnId: "last", item: { type: "agentMessage", text: "末轮", phase: "final_answer" } }], nextCursor: null, cursor: p.cursor };
     };
     expect(await show(t.ctx)).toBe(0);
@@ -200,7 +242,7 @@ describe("show 服务器与跟随", () => {
       const t = context(dir, ["show", "abcd", "--server", "--json"]);
       t.fake.handle = (m) => {
         if (m === "broker/threads/list") return { threads: [summary()] };
-        if (m === "thread/turns/list") return { data: [{ id: "last" }] };
+        if (m === "thread/turns/list") return { data: [{ id: "last", status: "completed" }], nextCursor: null };
         if (mode === "畸形") return { data: [], nextCursor: 17 };
         return { data: [{ turnId: mode === "错轮" ? "other" : "last", item: { type: "agentMessage", text: "不完整" } }], nextCursor: "相同游标" };
       };

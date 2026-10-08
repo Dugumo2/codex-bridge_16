@@ -213,7 +213,8 @@ describe("N4 端到端：跨命令链路", () => {
     expect(ended.filter((event) => event.run.runId === snapshot.run.runId)).toHaveLength(1);
     if (innerReview) {
       expect(mockLog().some((entry) => entry.method === "thread/items/list" && entry.params.turnId === final.run.turns[0].turnId)).toBe(true);
-      expect(mockLog().some((entry) => entry.method === "thread/read" && entry.params.threadId === parent && entry.params.includeTurns)).toBe(true);
+      // H2：结果补读只走条目分页，不再整线程回退。
+      expect(mockLog().some((entry) => entry.method === "thread/read" && entry.params.threadId === parent && entry.params.includeTurns)).toBe(false);
     }
     unwatch();
   }, TEST_LIMIT_MS);
