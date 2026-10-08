@@ -11,7 +11,9 @@
 //   MOCK_E2E_LONG_HISTORY=1：独立开关，仅恢复未排除历史时回约 12 MiB 历史，不改变场景选择。
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
+// CXB_INLINE_RESUME_HISTORY_BEGIN
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
+// CXB_INLINE_RESUME_HISTORY_END
 
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {

@@ -85,8 +85,19 @@ if (process.env.MOCK_PROXY_HANG === "1") {
  *  `codex app-server proxy …` 分派到 {@link MOCK_PROXY_SCRIPT}。必须关闭命令回显，避免污染 stdout 上的 JSON-RPC。 */
 export function writeMockCodexScript(dir: string, script: string): void {
   // 复制后的夹具保持自包含，避免模块加载期间预加载观测器提前排空握手。
-  script = script.replace('import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";',
-    () => readFileSync(join(import.meta.dir, "resume-history.ts"), "utf8").replace(/^export /gm, ""));
+  const begin = "// CXB_INLINE_RESUME_HISTORY_BEGIN";
+  const end = "// CXB_INLINE_RESUME_HISTORY_END";
+  if (script.includes("../../test-support/resume-history") || script.includes(begin) || script.includes(end)) {
+    if (script.split(begin).length !== 2 || script.split(end).length !== 2) {
+      throw new Error("恢复历史内联标记必须各出现一次");
+    }
+    let replacements = 0;
+    script = script.replace(/^\/\/ CXB_INLINE_RESUME_HISTORY_BEGIN\r?\n[\s\S]*?^\/\/ CXB_INLINE_RESUME_HISTORY_END\r?$/gm, () => {
+      replacements++;
+      return readFileSync(join(import.meta.dir, "resume-history.ts"), "utf8").replace(/^export /gm, "");
+    });
+    if (replacements !== 1) throw new Error(`恢复历史内联替换必须恰好一次，实际为 ${replacements}`);
+  }
   if (process.platform === "win32") {
     writeFileSync(join(dir, "codex-mock.ts"), script);
     writeFileSync(join(dir, "codex-proxy.ts"), MOCK_PROXY_SCRIPT);
@@ -191,7 +202,9 @@ export function createMockCodex(dir: string, opts?: {
   const interruptLog = join(dir, "interrupts.log");
   const script = `#!/usr/bin/env bun
 import { appendFileSync } from "node:fs";
+// CXB_INLINE_RESUME_HISTORY_BEGIN
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
+// CXB_INLINE_RESUME_HISTORY_END
 // broker 测试使用的模拟 codex app-server。
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
