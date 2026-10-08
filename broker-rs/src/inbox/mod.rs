@@ -360,12 +360,76 @@ impl Machine {
     pub(crate) fn inbox_pending_total(&self) -> usize {
         self.inbox.entries.values().filter(|e| e.active()).count()
     }
+    /// 线程的未决事项数，按聚合值：本线程事项加上以它为逻辑根的子线程事项（SA-a 第 6 节）。
     pub(crate) fn inbox_pending_count(&self, thread_id: &str) -> u64 {
         self.inbox
             .entries
             .values()
-            .filter(|e| e.active() && e.item.thread_id == thread_id)
+            .filter(|e| {
+                e.active()
+                    && (e.item.thread_id == thread_id
+                        || e.item.root_thread_id.as_deref() == Some(thread_id))
+            })
             .count() as u64
+    }
+    /// 以 `root` 为逻辑根的子线程未决事项（不含 root 自己的事项）。
+    pub(crate) fn inbox_child_items_for_root(&self, root: &str) -> Vec<InboxItem> {
+        let mut items: Vec<_> = self
+            .inbox
+            .entries
+            .values()
+            .filter(|e| {
+                e.active()
+                    && e.item.thread_id != root
+                    && e.item.root_thread_id.as_deref() == Some(root)
+            })
+            .map(|e| e.item.clone())
+            .collect();
+        items.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        items
+    }
+    /// 父线程视角的聚合事项：本线程事项与子线程事项，按创建时间排序。
+    pub(crate) fn inbox_pending_aggregate(&self, thread_id: &str) -> Vec<InboxItem> {
+        let mut items = self.inbox_pending(thread_id);
+        items.extend(self.inbox_child_items_for_root(thread_id));
+        items.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        items
+    }
+    /// 运行 R 名下全部未决事项：父线程自己的与子线程的（含 gd_）。
+    pub(crate) fn inbox_pending_run_items(&self, run_id: &str) -> Vec<InboxItem> {
+        let mut items: Vec<_> = self
+            .inbox
+            .entries
+            .values()
+            .filter(|e| e.active() && e.item.run_id.as_deref() == Some(run_id))
+            .map(|e| e.item.clone())
+            .collect();
+        items.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        items
+    }
+    /// 子线程在运行 R 名下未决的 gd_ 事项数（成员待答计数用）。
+    pub(crate) fn inbox_guardian_pending(&self, thread_id: &str, run_id: &str) -> usize {
+        self.inbox
+            .entries
+            .values()
+            .filter(|e| {
+                e.active()
+                    && e.item.kind == InboxKind::Guardian
+                    && e.item.thread_id == thread_id
+                    && e.item.run_id.as_deref() == Some(run_id)
+                    && e.item.root_thread_id.is_some()
+            })
+            .count()
+    }
+    /// 子线程事项的额外接收者：运行的在线 owner 与逻辑根、执行线程的 watcher。
+    fn inbox_item_recipients(&self, item: &InboxItem) -> Vec<ConnId> {
+        if item.root_thread_id.is_none() {
+            return Vec::new();
+        }
+        item.run_id
+            .as_deref()
+            .map(|run| self.run_recipients(run))
+            .unwrap_or_default()
     }
     fn save_inbox(&mut self, actions: &mut Vec<Action>) {
         #[cfg(test)]
@@ -453,6 +517,23 @@ impl Machine {
             json!({"item":item}),
             actions,
         );
+        // 子线程事项同时发给运行的 owner 与逻辑根 watcher（来源线程的 watcher 已在上面收到）。
+        let sent: Vec<ConnId> = self
+            .owner_conn(&item.thread_id)
+            .into_iter()
+            .chain(
+                self.records
+                    .get(&item.thread_id)
+                    .into_iter()
+                    .flat_map(|r| r.watchers.iter().copied()),
+            )
+            .collect();
+        let message = proto::notification("broker/inbox/added", Some(json!({"item":item})));
+        for conn in self.inbox_item_recipients(&item) {
+            if !sent.contains(&conn) {
+                self.send_ext(conn, message.clone(), actions);
+            }
+        }
         self.wake_inbox(
             Some(&item),
             &item.thread_id,
@@ -481,17 +562,48 @@ impl Machine {
         expires_at_ms: Option<u64>,
         actions: &mut Vec<Action>,
     ) {
+        self.inbox_register(origin, None, None, request, expires_at_ms, actions);
+    }
+    /// 子线程请求进收件箱：threadId 保持来源线程，另记逻辑根与父线程；沿用首次收到时的截止时间。
+    /// 返回事项编号；关闭中或容量已满时已按原规则回答，返回 None。
+    pub(crate) fn inbox_register_child_request(
+        &mut self,
+        origin: InboxOrigin,
+        root_thread_id: Option<String>,
+        parent_thread_id: Option<String>,
+        request: HeldRequest,
+        expires_at_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> Option<String> {
+        self.inbox_register(
+            origin,
+            root_thread_id,
+            parent_thread_id,
+            request,
+            Some(expires_at_ms),
+            actions,
+        )
+    }
+    fn inbox_register(
+        &mut self,
+        origin: InboxOrigin,
+        root_thread_id: Option<String>,
+        parent_thread_id: Option<String>,
+        request: HeldRequest,
+        expires_at_ms: Option<u64>,
+        actions: &mut Vec<Action>,
+    ) -> Option<String> {
         self.inbox.trace("inbox_register_request");
         if self.closing {
             actions.push(Action::ServerError {
                 id: request.id,
                 error: requests::handler_error(SHUTDOWN),
             });
-            return;
+            return None;
         }
         let key = (origin.thread_id.clone(), proto::request_id_key(&request.id));
         if self.inbox.app_ids.contains_key(&key) {
-            return;
+            return None;
         }
         let mut request = request;
         let params = request.params.take().unwrap_or(json!({}));
@@ -513,10 +625,10 @@ impl Machine {
         };
         let entry = Entry {
             item: InboxItem {
-                root_thread_id: None,
-                parent_thread_id: None,
+                root_thread_id,
+                parent_thread_id,
 
-                id,
+                id: id.clone(),
                 kind,
                 thread_id: origin.thread_id,
                 run_id: origin.run_id,
@@ -544,7 +656,9 @@ impl Machine {
         };
         if !self.add_inbox(entry, actions) {
             requests::reject_no_client(request, actions);
+            return None;
         }
+        Some(id)
     }
     pub(crate) fn inbox_guardian_review(
         &mut self,
@@ -566,14 +680,55 @@ impl Machine {
         let Some(params) = params else {
             return;
         };
-        // 上游 events.ts 519–537：优先取 review.status，兼容顶层状态字段。
-        let status = params
-            .pointer("/review/status")
-            .or_else(|| params.get("decision"))
-            .or_else(|| params.get("verdict"))
-            .or_else(|| params.get("outcome"))
-            .or_else(|| params.get("status"));
-        if !status.is_some_and(|s| s == "denied" || s.get("type").is_some_and(|t| t == "denied")) {
+        let (run_id, turn_id, claim_id) = (
+            claim.run_id.clone(),
+            claim.turn_id().map(str::to_owned),
+            claim.claim_id,
+        );
+        self.add_guardian(
+            thread_id, run_id, turn_id, claim_id, None, None, params, actions,
+        );
+    }
+    /// 子线程的 Guardian 拒绝：归属已由关系模块证明；事项 threadId 为来源子线程，另记逻辑根与父线程。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inbox_guardian_child(
+        &mut self,
+        thread_id: &str,
+        run_id: &str,
+        turn_id: Option<String>,
+        root_thread_id: &str,
+        parent_thread_id: &str,
+        params: &Value,
+        actions: &mut Vec<Action>,
+    ) {
+        self.inbox.trace("inbox_guardian_child");
+        if self.closing {
+            return;
+        }
+        self.add_guardian(
+            thread_id,
+            Some(run_id.to_owned()),
+            turn_id,
+            0,
+            Some(root_thread_id.to_owned()),
+            Some(parent_thread_id.to_owned()).filter(|p| !p.is_empty()),
+            params,
+            actions,
+        );
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn add_guardian(
+        &mut self,
+        thread_id: &str,
+        run_id: Option<RunId>,
+        turn_id: Option<String>,
+        claim_id: u64,
+        root_thread_id: Option<String>,
+        parent_thread_id: Option<String>,
+        params: &Value,
+        actions: &mut Vec<Action>,
+    ) {
+        if !guardian_denied(params) {
             return;
         }
         let Some(review) = params["reviewId"].as_str().filter(|s| !s.is_empty()) else {
@@ -599,14 +754,14 @@ impl Machine {
         }
         let entry = Entry {
             item: InboxItem {
-                root_thread_id: None,
-                parent_thread_id: None,
+                root_thread_id,
+                parent_thread_id,
 
                 id,
                 kind: InboxKind::Guardian,
                 thread_id: thread_id.into(),
-                run_id: claim.run_id.clone(),
-                turn_id: claim.turn_id().map(str::to_owned),
+                run_id,
+                turn_id,
                 method: "item/autoApprovalReview/completed".into(),
                 params: params.clone(),
                 created_at: self.clock.now_ms,
@@ -614,7 +769,7 @@ impl Machine {
                 status: InboxStatus::Pending,
             },
             app_id: None,
-            claim_id: claim.claim_id,
+            claim_id,
             generation: self.inbox.next(),
             closed_at: None,
             answer: None,
@@ -629,4 +784,15 @@ impl Machine {
         };
         self.add_inbox(entry, actions);
     }
+}
+
+/// Guardian 审查结论是否为拒绝（上游 events.ts 519–537：优先取 review.status，兼容顶层状态字段）。
+pub(crate) fn guardian_denied(params: &Value) -> bool {
+    let status = params
+        .pointer("/review/status")
+        .or_else(|| params.get("decision"))
+        .or_else(|| params.get("verdict"))
+        .or_else(|| params.get("outcome"))
+        .or_else(|| params.get("status"));
+    status.is_some_and(|s| s == "denied" || s.get("type").is_some_and(|t| t == "denied"))
 }

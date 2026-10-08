@@ -469,7 +469,7 @@ impl Machine {
         if matches!(claim.owner(), Some(Owner::Broker { .. })) {
             ok(
                 request,
-                json!({"outcome":"alreadyDetached","turnId":claim.turn_id(),"pending":self.inbox_pending(thread)}),
+                json!({"outcome":"alreadyDetached","turnId":claim.turn_id(),"pending":self.inbox_pending_run_items(run)}),
                 actions,
             );
             return;
@@ -518,8 +518,7 @@ impl Machine {
             .get(run)
             .and_then(|r| r.turns.last())
             .map(|t| t.turn_id.as_str());
-        let mut result =
-            json!({"outcome":"runEnded","turnId":turn,"pending":self.inbox_pending(thread)});
+        let mut result = json!({"outcome":"runEnded","turnId":turn,"pending":self.inbox_pending_aggregate(thread)});
         if let Some(snapshot) = snapshot {
             result["result"] = snapshot;
         }
@@ -575,9 +574,14 @@ impl Machine {
                 actions,
             );
         }
+        // 回包的 pending 按运行汇总：父线程事项与子线程事项（SA-a 第 6 节）。
+        let items = match &origin.run_id {
+            Some(run) => self.inbox_pending_run_items(run),
+            None => self.inbox_pending(thread),
+        };
         ok(
             &pending.request,
-            json!({"outcome":"detached","turnId":origin.turn_id,"pending":self.inbox_pending(thread)}),
+            json!({"outcome":"detached","turnId":origin.turn_id,"pending":items}),
             actions,
         );
         self.reclaim_check(thread, actions);

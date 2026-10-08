@@ -66,6 +66,15 @@ impl Machine {
         if self.inbox_pending_count(&item.thread_id) == 0 {
             self.reclaim_check(&item.thread_id, actions);
         }
+        if item.root_thread_id.is_some() {
+            // 子线程事项结束：对应子请求结束；托管回收按父线程的聚合计数重新判断。
+            self.child_inbox_closed(&item.id, actions);
+            if let Some(root) = item.root_thread_id.as_deref() {
+                if self.inbox_pending_count(root) == 0 {
+                    self.reclaim_check(root, actions);
+                }
+            }
+        }
         true
     }
     pub(crate) fn inbox_server_resolved(
@@ -176,6 +185,38 @@ impl Machine {
         }
         if changed {
             self.save_inbox(actions);
+        }
+        // 来源线程的认领撤销覆盖不到子线程：运行随这次释放结束时按运行补撤（SA-a）。
+        self.relations_claim_released(thread_id, actions);
+    }
+    /// 撤销子线程请求事项：不回答上游、不 Dismiss；已在写出的回答按提交边界结算，不在这里撤。
+    pub(crate) fn inbox_revoke_child(&mut self, id: &str, actions: &mut Vec<Action>) {
+        self.inbox.trace("inbox_revoke_child");
+        let Some(entry) = self.inbox.entries.get(id).filter(|e| e.active()) else {
+            return;
+        };
+        if entry.op.is_some() && entry.phase == Some(Phase::Reply) {
+            return;
+        }
+        self.finish_inbox(id, InboxStatus::Cancelled, None, actions);
+    }
+    /// 运行收尾时撤销它名下子线程的 gd_ 事项。
+    pub(crate) fn inbox_revoke_child_guardians(&mut self, run: &str, actions: &mut Vec<Action>) {
+        let ids: Vec<String> = self
+            .inbox
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.active()
+                    && e.item.kind == InboxKind::Guardian
+                    && e.item.root_thread_id.is_some()
+                    && e.item.run_id.as_deref() == Some(run)
+                    && e.op.is_none()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.finish_inbox(&id, InboxStatus::Cancelled, None, actions);
         }
     }
     pub(crate) fn inbox_shutdown(&mut self, actions: &mut Vec<Action>) {

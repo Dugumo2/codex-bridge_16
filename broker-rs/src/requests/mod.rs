@@ -139,6 +139,27 @@ impl Machine {
         }
     }
 
+    /// 子线程请求转发给运行 owner（SA-a）：不属于任何认领（claim_id 0），截止时间沿用首次收到时的墙钟期限。
+    pub(crate) fn forward_child(
+        &mut self,
+        request: HeldRequest,
+        thread_id: String,
+        target: ConnId,
+        deadline_ms: u64,
+        actions: &mut Vec<Action>,
+    ) {
+        let delay_ms = deadline_ms.saturating_sub(self.clock.now_ms);
+        self.forward_until(
+            request,
+            thread_id,
+            0,
+            target,
+            deadline_ms,
+            delay_ms,
+            actions,
+        );
+    }
+
     /// 登记并发出一个转发：转发 id 由 core 预先生成，计时器带独立代号。
     fn forward(
         &mut self,
@@ -146,6 +167,29 @@ impl Machine {
         thread_id: String,
         claim_id: u64,
         target: ConnId,
+        actions: &mut Vec<Action>,
+    ) {
+        let deadline_ms = self.clock.now_ms.saturating_add(FORWARD_TIMEOUT_MS);
+        self.forward_until(
+            request,
+            thread_id,
+            claim_id,
+            target,
+            deadline_ms,
+            FORWARD_TIMEOUT_MS,
+            actions,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_until(
+        &mut self,
+        request: HeldRequest,
+        thread_id: String,
+        claim_id: u64,
+        target: ConnId,
+        deadline_ms: u64,
+        delay_ms: u64,
         actions: &mut Vec<Action>,
     ) {
         self.requests.next_generation = self
@@ -162,7 +206,7 @@ impl Machine {
                 request_id: request.id,
                 method: request.method.clone(),
                 params: request.params.clone(),
-                deadline_ms: self.clock.now_ms.saturating_add(FORWARD_TIMEOUT_MS),
+                deadline_ms,
                 thread_id,
                 claim_id,
                 target,
@@ -180,7 +224,7 @@ impl Machine {
         actions.push(Action::ScheduleForward {
             forward_id,
             generation,
-            delay_ms: FORWARD_TIMEOUT_MS,
+            delay_ms,
         });
     }
 
@@ -325,7 +369,10 @@ impl Machine {
         for forward_id in ids {
             self.take_forward(&forward_id, actions);
         }
-        actions.push(Action::Dismiss { id: id.clone() });
+        // 无认领线程上的请求（子线程或外部线程）不发 Dismiss，避免清掉上游去重登记（SA-a 第 4.3 节）。
+        if self.claims.contains_key(thread_id) {
+            actions.push(Action::Dismiss { id: id.clone() });
+        }
         // 2.3 节 B2：inbox 里对应的事项按上游已关闭处理（甲路）。
         let id = id.clone();
         self.inbox_server_resolved(thread_id, &id, actions);
@@ -350,6 +397,9 @@ impl Machine {
             forward_id: forward_id.into(),
             generation: pending.generation,
         });
+        if pending.claim_id == 0 {
+            self.child_forward_taken(forward_id, actions);
+        }
         Some(pending)
     }
 }

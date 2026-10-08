@@ -978,6 +978,23 @@ impl Machine {
         self.runs.evict();
     }
 
+    /// SA-a：运行记录的 children（子线程、直接父线程、已绑定轮次、证据与最终活动）变化时写盘。
+    pub(crate) fn run_set_children(
+        &mut self,
+        run: &str,
+        children: Vec<crate::relations::ChildRecord>,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(record) = self.runs.runs.get_mut(run) else {
+            return;
+        };
+        if record.children == children {
+            return;
+        }
+        record.children = children;
+        self.runs.put(run, actions);
+    }
+
     pub(crate) fn run_learn_thread(
         &mut self,
         thread: &str,

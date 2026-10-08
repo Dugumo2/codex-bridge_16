@@ -35,7 +35,12 @@ impl Machine {
                 .inbox
                 .entries
                 .values()
-                .filter(|e| e.active() && thread.as_ref().is_none_or(|t| t == &e.item.thread_id))
+                .filter(|e| {
+                    e.active()
+                        && thread.as_ref().is_none_or(|t| {
+                            t == &e.item.thread_id || e.item.root_thread_id.as_ref() == Some(t)
+                        })
+                })
                 .min_by_key(|e| (e.item.created_at, &e.item.id));
             if let Some(entry) = pending {
                 reply(to, Ok(json!({"event":"added","item":entry.item})), actions);
@@ -103,7 +108,10 @@ impl Machine {
                     &i.id == id
                         && !matches!(i.status, InboxStatus::Pending | InboxStatus::Resolving)
                 }),
-                None => w.thread.as_deref().is_none_or(|t| t == thread),
+                // 等待逻辑根的也会被子线程事项唤醒。
+                None => w.thread.as_deref().is_none_or(|t| {
+                    t == thread || item.and_then(|i| i.root_thread_id.as_deref()) == Some(t)
+                }),
             })
             .map(|(id, _)| *id)
             .collect();
