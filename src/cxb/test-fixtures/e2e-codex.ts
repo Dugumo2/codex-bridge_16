@@ -9,10 +9,13 @@
 //   MOCK_E2E_TRIGGER：ask-cancel 场景里出现该文件即撤销提问；
 //   MOCK_E2E_BUSY：该文件存在时 thread/read 报告一个 inProgress 的 turn（模拟 broker 重启后核实不通过）。
 //   MOCK_E2E_LONG_HISTORY=1：独立开关，仅恢复未排除历史时回约 12 MiB 历史，不改变场景选择。
+//   MOCK_STATUS_READ：状态读取的分页与历史选项（JSON，StatusReadMockOptions），默认关闭；开启后由
+//                     test-support/status-history.ts 接管 thread/read、thread/turns/list、thread/items/list。
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
 import { createSubagentMock } from "../../test-support/subagent-mock";
+import { createStatusHistory } from "../../test-support/status-history";
 
 const args = process.argv.slice(2);
 if (args[0] !== "app-server") {
@@ -31,7 +34,11 @@ function log(entry: unknown): void {
   if (logPath) appendFileSync(logPath, JSON.stringify(entry) + "\n");
 }
 log({ kind: "boot", pid: process.pid });
-const send = fixtureSender();
+const statusReadOptions = JSON.parse(process.env.MOCK_STATUS_READ ?? "{}");
+// 只有一个写出队列；状态历史从包装后的发送函数学习本模拟发出的轮次与条目。
+const rawSend = fixtureSender();
+const statusHistory = createStatusHistory(statusReadOptions, rawSend, longResumeTurns);
+const send = statusHistory.wrap(rawSend);
 const subagents = createSubagentMock(send, JSON.parse(process.env.MOCK_SUBAGENTS ?? "{}"));
 
 const waiting = new Map<string, (message: { result?: unknown; error?: unknown }) => void>();
@@ -217,6 +224,7 @@ process.stdin.on("data", (chunk: string) => {
       continue;
     }
     log({ kind: "request", method: msg.method, params: msg.params ?? null });
+    if (statusHistory.handle(msg)) continue;
     const threadId: string = msg.params?.threadId ?? "thread-e2e";
     switch (msg.method) {
       case "initialize":
@@ -225,7 +233,7 @@ process.stdin.on("data", (chunk: string) => {
       case "thread/start":
       case "thread/resume":
         send({ id: msg.id, result: { thread: { ...thread(msg.method === "thread/start" ? "thread-e2e" : threadId),
-          ...(process.env.MOCK_E2E_LONG_HISTORY === "1" && msg.method === "thread/resume"
+          ...((process.env.MOCK_E2E_LONG_HISTORY === "1" || statusReadOptions.longHistory) && msg.method === "thread/resume"
             ? { turns: msg.params?.excludeTurns === true ? [] : longResumeTurns() } : {}) },
           model: "gpt-mock", modelProvider: "openai", cwd: "D:\\", approvalPolicy: msg.params?.approvalPolicy ?? "never", sandbox: { type: msg.params?.sandbox === "read-only" ? "readOnly" : "workspaceWrite" } } });
         break;

@@ -367,6 +367,10 @@ pub struct RequestContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
+    /// 状态读取的 20 秒总期限（可撤销，完成时撤销）。
+    StatusReadDeadline {
+        read_id: u64,
+    },
     LookupDeadline {
         op_id: u64,
         generation: u64,
@@ -427,6 +431,7 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    StatusRead(u64),
     LookupDeadline(u64),
     DiscoveryDeadline(u64),
     TreeStopWait {
@@ -449,6 +454,7 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::StatusReadDeadline { read_id } => Some(TimerKey::StatusRead(*read_id)),
             TimerKind::LookupDeadline { op_id, .. } => Some(TimerKey::LookupDeadline(*op_id)),
             TimerKind::DiscoveryDeadline { op_id, .. } => Some(TimerKey::DiscoveryDeadline(*op_id)),
             TimerKind::TreeStopWait {
@@ -666,6 +672,8 @@ pub struct Clock {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Machine {
+    /// H2 线程状态读取层：在途读取、页代号与活动版本号。
+    pub status_reads: status_read::StatusReads,
     pub relations: crate::relations::Relations,
     pub trees: crate::stop::tree::Trees,
     pub lifecycle: crate::claim::lifecycle::Lifecycle,
@@ -1338,9 +1346,10 @@ impl Machine {
             self.learn_traffic(&context, &result, actions);
         }
         match &context.operation {
-            Operation::StatusRead { .. } => {
-                actions.push(Action::Warn("H2 状态读取分派尚未启用".into()))
-            }
+            Operation::StatusRead {
+                read_id,
+                generation,
+            } => self.status_read_reply(*read_id, *generation, result, actions),
             Operation::RelationLookup { .. }
             | Operation::Discovery { .. }
             | Operation::AttachThread { .. } => self.relation_reply(&context, result, actions),
@@ -1859,6 +1868,10 @@ impl Machine {
             });
             return;
         };
+        // H2：活动版本号在进入 held 之前推进；settling 结束后的回放走 commit_notification，不再推进。
+        if matches!(event.method.as_str(), "turn/started" | "turn/completed") {
+            self.status_activity_changed(&thread_id);
+        }
         if event.method == "serverRequest/resolved" {
             self.resolve_held_request(&thread_id, &event.params, actions);
         }
@@ -2480,6 +2493,9 @@ impl Machine {
             return;
         }
         match kind {
+            TimerKind::StatusReadDeadline { read_id } => {
+                self.status_read_deadline(read_id, actions)
+            }
             TimerKind::LookupDeadline { .. }
             | TimerKind::DiscoveryDeadline { .. }
             | TimerKind::TombstoneExpire { .. } => self.relation_timer(kind, actions),
@@ -2545,6 +2561,7 @@ impl Machine {
         self.closing = true;
         self.relations_shutdown(actions);
         self.trees_shutdown(actions);
+        self.status_reads_shutdown(actions);
         self.shutdown_stops.clear();
         self.shutdown_runs(actions);
         self.shutdown_stops(actions);
