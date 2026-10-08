@@ -200,6 +200,10 @@ impl Machine {
         }
         self.finish_inbox(id, InboxStatus::Cancelled, None, actions);
     }
+    /// 撤权后收到未提交的写入结果：关闭旧事项并退役操作，迟到确认不再结算。
+    pub(crate) fn inbox_cancel_child_reply(&mut self, id: &str, actions: &mut Vec<Action>) {
+        self.finish_inbox(id, InboxStatus::Cancelled, None, actions);
+    }
     /// 运行收尾时撤销它名下子线程的 gd_ 事项。
     pub(crate) fn inbox_revoke_child_guardians(&mut self, run: &str, actions: &mut Vec<Action>) {
         let ids: Vec<String> = self

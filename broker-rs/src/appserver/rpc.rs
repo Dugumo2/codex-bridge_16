@@ -511,6 +511,16 @@ impl ClientHandle {
     }
 
     /// 不回答某个服务端请求（交给真正的 owner，详细设计 4.2 节第 1 条）：把它移出「处理中」，
+    /// 关系墓碑已退役，释放对应的 RPC 去重键，不产生线上消息。
+    pub(crate) fn forget_server_request(&self, key: &str) {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .server_requests
+            .remove(key);
+    }
+
     /// 同一请求再次到达时会重新交付。与上游一致：处理函数一结束（含返回 NO_RESPONSE）就移除，见 rpc.ts 的 finally。
     pub fn dismiss(&self, id: &Value) {
         let mut state = self.shared.state.lock().unwrap();
@@ -1928,5 +1938,84 @@ mod tests {
         assert!(m.events.recv().await.is_none());
         assert!(m.client.respond_acked(1, json!(1), Ok(json!({}))).is_err());
         assert!(m.client.respond_acked(1, json!(1), Ok(json!({}))).is_err());
+    }
+}
+
+#[cfg(test)]
+mod relation_retirement_tests {
+    use super::*;
+    use crate::claim::{Action, Event, HeldRequest, Machine, TimerKind};
+    use crate::relations::{MAX_TOMBSTONES, TOMBSTONE_MS};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn 修复5_rpc去重随关系墓碑有界退役() {
+        let (_sender, inbound) = mpsc::unbounded_channel();
+        let (output, _receiver) = mpsc::unbounded_channel::<String>();
+        let (client, mut events) = new_client(inbound, output, || async {}, None);
+        let mut machine = Machine::new(true);
+        for id in 0..MAX_TOMBSTONES + 20 {
+            let message = proto::request(
+                json!(id),
+                "item/tool/call",
+                Some(json!({"threadId":"外部"})),
+            );
+            client.shared.dispatch(&message.to_string());
+            assert!(matches!(
+                events.recv().await,
+                Some(AppEvent::ServerRequest { .. })
+            ));
+            client.shared.dispatch(&message.to_string());
+            assert!(events.try_recv().is_err(), "墓碑退役前 RPC 必须去重");
+            let (next, actions) = crate::claim::step(
+                machine,
+                Event::Notification {
+                    method: "serverRequest/resolved".into(),
+                    params: Some(json!({"threadId":"外部","requestId":id})),
+                },
+            );
+            machine = next;
+            for action in actions {
+                if let Action::ForgetServerRequest { request_key } = action {
+                    client.forget_server_request(&request_key);
+                }
+            }
+            assert!(client.shared.state.lock().unwrap().server_requests.len() <= MAX_TOMBSTONES);
+        }
+        // resolved 先到时，迟到请求虽进入 RPC 仍由关系墓碑拦住。
+        let (_, generation) = machine.relations.aux.tombstone_timer.unwrap();
+        let mut actions = Vec::new();
+        let id = json!(MAX_TOMBSTONES + 19);
+        assert!(machine.route_child_request(
+            &HeldRequest {
+                id,
+                forward_id: "迟到".into(),
+                method: "item/tool/call".into(),
+                params: Some(json!({"threadId":"外部"}))
+            },
+            &mut actions
+        ));
+        assert!(machine.relations.requests.is_empty());
+        machine.clock.mono_ms += TOMBSTONE_MS;
+        machine.relation_timer(
+            TimerKind::TombstoneExpire {
+                conn_epoch: 0,
+                generation,
+            },
+            &mut actions,
+        );
+        for action in actions {
+            if let Action::ForgetServerRequest { request_key } = action {
+                client.forget_server_request(&request_key);
+            }
+        }
+        assert!(client
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .server_requests
+            .is_empty());
+        assert!(machine.relations.tombstones.is_empty());
     }
 }

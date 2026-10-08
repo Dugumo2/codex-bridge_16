@@ -720,50 +720,84 @@ fn 运行收尾按run撤销子请求与收件箱事项_不答不dismiss() {
 }
 
 #[test]
-fn 写入确认阶段不被收尾撤销() {
-    let (mut m, mut mock) = setup(false);
-    open_run(&mut m);
-    spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
-    set_broker(&mut m, Policy::OnRequest);
-    let mut a = Vec::new();
-    m.on_handoff(R, HandoffKind::Detach, &mut a);
-    let (id, event) = mock.request(C, Some("子轮1"), None, APPROVAL);
-    mock.inject(&mut m, event);
-    let item = m.inbox_pending_run_items(R)[0].id.clone();
-    let actions = mock.inject(
-        &mut m,
-        client(
-            1,
-            3,
-            "broker/inbox/resolve",
-            json!({"id": item, "answer": {"decision": "accept"}}),
-        ),
-    );
-    let op = actions
-        .iter()
-        .find_map(|a| match a {
-            Action::AppReplyAcked { op, .. } => Some(*op),
-            _ => None,
-        })
-        .unwrap();
-    let mut actions = Vec::new();
-    m.revoke_child_requests(R, &mut actions);
-    assert!(!actions
-        .iter()
-        .any(|a| matches!(a, Action::CancelAppReply { .. })));
-    assert!(matches!(
-        m.relations.requests.values().next().unwrap().stage,
-        ChildRequestStage::Writing { .. }
-    ));
-    mock.inject(
-        &mut m,
-        Event::AppReplyWritten {
-            op,
-            outcome: crate::inbox::ReplyOutcome::Written,
-        },
-    );
-    assert!(m.relations.requests.is_empty());
-    assert_eq!(mock.answer_count(C, &id), 1);
+fn 修复2_撤权取消排队回答且失败不得重试() {
+    for outcome in [
+        crate::inbox::ReplyOutcome::Written,
+        crate::inbox::ReplyOutcome::Cancelled,
+        crate::inbox::ReplyOutcome::Failed("写失败".into()),
+    ] {
+        for cleanup in [false, true] {
+            let (mut m, mut mock) = setup(false);
+            open_run(&mut m);
+            spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+            set_broker(&mut m, Policy::OnRequest);
+            let mut a = Vec::new();
+            m.on_handoff(R, HandoffKind::Detach, &mut a);
+            let (id, event) = mock.request(C, Some("子轮1"), None, APPROVAL);
+            mock.inject(&mut m, event);
+            let item = m.inbox_pending_run_items(R)[0].id.clone();
+            let actions = mock.inject(
+                &mut m,
+                client(
+                    1,
+                    3,
+                    "broker/inbox/resolve",
+                    json!({"id": item, "answer": {"decision": "accept"}}),
+                ),
+            );
+            let op = actions
+                .iter()
+                .find_map(|a| match a {
+                    Action::AppReplyAcked { op, .. } => Some(*op),
+                    _ => None,
+                })
+                .unwrap();
+            let mut actions = Vec::new();
+            if cleanup {
+                m.relations_end_cleanup(R, &mut actions);
+            } else {
+                m.on_handoff(R, HandoffKind::External, &mut actions);
+            }
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, Action::CancelAppReply { .. })));
+            assert!(matches!(
+                m.relations.requests.values().next().unwrap().stage,
+                ChildRequestStage::Writing { .. }
+            ));
+            mock.inject(
+                &mut m,
+                Event::AppReplyWritten {
+                    op,
+                    outcome: outcome.clone(),
+                },
+            );
+            assert!(m.relations.requests.is_empty());
+            let committed = outcome == crate::inbox::ReplyOutcome::Written;
+            assert_eq!(mock.answer_count(C, &id), 1);
+            let retry = mock.inject(
+                &mut m,
+                client(
+                    1,
+                    4,
+                    "broker/inbox/resolve",
+                    json!({"id": item, "answer": {"decision": "accept"}}),
+                ),
+            );
+            assert!(!retry
+                .iter()
+                .any(|a| matches!(a, Action::AppReplyAcked { .. })));
+            assert_eq!(reply_to(&retry, 1, 4).get("error").is_some(), !committed);
+            let duplicate = mock.inject(
+                &mut m,
+                Event::AppReplyWritten {
+                    op,
+                    outcome: outcome.clone(),
+                },
+            );
+            assert!(upstream(&duplicate).is_empty());
+        }
+    }
 }
 
 #[test]
@@ -977,4 +1011,140 @@ fn 无轮次请求只认唯一已绑定活动轮次() {
         1
     );
     let _ = TimerKind::Lifecycle;
+}
+
+#[test]
+fn 修复1_转发与收件箱超三十秒不反复扫描() {
+    for inbox in [false, true] {
+        let (mut m, mut mock) = setup(false);
+        open_run(&mut m);
+        spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+        if inbox {
+            set_broker(&mut m, Policy::OnRequest);
+            m.on_handoff(R, HandoffKind::Detach, &mut Vec::new());
+        }
+        let (_, event) = mock.request(C, Some("子轮1"), None, APPROVAL);
+        mock.inject(&mut m, event);
+        let actions = advance(&mut m, &mut mock, LOOKUP_DEADLINE_MS + 1);
+        assert_eq!(m.relations.requests.len(), 1);
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            Action::Schedule {
+                kind: TimerKind::LookupDeadline { .. },
+                delay_ms: 0,
+                ..
+            }
+        )));
+        assert!(m.relations.aux.sweep.is_none());
+        assert!(advance(&mut m, &mut mock, 1_000).is_empty());
+    }
+}
+
+#[test]
+fn 修复3_guardian处理后保留受管订阅_真实退订使附着失效() {
+    let (mut m, mut mock) = setup(false);
+    open_run(&mut m);
+    spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+    mock.inject(&mut m, Event::Notification {
+        method: "item/autoApprovalReview/completed".into(),
+        params: Some(json!({"threadId": C, "turnId": "子轮1", "reviewId": "审查1", "review": {"status": "denied"}, "action": {"type": "command"}})),
+    });
+    let item = m.inbox_pending_run_items(R)[0].id.clone();
+    let actions = mock.inject(
+        &mut m,
+        client(
+            1,
+            10,
+            "broker/inbox/resolve",
+            json!({"id":item,"answer":{"override":true,"event":{}}}),
+        ),
+    );
+    let resume = app_requests(&actions, "thread/resume")[0].clone();
+    let actions = mock.inject(
+        &mut m,
+        Event::Reply {
+            context: resume,
+            result: Ok(json!({"thread":{"id":C}})),
+        },
+    );
+    let approve = app_requests(&actions, "thread/approveGuardianDeniedAction")[0].clone();
+    let actions = mock.inject(
+        &mut m,
+        Event::Reply {
+            context: approve,
+            result: Ok(json!({})),
+        },
+    );
+    assert!(!actions.iter().any(|a| matches!(
+        a,
+        Action::Schedule {
+            kind: TimerKind::Unsubscribe,
+            ..
+        }
+    )));
+    let timer = Event::Timer {
+        token: crate::claim::ClaimToken {
+            thread_id: C.into(),
+            claim_id: 0,
+        },
+        kind: TimerKind::Unsubscribe,
+    };
+    // 即使旧计时已排队，执行时也重查管理关系。
+    assert!(app_requests(&mock.inject(&mut m, timer.clone()), "thread/unsubscribe").is_empty());
+    assert!(m.relations.attachments[C].valid);
+    assert!(m.records[C].subscribed);
+    // 单独验证活动绑定和清理范围，避免只靠成员快照挡住退订。
+    let context = m.relations.contexts.remove(R).unwrap();
+    assert!(m.relation_needs_subscription(C));
+    m.relations.contexts.insert(R.into(), context);
+    m.relations_enter_cleanup(R, 77, &mut Vec::new());
+    m.relations.contexts.get_mut(R).unwrap().authority = Authority::Revoked;
+    m.relations.bindings.clear();
+    m.relations.contexts.get_mut(R).unwrap().members.clear();
+    assert!(app_requests(&mock.inject(&mut m, timer.clone()), "thread/unsubscribe").is_empty());
+    m.relations.contexts.get_mut(R).unwrap().cleanup = None;
+    let actions = mock.inject(&mut m, timer);
+    assert_eq!(app_requests(&actions, "thread/unsubscribe").len(), 1);
+    assert!(!m.relations.attachments[C].valid);
+    assert!(!m.records[C].subscribed);
+}
+
+#[test]
+fn 修复5_回查超时静默丢弃仍退役rpc登记() {
+    let (mut m, mut mock) = setup(true);
+    let (id, event) = mock.request("未知外部", Some("轮"), None, APPROVAL);
+    mock.inject(&mut m, event);
+    let actions = advance(&mut m, &mut mock, LOOKUP_DEADLINE_MS + 1);
+    assert!(upstream(&actions).is_empty());
+    let key = crate::proto::request_id_key(&id);
+    assert!(m.relations.tombstones.contains_key(&(0, key.clone())));
+    assert!(m.relations.requests.is_empty());
+    let (_, duplicate) = mock.request("未知外部", Some("轮"), Some(id), APPROVAL);
+    let actions = mock.inject(&mut m, duplicate);
+    assert!(app_requests(&actions, "thread/read").is_empty());
+    let actions = advance(&mut m, &mut mock, TOMBSTONE_MS);
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, Action::ForgetServerRequest { request_key } if request_key == &key)));
+}
+
+#[test]
+fn 修复6_历史运行记录保留期间回收关系运行态() {
+    let (mut m, mut mock) = setup(false);
+    open_run(&mut m);
+    spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+    m.claims.clear();
+    m.relations.contexts.get_mut(R).unwrap().authority = Authority::Revoked;
+    m.prune_contexts();
+    assert!(m.manage_context(R).is_some(), "运行未结束不能回收");
+    m.runs.runs.get_mut(R).unwrap().ended_at = Some(m.clock.now_ms);
+    m.runs.tree_retained.insert(R.into());
+    m.prune_contexts();
+    assert!(m.manage_context(R).is_some(), "清理保留屏障未结算不能回收");
+    m.runs.tree_retained.remove(R);
+    mock.inject(&mut m, Event::Initialized { conn: 1, cxb: true });
+    assert!(m.runs.runs.contains_key(R));
+    assert!(m.manage_context(R).is_none());
+    assert!(m.relations.bindings.is_empty());
+    assert!(m.relations.aux.member_evidence.is_empty());
 }

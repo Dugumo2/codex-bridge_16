@@ -198,6 +198,9 @@ impl Core {
                     }
                 }
                 Action::CancelAppReply { op } => self.app.cancel_reply(op),
+                Action::ForgetServerRequest { request_key } => {
+                    self.app.forget_server_request(&request_key)
+                }
                 Action::Unschedule { key } => {
                     if let Some((_, timer)) = self.keyed_timers.remove(&key) {
                         timer.abort();

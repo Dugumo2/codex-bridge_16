@@ -203,7 +203,7 @@ fn 旧子线程在父新运行开始后才发事件不误绑_同一子代理被�
     let parent_done = mock.turn_completed(P, T, "completed");
     mock.inject(&mut m, parent_done);
     assert!(!m.claims.contains_key(P));
-    assert_eq!(m.manage_context(R).unwrap().authority, Authority::Revoked);
+    assert!(m.manage_context(R).is_none(), "已结算运行的管理态退役");
     // 新运行 R2 在 P 上开始。
     m.claims
         .insert(P.into(), claim(Owner::Client(1), "父轮2", "运行乙", 2));
@@ -216,7 +216,7 @@ fn 旧子线程在父新运行开始后才发事件不误绑_同一子代理被�
     let reuse = mock.turn_started(C, "子轮10");
     run(&mut m, &mut mock, vec![s, reuse, c]);
     assert_eq!(bound(&m, C, "子轮10"), None);
-    assert_eq!(bound(&m, C, "子轮1").as_deref(), Some(R), "历史绑定保留");
+    assert_eq!(bound(&m, C, "子轮1"), None, "已结算的绑定随运行退役");
 }
 
 #[test]
@@ -418,4 +418,108 @@ fn 线程索引与运行记录持久化_重启只恢复关系不恢复绑定() {
     assert_eq!(fresh.thread_relation(C).unwrap().parent_thread_id, P);
     assert!(fresh.binding(C, "子轮1").is_none());
     assert!(fresh.manage_context(R).is_none());
+}
+
+#[test]
+fn 修复4_一千零二十四条pending后拒绝unproven与新pending() {
+    let (mut m, mut mock) = setup(false);
+    for i in 0..MAX_OPERATIONS {
+        let (started, _) = SubagentMock::v1_spawn(P, T, &format!("派生{i}"), C, false);
+        mock.inject(&mut m, started);
+    }
+    assert_eq!(m.relations.operations.len(), MAX_OPERATIONS);
+    assert!(m
+        .relations
+        .operations
+        .values()
+        .all(|op| op.outcome == EvidenceOutcome::Pending));
+    for turn in ["外部父轮", T] {
+        let (started, _) = SubagentMock::v1_spawn(P, turn, "超限", C, false);
+        let actions = mock.inject(&mut m, started);
+        assert_eq!(m.relations.operations.len(), MAX_OPERATIONS);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Warn(w) if w.contains("证据操作达到上限"))));
+    }
+    // 旧操作仍可完成；腾出落定槽位后可接收新操作。
+    let (_, completed) = SubagentMock::v1_spawn(P, T, "派生0", C, true);
+    mock.inject(&mut m, completed);
+    let (started, _) = SubagentMock::v1_spawn(P, T, "新派生", C, false);
+    mock.inject(&mut m, started);
+    assert_eq!(m.relations.operations.len(), MAX_OPERATIONS);
+    assert!(m.relations.operations.keys().any(|k| k.item_id == "新派生"));
+}
+
+#[test]
+fn 修复1_settling证据过期不空转且定案后重新扫描() {
+    let (mut m, mut mock) = setup(false);
+    let (started, _) = SubagentMock::v1_spawn(P, T, "派生1", C, false);
+    mock.inject(&mut m, started);
+    let key = m.relations.operations.keys().next().unwrap().clone();
+    m.relations.aux.parent_waits.insert(
+        key.clone(),
+        ParentWait::Settle {
+            thread: P.into(),
+            claim_id: 1,
+        },
+    );
+    let actions = advance(&mut m, &mut mock, EVIDENCE_TTL_MS + 1);
+    assert!(!actions.iter().any(|a| matches!(
+        a,
+        Action::Schedule {
+            kind: crate::claim::TimerKind::LookupDeadline { .. },
+            delay_ms: 0,
+            ..
+        }
+    )));
+    assert!(m.relations.aux.sweep.is_none());
+    m.on_claim_settled(P, 1, true, &mut Vec::new());
+    advance(&mut m, &mut mock, 1);
+    assert_ne!(
+        m.relations.operations[&key].outcome,
+        EvidenceOutcome::Pending
+    );
+}
+
+#[test]
+fn 修复6_运行退役清理绑定与成员证据_等待写入及清理屏障() {
+    let (mut m, mut mock) = setup(false);
+    spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+    let (_, event) = mock.request(C, Some("子轮1"), None, APPROVAL);
+    mock.inject(&mut m, event);
+    m.relations.requests.values_mut().next().unwrap().stage =
+        ChildRequestStage::Writing { op: 99, gen: 1 };
+    m.relations_enter_cleanup(R, 77, &mut Vec::new());
+    m.claims.clear();
+    m.relations.contexts.get_mut(R).unwrap().authority = Authority::Revoked;
+    m.prune_contexts();
+    assert!(m.manage_context(R).is_some());
+    m.relations.contexts.get_mut(R).unwrap().cleanup = None;
+    m.prune_contexts();
+    assert!(m.manage_context(R).is_some(), "写入结算前保留上下文");
+    m.relations.requests.clear();
+    m.relations.aux.request_meta.clear();
+    for member in m
+        .relations
+        .contexts
+        .get_mut(R)
+        .unwrap()
+        .members
+        .values_mut()
+    {
+        member.pending_requests = 0;
+    }
+    mock.inject(&mut m, Event::Initialized { conn: 1, cxb: true });
+    assert!(m.manage_context(R).is_none());
+    assert!(m.relations.bindings.is_empty());
+    assert!(m.relations.aux.member_evidence.is_empty());
+    assert!(m.relations.aux.spawn_waits.is_empty());
+    assert!(m
+        .relations
+        .operations
+        .values()
+        .all(|op| op.outcome == EvidenceOutcome::Revoked));
+    let (_, late) = SubagentMock::v1_spawn(P, T, "派生1", C, false);
+    mock.inject(&mut m, late);
+    assert!(m.relations.bindings.is_empty());
 }

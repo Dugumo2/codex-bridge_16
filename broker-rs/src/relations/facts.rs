@@ -245,8 +245,39 @@ impl Machine {
         );
     }
 
+    /// 受管成员、活动绑定与清理范围仍需要订阅，Guardian 结束不能解除它们的附着。
+    pub(crate) fn relation_needs_subscription(&self, thread: &str) -> bool {
+        self.relations.contexts.values().any(|c| {
+            (c.authority != Authority::Revoked
+                && (c.members.contains_key(thread)
+                    || c.identity.execution_thread_id == thread
+                    || c.identity.logical_root_thread_id == thread))
+                || c.cleanup
+                    .as_ref()
+                    .is_some_and(|cleanup| cleanup.scope.contains(thread))
+        }) || self.relations.bindings.values().any(|b| {
+            b.thread_id == thread
+                && b.status == BindingStatus::Bound
+                && self
+                    .relations
+                    .aux
+                    .observed
+                    .get(thread)
+                    .is_some_and(|turns| turns.iter().any(|t| t.turn == b.turn_id && !t.completed))
+                && self
+                    .relations
+                    .contexts
+                    .get(&b.run_id)
+                    .is_none_or(|c| c.authority != Authority::Revoked || c.cleanup.is_some())
+        }) || self
+            .relations
+            .requests
+            .values()
+            .any(|r| r.source_thread_id == thread)
+    }
+
     /// 卸载、关闭、删除使附着证据立即失效。
-    fn detach_evidence(&mut self, thread: &str) {
+    pub(crate) fn detach_evidence(&mut self, thread: &str) {
         if let Some(a) = self.relations.attachments.get_mut(thread) {
             a.valid = false;
         }
@@ -497,6 +528,12 @@ impl Machine {
         let now = self.clock.mono_ms;
         let first = !self.relations.operations.contains_key(&key);
         if first {
+            if !self.reserve_operation() {
+                actions.push(Action::Warn(format!(
+                    "证据操作达到上限 {MAX_OPERATIONS}，忽略未证明归属的条目 {item_id}"
+                )));
+                return;
+            }
             let parent_run = self.parent_run(parent, parent_turn);
             let run_id = match &parent_run {
                 ParentRun::Own { run, .. } | ParentRun::Settling { run, .. } => run.clone(),
@@ -551,7 +588,6 @@ impl Machine {
                     failure: None,
                 },
             );
-            self.prune_operations();
         }
         let op = self
             .relations
@@ -1137,14 +1173,7 @@ impl Machine {
             .relations
             .operations
             .iter()
-            .filter(|(k, op)| {
-                op.outcome == EvidenceOutcome::Pending
-                    && now >= op.expires_at_ms
-                    && !matches!(
-                        self.relations.aux.parent_waits.get(*k),
-                        Some(ParentWait::Settle { .. })
-                    )
-            })
+            .filter(|(_, op)| self.evidence_expirable(op) && now >= op.expires_at_ms)
             .map(|(k, _)| k.clone())
             .collect();
         for key in expired {
@@ -1188,9 +1217,18 @@ impl Machine {
         self.prune_contexts();
     }
 
-    /// 过期记录只保留去重与诊断；超出上限淘汰最早的已落定记录。
-    fn prune_operations(&mut self) {
-        while self.relations.operations.len() > MAX_OPERATIONS {
+    /// 调度与到期处理使用同一资格，settling 由定案回调重新登记期限。
+    pub(crate) fn evidence_expirable(&self, op: &EvidenceOperation) -> bool {
+        op.outcome == EvidenceOutcome::Pending
+            && !matches!(
+                self.relations.aux.parent_waits.get(&op.key),
+                Some(ParentWait::Settle { .. })
+            )
+    }
+
+    /// 插入前预留容量；全是未决操作时保守拒绝，避免淘汰当前键或无界增长。
+    fn reserve_operation(&mut self) -> bool {
+        while self.relations.operations.len() >= MAX_OPERATIONS {
             let oldest = self
                 .relations
                 .operations
@@ -1202,14 +1240,15 @@ impl Machine {
                 .min_by_key(|(_, op)| op.first_seen_ms)
                 .map(|(k, _)| k.clone());
             let Some(oldest) = oldest else {
-                break;
+                return false;
             };
             self.relations.operations.remove(&oldest);
         }
+        true
     }
 
-    /// 已结束且没有成员、请求、清理授权的运行上下文不再保留。
-    fn prune_contexts(&mut self) {
+    /// 运行已结束且请求、清理屏障均结算后，回收上下文及其附属记录。
+    pub(crate) fn prune_contexts(&mut self) {
         let stale: Vec<String> = self
             .relations
             .contexts
@@ -1227,12 +1266,41 @@ impl Machine {
                         .requests
                         .values()
                         .any(|r| r.run_id.as_deref() == Some(run.as_str()))
-                    && !self.runs.runs.contains_key(run.as_str())
+                    && self
+                        .runs
+                        .runs
+                        .get(run.as_str())
+                        .is_none_or(|r| r.ended_at.is_some())
+                    && !self.runs.tree_retained.contains(run.as_str())
+                    && !self.tree_busy(Some(&c.identity.execution_thread_id))
             })
             .map(|(r, _)| r.clone())
             .collect();
         for run in stale {
             self.relations.contexts.remove(&run);
+            self.relations.bindings.retain(|_, b| b.run_id != run);
+            self.relations
+                .aux
+                .member_evidence
+                .retain(|(r, _), _| r != &run);
+            for op in self
+                .relations
+                .operations
+                .values_mut()
+                .filter(|op| op.run_id == run)
+            {
+                op.outcome = EvidenceOutcome::Revoked;
+                op.proven_turns.clear();
+            }
+            let operations = &self.relations.operations;
+            self.relations
+                .aux
+                .parent_waits
+                .retain(|k, _| operations.get(k).is_some_and(|op| op.run_id != run));
+            self.relations
+                .aux
+                .spawn_waits
+                .retain(|_, k| operations.get(k).is_some_and(|op| op.run_id != run));
         }
     }
 

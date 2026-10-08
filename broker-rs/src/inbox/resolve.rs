@@ -194,7 +194,7 @@ impl Machine {
         }));
     }
     fn guardian_unsubscribe(&self, thread: &str, actions: &mut Vec<Action>) {
-        if !self.claims.contains_key(thread) {
+        if !self.claims.contains_key(thread) && !self.relation_needs_subscription(thread) {
             let claim_id = self.records.get(thread).map_or(0, |r| r.last_claim_id);
             self.schedule_unsubscribe(
                 ClaimToken {

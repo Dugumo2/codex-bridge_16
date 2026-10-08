@@ -395,10 +395,9 @@ impl Machine {
         let Some(mut work) = self.relations.aux.work.remove(&op_id) else {
             return;
         };
-        let Some(op) = self.relations.discoveries.get_mut(&op_id) else {
+        let Some(op) = self.relations.discoveries.remove(&op_id) else {
             return;
         };
-        op.completed = true;
         let (root, scope, caller, generation) = (
             op.root.clone(),
             op.scope.clone(),
@@ -569,9 +568,7 @@ impl Machine {
         let ops: Vec<u64> = self.relations.aux.work.keys().copied().collect();
         for op_id in ops {
             self.relations.aux.work.remove(&op_id);
-            if let Some(op) = self.relations.discoveries.get_mut(&op_id) {
-                op.completed = true;
-            }
+            self.relations.discoveries.remove(&op_id);
             actions.push(Action::Unschedule {
                 key: crate::claim::TimerKey::DiscoveryDeadline(op_id),
             });
