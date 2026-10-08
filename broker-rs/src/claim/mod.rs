@@ -1874,6 +1874,23 @@ impl Machine {
 
     /// #5 的到达阶段先于 completed 查重与 goal 学习。
     fn arrive_notification(&mut self, event: HeldNotification, actions: &mut Vec<Action>) {
+        // 先撤销历史根的旧证据，避免关系通知中的同步协调提前确认树停止。
+        if !self.closing {
+            if let Some(thread) = thread_id(&event.params)
+                .filter(|t| !self.claims.contains_key(*t))
+                .map(str::to_owned)
+            {
+                let changed = matches!(event.method.as_str(), "turn/started" | "turn/completed")
+                    || event.method == "thread/goal/updated"
+                        && event
+                            .params
+                            .as_ref()
+                            .is_some_and(|p| p["goal"]["status"] == "active");
+                if changed {
+                    self.unclaimed_tree_root_changed(&thread, actions);
+                }
+            }
+        }
         self.on_relation_notification(&event, actions);
         if matches!(event.method.as_str(), "item/started" | "item/completed") {
             if let Some(p) = &event.params {

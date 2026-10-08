@@ -1530,7 +1530,22 @@ impl Machine {
             else {
                 continue;
             };
-            let mut turn_ids = member.bindings.clone();
+            // 清理上下文没有恢复活动绑定；刷新时仍应保留账本中已经证明的历史轮次。
+            let mut turn_ids = if context.cleanup.is_some() {
+                self.runs
+                    .runs
+                    .get(run)
+                    .and_then(|r| r.children.iter().find(|c| c.thread_id == *thread))
+                    .map(|c| c.turn_ids.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for turn in &member.bindings {
+                if !turn_ids.contains(turn) {
+                    turn_ids.push(turn.clone());
+                }
+            }
             if turn_ids.len() > MAX_TURN_IDS {
                 turn_ids.drain(..turn_ids.len() - MAX_TURN_IDS);
             }

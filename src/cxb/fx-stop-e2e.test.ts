@@ -155,16 +155,23 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     const snapshot = await state();
     order(snapshot, PARENT, sessions.map((s) => s.processId));
     order(snapshot, CHILD, ["31001"]);
-    // 已结束的树仍可能出现残留；第二次停止必须重新取得每个成员的清理证据。
-    const before = snapshot.calls.length;
-    await set(PARENT, { sessions });
-    await set(CHILD, { sessions: [{ itemId: "child-command", processId: "31001" }] });
-    const repeated = await cli("stop", PARENT, "--run", run.runId, "--json");
-    expect(repeated.code, JSON.stringify(repeated)).toBe(0);
-    expect(repeated.json()).toMatchObject({ stopOutcome: "confirmed", childrenStop: { phase: "confirmed" } });
-    const after = await state();
-    order({ ...after, calls: after.calls.slice(before) }, PARENT, sessions.map((s) => s.processId));
-    order({ ...after, calls: after.calls.slice(before) }, CHILD, ["31001"]);
+    const history = (await rpc("broker/threads/watch", { threadId: PARENT })).run.children;
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({ threadId: CHILD });
+    expect(history[0].turnIds.length).toBeGreaterThan(0);
+    // 连续三次停止：每次都保留历史成员、证据与轮次，并重新清理父子线程。
+    for (let attempt = 2; attempt <= 3; attempt++) {
+      const before = (await state()).calls.length;
+      await set(PARENT, { sessions });
+      await set(CHILD, { sessions: [{ itemId: "child-command", processId: "31001" }] });
+      const repeated = await cli("stop", PARENT, "--run", run.runId, "--json");
+      expect(repeated.code, `第 ${attempt} 次：${JSON.stringify(repeated)}`).toBe(0);
+      expect(repeated.json()).toMatchObject({ stopOutcome: "confirmed", childrenStop: { phase: "confirmed" } });
+      const after = await state();
+      order({ ...after, calls: after.calls.slice(before) }, PARENT, sessions.map((s) => s.processId));
+      order({ ...after, calls: after.calls.slice(before) }, CHILD, ["31001"]);
+      expect((await rpc("broker/threads/watch", { threadId: PARENT })).run.children).toEqual(history);
+    }
   }, 90_000);
 
   test("树停止 unconfirmed 后 --abandon：保留诊断、解除屏障且可再派单", async () => {

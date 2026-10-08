@@ -659,3 +659,211 @@ fn fx_单线程结束事件立即推进后台清理与后置复核无需等期�
     assert_eq!(s.m.clock.mono_ms, now);
     assert!(s.m.stops.operations.is_empty());
 }
+
+#[test]
+fn fx_review1_连续三次停止保留历史成员并逐次清理子命令() {
+    for narrow in [false, true] {
+        let mut s = Sim::new();
+        s.spawn_v1("子", "派生", "子轮");
+        command(&mut s, "子", "子轮", "71");
+        let history = s.record().children.clone();
+        for attempt in 1..=3 {
+            s.background
+                .insert("子".into(), vec![json!({"itemId":"71","processId":"71"})]);
+            let start = s.log.len();
+            let id = stop(&mut s, narrow);
+            assert_eq!(
+                s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+                "confirmed"
+            );
+            assert_eq!(
+                s.record().children.len(),
+                history.len(),
+                "第 {attempt} 次不得删除历史成员"
+            );
+            assert_eq!(s.record().children[0].thread_id, history[0].thread_id);
+            assert_eq!(s.record().children[0].evidence, history[0].evidence);
+            assert_eq!(s.record().children[0].turn_ids, history[0].turn_ids);
+            for method in [LIST, TERMINATE] {
+                assert!(
+                    s.log[start..].iter().any(|a| matches!(a, Action::Request(c)
+                    if c.method == method && c.params.as_ref().unwrap()["threadId"] == "子")),
+                    "第 {attempt} 次缺少子线程 {method}"
+                );
+            }
+            assert!(s.background["子"].is_empty());
+        }
+        assert_eq!(s.run_ended(&s.log), 1);
+    }
+}
+
+#[test]
+fn fx_review2_自然完成且没有树停止报告仍清理历史子命令() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    command(&mut s, "子", "子轮", "72");
+    s.turn_completed("子", "子轮", "completed");
+    s.turn_completed(P, T, "completed");
+    assert_eq!(s.record().state, RunState::Ended);
+    assert!(s.record().children_stop.is_none());
+    assert_eq!(s.record().children.len(), 1);
+    let start = s.log.len();
+    let id = stop(&mut s, false);
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "confirmed"
+    );
+    assert!(s.log[start..].iter().any(|a| matches!(a, Action::Request(c)
+        if c.method == TERMINATE && c.params.as_ref().unwrap()["threadId"] == "子")));
+    assert!(s.background["子"].is_empty());
+    assert_eq!(s.run_ended(&s.log), 1);
+}
+
+#[test]
+fn fx_review3_无认领根收尾后新活动撤销旧证据且不认领外部轮次() {
+    let mut s = Sim::new();
+    s.m.shared = true;
+    s.spawn_v1("子", "派生", "子轮");
+    stop(&mut s, true);
+    assert!(!s.m.claims.contains_key(P));
+    s.hold.push((LIST.into(), P.into()));
+    let id = stop(&mut s, true);
+    s.hold.push(("thread/list".into(), "".into()));
+    s.release(LIST, P);
+    let tree = s.tree_op().unwrap();
+    assert!(s.m.trees.aux.work[&tree].final_pending.is_empty());
+    assert!(s.m.trees.aux.work[&tree].final_discovery.is_some());
+    assert!(
+        s.m.trees.aux.derived[&(tree, P.into())]
+            .background
+            .confirmed
+    );
+    let start = s.log.len();
+    s.turn_started(P, "外部轮");
+    command(&mut s, P, "外部轮", "73");
+    s.release("thread/list", "");
+    assert!(
+        s.response(&s.log, id).is_none(),
+        "收到新活动后不得沿用根的旧空闲证据确认"
+    );
+    assert_eq!(s.tree_op(), Some(tree));
+    assert!(!s.m.trees.aux.work[&tree].root_done);
+    assert!(
+        !s.m.trees.aux.derived[&(tree, P.into())]
+            .background
+            .confirmed
+    );
+    assert!(!s.m.claims.contains_key(P));
+    assert_eq!(s.interrupts(&s.log[start..], P), 0);
+    assert!(!s.log[start..]
+        .iter()
+        .any(|a| matches!(a, Action::Request(c) if c.method == TERMINATE)));
+    // 外部运行自行结束并清掉命令后，可以重新核验收敛，不借用旧运行中断它。
+    s.background.get_mut(P).unwrap().clear();
+    s.turn_completed(P, "外部轮", "completed");
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "confirmed"
+    );
+    assert_eq!(s.interrupts(&s.log[start..], P), 0);
+    assert_eq!(s.run_ended(&s.log), 1);
+}
+
+#[test]
+fn fx_review4_重启恢复为lost且全空闲可确认历史树停止() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    let record = s.record().clone();
+    let index = s.m.runs.index.clone();
+    s.m = Machine::new(true);
+    s.m.clock.mono_ms = 1000;
+    s.m.clock.now_ms = record.started_at + 1000;
+    s.apply(Event::Connected { conn: OWNER });
+    s.apply(Event::Initialized {
+        conn: OWNER,
+        cxb: true,
+    });
+    let mut actions = Vec::new();
+    s.m.restore_runs(index, vec![record], &mut actions);
+    s.absorb(actions);
+    s.turns.clear();
+    s.learn_thread(P);
+    s.learn_thread("子");
+    assert_eq!(s.record().state, RunState::Lost);
+    assert!(s.m.claims.is_empty());
+    assert!(s.m.relations.contexts.is_empty());
+    for _ in 0..3 {
+        let start = s.log.len();
+        let id = stop(&mut s, true);
+        let reply = s
+            .response(&s.log, id)
+            .expect("全空闲、接口正常应在首轮收敛");
+        assert_eq!(reply["result"]["stopOutcome"], "confirmed");
+        assert!(s.tree_op().is_none());
+        assert!(!s.m.tree_busy(Some(P)));
+        assert_eq!(s.record().children.len(), 1);
+        assert_eq!(s.record().state, RunState::Lost);
+        assert!(s.m.claims.is_empty());
+        assert!(
+            !s.log[start..].iter().any(|a| matches!(a, Action::Request(c)
+            if matches!(c.method.as_str(), "thread/resume" | "turn/start" | "turn/interrupt")))
+        );
+    }
+    assert_eq!(
+        s.run_ended(&s.log),
+        0,
+        "Lost 只更新核验报告，不补发历史结束事件"
+    );
+}
+
+#[test]
+fn fx_review3_无认领根的active_goal也撤销收尾证据() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    stop(&mut s, true);
+    s.hold.push((LIST.into(), P.into()));
+    let id = stop(&mut s, true);
+    s.hold.push(("thread/list".into(), "".into()));
+    s.release(LIST, P);
+    let tree = s.tree_op().unwrap();
+    assert!(s.m.trees.aux.work[&tree].final_pending.is_empty());
+    let start = s.log.len();
+    let goal = json!({"threadId":P,"status":"active","objective":"外部目标"});
+    s.goals.insert(P.into(), goal.clone());
+    s.notify(json!({"method":"thread/goal/updated","params":{"threadId":P,"goal":goal}}));
+    s.release("thread/list", "");
+    assert!(s.response(&s.log, id).is_none());
+    assert!(!s.m.trees.aux.work[&tree].root_done);
+    assert!(
+        !s.m.trees.aux.derived[&(tree, P.into())]
+            .background
+            .confirmed
+    );
+    assert!(
+        !s.log[start..].iter().any(|a| matches!(a, Action::Request(c)
+        if c.method == "thread/goal/set" || c.method == "thread/goal/clear"))
+    );
+}
+
+#[test]
+fn fx_review2_自然完成但已撤权上下文尚未回收仍按历史成员停树() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    command(&mut s, "子", "子轮", "74");
+    s.turn_completed("子", "子轮", "completed");
+    // 控制回收边界：保留上下文直到显式 stop，模拟清理/淘汰保护尚未解除。
+    s.m.runs.tree_retained.insert(R.into());
+    s.turn_completed(P, T, "completed");
+    assert!(s.record().children_stop.is_none());
+    assert_eq!(
+        s.m.relations.contexts[R].authority,
+        crate::relations::Authority::Revoked
+    );
+    let id = stop(&mut s, false);
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "confirmed"
+    );
+    assert!(s.background["子"].is_empty());
+    assert_eq!(s.record().children.len(), 1);
+}

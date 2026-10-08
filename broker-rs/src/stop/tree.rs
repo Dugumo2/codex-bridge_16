@@ -303,9 +303,12 @@ impl Machine {
         if context.authority == Authority::Revoked
             && context.cleanup.is_none()
             && !self.runs.runs.get(run).is_some_and(|r| {
-                r.children_stop
-                    .as_ref()
-                    .is_some_and(|r| r.cleanup_state == "completed")
+                !r.joined
+                    && !r.children.is_empty()
+                    && matches!(
+                        r.state,
+                        crate::runs::RunState::Ended | crate::runs::RunState::Lost
+                    )
             })
         {
             return false;
@@ -495,8 +498,23 @@ impl Machine {
             self.trees.operations[&tree_op].request.trigger
         )));
         // 重复停止只重建本次显式授权的清理上下文，不恢复旧 owner 的开工或回答权。
-        if previously_ended && !self.relations.contexts.contains_key(&run) {
+        let historical_cleanup = root_derived
+            && self.runs.runs.get(&run).is_some_and(|r| {
+                !r.joined
+                    && matches!(
+                        r.state,
+                        crate::runs::RunState::Ended | crate::runs::RunState::Lost
+                    )
+            });
+        if historical_cleanup && !self.relations.contexts.contains_key(&run) {
             let record = &self.runs.runs[&run];
+            // 恢复成员的历史持久化证据，不重建轮次绑定或旧 owner 权限。
+            for child in &record.children {
+                self.relations
+                    .aux
+                    .member_evidence
+                    .insert((run.clone(), child.thread_id.clone()), child.evidence);
+            }
             let members = record
                 .children
                 .iter()
@@ -536,6 +554,15 @@ impl Machine {
                     cleanup: None,
                 },
             );
+        }
+        // Lost 的旧清理上下文可能仍在内存中；新一次已核对身份的停止只重授清理权。
+        if historical_cleanup {
+            if let Some(context) = self.relations.contexts.get_mut(&run) {
+                if context.authority == Authority::Revoked {
+                    context.gen = context.gen.saturating_add(1);
+                    context.authority = Authority::Cleanup { tree_op };
+                }
+            }
         }
         // 第 1 步：根屏障与清理策略在停止开始时冻结；已转发的子请求按清理策略撤回。
         self.relations_enter_cleanup(&run, tree_op, actions);
@@ -1018,6 +1045,43 @@ impl Machine {
             }
         }
         self.tree_drive(tree_op, actions);
+    }
+
+    /// 无认领的历史根也接收活动失效通知，只重做核验，不给外部轮次授予旧运行归属。
+    pub(crate) fn unclaimed_tree_root_changed(&mut self, thread: &str, actions: &mut Vec<Action>) {
+        let ops: Vec<_> = self
+            .trees
+            .operations
+            .values()
+            .filter(|op| {
+                !op.cancelled
+                    && self
+                        .trees
+                        .aux
+                        .work
+                        .get(&op.tree_op)
+                        .is_some_and(|w| w.root_derived && w.root_thread == thread)
+            })
+            .map(|op| op.tree_op)
+            .collect();
+        for tree_op in ops {
+            let key = (tree_op, thread.to_owned());
+            if let Some(work) = self.trees.aux.work.get_mut(&tree_op) {
+                work.root_done = false;
+                work.final_started = false;
+                work.final_complete = None;
+                work.final_pending.insert(thread.into());
+            }
+            self.derived_invalidate_background(&key, actions);
+            if let Some(op) = self.trees.aux.derived.get_mut(&key) {
+                op.stopped = false;
+                op.turn_ended = false;
+                op.verified = false;
+                op.goal_checked = false;
+            }
+            self.derived_requeue(&key);
+            self.tree_drive(tree_op, actions);
+        }
     }
 
     // ─── 事实变化 ────────────────────────────────────────────────────
@@ -2416,7 +2480,9 @@ impl Machine {
             return Some((op.request.snapshot.identity.run_id.clone(), root));
         }
         let latest = self.latest_run(thread)?;
-        if latest.children_stop.is_some() && !self.claims.contains_key(thread) {
+        if (latest.children_stop.is_some() || !latest.children.is_empty())
+            && !self.claims.contains_key(thread)
+        {
             return Some((
                 latest.run_id.clone(),
                 latest
