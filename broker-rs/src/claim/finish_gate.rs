@@ -136,6 +136,7 @@ impl Machine {
         };
         let key = (tree_op, thread.to_owned());
         self.invalidate_finishing_root(tree_op, thread);
+        self.derived_invalidate_background(&key, actions);
         if let Some(op) = self.trees.aux.derived.get_mut(&key) {
             if started && !turn.is_empty() {
                 // 结束快照持有线程：期间开始的轮次属于本运行，可以中断。
@@ -172,6 +173,7 @@ impl Machine {
         }
         let key = (tree_op, thread.to_owned());
         self.invalidate_finishing_root(tree_op, thread);
+        self.derived_invalidate_background(&key, actions);
         if let Some(op) = self.trees.aux.derived.get_mut(&key) {
             op.goal_checked = false;
             op.goal_braked = false;

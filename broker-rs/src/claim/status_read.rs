@@ -435,6 +435,49 @@ impl Machine {
         );
     }
 
+    pub(crate) fn cancel_status_read(&mut self, id: u64, actions: &mut Vec<Action>) {
+        if let Some(read) = self.status_reads.reads.remove(&id) {
+            self.forget_status_version(&read.thread);
+            actions.push(Action::Unschedule {
+                key: TimerKey::StatusRead(id),
+            });
+        }
+        self.status_reads
+            .deadline_rpcs
+            .retain(|(read, _), _| *read != id);
+    }
+
+    pub(crate) fn cancel_tree_reads(
+        &mut self,
+        tree_op: u64,
+        root_generation: Option<u64>,
+        actions: &mut Vec<Action>,
+    ) {
+        let matches = |caller: &StatusCaller| match caller {
+            StatusCaller::DerivedStopVerify { tree_op: id, .. } => *id == tree_op,
+            StatusCaller::StopVerify { tag } => root_generation == Some(tag.generation),
+            _ => false,
+        };
+        let ids: Vec<_> = self
+            .status_reads
+            .reads
+            .iter()
+            .filter(|(_, r)| matches(&r.caller))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(read) = self.status_reads.reads.remove(&id) {
+                self.forget_status_version(&read.thread);
+                actions.push(Action::Unschedule {
+                    key: TimerKey::StatusRead(id),
+                });
+            }
+        }
+        self.status_reads
+            .deadline_rpcs
+            .retain(|_, caller| !matches(caller));
+    }
+
     /// 关闭：在途读取全部清理，不回调；由现有关闭流程收尾。
     pub(crate) fn status_reads_shutdown(&mut self, actions: &mut Vec<Action>) {
         let reads = std::mem::take(&mut self.status_reads.reads);

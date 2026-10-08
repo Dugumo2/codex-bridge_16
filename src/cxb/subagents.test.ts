@@ -60,7 +60,7 @@ describe("停止报告与中断说明", () => {
       root: { ...report().root, clearRequested: true } }));
     expect(lines[0]).toBe("父线程已停；1 个子代理已停；1 个尚未确认");
     expect(lines.join("\n")).toContain("冲突：子线程 child-c（属于其他运行），未中断");
-    expect(lines.join("\n")).toContain("能力限制：子线程 child-d 不接受 goal 写入，目标仍可能 active，未能清除");
+    expect(lines.join("\n")).toContain("能力限制：子线程 child-d 存在能力限制，目标或受管后台命令尚未核验，未能清除");
     const notice = unfinishedNotice(runResult({ status: "interrupted", interruptReason: "subagentsUnfinished",
       childrenStop: report({ trigger: "parentFinishedEarly", phase: "unconfirmed", unconfirmed: ["child-b"], stopped: [] }) }), "abcd1234");
     expect(notice.join("\n")).not.toContain("已停止");
@@ -170,7 +170,7 @@ describe("命令展示", () => {
     t.fake.handle = (m) => m === "broker/threads/list" ? { threads: [summary()] } : { threadId: "thread-test", runId: "run-test",
       interruptSent: true, goal: "paused", alreadyStopped: false, stopOutcome: "unconfirmed", run: null, childrenStop: tree };
     expect(await stop(t.ctx)).toBe(EXIT.TIMEOUT);
-    expect(t.notices[0]).toBe("已发出停止，尚未全部确认：父线程已停；1 个子代理已停；1 个尚未确认；可再次 cxb stop abcd1234 重试");
+    expect(t.notices[0]).toBe("停止尚未确认：父线程已停；1 个子代理已停；1 个尚未确认；请先查看下列诊断");
     expect(t.notices.join("\n")).toContain("冲突：子线程 child-c");
     expect(t.json[0].childrenStop).toEqual(tree);
     expect(t.json[0].ok).toBe(false);

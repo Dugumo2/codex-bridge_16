@@ -253,6 +253,7 @@ export interface LoopGuardReport {
 
 export interface RunResult {
   children?: ChildRecord[];
+  backgroundCleanup?: BackgroundCleanup;
   childrenStop?: ChildrenStopReport;
   runId: string;
   threadId: string;
@@ -408,7 +409,14 @@ export type WaitRun = (rpc: BrokerRpc, opts: WaitRunOptions) => Promise<RunResul
 // ─── N4 命令用到的 broker 回包（详细设计 2.3 节；字段与 Rust 回包逐一对应）──────────────
 
 /** `broker/threads/stop` 的回包：确认已停或 40 秒窗口到了才回。 */
+export interface BackgroundCleanup {
+  scope: string; state: string; discovered: number; terminationResults: Record<string, boolean | null>;
+  remaining: string[]; lastVerifiedAt: number | null; failureReason: string | null;
+}
 export interface StopReply {
+  backgroundCleanup?: BackgroundCleanup;
+  actionApplied?: boolean;
+  reason?: string;
   threadId: string;
   runId: string | null;
   interruptSent: boolean;
@@ -483,13 +491,15 @@ export interface ChildRecord {
   turnIds: string[]; evidence: "v1Spawn" | "v1Message" | "v2Started" | "v2Interacted" | "inherited";
   finalState: ChildActivity;
 }
-export interface DiscoveryState { complete: boolean; version: number; incompleteReasons: string[] }
+export interface DiscoveryState { missing?: Record<string, string[]>; complete: boolean; version: number; incompleteReasons: string[] }
 export type TreePhase = "pending" | "confirmed" | "unconfirmed";
 export interface RootStopReport {
+  backgroundCleanup?: BackgroundCleanup; step?: string; lastVerifiedAt?: number | null;
   thread: string; phase: TreePhase; check: { ownership: boolean; turnEnded: boolean; goalBraked: boolean; settled: boolean; verifyDone: boolean };
   clearRequested: boolean; clearConfirmed: boolean; error: string | null;
 }
 export interface ChildrenStopReport {
+  members?: Record<string, RootStopReport>; cleanupState?: string; abandonReason?: string | null; abandonedAt?: number | null;
   trigger: "userStop" | "ownerGone" | "parentFinishedEarly" | "loopGuard" | "parentFailed" | "parentInterrupted";
   phase: TreePhase; version: number; root: RootStopReport;
   stopped: string[]; unconfirmed: string[]; failed: string[];

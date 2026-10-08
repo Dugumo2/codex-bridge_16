@@ -336,7 +336,7 @@ describe("帮助与选项表", () => {
     run: ["--file", "--resume", "--continue", "--run", "--template", "--goal", "--budget", "--memory", "--detach"],
     review: ["--mode", "--ref", "--base", "--resume"], show: ["--tail", "--log", "--follow", "--server", "--limit", "--full"],
     ls: ["--all", "--limit", "--local"], inbox: ["--kind", "--all", "--limit"], reply: [], wait: [],
-    stop: ["--clear", "--run"], rm: ["--purge"], config: ["--unset"], doctor: [],
+    stop: ["--abandon", "--clear", "--run"], rm: ["--purge"], config: ["--unset"], doctor: [],
   };
   test("总帮助恰好列出十一条命令和全局选项", () => {
     expect(Object.keys(COMMANDS)).toEqual(names);

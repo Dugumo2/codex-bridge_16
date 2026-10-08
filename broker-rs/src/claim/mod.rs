@@ -416,6 +416,7 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    Stop(String, u64, crate::stop::StopTimer),
     StatusRead(u64),
     LookupDeadline(u64),
     DiscoveryDeadline(u64),
@@ -439,6 +440,9 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::Stop(tag, kind) => {
+                Some(TimerKey::Stop(tag.id.clone(), tag.generation, kind.clone()))
+            }
             TimerKind::StatusReadDeadline { read_id } => Some(TimerKey::StatusRead(*read_id)),
             TimerKind::LookupDeadline { op_id, .. } => Some(TimerKey::LookupDeadline(*op_id)),
             TimerKind::DiscoveryDeadline { op_id, .. } => Some(TimerKey::DiscoveryDeadline(*op_id)),
@@ -1308,6 +1312,48 @@ impl Machine {
         if self.unwrap_goal_reply(&mut context, &result, false, actions) {
             return;
         }
+        // 清理已撤销或代号已换代的内部回包在事实学习之前隔离，不能污染后续运行。
+        let stale = match &context.operation {
+            Operation::DerivedStop {
+                tree_op,
+                generation,
+                thread,
+                round,
+            } => {
+                !self
+                    .trees
+                    .operations
+                    .get(tree_op)
+                    .is_some_and(|t| !t.cancelled && t.generation == *generation)
+                    || !self
+                        .trees
+                        .aux
+                        .derived
+                        .get(&(*tree_op, thread.clone()))
+                        .is_some_and(|d| d.request_round == *round)
+            }
+            Operation::StatusRead {
+                read_id,
+                generation,
+            } => !self
+                .status_reads
+                .reads
+                .get(read_id)
+                .is_some_and(|r| r.generation == *generation),
+            Operation::Discovery { op_id, .. } => !self.relations.discoveries.contains_key(op_id),
+            _ => false,
+        };
+        if stale {
+            if let Operation::StatusRead {
+                read_id,
+                generation,
+            } = context.operation
+            {
+                // 读取层仍须结算已到总期限的 RPC 证据；只跳过公共事实学习。
+                self.status_read_reply(read_id, generation, result, actions);
+            }
+            return;
+        }
         // 乙路：续跑核实读与 goal 恢复先核对自己持有的版本、认领与阶段，再由处理函数自己调用
         // `learn_traffic` 学习事实（回包自身会推进 goal 版本，先学习会把本次读数误判为过期）。
         match &context.operation {
@@ -1829,6 +1875,48 @@ impl Machine {
     /// #5 的到达阶段先于 completed 查重与 goal 学习。
     fn arrive_notification(&mut self, event: HeldNotification, actions: &mut Vec<Action>) {
         self.on_relation_notification(&event, actions);
+        if matches!(event.method.as_str(), "item/started" | "item/completed") {
+            if let Some(p) = &event.params {
+                if p["item"]["type"] == "commandExecution" {
+                    if let (Some(thread), Some(turn), Some(item)) = (
+                        p["threadId"].as_str(),
+                        p["turnId"].as_str(),
+                        p["item"]["id"].as_str(),
+                    ) {
+                        if self.stops.command_turns.len() < 16_384
+                            || self
+                                .stops
+                                .command_turns
+                                .contains_key(&(thread.into(), item.into()))
+                        {
+                            let owner = self
+                                .binding(thread, turn)
+                                .filter(|b| b.status == crate::relations::BindingStatus::Bound)
+                                .map(|b| b.run_id.clone())
+                                .or_else(|| {
+                                    self.claims
+                                        .get(thread)
+                                        .filter(|c| {
+                                            c.owned_turns.contains(turn)
+                                                && !c.joined()
+                                                && !c.settling()
+                                        })
+                                        .and_then(|c| c.run_id.clone())
+                                });
+                            if let Some(run) = owner {
+                                self.stops
+                                    .command_owners
+                                    .insert((thread.into(), item.into()), run);
+                            }
+                            self.stops
+                                .command_turns
+                                .insert((thread.into(), item.into()), turn.into());
+                        }
+                    }
+                }
+            }
+        }
+
         if self.closing {
             return;
         }

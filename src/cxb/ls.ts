@@ -1,7 +1,7 @@
 import { sanitizeForTerminal } from "../questions";
 import { CxbError, type LifecycleInfo, type ThreadSummary } from "./contracts";
 import { readLifecycle, readRunRecord, readThreadIndex, type ThreadIndexEntry } from "./ledger";
-import { derivedOnly } from "./subagents";
+import { backgroundLines, derivedOnly, stopReportLines } from "./subagents";
 import { lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
 import { commandSession } from "./command-session";
@@ -13,6 +13,8 @@ interface ListItem {
   lifecycle?: LifecycleInfo;
   /** 默认隐藏的、只作为派生成员的子代理线程（父行显示数量，`--json` 带出 ID）。 */
   subagents?: string[];
+  backgroundCleanup?: import("./contracts").BackgroundCleanup;
+  childrenStop?: import("./contracts").ChildrenStopReport;
 }
 interface ServerThread {
   id: string; updatedAt: number; model?: string | null; preview?: string;
@@ -28,11 +30,11 @@ type LocalThread = Pick<ThreadSummary, "threadId" | "shortId" | "lastRunId" | "u
 function localItems(ctx: CommandContext, threads: LocalThread[]): ListItem[] {
   return threads.map((thread) => {
     // 待核实的归档或删除优先显示（门禁挡着，线程不能照常使用）；只剩记录的线程没有运行可读。
-    const run = !thread.lifecycle && (!thread.state || thread.state === "idle") && thread.lastRunId
+    const run = thread.lastRunId
       ? readRunRecord(ctx.workspace.workspaceDir, thread.lastRunId) : null;
     const status = thread.lifecycle ? lifecycleLabel(thread.lifecycle) : thread.state && thread.state !== "idle" ? thread.state
       : run?.state === "running" || run?.state === "stopping" || run?.state === "lost" ? run.state : run?.status ?? "idle";
-    return { ...thread, status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
+    return { ...thread, ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
   });
 }
 
@@ -136,6 +138,8 @@ export const ls: CommandHandler = async (ctx) => {
     ctx.out.progress(`共发现 ${ranked.length} 条线程，显示 ${items.length} 条`);
     ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL PREVIEW\n");
     for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${item.model ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
+    for (const item of items) if (item.childrenStop) for (const line of stopReportLines(item.childrenStop)) ctx.out.notice(`${item.shortId ?? item.threadId} ${line}`);
+    for (const item of items) if (item.backgroundCleanup && !item.childrenStop) for (const line of backgroundLines(item.threadId, item.backgroundCleanup)) ctx.out.notice(line);
     ctx.out.resultJson({ ok: true, command: "ls", workspace: ctx.workspace.root, source, items, truncated });
     return 0;
   } finally { session.dispose(); }

@@ -961,6 +961,7 @@ async fn 核心断开时未知轮次在启动回包后中断且回包不释放()
             json!({"threadId": "线程", "turn": {"id": "本轮"}}),
         )
         .await;
+    empty_background(&mut harness).await;
     assert!(harness.core.machine.claims.is_empty());
 }
 
@@ -1234,6 +1235,7 @@ async fn 核心停止四十秒与十五秒核实按操作代号处理() {
     .await;
     assert!(h.core.machine.claims.contains_key("线程"));
     h.answer(&goal, Ok(json!({"goal":null}))).await;
+    empty_background(&mut h).await;
     assert!(h.core.machine.claims.is_empty());
     assert!(h.core.machine.stops.operations.is_empty());
     assert!(!h.core.machine.stops_busy());
@@ -2465,4 +2467,21 @@ async fn 健康查询无存储与终态为降级并在关闭期间可读() {
     h.core.store_terminal = true;
     h.client(11, "broker/health", json!({}));
     assert_eq!(h.incoming_client().await["result"]["storage"], "degraded");
+}
+
+/// 停止确认新增的受管后台命令核验：空列表后仍读 Activity 和 goal。
+async fn empty_background(h: &mut Harness) {
+    let list = h.outgoing().await;
+    assert_eq!(list["method"], "thread/backgroundTerminals/list");
+    h.answer(&list, Ok(json!({"data":[],"nextCursor":null})))
+        .await;
+    for _ in 0..2 {
+        let query = h.outgoing().await;
+        let result = match query["method"].as_str().unwrap() {
+            "thread/read" => json!({"thread":{"id":"线程","status":{"type":"idle"}}}),
+            "thread/goal/get" => json!({"goal":null}),
+            method => panic!("非预期清理后核验 {method}"),
+        };
+        h.answer(&query, Ok(result)).await;
+    }
 }

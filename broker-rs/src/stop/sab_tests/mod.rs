@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 mod derived;
+mod fx_stop;
 mod gate;
 mod lifecycle;
 mod tree;
@@ -30,6 +31,9 @@ pub(super) struct Sim {
     /// 每线程的轮次 (id, status)，按开始顺序。
     pub turns: BTreeMap<String, Vec<(String, String)>>,
     pub goals: BTreeMap<String, Value>,
+    pub background: BTreeMap<String, Vec<Value>>,
+    pub background_supported: bool,
+    pub terminate_false: bool,
     /// 中断永不生效的线程。
     pub never: BTreeSet<String>,
     /// 不自动回答的 (方法, 线程)；线程为空表示所有线程。
@@ -53,6 +57,9 @@ impl Sim {
             mock: SubagentMock::default(),
             turns: BTreeMap::new(),
             goals: BTreeMap::new(),
+            background: BTreeMap::new(),
+            background_supported: true,
+            terminate_false: false,
             never: BTreeSet::new(),
             hold: Vec::new(),
             held: Vec::new(),
@@ -394,6 +401,14 @@ impl Sim {
         let inner = unwrap_operation(&context.operation);
         let mut events = Vec::new();
         match (context.method.as_str(), inner) {
+            ("thread/backgroundTerminals/list", _) => events.push(reply(if self.background_supported {
+                Ok(json!({"data":self.background.get(&thread).cloned().unwrap_or_default(),"nextCursor":null}))
+            } else { Err(json!({"code":-32601,"message":"方法不存在"})) })),
+            ("thread/backgroundTerminals/terminate", _) => {
+                self.background.entry(thread).or_default().retain(|v| v["processId"] != params["processId"]);
+                events.push(reply(Ok(json!({"terminated":!self.terminate_false}))));
+            }
+
             ("thread/goal/get", _) => {
                 let goal = self.goals.get(&thread).cloned().unwrap_or(Value::Null);
                 events.push(reply(Ok(json!({"goal": goal}))));
