@@ -1,8 +1,14 @@
 //! M4 任务说明第 4 节的停止证据、时序、超时与隔离测试。
+#[path = "h2b_tests.rs"]
+mod h2b;
 #[path = "n4_review_tests.rs"]
 mod n4_review;
 use super::*;
+use crate::claim::status_read::{StatusDone, StatusResult, StatusTurn};
 use crate::claim::{self, Event, Owner};
+use crate::test_support::status_read::{
+    meta, reply_status, status_requests, turns_page, StatusPhase, StatusRequest,
+};
 use std::time::Instant;
 
 fn apply(m: &mut Machine, event: Event) -> Vec<Action> {
@@ -47,6 +53,41 @@ fn reply(m: &mut Machine, c: &RequestContext, result: Result<Value, Value>) -> V
             result,
         },
     )
+}
+/// 经单步驱动回答一次状态读取，结果与旧全量快照 `{"thread":{"turns":[...]}}` 同义：`turns` 按旧回包
+/// 的升序给出 (id, status)。元数据有 inProgress 时为 active、否则为 idle；轮次页按上游倒序一页给完。
+/// `first` 是这次读取发出的第一个请求（Activity 为元数据读，Turn 为轮次页）。
+fn snapshot(m: &mut Machine, first: &RequestContext, turns: &[(&str, &str)]) -> Vec<Action> {
+    let mut request = status_request(first);
+    let thread = request.params.as_ref().unwrap()["threadId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let active = turns.iter().any(|(_, status)| *status == "inProgress");
+    let descending: Vec<_> = turns.iter().rev().copied().collect();
+    let mut actions = Vec::new();
+    loop {
+        let result = match request.phase {
+            StatusPhase::Metadata => meta(&thread, if active { "active" } else { "idle" }),
+            StatusPhase::Turns => turns_page(&descending, None),
+            StatusPhase::Items => panic!("停止与对账读取不读条目"),
+        };
+        let next = reply_status(m, &request, Ok(result));
+        let follow = status_requests(&next)
+            .into_iter()
+            .find(|r| r.read_id == request.read_id);
+        actions.extend(next);
+        match follow {
+            Some(follow) => request = follow,
+            None => return actions,
+        }
+    }
+}
+/// 请求上下文对应的状态读取请求；不是状态读取则说明用例取错了请求。
+fn status_request(context: &RequestContext) -> StatusRequest {
+    status_requests(&[Action::Request(context.clone())])
+        .pop()
+        .unwrap_or_else(|| panic!("不是状态读取请求：{context:?}"))
 }
 fn err() -> Value {
     proto::error_object(-32000, "测试失败", None)
@@ -678,12 +719,33 @@ fn 四十秒到期请求各自回未确认且认领保留() {
 }
 #[test]
 fn 十五秒核实未知不放行完整成功解除() {
-    for value in [
-        json!({}),
-        json!({"thread":{"turns":null}}),
-        json!({"thread":{"turns":[{"status":"inProgress"}]}}),
-        json!({"thread":{"turns":[]}}),
-    ] {
+    // (元数据回包, 活动线程的轮次页, 是否确认)。只有元数据非 active（Idle）才证明没有活动轮次；
+    // 畸形回包、Active([])（状态 active 但轮次页暂时为空）都不放行。
+    let empty = turns_page(&[], None);
+    let cases = [
+        (json!({}), None, false),
+        (json!({"thread":{"id":"线程"}}), None, false),
+        (
+            json!({"thread":{"id":"线程","status":{"type":"未知"}}}),
+            None,
+            false,
+        ),
+        (
+            meta("线程", "active"),
+            Some(json!({"data":[{"status":"inProgress"}],"nextCursor":null})),
+            false,
+        ),
+        (meta("线程", "active"), Some(empty.clone()), false),
+        (
+            meta("线程", "active"),
+            Some(turns_page(&[("本轮", "completed")], None)),
+            false,
+        ),
+        (meta("线程", "idle"), None, true),
+        (meta("线程", "notLoaded"), None, true),
+        (meta("线程", "systemError"), None, true),
+    ];
+    for (metadata, page, confirmed) in cases {
         let mut m = running();
         let initial = stop(&mut m, 2, false);
         reply(
@@ -692,11 +754,22 @@ fn 十五秒核实未知不放行完整成功解除() {
             Ok(json!({"goal":null})),
         );
         let verify = verification(&mut m, &initial);
-        let read = req(&verify, "thread/read");
+        let read = status_request(&req(&verify, "thread/read"));
         let get = req(&verify, "thread/goal/get");
-        reply(&mut m, &read, Ok(value.clone()));
+        let a = reply_status(&mut m, &read, Ok(metadata.clone()));
+        if let Some(page) = page {
+            let turns = status_requests(&a).pop().expect("活动线程继续分页");
+            assert_eq!(turns.phase, StatusPhase::Turns);
+            reply_status(&mut m, &turns, Ok(page));
+        }
         reply(&mut m, &get, Ok(json!({"goal":null})));
-        assert_eq!(m.claims.is_empty(), value == json!({"thread":{"turns":[]}}));
+        assert_eq!(m.claims.is_empty(), confirmed, "{metadata}");
+        if !confirmed {
+            assert!(
+                !op(&m).turn_absent,
+                "未证明空闲时缺轮证据不成立：{metadata}"
+            );
+        }
     }
 }
 #[test]
@@ -730,10 +803,10 @@ fn 核实同轮活动快照不重复中断() {
         Ok(json!({"goal":null})),
     );
     let verify = verification(&mut m, &initial);
-    reply(
+    snapshot(
         &mut m,
         &req(&verify, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"}]}})),
+        &[("本轮", "inProgress")],
     );
     let a = reply(
         &mut m,
@@ -751,10 +824,10 @@ fn 真完成证据不被陈旧活动快照撤销() {
     reply(&mut m, &get, Err(err()));
     let verify = verification(&mut m, &initial);
     let completed = turn(&mut m, "turn/completed", "本轮");
-    reply(
+    snapshot(
         &mut m,
         &req(&verify, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"}]}})),
+        &[("本轮", "inProgress")],
     );
     assert!(op(&m).ended.contains("本轮"));
     reply(
@@ -786,11 +859,7 @@ fn 核实期间启动目标变活与清除升级分别使旧轮次失效() {
             ),
             _ => stop(&mut m, 3, true),
         };
-        reply(
-            &mut m,
-            &req(&verify, "thread/read"),
-            Ok(json!({"thread":{"turns":[]}})),
-        );
+        snapshot(&mut m, &req(&verify, "thread/read"), &[]);
         reply(
             &mut m,
             &req(&verify, "thread/goal/get"),
@@ -805,11 +874,7 @@ fn 核实期间启动目标变活与清除升级分别使旧轮次失效() {
             reply(&mut m, &get, Ok(json!({"goal":null})));
         }
         let verify = apply(&mut m, successor);
-        reply(
-            &mut m,
-            &req(&verify, "thread/read"),
-            Ok(json!({"thread":{"turns":[]}})),
-        );
+        snapshot(&mut m, &req(&verify, "thread/read"), &[]);
         reply(
             &mut m,
             &req(&verify, "thread/goal/get"),
@@ -830,12 +895,34 @@ fn 过期代号计时器与旧轮次回包无效() {
     );
     let verify = verification(&mut m, &initial);
     let before = m.clone();
-    let mut stale = req(&verify, "thread/read");
-    if let Operation::Stop(tag, ..) = &mut stale.operation {
-        tag.round -= 1;
-    }
-    reply(&mut m, &stale, Ok(json!({"thread":{"turns":[]}})));
-    assert_eq!(m, before);
+    // 旧代号的回包由读取层丢弃；旧轮次的完成结果由处理函数按 round 丢弃。
+    let read = status_request(&req(&verify, "thread/read"));
+    let mut stale = read.clone();
+    stale.context.operation = Operation::StatusRead {
+        read_id: read.read_id,
+        generation: read.generation - 1,
+    };
+    reply_status(&mut m, &stale, Ok(meta("线程", "idle")));
+    assert_eq!(m.status_reads, before.status_reads);
+    assert_eq!(m.stops, before.stops);
+    let mut done = m.clone();
+    let StatusCaller::StopVerify { mut tag } =
+        done.status_reads.reads[&read.read_id].caller.clone()
+    else {
+        panic!("核实读取的调用方")
+    };
+    tag.round -= 1;
+    done.stop_verify_done(
+        StatusDone {
+            read_id: read.read_id,
+            thread: "线程".into(),
+            token: None,
+            caller: StatusCaller::StopVerify { tag },
+            result: StatusResult::Idle,
+        },
+        &mut Vec::new(),
+    );
+    assert_eq!(done, m);
     let mut stale = timer(&initial, |k| {
         matches!(k, TimerKind::Stop(_, StopTimer::Deadline))
     });
@@ -1032,11 +1119,7 @@ fn 启动超时对账找到活动轮次按失败停止并正常确认() {
         );
         let read = req(&a, "thread/read");
         assert!(m.claims["线程"].request_pending);
-        let a = reply(
-            &mut m,
-            &read,
-            Ok(json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"}]}})),
-        );
+        let a = snapshot(&mut m, &read, &[("本轮", "inProgress")]);
         let a = reply(
             &mut m,
             &req(&a, "thread/goal/get"),
@@ -1078,11 +1161,7 @@ fn 超时对账没有活动释放登记迟到按编号中断不碰新认领() {
             error: err(),
         },
     );
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     assert!(m.claims.is_empty());
     assert_eq!(m.stops.late.len(), 1);
     client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
@@ -1118,11 +1197,7 @@ fn 迟到登记期间旧轮次启动只中断旧轮次且完成清除登记() {
             error: err(),
         },
     );
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     m.stops.late[0].turn = Some("旧轮".into());
     let queued = client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
     let new = m.claims["线程"].clone();
@@ -1225,11 +1300,7 @@ fn 迟到登记十分钟过期六十四条上限与关闭清理() {
                 ..
             }
         )));
-        reply(
-            &mut m,
-            &req(&a, "thread/read"),
-            Ok(json!({"thread":{"turns":[]}})),
-        );
+        snapshot(&mut m, &req(&a, "thread/read"), &[]);
         contexts.push(c);
     }
     assert_eq!(m.stops.late.len(), MAX_LATE);
@@ -1319,11 +1390,7 @@ fn 共享启动超时活动快照不能直接当成自有轮次() {
             error: err(),
         },
     );
-    let a = reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"其他轮","status":"inProgress"}]}})),
-    );
+    let a = snapshot(&mut m, &req(&a, "thread/read"), &[("其他轮", "inProgress")]);
     assert!(requests(&a, "thread/goal/get").is_empty());
     assert!(requests(&a, "turn/interrupt").is_empty());
     assert!(m.claims["线程"].settling());
@@ -1373,11 +1440,7 @@ fn 已中断迟到轮次的后续通知不改变新认领() {
             error: err(),
         },
     );
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
     let new = m.claims["线程"].clone();
     let a = apply(
@@ -1443,10 +1506,10 @@ fn 停止核实观察私有新轮次自动中断一次() {
         Ok(json!({"goal":null})),
     );
     let verify = verification(&mut m, &initial);
-    let mut read_actions = reply(
+    let mut read_actions = snapshot(
         &mut m,
         &req(&verify, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"新轮","status":"inProgress"}]}})),
+        &[("新轮", "inProgress")],
     );
     let a = reply(
         &mut m,
@@ -1471,11 +1534,7 @@ fn 核实空快照先到后清除升级不能复用旧轮次放行() {
         Ok(json!({"goal":null})),
     );
     let verify = verification(&mut m, &initial);
-    reply(
-        &mut m,
-        &req(&verify, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&verify, "thread/read"), &[]);
     assert!(op(&m).turn_absent);
     let a = stop(&mut m, 3, true);
     let a = reply(&mut m, &req(&a, "thread/goal/get"), Ok(goal("paused")));
@@ -1765,11 +1824,7 @@ fn 未知目标变更到期前不放行到期后重新核实制动才确认() {
         );
         turn(&mut m, "turn/completed", "本轮");
         let verify = verification(&mut m, &initial);
-        reply(
-            &mut m,
-            &req(&verify, "thread/read"),
-            Ok(json!({"thread":{"turns":[]}})),
-        );
+        snapshot(&mut m, &req(&verify, "thread/read"), &[]);
         let a = reply(
             &mut m,
             &req(&verify, "thread/goal/get"),
@@ -1790,11 +1845,7 @@ fn 未知目标变更到期前不放行到期后重新核实制动才确认() {
         assert!(m.claims.contains_key("线程"));
         assert!(requests(&a, "thread/goal/get").is_empty());
         let verify = apply(&mut m, next_verify);
-        reply(
-            &mut m,
-            &req(&verify, "thread/read"),
-            Ok(json!({"thread":{"turns":[]}})),
-        );
+        snapshot(&mut m, &req(&verify, "thread/read"), &[]);
         let a = reply(&mut m, &req(&verify, "thread/goal/get"), Ok(goal("active")));
         let pause = req(&a, "thread/goal/set");
         assert!(m.claims.contains_key("线程"));
@@ -2036,11 +2087,7 @@ fn 审查超时活动父轮次不授予停止权限迟到回包确定子线程�
             error: err(),
         },
     );
-    let a = reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"父轮","status":"inProgress"}]}})),
-    );
+    let a = snapshot(&mut m, &req(&a, "thread/read"), &[("父轮", "inProgress")]);
     assert!(requests(&a, "thread/goal/get").is_empty());
     assert!(requests(&a, "turn/interrupt").is_empty());
     assert_eq!(m.pending_reviews, 1);
@@ -2083,11 +2130,7 @@ fn 共享释放后迟到启动先按回包编号核实归属且不碰新认领()
                 error: err(),
             },
         );
-        reply(
-            &mut m,
-            &req(&a, "thread/read"),
-            Ok(json!({"thread":{"turns":[]}})),
-        );
+        snapshot(&mut m, &req(&a, "thread/read"), &[]);
         assert!(m.claims.is_empty());
         let a = client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
         let new_context = req(&a, "turn/start");
@@ -2101,12 +2144,12 @@ fn 共享释放后迟到启动先按回包编号核实归属且不碰新认领()
         );
         assert!(requests(&a, "turn/interrupt").is_empty());
         assert_eq!(m.claims["线程"], newer);
-        let a = reply(
+        // 迟到归属在 target_thread 上按轮次查找旧轮：命中且在活动才取得自有证据；
+        // 遍历完未命中、元数据非 active 则不存在，结束跟踪。
+        let a = snapshot(
             &mut m,
-            &req(&a, "thread/read"),
-            Ok(
-                json!({"thread":{"turns":[{"id":if own {"旧轮"}else{"别人轮"},"status":"inProgress"}]}}),
-            ),
+            &req(&a, "thread/turns/list"),
+            &[(if own { "旧轮" } else { "别人轮" }, "inProgress")],
         );
         let a = if own {
             reply(
@@ -2159,11 +2202,7 @@ fn 旧超时启动加入释放新连接认领后旧成功回包不改变新认�
     );
     assert!(!requests(&a, "turn/start").is_empty());
     let newer = m.claims["线程"].clone();
-    let a = reply(
-        &mut m,
-        &old_read,
-        Ok(json!({"thread":{"turns":[{"id":"别人轮","status":"inProgress"}]}})),
-    );
+    let a = snapshot(&mut m, &old_read, &[("别人轮", "inProgress")]);
     assert!(requests(&a, "turn/interrupt").is_empty());
     let a = apply(
         &mut m,
@@ -2194,7 +2233,7 @@ fn 对账认领过期转为旧请求跟踪迟到只按旧编号中断() {
     let a = client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
     let _ = req(&a, "turn/start");
     let newer = m.claims["线程"].clone();
-    reply(&mut m, &old, Ok(json!({"thread":{"turns":[]}})));
+    snapshot(&mut m, &old, &[]);
     let a = apply(
         &mut m,
         Event::LateReply {
@@ -2232,19 +2271,11 @@ fn 核实期间客户端目标写失败无通知旧双读失效后下一轮可�
     });
     reply(&mut m, &req(&verify, "thread/goal/get"), Ok(goal("paused")));
     reply(&mut m, &req(&changed, "thread/goal/set"), Err(err()));
-    reply(
-        &mut m,
-        &req(&verify, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&verify, "thread/read"), &[]);
     assert!(!op(&m).verifying);
     assert!(m.claims.contains_key("线程"));
     let verify = apply(&mut m, successor);
-    reply(
-        &mut m,
-        &req(&verify, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&verify, "thread/read"), &[]);
     let a = reply(
         &mut m,
         &req(&verify, "thread/goal/get"),
@@ -2272,11 +2303,7 @@ fn 核实目标读版本拒用时结束轮次并安排后继() {
         reply(&mut m, &get, Ok(json!({"goal":null})));
     }
     let verify = apply(&mut m, successor);
-    reply(
-        &mut m,
-        &req(&verify, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&verify, "thread/read"), &[]);
     reply(
         &mut m,
         &req(&verify, "thread/goal/get"),
@@ -2344,11 +2371,7 @@ fn 审查超时跟踪迟到失败过期淘汰与关闭各结算一次计数() {
                 ..
             }
         )));
-        reply(
-            &mut m,
-            &req(&a, "thread/read"),
-            Ok(json!({"thread":{"turns":[{"id":"父轮","status":"inProgress"}]}})),
-        );
+        snapshot(&mut m, &req(&a, "thread/read"), &[("父轮", "inProgress")]);
         apply(
             &mut m,
             Event::Notification {
@@ -2411,11 +2434,7 @@ fn 线上等待截止不延长回包消费后另给收尾期() {
             ..
         }
     )));
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     assert_eq!(m.stops.late[0].deadline, deadline);
     let a = apply(
         &mut m,
@@ -2495,11 +2514,7 @@ fn 审查超时父线程没有活动也继续等子线程权威回包() {
             error: err(),
         },
     );
-    let a = reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    let a = snapshot(&mut m, &req(&a, "thread/read"), &[]);
     assert!(m.claims.contains_key("线程"));
     assert_eq!(m.pending_reviews, 1);
     assert!(requests(&a, "turn/interrupt").is_empty());
@@ -2529,17 +2544,14 @@ fn 共享迟到轮次与新认领重合时不按旧请求停止新任务() {
             error: err(),
         },
     );
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     let a = client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
     let a = reply(
         &mut m,
         &req(&a, "turn/start"),
         Ok(json!({"turn":{"id":"新轮"}})),
     );
+    // 新认领的共享吸收判定（settling 读取，不属于本路迁移）仍按全量快照回答。
     reply(
         &mut m,
         &req(&a, "thread/read"),
@@ -2553,10 +2565,11 @@ fn 共享迟到轮次与新认领重合时不按旧请求停止新任务() {
             result: Ok(json!({"turn":{"id":"新轮"}})),
         },
     );
-    let a = reply(
+    // 迟到归属按轮次分页查找（Turn），第一页命中即停。
+    let a = snapshot(
         &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"新轮","status":"inProgress"}]}})),
+        &req(&a, "thread/turns/list"),
+        &[("新轮", "inProgress")],
     );
     assert!(requests(&a, "turn/interrupt").is_empty());
     assert_eq!(m.claims["线程"], newer);
@@ -2595,11 +2608,7 @@ fn 已对账自有轮次的迟到回包仍等待目标制动再中断() {
             error: err(),
         },
     );
-    let a = reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"}]}})),
-    );
+    let a = snapshot(&mut m, &req(&a, "thread/read"), &[("本轮", "inProgress")]);
     let get = req(&a, "thread/goal/get");
     let a = apply(
         &mut m,
@@ -2626,11 +2635,7 @@ fn 已对账自有轮次的迟到启动通知先制动且只中断一次() {
             error: err(),
         },
     );
-    let a = reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"}]}})),
-    );
+    let a = snapshot(&mut m, &req(&a, "thread/read"), &[("本轮", "inProgress")]);
     let get = req(&a, "thread/goal/get");
     let a = turn(&mut m, "turn/started", "本轮");
     assert!(requests(&a, "turn/interrupt").is_empty());
@@ -2659,11 +2664,7 @@ fn 纯迟到启动通知读取并暂停目标后才按编号中断一次() {
             error: err(),
         },
     );
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     m.stops.late[0].turn = Some("旧轮".into());
     let a = turn(&mut m, "turn/started", "旧轮");
     let get = req(&a, "thread/goal/get");
@@ -2691,11 +2692,7 @@ fn 后来认领目标活跃时纯迟到制动等待其释放() {
             error: err(),
         },
     );
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     let a = client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
     reply(
         &mut m,
@@ -2836,7 +2833,7 @@ fn 迟到回包已到但定案失败超过六十四条仍限额并结算审查�
         evicted |= a
             .iter()
             .any(|action| matches!(action, Action::ForgetLate { tag: 34 }));
-        let read = req(&a, "thread/read");
+        let read = req(&a, "thread/turns/list");
         reply(&mut m, &read, Err(err()));
         assert!(m.stops.late.len() <= MAX_LATE);
         assert!(m.stream_slots.len() <= MAX_UNRESOLVED_STARTS);
@@ -3074,11 +3071,7 @@ fn 对账失败指数退避到五分钟完整结果后清零() {
         );
         read = req(&a, "thread/read");
     }
-    let a = reply(
-        &mut m,
-        &read,
-        Ok(json!({"thread":{"turns":[{"id":"别人的轮","status":"inProgress"}]}})),
-    );
+    let a = snapshot(&mut m, &read, &[("别人的轮", "inProgress")]);
     assert_eq!(
         scheduled_delay(&a, |k| matches!(k, TimerKind::Reconcile { .. })),
         VERIFY_MS
@@ -3178,7 +3171,7 @@ fn 六十四项未结清对账拒绝新开工结清一项后放行() {
         json!({"threadId":"线程0"}),
     );
     assert_eq!(requests(&a, "thread/goal/get").len(), 1);
-    reply(&mut m, &reads[0], Ok(json!({"thread":{"turns":[]}})));
+    snapshot(&mut m, &reads[0], &[]);
     assert_eq!(m.stops.reconciliations.len(), 63);
     assert!(m.claims.contains_key("线程1"));
     m.records.entry("新线程".into()).or_default().subscribed = true;
@@ -3242,12 +3235,10 @@ fn 停止证据只记目标及自有轮次无关完成不使集合增长() {
     let a = reply(&mut m, &pause, Ok(goal("paused")));
     assert_eq!(req(&a, "turn/interrupt").params.unwrap()["turnId"], "新轮");
     let verify = verification(&mut m, &initial);
-    reply(
+    snapshot(
         &mut m,
         &req(&verify, "thread/read"),
-        Ok(
-            json!({"thread":{"turns":[{"id":"本轮","status":"inProgress"},{"id":"新轮","status":"inProgress"}]}}),
-        ),
+        &[("本轮", "inProgress"), ("新轮", "inProgress")],
     );
     reply(&mut m, &req(&verify, "thread/goal/get"), Ok(goal("paused")));
     assert!(m.claims.contains_key("线程"));
@@ -3287,11 +3278,7 @@ fn 停止操作保留发起前本认领自有完成证据并排除历史外部�
 fn orphan_pause() -> (Machine, RequestContext) {
     let (mut m, c) = started(false, "turn/start");
     let a = begin_unresolved(&mut m, &c, 60);
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     let a = apply(
         &mut m,
         Event::LateReply {
@@ -3491,7 +3478,7 @@ fn 集中受理含恢复屏障的启动最多六十四个超时沿用名额() {
             assert_eq!(m.stream_slots.len(), 64);
             assert_eq!(m.stops.reconciliations.len(), 64);
             if method == "turn/start" {
-                reply(&mut m, &reads[0], Ok(json!({"thread":{"turns":[]}})));
+                snapshot(&mut m, &reads[0], &[]);
             } else {
                 apply(
                     &mut m,
@@ -3718,11 +3705,7 @@ fn 未知暂停被迟到登记上限挤出后屏障保留到原截止再解除()
 fn 收尾期到后读回目标活跃且线程已有后来认领时结束旧跟踪() {
     let (mut m, c) = started(false, "turn/start");
     let a = begin_unresolved(&mut m, &c, 32);
-    reply(
-        &mut m,
-        &req(&a, "thread/read"),
-        Ok(json!({"thread":{"turns":[]}})),
-    );
+    snapshot(&mut m, &req(&a, "thread/read"), &[]);
     let a = client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
     reply(
         &mut m,
@@ -3867,12 +3850,9 @@ fn 丢失运行核实不采用历史完成且实际线程立即双读() {
     assert!(!m.runs.hook_log.iter().any(|h| h == "run_stop_began"));
     let read = req(&actions, "thread/read");
     assert_eq!(read.params.as_ref().unwrap()["threadId"], "子线程");
-    assert_eq!(read.params.as_ref().unwrap()["includeTurns"], true);
-    reply(
-        &mut m,
-        &read,
-        Ok(json!({"thread":{"turns":[{"id":"当前轮","status":"inProgress"}]}})),
-    );
+    // H2：只读元数据，不再带 includeTurns。
+    assert!(read.params.as_ref().unwrap().get("includeTurns").is_none());
+    snapshot(&mut m, &read, &[("当前轮", "inProgress")]);
     let a = reply(
         &mut m,
         &req(&actions, "thread/goal/get"),
@@ -3887,11 +3867,7 @@ fn 丢失运行核实不采用历史完成且实际线程立即双读() {
 
 #[test]
 fn 丢失运行未知读取不放行且确认不释放认领() {
-    for result in [
-        Err(err()),
-        Ok(json!({})),
-        Ok(json!({"thread":{"turns":[]}})),
-    ] {
+    for result in [Err(err()), Ok(json!({})), Ok(meta("线程", "idle"))] {
         let mut m = Machine::default();
         let mut a = Vec::new();
         m.begin_lost_stop("线程", "丢失运行", false, &mut a);
@@ -3901,10 +3877,7 @@ fn 丢失运行未知读取不放行且确认不释放认领() {
             &req(&a, "thread/goal/get"),
             Ok(json!({"goal":null})),
         );
-        let confirmed = result
-            .as_ref()
-            .ok()
-            .is_some_and(|v| v.get("thread").is_some());
+        let confirmed = result.as_ref().ok() == Some(&meta("线程", "idle"));
         assert_eq!(
             m.runs.hook_log.iter().any(|h| h == "run_stop_confirmed"),
             confirmed

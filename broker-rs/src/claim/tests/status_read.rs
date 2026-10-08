@@ -1331,11 +1331,8 @@ fn 关闭时静默取消在途读取() {
 
 #[test]
 fn 完成按调用方分派到各处理函数() {
+    // ContinueCheck、StopVerify、Reconcile、LateSettlement 已由 H2-b 实现，分派由各自的用例覆盖。
     for (caller, warning) in [
-        (
-            StatusCaller::ContinueCheck { round: 1 },
-            "H2 调用点尚未迁移",
-        ),
         (StatusCaller::Settlement { attempt: 0 }, "H2 调用点尚未迁移"),
         (
             StatusCaller::DerivedStopVerify {

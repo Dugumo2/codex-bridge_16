@@ -7,7 +7,8 @@
 //                      review/start 默认 inline；显式 MOCK_E2E_LEGACY_REVIEW 才允许 detached，在审查线程上先后提问两次，答完以审查结论完成；
 //   MOCK_E2E_LOG：每条收到的请求、对服务端请求的回包各追加一行 JSON，供用例断言载荷与「恰好一次」；启动时记一行 boot（含 pid）；
 //   MOCK_E2E_TRIGGER：ask-cancel 场景里出现该文件即撤销提问；
-//   MOCK_E2E_BUSY：该文件存在时 thread/read 报告一个 inProgress 的 turn（模拟 broker 重启后核实不通过）。
+//   MOCK_E2E_BUSY：该文件存在时 thread/read 报告一个 inProgress 的 turn（模拟 broker 重启后核实不通过），元数据状态为 active；
+//                  未启用 MOCK_STATUS_READ 时 thread/turns/list 也只给出这一轮（broker 的状态读取层先读元数据、再分页）。
 //   MOCK_E2E_LONG_HISTORY=1：独立开关，仅恢复未排除历史时回约 12 MiB 历史，不改变场景选择。
 //   MOCK_STATUS_READ：状态读取的分页与历史选项（JSON，StatusReadMockOptions），默认关闭；开启后由
 //                     test-support/status-history.ts 接管 thread/read、thread/turns/list、thread/items/list。
@@ -49,6 +50,10 @@ const completedTurns = new Map<string, unknown[]>();
 const heldReads: Array<{ id: unknown; threadId: string }> = [];
 let resultsReleased = false;
 const heldLifecycle: Array<{ id: unknown; method: string; threadId: string }> = [];
+
+function busy(): boolean {
+  return !!busyFlag && existsSync(busyFlag);
+}
 
 function gate(name: string): boolean {
   return !gateDir || existsSync(`${gateDir}/${name}`);
@@ -271,7 +276,16 @@ process.stdin.on("data", (chunk: string) => {
           break;
         }
         send({ id: msg.id, result: { thread: { ...thread(threadId),
-          turns: busyFlag && existsSync(busyFlag) ? [{ id: "turn-lost", items: [], status: "inProgress", error: null }] : completedTurns.get(threadId) ?? [] } } });
+          ...(busy() ? { status: { type: "active", activeFlags: [] } } : {}),
+          turns: busy() ? [{ id: "turn-lost", items: [], status: "inProgress", error: null }] : completedTurns.get(threadId) ?? [] } } });
+        break;
+      case "thread/turns/list":
+        if (!busy()) {
+          send({ id: msg.id, error: { code: -32601, message: `模拟 codex 不支持 ${msg.method}` } });
+          break;
+        }
+        send({ id: msg.id, result: { data: [{ id: "turn-lost", items: [], itemsView: "notLoaded", status: "inProgress", error: null }],
+          nextCursor: null, backwardsCursor: null } });
         break;
       case "fixture/releaseResult":
         resultsReleased = true;

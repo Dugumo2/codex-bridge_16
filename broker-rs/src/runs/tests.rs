@@ -1521,7 +1521,8 @@ fn 父线程新运行后子线程失联审查仍受保护并进入实际线程�
             Action::Request(context)
                 if matches!(
                     &context.operation,
-                    Operation::Stop(_, StopRequest::VerifyTurn | StopRequest::VerifyGoal { .. })
+                    Operation::Stop(_, StopRequest::VerifyGoal { .. })
+                        | Operation::StatusRead { .. }
                 ) =>
             {
                 Some(context.clone())
@@ -1546,8 +1547,10 @@ fn 父线程新运行后子线程失联审查仍受保护并进入实际线程�
     ));
     m.clock.now_ms += 1;
     for context in verification {
+        // 活动轮次经状态读取层核实：元数据非 active 即 Idle，不再读全量历史。
         let result = if context.method == "thread/read" {
-            json!({"thread":{"id":"子线程","turns":[]}})
+            assert_eq!(context.params, Some(json!({"threadId":"子线程"})));
+            json!({"thread":{"id":"子线程","status":{"type":"idle"}}})
         } else {
             json!({"goal":null})
         };

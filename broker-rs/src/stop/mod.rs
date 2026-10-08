@@ -5,8 +5,9 @@ pub mod derived;
 pub mod tree;
 
 use crate::claim::{
-    status_read::StatusCaller, Action, ClaimToken, ClientRequest, ConnId, Machine, Operation,
-    RequestContext, State, StopReason, TimerKind,
+    status_read::{StatusCaller, StatusDone, StatusQuery, StatusResult, StatusTurn},
+    Action, ClaimToken, ClientRequest, ConnId, Machine, Operation, RequestContext, State,
+    StopReason, TimerKind,
 };
 use crate::proto::{self, code};
 use crate::runs::{ReleaseKind, RunState, StopCheck, StopOutcome};
@@ -35,7 +36,6 @@ pub struct StopTag {
 pub enum StopRequest {
     GoalGet { version: u64 },
     GoalWrite { version: u64, clear: bool },
-    VerifyTurn,
     VerifyGoal { version: u64 },
     Interrupt { turn: String },
 }
@@ -813,20 +813,21 @@ impl Machine {
         id
     }
 
-    fn start_verification(&self, id: &str, op: &mut StopOp, actions: &mut Vec<Action>) {
+    fn start_verification(&mut self, id: &str, op: &mut StopOp, actions: &mut Vec<Action>) {
         op.invalidate_round();
         op.verifying = true;
         op.verification_pending = true;
         op.read_done = false;
         op.goal_read_done = false;
         op.goal_attempted = true;
-        stop_request(
-            id,
-            op,
-            op.round,
-            StopRequest::VerifyTurn,
-            "thread/read",
-            json!({"threadId":op.thread,"includeTurns":true}),
+        // H2：活动轮次集合经状态读取层（Activity）取得，回到 `stop_verify_done`；不再发全量读。
+        self.begin_status_read(
+            &op.thread,
+            Some(op.token()),
+            StatusQuery::Activity,
+            StatusCaller::StopVerify {
+                tag: op.tag(id, op.round),
+            },
             actions,
         );
         stop_request(
@@ -1379,64 +1380,31 @@ impl Machine {
                     op.goal_attempted = false;
                 }
             }
-            StopRequest::VerifyTurn => {
-                if !op.verifying || op.round != tag.round {
-                    self.stops.operations.insert(tag.id, op);
-                    return;
-                }
-                op.read_done = true;
-                if let Some(active) = strict_active(&result) {
-                    let active: Vec<_> = active
-                        .into_iter()
-                        .filter(|t| !op.ended.contains(t))
-                        .collect();
-                    // 不把共享服务器上未观察到的其他 turn 认成自己的。
-                    op.turn_absent = active.is_empty();
-                    op.snapshot_absent = op.turn_absent.then_some(op.round);
-                    if !self.shared || (op.claim_id.is_none() && op.run_id.is_some()) {
-                        if let Some(turn) = active.first() {
-                            if op.target.as_ref() != Some(turn) {
-                                op.target = Some(turn.clone());
-                                if let Some(claim) = self.claims.get_mut(&op.thread) {
-                                    match &mut claim.state {
-                                        State::Running { turn_id, .. } => *turn_id = turn.clone(),
-                                        State::Starting { turn_id, .. } => {
-                                            *turn_id = Some(turn.clone())
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                self.record_run_turn_started(&op.thread, turn, actions);
-                            }
-                        }
-                    }
-                } else {
-                    actions.push(Action::Warn(format!(
-                        "线程 {} 的停止核实读取未知，保留占用",
-                        op.thread
-                    )));
-                }
-            }
         }
+        self.verification_step_done(&tag.id, &mut op, actions);
+        self.stops.operations.insert(tag.id, op);
+    }
+
+    /// 停止核实的一份读取（活动轮次或 goal）已处理：两份都齐后结束本轮核实并预约下一轮。
+    fn verification_step_done(&mut self, id: &str, op: &mut StopOp, actions: &mut Vec<Action>) {
         if op.verifying && op.read_done && op.goal_read_done {
-            let tree_owned = self.root_stop_report(&op, tree::RootStopStage::Verified, actions);
+            let tree_owned = self.root_stop_report(op, tree::RootStopStage::Verified, actions);
             if !tree_owned
-                && (!self.confirmed(&op) || op.goal_busy || (op.clear && !op.clear_done))
+                && (!self.confirmed(op) || op.goal_busy || (op.clear && !op.clear_done))
                 && !op.already_stopped
             {
                 if let Some(run) = &op.run_id {
-                    self.run_stop_check(run, self.stop_check(&op), actions);
+                    self.run_stop_check(run, self.stop_check(op), actions);
                 }
             }
             op.verifying = false;
             op.verification_pending = false;
             actions.push(Action::Schedule {
                 token: op.token(),
-                kind: TimerKind::Stop(op.tag(&tag.id, op.verify_timer), StopTimer::Verify),
+                kind: TimerKind::Stop(op.tag(id, op.verify_timer), StopTimer::Verify),
                 delay_ms: VERIFY_MS,
             });
         }
-        self.stops.operations.insert(tag.id, op);
     }
 
     pub(crate) fn stop_timer(&mut self, tag: StopTag, kind: StopTimer, actions: &mut Vec<Action>) {
@@ -1890,7 +1858,7 @@ impl Machine {
             generation,
         } = context.operation
         {
-            // H2：对账与迟到归属改用状态读取后，按 StatusCaller 识别，效果与原 Operation 判定相同。
+            // H2：对账与迟到归属经状态读取，按 StatusCaller 识别当前登记，置无响应并告警。
             let current_reconcile = match self.status_read_caller(read_id, generation) {
                 Some(StatusCaller::Reconcile { generation, round }) => self
                     .stops
@@ -1921,25 +1889,6 @@ impl Machine {
         }
         let before = actions.len();
         self.unwrap_goal_reply(&mut context, &Err(error.clone()), true, actions);
-        let current_reconcile = match context.operation {
-            Operation::Reconcile { generation, round } => self
-                .stops
-                .reconciliations
-                .get(&generation)
-                .is_some_and(|reg| reg.round == round),
-            Operation::LateSettlement { generation, round } => {
-                self.stops.late.iter().any(|reg| {
-                    reg.generation == generation && reg.round == round && reg.late_settling
-                })
-            }
-            _ => false,
-        };
-        if current_reconcile && !self.app_server_unresponsive {
-            self.app_server_unresponsive = true;
-            actions.push(Action::Warn(
-                "流式启动和后续对账读取均超时，Codex 无响应，暂停接收新的流式请求".into(),
-            ));
-        }
         // 等待线上 goal 回包时不另开截止竞争入口，RPC 的有序丢弃事件负责过期。
         let mut index = before;
         while index < actions.len() {
@@ -2035,6 +1984,7 @@ impl Machine {
             self.apply_reply(context, Err(error), actions);
         }
     }
+    /// 启动超时对账读取：活动轮次集合经状态读取层（Activity）取得，回到 `reconcile_status_done`。
     fn begin_reconcile(
         &mut self,
         token: ClaimToken,
@@ -2042,16 +1992,14 @@ impl Machine {
         round: u64,
         actions: &mut Vec<Action>,
     ) {
-        actions.push(Action::Request(RequestContext {
-            resume_retried: false,
-            stream_id: None,
-            review_id: None,
-            client: None,
-            params: Some(json!({"threadId":token.thread_id,"includeTurns":true})),
-            token: Some(token),
-            operation: Operation::Reconcile { generation, round },
-            method: "thread/read".into(),
-        }));
+        let thread = token.thread_id.clone();
+        self.begin_status_read(
+            &thread,
+            Some(token),
+            StatusQuery::Activity,
+            StatusCaller::Reconcile { generation, round },
+            actions,
+        );
     }
     fn retry_reconcile(
         &mut self,
@@ -2073,14 +2021,17 @@ impl Machine {
             .reconciliations
             .insert(registration.generation, registration);
     }
-    pub(crate) fn reconcile_reply(
-        &mut self,
-        _context: &RequestContext,
-        generation: u64,
-        round: u64,
-        result: Result<Value, Value>,
-        actions: &mut Vec<Action>,
-    ) {
+    /// 启动超时对账的读取完成。有效性沿用原写法：登记按 generation、round 是当前的才处理；
+    /// 认领已过期（token 不再当前）时不看结果，转入迟到跟踪收尾。
+    ///
+    /// - `Idle`：线程上没有活动轮次，启动未生效，释放（或交给进行中的停止）；
+    /// - `Active(ids)`：私有档取升序第一个；共享档仍要求本认领自己观察到的 started 证据。
+    ///   `Active([])`（状态 active、轮次暂不在存储页里）没有可认领的轮次，继续对账，不算失败；
+    /// - `Unknown`：按失败退避重试；review 不论结果都等待子线程的权威回包，只是否算失败不同。
+    pub fn reconcile_status_done(&mut self, done: StatusDone, actions: &mut Vec<Action>) {
+        let StatusCaller::Reconcile { generation, round } = done.caller else {
+            return;
+        };
         if self.closing {
             return;
         }
@@ -2100,7 +2051,12 @@ impl Machine {
             self.push_late(registration, actions);
             return;
         }
-        let active = strict_active(&result);
+        // 只有 Idle 证明没有活动轮次；Active([]) 不是 Idle。
+        let (idle, active) = match done.result {
+            StatusResult::Idle => (true, Some(Vec::new())),
+            StatusResult::Active(ids) => (false, Some(ids)),
+            _ => (false, None),
+        };
         if active.is_some() {
             registration.reconcile_delay_ms = 0;
         }
@@ -2110,7 +2066,7 @@ impl Machine {
             return;
         }
         match active {
-            Some(active) if active.is_empty() => {
+            Some(_) if idle => {
                 self.release_stream_slot(registration.stream_id);
                 self.stops.reconciliations.remove(&generation);
                 registration.reconciling = false;
@@ -2482,40 +2438,63 @@ impl Machine {
             self.interrupt_late(generation, actions);
         }
     }
+    /// 迟到启动的归属读取：在 `reg.target_thread`（review 为子线程）上按轮次查 `reg.turn`
+    /// （Turn 查询），回到 `late_settlement_status_done`。
     fn begin_late_settlement(&mut self, generation: u64, actions: &mut Vec<Action>) {
         let Some(reg) = self.stops.late.iter().find(|l| l.generation == generation) else {
             return;
         };
-        actions.push(Action::Request(RequestContext {
-            resume_retried: false,
-            stream_id: None,
-            review_id: None,
-            client: None,
-            token: Some(reg.token.clone()),
-            operation: Operation::LateSettlement {
-                generation,
-                round: reg.round,
-            },
-            method: "thread/read".into(),
-            params: Some(json!({"threadId":reg.target_thread,"includeTurns":true})),
-        }));
-    }
-    pub(crate) fn late_settlement_reply(
-        &mut self,
-        generation: u64,
-        round: u64,
-        result: Result<Value, Value>,
-        actions: &mut Vec<Action>,
-    ) {
-        let Some(index) = self
-            .stops
-            .late
-            .iter()
-            .position(|l| l.generation == generation && l.round == round && l.late_settling)
-        else {
+        let (thread, token, round) = (reg.target_thread.clone(), reg.token.clone(), reg.round);
+        let Some(target) = reg.turn.clone() else {
+            // 迟到回包已给出轮次才会进入归属核实；没有目标就没有可取得的自有证据，直接收尾。
+            let index = self
+                .stops
+                .late
+                .iter()
+                .position(|l| l.generation == generation)
+                .expect("登记存在");
+            let reg = self.stops.late.remove(index).unwrap();
+            self.finish_tracking(reg, actions);
             return;
         };
-        let Some(active) = strict_active(&result) else {
+        self.begin_status_read(
+            &thread,
+            Some(token),
+            StatusQuery::Turn { target },
+            StatusCaller::LateSettlement { generation, round },
+            actions,
+        );
+    }
+    /// 迟到启动归属读取完成。有效性沿用原写法：按 generation、round 且仍在 `late_settling`；
+    /// 本来就允许旧 token，不按认领丢弃。
+    ///
+    /// - `Found{inProgress}`：目标在活动，取得自有证据，转入迟到中断；
+    /// - `Absent` 或 `Found{终态}`：目标已不在活动（或从未出现），结束跟踪；
+    /// - `Unknown`（含第一页未命中后的 `NotVisible`、-32601、超时、无响应）：退避重试，不结束跟踪。
+    pub fn late_settlement_status_done(&mut self, done: StatusDone, actions: &mut Vec<Action>) {
+        let StatusCaller::LateSettlement { generation, round } = done.caller else {
+            return;
+        };
+        if self.closing {
+            return;
+        }
+        let Some(index) = self.stops.late.iter().position(|l| {
+            l.generation == generation
+                && l.round == round
+                && l.late_settling
+                && l.target_thread == done.thread
+        }) else {
+            return;
+        };
+        let owned = match done.result {
+            StatusResult::Found {
+                status: StatusTurn::InProgress,
+                ..
+            } => Some(true),
+            StatusResult::Found { .. } | StatusResult::Absent => Some(false),
+            _ => None,
+        };
+        let Some(owned) = owned else {
             let reg = &mut self.stops.late[index];
             reg.round += 1;
             let delay_ms = reconcile_delay(&mut reg.reconcile_delay_ms, true);
@@ -2532,7 +2511,7 @@ impl Machine {
         let mut reg = self.stops.late.remove(index).unwrap();
         reg.reconcile_delay_ms = 0;
         // 与 settling 相同：成功回包编号与活动编号一致才取得自有证据。
-        if !active.is_empty() && reg.turn.as_ref().is_some_and(|turn| active.contains(turn)) {
+        if owned {
             reg.ownership_proven = true;
             reg.late_settling = false;
             self.push_late(reg, actions);
@@ -3063,28 +3042,6 @@ fn read_goal(result: &Result<Value, Value>) -> Option<Option<Value>> {
         }
     }
 }
-/// 核实与超时对账采用从严解析，字段缺失或任意 turn 形状错误均为未知。
-pub(crate) fn strict_active(result: &Result<Value, Value>) -> Option<Vec<String>> {
-    let turns = result
-        .as_ref()
-        .ok()?
-        .get("thread")?
-        .get("turns")?
-        .as_array()?;
-    let mut active = Vec::new();
-    for turn in turns {
-        let id = turn.get("id")?.as_str()?;
-        let status = turn.get("status")?.as_str()?;
-        if id.is_empty() {
-            return None;
-        }
-        if status == "inProgress" {
-            active.push(id.into());
-        }
-    }
-    Some(active)
-}
-
 fn claim_settling(machine: &Machine, token: &ClaimToken) -> bool {
     machine
         .claims
@@ -3108,25 +3065,74 @@ fn reconcile_delay(previous: &mut u64, failed: bool) -> u64 {
 }
 
 impl Machine {
-    pub fn stop_verify_done(
-        &mut self,
-        _done: crate::claim::status_read::StatusDone,
-        actions: &mut Vec<Action>,
-    ) {
-        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
-    }
-    pub fn reconcile_status_done(
-        &mut self,
-        _done: crate::claim::status_read::StatusDone,
-        actions: &mut Vec<Action>,
-    ) {
-        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
-    }
-    pub fn late_settlement_status_done(
-        &mut self,
-        _done: crate::claim::status_read::StatusDone,
-        actions: &mut Vec<Action>,
-    ) {
-        actions.push(Action::Warn("H2 调用点尚未迁移".into()));
+    /// 停止核实的活动轮次读取完成。有效性沿用原核实读的口径：操作仍在、代号相同、正在核实且
+    /// round 是当前轮（目标、goal、认领变化都会推进 round），否则丢弃。
+    ///
+    /// - `Idle`：线程上没有活动轮次，`turn_absent` 成立（本轮快照，换轮即撤销）；
+    /// - `Active(ids)`：先扣除已收到结束通知的轮次。`turn_absent` 不成立——即使过滤后为空，
+    ///   或 `Active([])`（状态 active、轮次暂不在存储页里），都不能当作线程空闲；
+    ///   已独立收到的 completed 证据（`ended`）原样保留，照常参与确认。
+    ///   私有档（或无认领的丢失运行）把过滤后升序第一个设为中断目标；共享档不把未观察到的
+    ///   其他轮次认成自己的；
+    /// - `Unknown`：保留占用，本份读取视为已完成，等下一轮核实。
+    pub fn stop_verify_done(&mut self, done: StatusDone, actions: &mut Vec<Action>) {
+        let StatusCaller::StopVerify { tag } = done.caller else {
+            return;
+        };
+        if self.closing {
+            return;
+        }
+        let Some(mut op) = self.stops.operations.remove(&tag.id) else {
+            return;
+        };
+        if op.generation != tag.generation
+            || !op.verifying
+            || op.round != tag.round
+            || op.thread != done.thread
+        {
+            self.stops.operations.insert(tag.id, op);
+            return;
+        }
+        op.read_done = true;
+        match done.result {
+            StatusResult::Idle => {
+                op.turn_absent = true;
+                op.snapshot_absent = Some(op.round);
+            }
+            StatusResult::Active(active) => {
+                let active: Vec<_> = active
+                    .into_iter()
+                    .filter(|t| !op.ended.contains(t))
+                    .collect();
+                op.turn_absent = false;
+                op.snapshot_absent = None;
+                // 不把共享服务器上未观察到的其他 turn 认成自己的。
+                if !self.shared || (op.claim_id.is_none() && op.run_id.is_some()) {
+                    if let Some(turn) = active.first() {
+                        if op.target.as_ref() != Some(turn) {
+                            op.target = Some(turn.clone());
+                            if let Some(claim) = self.claims.get_mut(&op.thread) {
+                                match &mut claim.state {
+                                    State::Running { turn_id, .. } => *turn_id = turn.clone(),
+                                    State::Starting { turn_id, .. } => {
+                                        *turn_id = Some(turn.clone())
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            self.record_run_turn_started(&op.thread, turn, actions);
+                        }
+                    }
+                }
+            }
+            _ => {
+                actions.push(Action::Warn(format!(
+                    "线程 {} 的停止核实读取未知，保留占用",
+                    op.thread
+                )));
+            }
+        }
+        self.verification_step_done(&tag.id, &mut op, actions);
+        self.stops.operations.insert(tag.id, op);
     }
 }
