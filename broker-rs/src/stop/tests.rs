@@ -14,7 +14,7 @@ use std::time::Instant;
 fn apply(m: &mut Machine, event: Event) -> Vec<Action> {
     let (next, actions) = claim::step(std::mem::take(m), event);
     *m = next;
-    actions
+    crate::test_support::background::empty_background(m, actions)
 }
 fn client(m: &mut Machine, method: &str, id: u64, params: Value) -> Vec<Action> {
     apply(
@@ -307,6 +307,7 @@ fn 唯一判定四项分别缺一均不放行() {
     stop(&mut m, 2, false);
     let id = m.stop_key("线程").unwrap();
     let mut base = op(&m).clone();
+    base.background.finish();
     base.turn_absent = true;
     base.brake_version = Some(m.stops.version("线程"));
     assert!(m.confirmed(&base));
@@ -3779,10 +3780,11 @@ fn 五项展示与原停止判定逐项等价() {
     let mut base = running();
     stop(&mut base, 2, false);
     let original = op(&base).clone();
-    for flags in 0..1024 {
+    for flags in 0..2048 {
         let mut m = base.clone();
         let mut candidate = original.clone();
         let bit = |n| flags & (1 << n) != 0;
+        candidate.background.confirmed = bit(10);
         candidate.foreign_claim = bit(0);
         candidate.turn_absent = bit(1);
         if bit(2) {
@@ -3812,7 +3814,8 @@ fn 五项展示与原停止判定逐项等价() {
         let claim = candidate
             .claim_id
             .and_then(|id| m.claims.get(&candidate.thread).filter(|c| c.claim_id == id));
-        let before = !candidate.foreign_claim
+        let before = candidate.background.confirmed
+            && !candidate.foreign_claim
             && claim.is_none_or(|c| !c.settling() && !c.joined())
             && (candidate.turn_absent
                 || candidate
@@ -3848,8 +3851,8 @@ fn 停止钩子只在唯一判定通过后确认并先于释放() {
     assert!(!m.runs.hook_log.iter().any(|h| h == "run_stop_confirmed"));
     let a = turn(&mut m, "turn/completed", "本轮");
     assert_eq!(
-        &m.runs.hook_log[m.runs.hook_log.len() - 3..],
-        ["run_turn_completed", "run_stop_confirmed", "run_released"]
+        &m.runs.hook_log[m.runs.hook_log.len() - 2..],
+        ["run_stop_confirmed", "run_released"]
     );
     // 乙路账本合入后，回包的 run 是更新之后的运行快照（任务说明 8.1 第 13 条）。
     let reply = outcome(&a, 2);
@@ -4126,7 +4129,7 @@ fn 按运行停止拒绝换代和未知认领且旧终态不影响新运行() {
         91,
         json!({"threadId":"线程","runId":"old","clear":true}),
     );
-    assert!(actions.iter().any(|a|matches!(a,Action::Send {message,..} if message["result"]["alreadyStopped"]==true && message["result"]["runId"]=="old")));
+    assert!(actions.iter().any(|a|matches!(a,Action::Send {message,..} if message["error"]["data"]["reason"]=="runMismatch")));
     assert!(m.stops.operations.is_empty());
     assert_eq!(m.claims["线程"].run_id.as_deref(), Some("run-1"));
     m.claims.clear();

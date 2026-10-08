@@ -113,7 +113,7 @@ pub(crate) fn drive_status(
 fn apply(machine: &mut Machine, event: Event) -> Vec<Action> {
     let (next, actions) = step(std::mem::take(machine), event);
     *machine = next;
-    actions
+    crate::test_support::background::empty_background(machine, actions)
 }
 
 /// 把模板换成在途读取的当前请求；找不到或阶段不符说明脚本写错，直接 panic。

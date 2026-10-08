@@ -182,6 +182,8 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_cleanup: Option<crate::stop::background::BackgroundReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<crate::relations::ChildRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

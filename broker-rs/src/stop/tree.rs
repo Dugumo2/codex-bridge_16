@@ -47,6 +47,12 @@ pub enum TreePhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RootStopReport {
+    #[serde(default)]
+    pub background_cleanup: super::background::BackgroundReport,
+    #[serde(default)]
+    pub step: String,
+    #[serde(default)]
+    pub last_verified_at: Option<u64>,
     pub thread: String,
     pub phase: TreePhase,
     pub check: StopCheck,
@@ -63,6 +69,14 @@ pub struct StopConflict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildrenStopReport {
+    #[serde(default)]
+    pub members: BTreeMap<String, RootStopReport>,
+    #[serde(default)]
+    pub cleanup_state: String,
+    #[serde(default)]
+    pub abandon_reason: Option<String>,
+    #[serde(default)]
+    pub abandoned_at: Option<u64>,
     pub trigger: TreeTrigger,
     pub phase: TreePhase,
     pub version: u64,
@@ -234,6 +248,7 @@ fn tree_token(thread: &str) -> ClaimToken {
 
 fn empty_discovery() -> DiscoveryState {
     DiscoveryState {
+        missing: Default::default(),
         complete: false,
         version: 0,
         incomplete_reasons: Vec::new(),
@@ -242,6 +257,9 @@ fn empty_discovery() -> DiscoveryState {
 
 fn root_report(thread: &str, phase: TreePhase) -> RootStopReport {
     RootStopReport {
+        background_cleanup: Default::default(),
+        step: "pending".into(),
+        last_verified_at: None,
         thread: thread.into(),
         phase,
         check: StopCheck {
@@ -275,9 +293,21 @@ impl Machine {
             return true;
         }
         let Some(context) = self.manage_context(run) else {
-            return false;
+            return self
+                .runs
+                .runs
+                .get(run)
+                .is_some_and(|r| !r.children.is_empty())
+                && !self.tree_abandoned(run);
         };
-        if context.authority == Authority::Revoked && context.cleanup.is_none() {
+        if context.authority == Authority::Revoked
+            && context.cleanup.is_none()
+            && !self.runs.runs.get(run).is_some_and(|r| {
+                r.children_stop
+                    .as_ref()
+                    .is_some_and(|r| r.cleanup_state == "completed")
+            })
+        {
             return false;
         }
         !context.in_flight_spawns.is_empty()
@@ -359,9 +389,22 @@ impl Machine {
             return 0;
         }
         let run = request.snapshot.identity.run_id.clone();
+        if self.tree_abandoned(&run) {
+            return 0;
+        }
         if let Some(existing) = self.tree_for_run(&run) {
             self.tree_merge(existing, request.clear, request.waiter, actions);
             return existing;
+        }
+        let previously_ended = self
+            .runs
+            .runs
+            .get(&run)
+            .is_some_and(|r| r.state == crate::runs::RunState::Ended);
+        if previously_ended {
+            if let Some(record) = self.runs.runs.get_mut(&run) {
+                record.stop_outcome = Some(crate::runs::StopOutcome::Unconfirmed);
+            }
         }
         let tree_op = self.trees.aux.next();
         let generation = self.trees.aux.next();
@@ -387,6 +430,10 @@ impl Machine {
             generation,
             round: 1,
             children: ChildrenStopReport {
+                members: BTreeMap::new(),
+                cleanup_state: "active".into(),
+                abandon_reason: None,
+                abandoned_at: None,
                 trigger: request.trigger,
                 phase: TreePhase::Pending,
                 version: 0,
@@ -400,7 +447,7 @@ impl Machine {
                 unsettled_spawns: 0,
             },
             first_delivery_deadline_ms: first_deadline,
-            committed: false,
+            committed: previously_ended,
             cancelled: false,
             barrier: true,
         };
@@ -415,7 +462,7 @@ impl Machine {
                 report,
                 in_flight: 0,
                 cancelled: false,
-                committed: false,
+                committed: previously_ended,
             },
         );
         self.trees.aux.work.insert(
@@ -447,8 +494,54 @@ impl Machine {
             "运行 {run} 发起整树停止 {tree_op}（{:?}）",
             self.trees.operations[&tree_op].request.trigger
         )));
+        // 重复停止只重建本次显式授权的清理上下文，不恢复旧 owner 的开工或回答权。
+        if previously_ended && !self.relations.contexts.contains_key(&run) {
+            let record = &self.runs.runs[&run];
+            let members = record
+                .children
+                .iter()
+                .map(|child| {
+                    let edge = self.thread_relation(&child.thread_id);
+                    (
+                        child.thread_id.clone(),
+                        crate::relations::MemberState {
+                            parent: child.parent_thread_id.clone(),
+                            kind: child.relation_kind,
+                            capability: edge.as_ref().and_then(|e| e.can_accept_direct_input),
+                            agent_version: edge.map_or(AgentVersion::Unknown, |e| e.agent_version),
+                            bindings: child.turn_ids.clone(),
+                            conflict: None,
+                            activity: MemberActivity::Unknown,
+                            pending_requests: 0,
+                            active_goal: None,
+                        },
+                    )
+                })
+                .collect();
+            self.relations.contexts.insert(
+                run.clone(),
+                crate::relations::ManageContext {
+                    identity: self.trees.operations[&tree_op]
+                        .request
+                        .snapshot
+                        .identity
+                        .clone(),
+                    gen: 1,
+                    authority: Authority::Cleanup { tree_op },
+                    policy: crate::policy::Policy::OnRequest,
+                    members,
+                    in_flight_spawns: BTreeSet::new(),
+                    revision: 0,
+                    discovery: empty_discovery(),
+                    cleanup: None,
+                },
+            );
+        }
         // 第 1 步：根屏障与清理策略在停止开始时冻结；已转发的子请求按清理策略撤回。
         self.relations_enter_cleanup(&run, tree_op, actions);
+        if previously_ended {
+            self.relations_commit_cleanup(&run, tree_op, actions);
+        }
         // 独立首次交付期限：内部触发也从首次 begin_tree_stop 起算，重试与新成员都不续期。
         actions.push(Action::Schedule {
             token: tree_token(&root_thread),
@@ -515,6 +608,10 @@ impl Machine {
         let now = self.clock.mono_ms;
         let mut moved = Vec::new();
         if let Some(op) = self.stops.operations.get_mut(&id) {
+            op.narrow = matches!(
+                self.trees.operations[&tree_op].request.scope,
+                TreeScope::Run { .. }
+            );
             op.goal_attempted = false;
             if op.clear {
                 op.clear_done = false;
@@ -804,6 +901,9 @@ impl Machine {
         }
         let deadline_passed = self.trees.aux.work[&tree_op].deadline_passed;
         let mut report = RootStopReport {
+            background_cleanup: op.background.report.clone(),
+            step: op.background.report.state.clone(),
+            last_verified_at: op.background.report.last_verified_at,
             thread: op.thread.clone(),
             phase: if deadline_passed {
                 TreePhase::Unconfirmed
@@ -835,6 +935,8 @@ impl Machine {
                 self.tree_root_derived(tree_op, proven, true, actions);
                 let key = (tree_op, op.thread.clone());
                 if let Some(d) = self.trees.aux.derived.get_mut(&key) {
+                    d.background = op.background.clone();
+                    d.connection_epoch = op.connection_epoch;
                     d.target.clear = op.clear;
                     d.clear_done = !op.clear || op.clear_done;
                     d.goal_report = op.goal.clone();
@@ -985,6 +1087,17 @@ impl Machine {
                 op.goal_checked = false;
                 op.stopped = false;
             }
+            if (changed || member.active_goal == Some(true))
+                && (op.background.busy || op.background.verifying || op.background.confirmed)
+            {
+                op.background.invalidate();
+                op.request_round += 1;
+                op.stopped = false;
+                op.goal_checked = false;
+                self.derived_release_slot(&key);
+                requeue.push(key.clone());
+                continue;
+            }
             if active && op.stopped {
                 op.stopped = false;
             }
@@ -1027,6 +1140,11 @@ impl Machine {
             .map(|op| op.tree_op)
             .collect();
         for tree_op in ops {
+            // 新成员使整次收尾的空列表证据过时；完整性恢复后对全部成员重新核验。
+            if let Some(work) = self.trees.aux.work.get_mut(&tree_op) {
+                work.final_started = false;
+                work.final_complete = None;
+            }
             self.tree_drive(tree_op, actions);
         }
     }
@@ -1189,6 +1307,7 @@ impl Machine {
                         .get(&id)
                         .filter(|d| d.completed)
                         .map(|_| DiscoveryState {
+                            missing: Default::default(),
                             complete: false,
                             version: 0,
                             incomplete_reasons: vec!["发现已取消".into()],
@@ -1292,9 +1411,88 @@ impl Machine {
         } else {
             TreePhase::Pending
         };
+        let root_current = self
+            .trees
+            .aux
+            .derived
+            .get(&(tree_op, work.root_thread.clone()))
+            .map(|d| RootStopReport {
+                thread: work.root_thread.clone(),
+                phase: if d.stopped {
+                    TreePhase::Confirmed
+                } else {
+                    phase
+                },
+                check: d.check(),
+                clear_requested: d.target.clear,
+                clear_confirmed: d.target.clear && d.clear_done,
+                error: d.error.clone(),
+                background_cleanup: d.background.report.clone(),
+                step: format!("{:?}", d.stage),
+                last_verified_at: d.last_verified_at,
+            })
+            .or_else(|| {
+                self.stops
+                    .operations
+                    .values()
+                    .find(|s| Some(s.generation) == work.root_stop_gen)
+                    .map(|s| RootStopReport {
+                        thread: s.thread.clone(),
+                        phase,
+                        check: self.stop_check(s),
+                        clear_requested: s.clear,
+                        clear_confirmed: s.clear && s.clear_done,
+                        error: s.background.report.failure_reason.clone(),
+                        background_cleanup: s.background.report.clone(),
+                        step: if !s.background.busy
+                            && !s.background.verifying
+                            && !s.background.failed
+                        {
+                            "turnAndGoal".into()
+                        } else {
+                            s.background.report.state.clone()
+                        },
+                        last_verified_at: s.background.report.last_verified_at,
+                    })
+            });
         let op = self.trees.operations.get_mut(&tree_op).expect("树停止存在");
         let mut next = op.report.children.clone();
+        if let Some(root) = root_current {
+            next.root = root;
+        }
+        next.members = members
+            .keys()
+            .filter_map(|thread| {
+                self.trees
+                    .aux
+                    .derived
+                    .get(&(tree_op, thread.clone()))
+                    .map(|d| {
+                        (
+                            thread.clone(),
+                            RootStopReport {
+                                thread: thread.clone(),
+                                phase: if d.stopped {
+                                    TreePhase::Confirmed
+                                } else {
+                                    phase
+                                },
+                                check: d.check(),
+                                clear_requested: d.target.clear,
+                                clear_confirmed: d.target.clear && d.clear_done,
+                                error: d.error.clone(),
+                                background_cleanup: d.background.report.clone(),
+                                step: format!("{:?}", d.stage),
+                                last_verified_at: d.last_verified_at,
+                            },
+                        )
+                    })
+            })
+            .collect();
         next.phase = phase;
+        if phase == TreePhase::Confirmed {
+            next.cleanup_state = "completed".into();
+        }
         next.stopped = stopped;
         next.unconfirmed = unconfirmed;
         next.failed = failed;
@@ -1948,6 +2146,154 @@ pub(crate) fn commit_status(
 
 impl Machine {
     /// SA-b：客户端树等待者必须在单线程 alreadyStopped 快捷出口之前登记。
+    fn tree_abandoned(&self, run: &str) -> bool {
+        self.runs
+            .runs
+            .get(run)
+            .and_then(|r| r.children_stop.as_ref())
+            .is_some_and(|r| r.cleanup_state == "abandoned")
+    }
+
+    pub(crate) fn tree_abandon_request(
+        &mut self,
+        request: &ClientRequest,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        if self.closing {
+            return false;
+        }
+        let Some(p) = &request.params else {
+            return false;
+        };
+        let abandon = p.get("abandon");
+        if abandon.is_some_and(|v| !v.is_boolean())
+            || (abandon == Some(&Value::Bool(true))
+                && p.get("runId")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty))
+            || (abandon == Some(&Value::Bool(true))
+                && p.get("clear").is_some_and(|v| v != &Value::Bool(false)))
+        {
+            super::stop_error(
+                request.clone(),
+                proto::code::INVALID_PARAMS,
+                "--abandon 必须带 --run，不能与 --clear 同用；abandon 必须是布尔值",
+                None,
+                actions,
+            );
+            return true;
+        }
+        if p.get("runId")
+            .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+        {
+            return false;
+        }
+        let Some(thread) = p.get("threadId").and_then(Value::as_str) else {
+            return false;
+        };
+        let run = p
+            .get("runId")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| self.latest_run(thread).map(|r| r.run_id.clone()));
+        let valid = run
+            .as_ref()
+            .and_then(|r| self.runs.runs.get(r))
+            .is_some_and(|r| {
+                r.thread_id == thread || r.review_thread_id.as_deref() == Some(thread)
+            });
+        let abandoned = valid && run.as_ref().is_some_and(|r| self.tree_abandoned(r));
+        if abandon != Some(&Value::Bool(true)) && !abandoned {
+            return false;
+        }
+        let tree = run
+            .as_ref()
+            .filter(|_| valid)
+            .and_then(|r| self.tree_for_run(r));
+        let mut applied = false;
+        let reason;
+        let mut report = run
+            .as_ref()
+            .filter(|_| valid)
+            .and_then(|r| self.runs.runs.get(r))
+            .and_then(|r| r.children_stop.clone());
+        if abandoned {
+            reason = "alreadyAbandoned";
+        } else if let Some(tree_op) = tree {
+            let op = self.trees.operations.get_mut(&tree_op).expect("树停止存在");
+            op.report.children.phase = TreePhase::Unconfirmed;
+            op.report.children.cleanup_state = "abandoned".into();
+            op.report.children.abandon_reason =
+                Some("用户显式放弃本次树清理责任；可能仍有子代理或命令在运行".into());
+            op.report.children.abandoned_at = Some(self.clock.now_ms);
+            op.report.children.version += 1;
+            self.tree_publish(tree_op, actions);
+            report = Some(self.trees.operations[&tree_op].report.children.clone());
+            self.trees
+                .operations
+                .get_mut(&tree_op)
+                .expect("树停止存在")
+                .cancelled = true;
+            let root_generation = self.trees.aux.work[&tree_op].root_stop_gen;
+            let roots: Vec<_> = self
+                .stops
+                .operations
+                .iter()
+                .filter(|(_, op)| Some(op.generation) == root_generation)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in roots {
+                if let Some(mut op) = self.stops.operations.remove(&id) {
+                    for waiter in &op.waiters {
+                        actions.push(Action::Unschedule {
+                            key: TimerKey::Stop(
+                                id.clone(),
+                                op.generation,
+                                super::StopTimer::Waiter(waiter.id),
+                            ),
+                        });
+                    }
+                    self.answer_waiters(&mut op, None, "unconfirmed", actions);
+                    for kind in [super::StopTimer::Deadline, super::StopTimer::Verify] {
+                        if let Some(key) = TimerKind::Stop(op.tag(&id, 0), kind).key(&op.token()) {
+                            actions.push(Action::Unschedule { key });
+                        }
+                    }
+                }
+            }
+            self.cancel_tree_reads(tree_op, root_generation, actions);
+            let discoveries: Vec<_> = self.relations.discoveries.iter().filter(|(_, op)| matches!(op.caller, DiscoveryCaller::TreeStop { tree_op: id, .. } if id == tree_op)).map(|(id, _)| *id).collect();
+            for id in discoveries {
+                self.relations.discoveries.remove(&id);
+                self.relations.aux.work.remove(&id);
+                actions.push(Action::Unschedule {
+                    key: TimerKey::DiscoveryDeadline(id),
+                });
+            }
+            let runs = self.trees.aux.work[&tree_op].runs.clone();
+            for run in runs {
+                self.relations_end_cleanup(&run, actions);
+            }
+            self.tree_answer(tree_op, None, "unconfirmed", actions);
+            self.tree_finish(tree_op, actions);
+            applied = true;
+            reason = "abandoned";
+        } else if report
+            .as_ref()
+            .is_some_and(|r| r.phase == TreePhase::Confirmed)
+        {
+            reason = "alreadyConfirmed";
+        } else {
+            reason = "treeStopNotFound";
+        }
+        actions.push(Action::Send { conn: request.conn, message: proto::response_ok(request.id.clone(), json!({
+            "threadId": thread, "runId": run, "stopOutcome": "unconfirmed", "actionApplied": applied,
+            "reason": reason, "interruptSent": false, "goal": "unchanged", "alreadyStopped": false,
+            "childrenStop": report, "run": run.as_deref().and_then(|r| self.run_snapshot(r))
+        })) });
+        true
+    }
+
     /// 有受管子树（或已有树停止）的运行一律合并进整树停止；否则交回原路径（含参数与状态错误）。
     pub fn tree_client_stop(&mut self, request: &ClientRequest, actions: &mut Vec<Action>) -> bool {
         if self.closing {
@@ -2034,6 +2380,16 @@ impl Machine {
                 let root = self.trees.aux.work.get(&tree_op)?.root_thread.clone();
                 return Some((run.into(), root));
             }
+            if belongs
+                && !self.claims.contains_key(thread)
+                && self.latest_run(thread).is_none_or(|r| r.run_id == run)
+            {
+                let record = &self.runs.runs[run];
+                let actual = record.review_thread_id.as_deref().unwrap_or(thread);
+                if !self.claims.contains_key(actual) {
+                    return Some((run.into(), actual.into()));
+                }
+            }
             return None;
         }
         if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
@@ -2065,6 +2421,15 @@ impl Machine {
             return Some((op.request.snapshot.identity.run_id.clone(), root));
         }
         let latest = self.latest_run(thread)?;
+        if latest.children_stop.is_some() && !self.claims.contains_key(thread) {
+            return Some((
+                latest.run_id.clone(),
+                latest
+                    .review_thread_id
+                    .clone()
+                    .unwrap_or_else(|| thread.into()),
+            ));
+        }
         let child = latest.review_thread_id.as_ref()?;
         let claim = self.claims.get(child)?;
         (claim.run_id.as_deref() == Some(latest.run_id.as_str()))

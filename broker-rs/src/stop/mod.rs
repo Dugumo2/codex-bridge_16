@@ -1,6 +1,7 @@
 //! 停止操作与启动超时对账：与认领、服务端请求共用一次纯函数迁移。
 //! 只有 confirmed 判断函数可以确认停止；中断回包从不提供完成证据。
 
+pub mod background;
 pub mod derived;
 pub mod tree;
 
@@ -34,12 +35,13 @@ pub struct StopTag {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopRequest {
+    Background { epoch: u64 },
     GoalGet { version: u64 },
     GoalWrite { version: u64, clear: bool },
     VerifyGoal { version: u64 },
     Interrupt { turn: String },
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum StopTimer {
     Deadline,
     Waiter(u64),
@@ -57,6 +59,9 @@ pub struct Waiter {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopOp {
+    pub background: background::Background,
+    pub narrow: bool,
+    pub connection_epoch: u64,
     pub thread: String,
     pub claim_id: Option<u64>,
     pub foreign_claim: bool,
@@ -140,6 +145,8 @@ pub struct BreakerProbe {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stops {
+    pub command_owners: HashMap<(String, String), String>,
+    pub command_turns: HashMap<(String, String), String>,
     pub probe: BreakerProbe,
     pub operations: HashMap<String, StopOp>,
     pub versions: HashMap<String, u64>,
@@ -176,6 +183,7 @@ impl Stops {
 }
 impl StopOp {
     fn invalidate_round(&mut self) {
+        self.background.invalidate();
         if self.verifying {
             self.verification_pending = true;
         }
@@ -214,7 +222,7 @@ impl StopOp {
     }
     fn result(&self, outcome: &str) -> Value {
         json!({"threadId":self.thread,"runId":self.run_id,"interruptSent":self.interrupt_sent,
-            "goal":self.goal,"alreadyStopped":self.already_stopped,"stopOutcome":outcome,"run":null})
+            "backgroundCleanup":self.background.report,"goal":self.goal,"alreadyStopped":self.already_stopped,"stopOutcome":outcome,"run":null})
     }
 }
 
@@ -436,6 +444,9 @@ impl Machine {
             c.pending_start.is_some() || matches!(c.state, State::AwaitingContinuation { .. })
         });
         let op = StopOp {
+            background: background::Background::new(self.clock.mono_ms + CONFIRM_MS),
+            narrow: true,
+            connection_epoch: self.relations.conn_epoch,
             thread: thread.into(),
             claim_id: claim.map(|c| c.claim_id),
             foreign_claim: false,
@@ -511,7 +522,8 @@ impl Machine {
     }
 
     pub(crate) fn client_stop(&mut self, request: ClientRequest, actions: &mut Vec<Action>) {
-        if self.tree_client_stop(&request, actions) {
+        if self.tree_abandon_request(&request, actions) || self.tree_client_stop(&request, actions)
+        {
             return;
         }
         let thread = request
@@ -565,12 +577,6 @@ impl Machine {
                         || run.state == RunState::Lost
                             && run.stop_outcome == Some(StopOutcome::Confirmed)
                 });
-            if ended {
-                actions.push(Action::Send {conn: request.conn, message: proto::response_ok(request.id.clone(),
-                    json!({"threadId":thread,"runId":expected,"interruptSent":false,"goal":"unchanged",
-                        "alreadyStopped":true,"stopOutcome":"confirmed","run":self.run_snapshot(expected)}))});
-                return;
-            }
             // 原子核对运行身份后，review 按稳定 runId 定位实际认领；绝不借父线程去停新运行。
             let actual = self
                 .claims
@@ -584,7 +590,8 @@ impl Machine {
                         .filter(|r| {
                             belongs
                                 && !r.joined
-                                && (r.state == RunState::Stopping
+                                && (ended
+                                    || r.state == RunState::Stopping
                                     || r.state == RunState::Lost
                                         && r.stop_outcome != Some(StopOutcome::Confirmed))
                         })
@@ -604,6 +611,24 @@ impl Machine {
                 );
                 return;
             };
+            if self
+                .claims
+                .get(&actual)
+                .is_some_and(|c| c.run_id.as_deref() != Some(expected))
+                || (ended
+                    && self
+                        .latest_run(&actual)
+                        .is_some_and(|r| r.run_id != expected))
+            {
+                stop_error(
+                    request,
+                    code::GENERAL_ERROR,
+                    "线程已被后续运行使用，不能用旧 runId 停止",
+                    Some(json!({"reason":"runMismatch"})),
+                    actions,
+                );
+                return;
+            }
             thread = actual;
         }
         // 无 runId 时只从空闲父线程的最近运行定位，不能借历史关系取得其他运行的权限。
@@ -684,7 +709,8 @@ impl Machine {
             })
             .or_else(|| self.latest_run(&thread))
             .filter(|r| {
-                (r.state == RunState::Stopping
+                ((r.state == RunState::Ended && expected.is_some())
+                    || r.state == RunState::Stopping
                     || r.state == RunState::Lost
                         && r.stop_outcome == Some(StopOutcome::Unconfirmed))
                     && !r.joined
@@ -728,6 +754,7 @@ impl Machine {
         if op.clear {
             op.clear_done = false;
         }
+        op.narrow = expected.is_some();
         op.explicit_interrupts = true;
         if op.waiters.len() >= MAX_STOP_WAITERS {
             let mut result = op.result("unconfirmed");
@@ -771,18 +798,23 @@ impl Machine {
             turn_ended: turn,
             goal_braked: brake,
             settled,
-            verify_done: !op.verifying || (op.read_done && op.goal_read_done),
+            verify_done: op.background.confirmed
+                && (!op.verifying || (op.read_done && op.goal_read_done)),
         }
     }
 
     /// 唯一停止判定；外层 goal_busy、clear_done 门控保持不变。
     pub(crate) fn confirmed(&self, op: &StopOp) -> bool {
+        self.stop_ready(op) && op.background.confirmed
+    }
+
+    fn stop_ready(&self, op: &StopOp) -> bool {
         let check = self.stop_check(op);
         check.ownership
             && check.turn_ended
             && check.goal_braked
             && check.settled
-            && check.verify_done
+            && (!op.verifying || (op.read_done && op.goal_read_done))
     }
 
     /// 重启后的运行不沿用 Idle 的缺轮证据，立即读取实际线程的当前状态。
@@ -806,7 +838,11 @@ impl Machine {
         self.runs.verifying_history.insert(run.into());
         op.target = None;
         op.turn_absent = false;
-        op.already_stopped = false;
+        op.already_stopped = self
+            .runs
+            .runs
+            .get(run)
+            .is_some_and(|r| r.state == RunState::Ended);
         op.ended.clear();
         self.start_verification(&id, &mut op, actions);
         self.stops.operations.insert(id.clone(), op);
@@ -850,6 +886,18 @@ impl Machine {
         let ids: Vec<_> = self.stops.operations.keys().cloned().collect();
         for id in ids {
             let mut op = self.stops.operations.remove(&id).unwrap();
+            if op.connection_epoch != self.relations.conn_epoch {
+                op.invalidate_round();
+                op.connection_epoch = self.relations.conn_epoch;
+            }
+            if self
+                .claims
+                .get(&op.thread)
+                .is_some_and(|c| Some(c.claim_id) != op.claim_id)
+            {
+                op.foreign_claim = true;
+                op.background.fail("conflict", "线程所有权已变化".into());
+            }
             // review 迁移后的子线程也必须先分配版本，再发出目标读取。
             self.stops.ensure_version(&op.thread);
             let claim = op
@@ -932,8 +980,40 @@ impl Machine {
                     let explicit = std::mem::take(&mut op.explicit_interrupts);
                     self.stop_interrupt(&id, &mut op, explicit, actions);
                 }
+                if op.narrow
+                    && op.background.pending_item().is_some_and(|item| {
+                        !self.background_item_owned(
+                            &op.thread,
+                            item,
+                            &op.run_id.iter().cloned().collect(),
+                        )
+                    })
+                {
+                    op.background
+                        .fail("conflict", "终止前命令归属已变化".into());
+                }
+                if self.stop_ready(&op) && !op.goal_busy && (!op.clear || op.clear_done) {
+                    if op.background.verifying && self.clock.mono_ms < op.background.deadline {
+                        op.background.finish();
+                    } else if let Some((method, params)) =
+                        op.background.next(&op.thread, self.clock.mono_ms)
+                    {
+                        stop_request(
+                            &id,
+                            &op,
+                            op.round,
+                            StopRequest::Background {
+                                epoch: op.background.epoch,
+                            },
+                            method,
+                            params,
+                            actions,
+                        );
+                    }
+                }
                 // clear 的执行结果要先回来，报告值与停止证据分别保存。
                 if !op.goal_busy && (!op.clear || op.clear_done) && self.confirmed(&op) {
+                    self.publish_background(&op, actions);
                     if self.root_stop_report(&op, tree::RootStopStage::Confirmed, actions) {
                         continue;
                     }
@@ -954,6 +1034,7 @@ impl Machine {
                     continue;
                 }
             }
+            self.publish_background(&op, actions);
             self.stops.operations.insert(id, op);
         }
     }
@@ -1220,7 +1301,30 @@ impl Machine {
             self.stops.operations.insert(tag.id, op);
             return;
         }
+        let cleanup_goal_report = op.background.verifying.then(|| op.goal.clone());
         match request {
+            StopRequest::Background { epoch } => {
+                if op.round == tag.round
+                    && op.background.epoch == epoch
+                    && op.background.busy
+                    && !op.foreign_claim
+                {
+                    let runs = op.run_id.iter().cloned().collect();
+                    if self.clock.mono_ms >= op.background.deadline {
+                        op.background
+                            .fail("unknown", "清理回包超过本轮总期限".into());
+                    } else {
+                        op.background.reply(result, self.clock.now_ms, |item| {
+                            !op.narrow || self.background_item_owned(&op.thread, item, &runs)
+                        });
+                    }
+                    if op.background.verifying {
+                        let background = op.background.clone();
+                        self.start_verification(&tag.id, &mut op, actions);
+                        op.background = background;
+                    }
+                }
+            }
             StopRequest::Interrupt { turn } => {
                 if let Err(error) = result {
                     actions.push(Action::Warn(format!(
@@ -1319,6 +1423,10 @@ impl Machine {
                             }
                         }
                         None => {
+                            if verify && op.background.verifying {
+                                op.brake_version = None;
+                                op.background.fail("unknown", "清理后 goal 无法核验".into());
+                            }
                             op.goal_done = true;
                             if verify {
                                 op.goal_read_done = true;
@@ -1381,6 +1489,9 @@ impl Machine {
                 }
             }
         }
+        if let Some(goal) = cleanup_goal_report {
+            op.goal = goal;
+        }
         self.verification_step_done(&tag.id, &mut op, actions);
         self.stops.operations.insert(tag.id, op);
     }
@@ -1388,6 +1499,12 @@ impl Machine {
     /// 停止核实的一份读取（活动轮次或 goal）已处理：两份都齐后结束本轮核实并预约下一轮。
     fn verification_step_done(&mut self, id: &str, op: &mut StopOp, actions: &mut Vec<Action>) {
         if op.verifying && op.read_done && op.goal_read_done {
+            if op.background.verifying
+                && self.stop_ready(op)
+                && self.clock.mono_ms < op.background.deadline
+            {
+                op.background.finish();
+            }
             let tree_owned = self.root_stop_report(op, tree::RootStopStage::Verified, actions);
             if !tree_owned
                 && (!self.confirmed(op) || op.goal_busy || (op.clear && !op.clear_done))
@@ -1493,6 +1610,7 @@ impl Machine {
                     self.stops.operations.insert(tag.id, op);
                     return;
                 }
+                op.background.deadline = self.clock.mono_ms + VERIFY_MS;
                 self.start_verification(&tag.id, &mut op, actions);
             }
         }
@@ -3108,6 +3226,7 @@ impl Machine {
                 op.snapshot_absent = Some(op.round);
             }
             StatusResult::Active(active) => {
+                op.background.invalidate();
                 let active: Vec<_> = active
                     .into_iter()
                     .filter(|t| !op.ended.contains(t))
@@ -3134,6 +3253,10 @@ impl Machine {
                 }
             }
             _ => {
+                if op.background.verifying {
+                    op.background
+                        .fail("unknown", "清理后活动轮次无法核验".into());
+                }
                 actions.push(Action::Warn(format!(
                     "线程 {} 的停止核实读取未知，保留占用",
                     op.thread

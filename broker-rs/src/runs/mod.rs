@@ -290,6 +290,7 @@ impl Machine {
             RunRecord {
                 children: Vec::new(),
                 children_stop: None,
+                background_cleanup: None,
 
                 run_id: run_id.clone(),
                 thread_id: open.thread_id,
@@ -1431,5 +1432,31 @@ impl Machine {
         }
         self.runs.updated.insert(run.into(), self.clock.now_ms);
         self.runs.put(run, actions);
+    }
+}
+
+impl Machine {
+    pub(crate) fn publish_background(
+        &mut self,
+        op: &crate::stop::StopOp,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(id) = &op.run_id else {
+            return;
+        };
+        let Some(run) = self.runs.runs.get_mut(id) else {
+            return;
+        };
+        if run.background_cleanup.as_ref() == Some(&op.background.report) {
+            return;
+        }
+        run.background_cleanup = Some(op.background.report.clone());
+        if run.stop_outcome == Some(StopOutcome::Confirmed) && !op.background.confirmed {
+            run.stop_outcome = Some(StopOutcome::Unconfirmed);
+        }
+        if op.already_stopped && op.background.confirmed {
+            run.stop_outcome = Some(StopOutcome::Confirmed);
+        }
+        self.runs.put(id, actions);
     }
 }

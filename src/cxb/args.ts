@@ -50,6 +50,7 @@ export interface CommandOptions {
   local?: boolean;
   kind?: "approval" | "question" | "mcp" | "guardian";
   clear?: boolean;
+  abandon?: boolean;
   purge?: boolean;
   unset?: boolean;
 }
@@ -263,11 +264,15 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
     },
   },
   stop: {
-    description: "停止运行并暂停或清除目标", usage: ["cxb stop <线程ID> [--clear] [--run <运行ID>] [选项]"], globals: COMMON,
-    options: [flag("clear", ["--clear"], "同时放弃目标；默认仅暂停目标。"),
+    description: "停止运行并暂停或清除目标", usage: ["cxb stop <线程ID> [--clear] [--run <运行ID>] [--abandon] [选项]"], globals: COMMON,
+    options: [flag("abandon", ["--abandon"], "放弃指定运行的树清理责任，必须带 --run；不表示已经停止。"), flag("clear", ["--clear"], "同时放弃目标；默认仅暂停目标。"),
       value("run", ["--run"], "运行ID", "停止或核实指定运行（含已失联、未确认停下的历史运行）；默认只看最近一次运行。", id)],
     rules: ["必须提供一个线程 ID；停止确认由 broker 处理。",
-      "归档被历史运行挡住时，按 cxb rm 列出的运行 ID 用 --run 核实。"], validate: (p) => positionCount(p, 1, 1),
+      "归档被历史运行挡住时，按 cxb rm 列出的运行 ID 用 --run 核实。"], validate: (p) => {
+      positionCount(p, 1, 1);
+      if (p.options.abandon && !p.options.run) usage("--abandon 必须带 --run <运行ID>。");
+      if (p.options.abandon && p.options.clear) usage("--abandon 不能与 --clear 同时使用。");
+    },
   },
   rm: {
     description: "归档或永久删除线程", usage: ["cxb rm <线程ID> [--purge] [选项]"], globals: COMMON,

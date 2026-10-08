@@ -19,6 +19,7 @@ pub struct SourceState {
 /// 一次发现的进度；完成、到期或关闭时删除。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryWork {
+    pub missing: BTreeMap<String, Vec<String>>,
     pub start_version: u64,
     pub rerun: bool,
     pub found: BTreeMap<String, RelationEdge>,
@@ -262,10 +263,18 @@ impl Machine {
                             }
                         } else {
                             work.reasons.insert("readMismatch".into());
+                            work.missing
+                                .entry(thread.clone())
+                                .or_default()
+                                .push("readMismatch".into());
                         }
                     }
                     Err(_) => {
                         work.reasons.insert("readError".into());
+                        work.missing
+                            .entry(thread.clone())
+                            .or_default()
+                            .push("readError".into());
                     }
                 }
             }
@@ -386,6 +395,12 @@ impl Machine {
         }
         if let Some(work) = self.relations.aux.work.get_mut(&op_id) {
             work.reasons.insert("timeout".into());
+            for thread in work.reads_queue.iter().chain(work.reads_in_flight.iter()) {
+                work.missing
+                    .entry(thread.clone())
+                    .or_default()
+                    .push("timeout".into());
+            }
         }
         self.discovery_finish(op_id, actions);
     }
@@ -475,6 +490,13 @@ impl Machine {
         if !unattached.is_empty() {
             work.reasons.insert("attachmentMissing".into());
         }
+        let mut missing = work.missing;
+        for thread in &unattached {
+            missing
+                .entry(thread.clone())
+                .or_default()
+                .push("attachmentMissing".into());
+        }
         self.relations.aux.unobserved_loaded = unattached;
         let reasons: Vec<String> = work.reasons.into_iter().collect();
         let result = DiscoveryResult {
@@ -483,6 +505,7 @@ impl Machine {
             generation,
             members,
             state: DiscoveryState {
+                missing,
                 complete: reasons.is_empty(),
                 version: self.relations.aux.version,
                 incomplete_reasons: reasons,

@@ -167,6 +167,8 @@ pub struct ManageContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveryState {
+    #[serde(default)]
+    pub missing: BTreeMap<String, Vec<String>>,
     pub complete: bool,
     pub version: u64,
     pub incomplete_reasons: Vec<String>,

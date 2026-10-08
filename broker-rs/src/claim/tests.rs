@@ -35,7 +35,7 @@ fn apply(machine: &mut Machine, event: Event) -> Vec<Action> {
         *machine = next;
         actions.extend(extra);
     }
-    actions
+    crate::test_support::background::empty_background(machine, actions)
 }
 
 fn request(conn: u64, id: u64, method: &str, params: Value) -> ClientRequest {

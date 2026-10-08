@@ -1396,7 +1396,7 @@ fn 历史失联按编号读取核实后写回且较新运行保持不变() {
             },
         );
         m = next;
-        all.extend(a);
+        all.extend(crate::test_support::background::empty_background(&mut m, a));
     }
     assert!(all.iter().any(|a|matches!(a,Action::Store(StoreOp::PutRun(r)) if r.run_id=="old" && r.stop_outcome==Some(StopOutcome::Confirmed))));
     assert_eq!(m.runs.runs["new"], newer);
