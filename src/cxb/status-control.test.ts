@@ -24,7 +24,7 @@ afterEach(async () => {
 }, CLEANUP_BUDGET);
 
 test("长历史与严格分页：cxb stop、--continue 正常，broker 不退出，另一条线程不受影响", async () => {
-  const observer = await h.start({ hold: true, statusRead: STATUS_READ });
+  const observer = await h.start({ hold: true, statusRead: STATUS_READ, backgroundTerminals: { enabled: true } });
   const pid = h.broker!.pid!;
   const before = await observer.rpc.request<any>("broker/health");
   const env = { ...h.env, RUN_FIXTURE_WORKSPACE: JSON.stringify(h.workspace) };
