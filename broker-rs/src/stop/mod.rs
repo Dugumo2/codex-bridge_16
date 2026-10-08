@@ -1860,19 +1860,9 @@ impl Machine {
         } = context.operation
         {
             // H2：对账与迟到归属经状态读取，按 StatusCaller 识别当前登记，置无响应并告警。
-            let current_reconcile = match self.status_read_caller(read_id, generation) {
-                Some(StatusCaller::Reconcile { generation, round }) => self
-                    .stops
-                    .reconciliations
-                    .get(generation)
-                    .is_some_and(|reg| reg.round == *round),
-                Some(StatusCaller::LateSettlement { generation, round }) => {
-                    self.stops.late.iter().any(|reg| {
-                        reg.generation == *generation && reg.round == *round && reg.late_settling
-                    })
-                }
-                _ => false,
-            };
+            let current_reconcile = self
+                .status_read_caller(read_id, generation)
+                .is_some_and(|caller| self.status_caller_reconciling(caller));
             if current_reconcile && !self.app_server_unresponsive {
                 self.app_server_unresponsive = true;
                 actions.push(Action::Warn(
@@ -1985,6 +1975,23 @@ impl Machine {
             self.apply_reply(context, Err(error), actions);
         }
     }
+    /// 读取或独立保留的 RPC 证据是否仍属于当前对账登记。
+    pub(crate) fn status_caller_reconciling(&self, caller: &StatusCaller) -> bool {
+        match caller {
+            StatusCaller::Reconcile { generation, round } => self
+                .stops
+                .reconciliations
+                .get(generation)
+                .is_some_and(|reg| reg.round == *round),
+            StatusCaller::LateSettlement { generation, round } => {
+                self.stops.late.iter().any(|reg| {
+                    reg.generation == *generation && reg.round == *round && reg.late_settling
+                })
+            }
+            _ => false,
+        }
+    }
+
     /// 启动超时对账读取：活动轮次集合经状态读取层（Activity）取得，回到 `reconcile_status_done`。
     fn begin_reconcile(
         &mut self,

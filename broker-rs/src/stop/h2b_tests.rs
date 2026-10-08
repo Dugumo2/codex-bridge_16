@@ -219,6 +219,99 @@ fn 迟到归属读取无响应仍置熔断并退避重试() {
     assert!(requests(&a, "turn/start").is_empty());
 }
 
+/// 两种调用方均按真实顺序先走读取总期限，再等待同一 RPC 结算。
+fn deadline_pending(late: bool) -> (Machine, StatusRequest, Vec<Action>) {
+    let (mut m, a) = if late {
+        late_settling()
+    } else {
+        let (mut m, c) = started(false, "turn/start");
+        let a = begin_unresolved(&mut m, &c, 70);
+        (m, a)
+    };
+    let request = status_requests(&a).remove(0);
+    let deadline = timer(&a, |k| matches!(k, TimerKind::StatusReadDeadline { .. }));
+    let a = apply(&mut m, deadline);
+    assert!(!m.app_server_unresponsive, "累计总期限不能直接触发熔断");
+    assert!(live_status_requests(&m).is_empty());
+    assert_eq!(reconcile_timer_delay(&a), VERIFY_MS);
+    (m, request, a)
+}
+
+#[test]
+fn 总期限后同一在途rpc超时仍熔断且只回调一次() {
+    for late in [false, true] {
+        let (mut m, request, _) = deadline_pending(late);
+        let done = m.status_reads.observed.len();
+        let a = begin_unresolved(&mut m, &request.context, 71);
+        assert!(m.app_server_unresponsive, "迟到归属={late}");
+        assert!(a
+            .iter()
+            .any(|a| matches!(a, Action::Warn(s) if s.contains("Codex 无响应"))));
+        assert_eq!(m.status_reads.observed.len(), done, "不得重复回调");
+        assert!(m
+            .status_read_caller(request.read_id, request.generation)
+            .is_none());
+        let a = client(&mut m, "turn/start", 9, json!({"threadId":"新线程"}));
+        assert!(requests(&a, "turn/start").is_empty());
+        assert!(a.iter().any(|a| matches!(a, Action::Send { message, .. }
+            if message["error"]["data"]["reason"] == "appServerUnresponsive")));
+    }
+}
+
+#[test]
+fn 总期限后新一轮读取取代旧rpc时不误熔断() {
+    for late in [false, true] {
+        let (mut m, request, a) = deadline_pending(late);
+        let retry = timer(&a, |k| matches!(k, TimerKind::Reconcile { .. }));
+        let a = apply(&mut m, retry);
+        assert_eq!(status_requests(&a).len(), 1);
+        let done = m.status_reads.observed.len();
+        begin_unresolved(&mut m, &request.context, 71);
+        assert!(!m.app_server_unresponsive);
+        assert_eq!(m.status_reads.observed.len(), done);
+        assert_eq!(live_status_requests(&m).len(), 1);
+    }
+}
+
+#[test]
+fn 总期限后rpc回包或关闭清理证据不重复回调() {
+    for late in [false, true] {
+        for result in [Some(Ok(json!({}))), Some(Err(err())), None] {
+            let (mut m, request, _) = deadline_pending(late);
+            let done = m.status_reads.observed.len();
+            if let Some(result) = result {
+                reply_status(&mut m, &request, result);
+            } else {
+                m.status_reads_shutdown(&mut Vec::new());
+            }
+            assert!(m
+                .status_read_caller(request.read_id, request.generation)
+                .is_none());
+            begin_unresolved(&mut m, &request.context, 71);
+            assert!(!m.app_server_unresponsive);
+            assert_eq!(m.status_reads.observed.len(), done);
+        }
+    }
+}
+
+#[test]
+fn 分页累计总期限仅保留当前页rpc的无响应证据() {
+    let (mut m, a) = late_settling();
+    let first = status_requests(&a).remove(0);
+    let deadline = timer(&a, |k| matches!(k, TimerKind::StatusReadDeadline { .. }));
+    let a = reply_status(
+        &mut m,
+        &first,
+        Ok(turns_page(&[("后来轮", "completed")], Some("第二页"))),
+    );
+    let second = status_requests(&a).remove(0);
+    apply(&mut m, deadline);
+    begin_unresolved(&mut m, &first.context, 71);
+    assert!(!m.app_server_unresponsive, "已经正常回包的页不能置熔断");
+    begin_unresolved(&mut m, &second.context, 72);
+    assert!(m.app_server_unresponsive);
+}
+
 #[test]
 fn 停止核实读取超时不置熔断且不放行() {
     let mut m = running();

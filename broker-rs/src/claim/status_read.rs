@@ -24,6 +24,8 @@ pub const STATUS_TURNS_LIMIT: usize = 100;
 /// `thread/items/list` 每页条数，与结果补读一致。
 pub const STATUS_ITEMS_LIMIT: usize = 64;
 const MAX_CURSOR_BYTES: usize = 4096;
+/// 只保留对账和迟到归属的在途超时证据，容量覆盖两类登记的上限。
+const MAX_DEADLINE_RPCS: usize = crate::stop::MAX_UNRESOLVED_STARTS + crate::stop::MAX_LATE;
 /// 上游把「第一轮前」等不支持情形映射成方法不存在。
 const METHOD_NOT_FOUND: i64 = -32601;
 
@@ -148,6 +150,8 @@ pub struct StatusReads {
     next_generation: u64,
     /// 按编号有序，关闭清理与测试观测的顺序稳定。
     pub(crate) reads: BTreeMap<u64, ReadState>,
+    /// 总期限已回调、RPC 尚未结算；调用方轮次指向期限结束后安排的退避轮次。
+    deadline_rpcs: BTreeMap<(u64, u64), StatusCaller>,
     /// 活动版本号；只为有在途读取的线程登记，最后一个读取结束时移除，不随线程数增长。
     versions: HashMap<String, u64>,
     /// 单步驱动观测到的完成（按完成顺序），只在测试中记录。
@@ -206,6 +210,10 @@ impl Machine {
             )));
             return read_id;
         }
+        // 真正开始下一轮读取时，上一轮的无响应证据失效；仅安排退避不算被新读取取代。
+        self.status_reads
+            .deadline_rpcs
+            .retain(|_, waiting| waiting != &caller);
         let version = *self
             .status_reads
             .versions
@@ -357,6 +365,18 @@ impl Machine {
 
     /// 总期限到期。
     pub(crate) fn status_read_deadline(&mut self, read_id: u64, actions: &mut Vec<Action>) {
+        let pending = self.status_reads.reads.get(&read_id).and_then(|read| {
+            if read.generation == 0 || !self.status_caller_reconciling(&read.caller) {
+                return None;
+            }
+            let mut caller = read.caller.clone();
+            match &mut caller {
+                StatusCaller::Reconcile { round, .. }
+                | StatusCaller::LateSettlement { round, .. } => *round += 1,
+                _ => return None,
+            }
+            Some(((read_id, read.generation), caller))
+        });
         if self.status_reads.reads.contains_key(&read_id) {
             self.finish_status_read(
                 read_id,
@@ -364,9 +384,16 @@ impl Machine {
                 actions,
             );
         }
+        // 完成回调会推进退避轮次，也可能结束登记；只留下仍有效的 RPC 证据。
+        if let Some((key, caller)) = pending.filter(|(_, c)| self.status_caller_reconciling(c)) {
+            if self.status_reads.deadline_rpcs.len() >= MAX_DEADLINE_RPCS {
+                self.status_reads.deadline_rpcs.pop_first();
+            }
+            self.status_reads.deadline_rpcs.insert(key, caller);
+        }
     }
 
-    /// 在途请求的调用方；请求已被消费或读取已完成时为 None。
+    /// 在途 RPC 的调用方；总期限已结束的读取仍可提供熔断证据，但不得再次回调。
     pub(crate) fn status_read_caller(
         &self,
         read_id: u64,
@@ -377,6 +404,7 @@ impl Machine {
             .get(&read_id)
             .filter(|read| read.generation != 0 && read.generation == generation)
             .map(|read| &read.caller)
+            .or_else(|| self.status_reads.deadline_rpcs.get(&(read_id, generation)))
     }
 
     /// 单次请求无响应（上游 RPC 超时）：只对仍在途的那一页生效，读取以 `Unresponsive` 完成。
@@ -386,6 +414,14 @@ impl Machine {
         generation: u64,
         actions: &mut Vec<Action>,
     ) {
+        if self
+            .status_reads
+            .deadline_rpcs
+            .remove(&(read_id, generation))
+            .is_some()
+        {
+            return;
+        }
         if self.status_read_caller(read_id, generation).is_none() {
             actions.push(Action::Debug(format!(
                 "忽略已完成或旧代号的状态读取超时 {read_id}/{generation}"
@@ -408,6 +444,7 @@ impl Machine {
             });
         }
         self.status_reads.versions.clear();
+        self.status_reads.deadline_rpcs.clear();
     }
 
     /// 回包入口（`Operation::StatusRead`）。
@@ -418,6 +455,9 @@ impl Machine {
         result: Result<Value, Value>,
         actions: &mut Vec<Action>,
     ) {
+        self.status_reads
+            .deadline_rpcs
+            .remove(&(read_id, generation));
         let Some(read) = self.status_reads.reads.get_mut(&read_id) else {
             actions.push(Action::Debug(format!(
                 "丢弃已完成或已取消的状态读取回包 {read_id}"

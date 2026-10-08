@@ -1248,6 +1248,30 @@ fn late_start(generation: u64, round: u64, late_settling: bool) -> crate::stop::
     }
 }
 
+#[test]
+fn 总期限遗留rpc证据有硬上限并在关闭时清空() {
+    let mut m = Machine::new(true);
+    for generation in 1..=(MAX_DEADLINE_RPCS as u64 + 2) {
+        m.stops.late.push_back(late_start(generation, 0, true));
+        let (read_id, actions) = begin_with(
+            &mut m,
+            StatusQuery::Activity,
+            StatusCaller::LateSettlement {
+                generation,
+                round: 0,
+            },
+        );
+        let request = status_requests(&actions).remove(0);
+        m.status_read_deadline(read_id, &mut Vec::new());
+        assert!(m.status_reads.deadline_rpcs.len() <= MAX_DEADLINE_RPCS);
+        assert!(m.status_read_caller(read_id, request.generation).is_some());
+    }
+    assert_eq!(m.status_reads.deadline_rpcs.len(), MAX_DEADLINE_RPCS);
+    assert!(!m.status_reads.deadline_rpcs.contains_key(&(1, 1)));
+    m.status_reads_shutdown(&mut Vec::new());
+    assert!(m.status_reads.deadline_rpcs.is_empty());
+}
+
 /// 直接走 `timeout_reply`（与 step 的超时入口相同），不让伪造的登记进入停止驱动。
 fn time_out(m: &mut Machine, caller: StatusCaller) -> (Vec<Action>, StatusResult) {
     let (id, actions) = begin_with(m, StatusQuery::Activity, caller);

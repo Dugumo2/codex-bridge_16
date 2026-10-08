@@ -21,7 +21,7 @@ import { context } from "./test-fixtures/n4a-unit";
 import { resolveWorkspace } from "./workspace";
 
 const RUNNABLE = process.platform === "win32";
-const THREAD = "长历史线程";
+const THREAD = "h2c-long-history";
 const HISTORY_TURNS = 3072;
 /** 每轮条目前置的推理条目数，等于条目页大小，使关键条目必然落在第二页以后。 */
 const FILLER_ITEMS = 64;
@@ -44,7 +44,8 @@ const agent = (text: string): Item => ({ type: "agentMessage", id: `a-${text}`, 
 
 /** 共享的分页服务器：严格执行 limit、cursor（以轮次编号锚定）、方向与 itemsView；全量读返回超过 10 MiB。 */
 function servePagedShared(socketPath: string) {
-  const log: Array<{ method: string; params: any }> = [];
+  type Entry = { method: string; params: any; turnPage?: { data: Array<{ id: string; status: string }>; nextCursor: string | null } };
+  const log: Entry[] = [];
   const threads = new Map<string, MockTurn[]>();
   const sockets = new Set<{ send(data: string): unknown }>();
   let seq = 0;
@@ -85,7 +86,8 @@ function servePagedShared(socketPath: string) {
 
   function handle(send: (message: unknown) => void, msg: any) {
     const p = msg.params ?? {};
-    if (msg.method !== "initialize") log.push({ method: msg.method, params: p });
+    const entry: Entry = { method: msg.method, params: p };
+    if (msg.method !== "initialize") log.push(entry);
     const reply = (result: unknown) => send({ id: msg.id, result });
     const fail = (code: number, message: string) => send({ id: msg.id, error: { code, message } });
     switch (msg.method) {
@@ -109,6 +111,7 @@ function servePagedShared(socketPath: string) {
         const limit = Math.min(100, Math.max(1, typeof p.limit === "number" ? p.limit : 25));
         const result = page(ordered, p.cursor, limit, (turn) => `轮次:${turn.id}`);
         if (!result) { fail(-32600, "invalid cursor"); break; }
+        entry.turnPage = { data: result.data.map(({ id, status }) => ({ id, status })), nextCursor: result.nextCursor };
         const itemsView = typeof p.itemsView === "string" ? p.itemsView : "summary";
         reply({ ...result, data: result.data.map((turn) => view(turn, itemsView)) });
         break;
@@ -325,6 +328,7 @@ describe.skipIf(!RUNNABLE)("H2-c 黑盒：共享模式长历史下的吸收判�
       mock().complete(THREAD, other, `他轮结论${i}`);
     }
     mock().complete(THREAD, target, "目标结论");
+    const joinedLogStart = mock().log.length;
     mock().release();
     const reply = await start;
     expect(reply.absorbedBy).toBe(target);
@@ -335,9 +339,20 @@ describe.skipIf(!RUNNABLE)("H2-c 黑盒：共享模式长历史下的吸收判�
     const run = await watchRun(observer);
     expect(run.joined).toBe(true);
     expect(run.turns.at(-1)).toMatchObject({ turnId: target, ready: "ready", output: "目标结论" });
-    const turnPages = mock().log.filter((e) => e.method === "thread/turns/list");
-    expect(turnPages.length).toBeGreaterThanOrEqual(2);
-    expect(turnPages[1]!.params.cursor).toEqual(expect.any(String));
+    // 只看本次释放回包后的 Turn 查询。release 的 started 通知可能触发版本重读，
+    // 因此从最后一次首页开始核对完整游标链，不能把重读首页当成第二页。
+    const joinedLog = mock().log.slice(joinedLogStart);
+    expect(joinedLog.some((e) => e.method === "thread/read")).toBe(false);
+    const turnPages = joinedLog.filter((e) => e.method === "thread/turns/list" && e.params.threadId === THREAD);
+    const firstIndex = turnPages.findLastIndex((e) => e.params.cursor === null);
+    expect(firstIndex).toBeGreaterThanOrEqual(0);
+    const completedRead = turnPages.slice(firstIndex);
+    expect(completedRead).toHaveLength(2);
+    expect(completedRead.every((e) => e.params.limit === 100 && e.params.sortDirection === "desc")).toBe(true);
+    expect(completedRead[0]!.turnPage!.data.some((turn) => turn.id === target)).toBe(false);
+    expect(completedRead[0]!.turnPage!.nextCursor).toEqual(expect.any(String));
+    expect(completedRead[1]!.params.cursor).toBe(completedRead[0]!.turnPage!.nextCursor);
+    expect(completedRead[1]!.turnPage!.data).toContainEqual({ id: target, status: "completed" });
     expect(mock().log.some((e) => e.method === "thread/items/list" && e.params.turnId === target)).toBe(true);
     assertBounded();
     await alive(owner);
