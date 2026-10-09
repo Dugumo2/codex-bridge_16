@@ -2362,6 +2362,13 @@ impl Machine {
             (false, "根所有权证据不足，保留占用")
         } else if check.as_ref().is_none_or(|c| !c.turn_ended) {
             (false, "根轮次仍活动或缺少结束证据，保留占用")
+        } else if self
+            .stops
+            .changes
+            .values()
+            .any(|c| c.thread == work.root_thread)
+        {
+            (false, "根请求未落定，保留占用")
         } else if check.as_ref().is_none_or(|c| !c.goal_braked)
             || self
                 .records
@@ -2386,12 +2393,65 @@ impl Machine {
     }
 
     /// SA-b：客户端树等待者必须在单线程 alreadyStopped 快捷出口之前登记。
-    fn tree_abandoned(&self, run: &str) -> bool {
+    pub(crate) fn tree_abandoned(&self, run: &str) -> bool {
         self.runs
             .runs
             .get(run)
             .and_then(|r| r.children_stop.as_ref())
             .is_some_and(|r| r.cleanup_state == "abandoned")
+    }
+
+    /// 弃管只撤树责任；未释放的自有结束快照恢复普通生命周期，不能指向已删除的协调器。
+    fn tree_abandon_restore_root(&mut self, tree_op: u64) {
+        let op = &self.trees.operations[&tree_op];
+        let thread = &self.trees.aux.work[&tree_op].root_thread;
+        let Some(claim) = self.claims.get(thread).filter(|c| {
+            c.run_id.as_ref() == Some(&op.request.snapshot.identity.run_id)
+                && op
+                    .request
+                    .snapshot
+                    .token
+                    .as_ref()
+                    .is_some_and(|t| t.thread_id == *thread && t.claim_id == c.claim_id)
+        }) else {
+            return;
+        };
+        let State::FinishingTree {
+            owner,
+            tree_op: held_op,
+            ..
+        } = &claim.state
+        else {
+            return;
+        };
+        if *held_op != tree_op {
+            return;
+        }
+        let owner = owner.clone();
+        let active = self
+            .trees
+            .aux
+            .derived
+            .get(&(tree_op, thread.clone()))
+            .into_iter()
+            .flat_map(|d| d.target.proven_turns.iter())
+            .chain(claim.owned_turns.iter())
+            .find(|turn| {
+                !claim.owned_ended.contains(turn)
+                    && !self
+                        .records
+                        .get(thread)
+                        .is_some_and(|r| r.ended_turns.contains(turn))
+            })
+            .cloned();
+        self.claims.get_mut(thread).expect("已核对自有根认领").state = match active {
+            Some(turn_id) => State::Running {
+                owner,
+                turn_id,
+                joined: false,
+            },
+            None => State::AwaitingContinuation { owner },
+        };
     }
 
     pub(crate) fn tree_abandon_request(
@@ -2473,6 +2533,8 @@ impl Machine {
             self.tree_publish(tree_op, actions);
             if release {
                 self.tree_commit(tree_op, actions);
+            } else {
+                self.tree_abandon_restore_root(tree_op);
             }
             report = Some(self.trees.operations[&tree_op].report.children.clone());
             self.trees

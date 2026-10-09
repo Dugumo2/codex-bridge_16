@@ -328,6 +328,146 @@ fn lim_b_abandon结束快照提交中断且不沿用展示报告() {
     }
 }
 
+fn lim_b_review_结束快照() -> Sim {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    s.never.insert("子".into());
+    stop(&mut s, true);
+    assert!(matches!(s.m.claims[P].state, State::FinishingTree { .. }));
+    s
+}
+
+fn lim_b_review_goal(s: &mut Sim, status: &str) {
+    let g = goal(P, status);
+    s.goals.insert(P.into(), g.clone());
+    s.notify(json!({"method":"thread/goal/updated","params":{"threadId":P,"goal":g}}));
+}
+
+fn lim_b_review_可再派单(s: &mut Sim) {
+    assert!(!s.m.claims.contains_key(P));
+    assert_eq!(s.record().state, RunState::Ended);
+    assert_eq!(s.run_ended(&s.log), 1);
+    assert_eq!(
+        s.record().children_stop.as_ref().unwrap().cleanup_state,
+        "abandoned"
+    );
+    assert_eq!(s.record().stop_outcome, Some(StopOutcome::Unconfirmed));
+    let a = s.client(
+        OWNER,
+        "turn/start",
+        json!({"threadId":P,"input":[]}),
+        Some("审查修复新运行"),
+    );
+    assert_eq!(s.m.claims[P].run_id.as_deref(), Some("审查修复新运行"));
+    assert!(a.iter().any(|a| matches!(a, Action::Request(c) if c.method == "turn/start" || c.method == "thread/resume")));
+}
+
+#[test]
+fn lim_b_review_弃管未释放快照后轮次事件可收敛并再派单() {
+    for started_before in [false, true] {
+        let mut s = lim_b_review_结束快照();
+        s.never.insert(P.into());
+        s.hold.push(("thread/goal/get".into(), P.into()));
+        if started_before {
+            s.turn_started(P, "恢复轮");
+        } else {
+            lim_b_review_goal(&mut s, "active");
+        }
+        assert_eq!(
+            abandon(&mut s)["childrenStop"]["rootRelease"]["released"],
+            false
+        );
+        assert!(!s.m.tree_busy(Some(P)));
+        assert!(s.tree_op().is_none());
+        assert!(s.m.claims.contains_key(P), "弃管当时不得强行释放");
+        if !started_before {
+            s.turn_started(P, "恢复轮");
+        }
+        lim_b_review_goal(&mut s, "paused");
+        s.turn_completed(P, "恢复轮", "completed");
+        lim_b_review_可再派单(&mut s);
+    }
+}
+
+#[test]
+fn lim_b_review_派生根goal写在途弃管不释放且回包落定后收敛() {
+    for status in ["active", "paused"] {
+        let mut s = lim_b_review_结束快照();
+        s.goals.insert(P.into(), goal(P, "paused"));
+        s.hold.push(("thread/goal/set".into(), P.into()));
+        let a = s.client(
+            OWNER,
+            "thread/goal/set",
+            json!({"threadId":P,"status":status}),
+            None,
+        );
+        let write = a
+            .iter()
+            .find_map(|a| match a {
+                Action::Request(c) if c.method == "thread/goal/set" => Some(c.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(s.m.stops.changes.values().any(|c| c.thread == P));
+        let result = abandon(&mut s);
+        assert_eq!(result["childrenStop"]["rootRelease"]["released"], false);
+        assert!(result["childrenStop"]["rootRelease"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("请求未落定"));
+        assert_eq!(s.run_ended(&s.log), 0);
+        // 即使其他通知先报告根停下，也必须等写请求落定。
+        lim_b_review_goal(&mut s, "paused");
+        assert!(s.m.claims.contains_key(P));
+        assert_eq!(s.run_ended(&s.log), 0);
+        s.turn_started(P, "写回包前的新轮");
+        s.turn_completed(P, "写回包前的新轮", "completed");
+        assert!(
+            s.m.claims.contains_key(P),
+            "轮次完成也不能越过尚未落定的 goal 写"
+        );
+        assert_eq!(s.run_ended(&s.log), 0);
+        s.apply(Event::Reply {
+            context: write,
+            result: Ok(json!({"goal":goal(P,status)})),
+        });
+        if status == "active" {
+            assert!(s.m.records[P].goal_active);
+            assert!(s.m.claims.contains_key(P));
+            lim_b_review_goal(&mut s, "paused");
+        }
+        lim_b_review_可再派单(&mut s);
+    }
+}
+
+#[test]
+fn lim_b_review_弃管根读取迟到不污染已结束运行且不重复结束() {
+    let mut s = lim_b_review_结束快照();
+    s.hold.push(("thread/goal/get".into(), P.into()));
+    lim_b_review_goal(&mut s, "active");
+    let old = s
+        .held
+        .iter()
+        .find(|c| c.method == "thread/goal/get" && c.params.as_ref().unwrap()["threadId"] == P)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        abandon(&mut s)["childrenStop"]["rootRelease"]["released"],
+        false
+    );
+    lim_b_review_goal(&mut s, "paused");
+    assert_eq!(s.record().state, RunState::Ended);
+    let record = s.record().clone();
+    s.apply(Event::Reply {
+        context: old,
+        result: Ok(json!({"goal":goal(P,"active")})),
+    });
+    assert!(!s.m.records[P].goal_active);
+    assert_eq!(s.record(), &record);
+    assert_eq!(s.run_ended(&s.log), 1);
+    lim_b_review_可再派单(&mut s);
+}
+
 #[test]
 fn lim_b_abandon自然收尾根后台受限也提交中断() {
     for status in ["completed", "failed", "interrupted"] {

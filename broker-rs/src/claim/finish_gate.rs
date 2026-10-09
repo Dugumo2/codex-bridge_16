@@ -29,6 +29,21 @@ pub enum ReleaseDecision {
 }
 
 impl Machine {
+    /// 弃管根已无轮次，只等 goal 请求落定时，用当前事实收尾；旧回包不覆盖新 goal 状态。
+    pub(crate) fn abandoned_root_goal_settled(&mut self, thread: &str, actions: &mut Vec<Action>) {
+        if !self.closing
+            && self.claims.get(thread).is_some_and(|c| {
+                matches!(c.state, State::AwaitingContinuation { .. })
+                    && c.run_id
+                        .as_deref()
+                        .is_some_and(|run| self.tree_abandoned(run))
+            })
+            && self.records.get(thread).is_some_and(|r| !r.goal_active)
+        {
+            self.learn_goal(thread, false, actions);
+        }
+    }
+
     /// 父认领自然释放之前的门禁：两条自然释放路径（父轮完成、两轮之间 goal 不再 active）都经过这里。
     pub fn natural_release_gate(
         &mut self,
@@ -53,6 +68,16 @@ impl Machine {
         let Some(run) = claim.run_id.clone() else {
             return ReleaseDecision::Release;
         };
+        // 弃管根走普通收尾，不重新创建树；goal 写尚未落定时保留可由 goal 回包推进的状态。
+        if self.tree_abandoned(&run) {
+            if claim.request_pending || self.stops.changes.values().any(|c| c.thread == thread) {
+                let owner = claim.owner().cloned().expect("自有收尾有 owner");
+                self.claims.get_mut(thread).expect("根认领存在").state =
+                    State::AwaitingContinuation { owner };
+                return ReleaseDecision::Hold;
+            }
+            return ReleaseDecision::Release;
+        }
         // 已有停止（单线程或整树）的运行按停止路径收尾；树协调器的释放门禁另行把关。
         if self.tree_for_run(&run).is_some() || self.stop_busy(thread) {
             return ReleaseDecision::Release;

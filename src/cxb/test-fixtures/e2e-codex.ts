@@ -59,6 +59,9 @@ const interruptedTurns = new Set<string>();
 const holds = new Map<string, () => void>();
 const completedTurns = new Map<string, unknown[]>();
 const heldReads: Array<{ id: unknown; threadId: string }> = [];
+// 审查回归用控制点：扣住根 goal 读取，再在弃管收尾后发送迟到回包。
+let holdRootGoalReads = false;
+const heldRootGoalReads: unknown[] = [];
 const heldItemReads: Array<{ id: unknown; threadId: string; turnId: string }> = [];
 let resultsReleased = false;
 /** 只有完成通知不带完整条目的场景才需要结果补读的条目分页。 */
@@ -293,7 +296,15 @@ process.stdin.on("data", (chunk: string) => {
         send({ id: msg.id, result: { data: [], nextCursor: null } });
         break;
       case "thread/goal/get":
+        if (holdRootGoalReads) { heldRootGoalReads.push(msg.id); break; }
         send({ id: msg.id, result: { goal: null } });
+        break;
+      case "fixture/rootGoalReadControl":
+        if (typeof msg.params?.hold === "boolean") holdRootGoalReads = msg.params.hold;
+        if (!holdRootGoalReads) for (const id of heldRootGoalReads.splice(0)) {
+          send({ id, result: { goal: { threadId, status: msg.params?.status ?? "paused", objective: "迟到根读取" } } });
+        }
+        send({ id: msg.id, result: { pending: heldRootGoalReads.length } });
         break;
       case "thread/read":
         if (completedTurns.has(threadId) && !resultsReleased && delayResult && !(pendingMetadata && msg.params?.includeTurns !== true)) {

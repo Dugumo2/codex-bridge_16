@@ -728,6 +728,22 @@ pub struct Machine {
 /// 所有输入通过同一个纯函数迁移；运行时只持有返回的新状态。
 pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     let mut actions = Vec::new();
+    // goal 通知可能早于写回包；请求落定后再推进已弃管根，不能依赖第二条 inactive 通知。
+    let settled_goal = match &event {
+        Event::Reply { context, .. }
+        | Event::LateReply { context, .. }
+        | Event::TransportFailed { context, .. }
+            if matches!(context.operation, Operation::GoalChange { .. }) =>
+        {
+            context
+                .params
+                .as_ref()
+                .and_then(|p| p.get("threadId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
+        _ => None,
+    };
     match event {
         Event::PrivateInstanceExited { instance } => state.lifecycle_instance_exited(&instance),
         Event::AppResponsive => state.observe_app_response(&mut actions),
@@ -837,6 +853,9 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
                 state.runs_finalized = true;
             }
         }
+    }
+    if let Some(thread) = settled_goal {
+        state.abandoned_root_goal_settled(&thread, &mut actions);
     }
     // 空转刹车在停止驱动之前结算，触发的停止当场发出请求。
     state.drive_loop_guards(&mut actions);

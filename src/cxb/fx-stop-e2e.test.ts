@@ -239,4 +239,46 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     expect(resumed.json().runId).not.toBe(run.runId);
   }, 90_000);
 
+  test("审查修复：未释放的结束快照弃管后经轮次收敛，迟到根读取无副作用且可再派单", async () => {
+    const run = await start();
+    await commandEvents(PARENT, "turn-001", sessions);
+    await child();
+    await rpc("fixture/interruptBehavior", { threadId: CHILD, mode: "never" });
+    const stopping = rpc("broker/threads/stop", { threadId: PARENT, runId: run.runId });
+    void stopping.catch(() => {});
+    async function until(check: () => Promise<boolean>) {
+      const deadline = performance.now() + 8000;
+      while (performance.now() < deadline) {
+        if (await check()) return;
+        await Bun.sleep(20);
+      }
+      throw new Error("审查回归的确定性控制点未到达");
+    }
+    await until(async () => (await rpc("broker/threads/watch", { threadId: PARENT })).run.childrenStop?.root.phase === "confirmed");
+    await rpc("fixture/rootGoalReadControl", { hold: true });
+    await rpc("fixture/goal", { threadId: PARENT, status: "active" });
+    await until(async () => (await rpc("fixture/rootGoalReadControl", {})).pending > 0);
+    const abandoned = await cli("stop", PARENT, "--run", run.runId, "--abandon", "--json");
+    expect(abandoned.code).toBe(3);
+    expect(abandoned.json()).toMatchObject({ actionApplied: true, childrenStop: { cleanupState: "abandoned", rootRelease: { released: false } } });
+    expect(abandoned.stderr).toContain("仍被占用");
+    expect((await stopping).stopOutcome).toBe("unconfirmed");
+    expect((await rpc("broker/health")).claims).toBe(1);
+    await rpc("fixture/inject", { threadId: PARENT, kind: "notification", payload: {
+      method: "turn/started", params: { turn: { id: "review-recovery-turn", status: "inProgress", items: [] } } } });
+    await rpc("fixture/goal", { threadId: PARENT, status: "paused" });
+    await rpc("fixture/inject", { threadId: PARENT, kind: "notification", payload: {
+      method: "turn/completed", params: { turn: { id: "review-recovery-turn", status: "completed", items: [], error: null } } } });
+    await until(async () => (await rpc("broker/health")).claims === 0);
+    const ended = (await rpc("broker/threads/watch", { threadId: PARENT })).run;
+    expect(ended).toMatchObject({ state: "ended", stopOutcome: "unconfirmed", childrenStop: { cleanupState: "abandoned" } });
+    await rpc("fixture/rootGoalReadControl", { hold: false, status: "active" });
+    const after = await rpc("broker/threads/watch", { threadId: PARENT });
+    expect(after.thread.goalActive).toBe(false);
+    expect(after.run).toEqual(ended);
+    const resumed = await cli("run", "--resume", PARENT, "--json", "审查修复后同线程再派单");
+    expect(resumed.code, JSON.stringify(resumed)).toBe(0);
+    expect(resumed.json().runId).not.toBe(run.runId);
+  }, 60_000);
+
 });
