@@ -199,10 +199,179 @@ fn fx_abandon根活动不提交结束且解除树屏障() {
     assert_eq!(result["actionApplied"], true);
     assert_eq!(result["stopOutcome"], "unconfirmed");
     assert_eq!(result["childrenStop"]["cleanupState"], "abandoned");
+    assert_eq!(result["childrenStop"]["rootRelease"]["released"], false);
+    assert!(result["childrenStop"]["rootRelease"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("轮次"));
+    assert!(s.m.claims.contains_key(P));
     assert_eq!(s.run_ended(&s.log), before);
     assert_ne!(s.record().state, RunState::Ended);
     assert!(!s.m.tree_busy(Some(P)));
     assert!(s.m.stops.operations.is_empty());
+}
+
+fn lim_b_根后台受限() -> Sim {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    s.background_supported = false;
+    stop(&mut s, true);
+    s.advance(40_000);
+    assert_ne!(s.record().state, RunState::Ended);
+    assert!(s.m.claims.contains_key(P));
+    s
+}
+
+#[test]
+fn lim_b_abandon根已停但后台受限应唯一提交并可同线程派单() {
+    for no_claim in [false, true] {
+        let mut s = lim_b_根后台受限();
+        if no_claim {
+            s.m.claims.remove(P);
+        }
+        let result = abandon(&mut s);
+        assert_eq!(result["childrenStop"]["rootRelease"]["released"], true);
+        assert_eq!(result["run"]["state"], "ended");
+        assert_eq!(result["run"]["status"], "interrupted");
+        assert_eq!(result["run"]["stopOutcome"], "unconfirmed");
+        assert_eq!(result["run"]["childrenStop"]["cleanupState"], "abandoned");
+        assert_eq!(s.run_ended(&s.log), 1);
+        assert_eq!(abandon(&mut s)["reason"], "alreadyAbandoned");
+        s.advance(60_000);
+        assert_eq!(s.run_ended(&s.log), 1);
+        assert!(s.m.claims.is_empty());
+        assert!(!s.m.stops_busy());
+        assert!(!s.m.tree_busy(None));
+        let a = s.client(
+            OWNER,
+            "turn/start",
+            json!({"threadId":P,"input":[]}),
+            Some("新运行"),
+        );
+        assert_eq!(s.m.claims[P].run_id.as_deref(), Some("新运行"));
+        assert!(
+            a.iter()
+                .any(|a| matches!(a, Action::Request(c) if c.method == "thread/resume")),
+            "新运行通过门禁并开始恢复订阅"
+        );
+    }
+}
+
+#[test]
+fn lim_b_abandon证据不足或认领变更不释放且说明原因() {
+    for fault in [
+        "ownership",
+        "goal",
+        "pending",
+        "joined",
+        "claim",
+        "run",
+        "evidence",
+        "epoch",
+    ] {
+        let mut s = lim_b_根后台受限();
+        match fault {
+            "ownership" => {
+                s.m.stops
+                    .operations
+                    .values_mut()
+                    .find(|o| o.thread == P)
+                    .unwrap()
+                    .foreign_claim = true
+            }
+            "goal" => s.m.records.get_mut(P).unwrap().goal_active = true,
+            "pending" => s.m.claims.get_mut(P).unwrap().request_pending = true,
+            "joined" => {
+                s.m.claims.get_mut(P).unwrap().state = State::Running {
+                    owner: crate::claim::Owner::Client(OWNER),
+                    turn_id: T.into(),
+                    joined: true,
+                }
+            }
+            "claim" => s.m.claims.get_mut(P).unwrap().claim_id += 1,
+            "run" => s.m.claims.get_mut(P).unwrap().run_id = Some("外部运行".into()),
+            "evidence" => s.m.stops.operations.clear(),
+            "epoch" => s.m.relations.conn_epoch += 1,
+            _ => unreachable!(),
+        }
+        let claim = s.m.claims[P].clone();
+        let result = abandon(&mut s);
+        assert_eq!(result["actionApplied"], true, "{fault}");
+        assert_eq!(
+            result["childrenStop"]["rootRelease"]["released"], false,
+            "{fault}"
+        );
+        assert!(!result["childrenStop"]["rootRelease"]["reason"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.m.claims[P], claim, "{fault}");
+        assert_ne!(s.record().state, RunState::Ended, "{fault}");
+        assert_eq!(s.run_ended(&s.log), 0, "{fault}");
+    }
+}
+
+#[test]
+fn lim_b_abandon结束快照提交中断且不沿用展示报告() {
+    for active_goal in [false, true] {
+        let mut s = Sim::new();
+        s.spawn_v1("子", "派生", "子轮");
+        s.never.insert("子".into());
+        stop(&mut s, true);
+        assert!(matches!(s.m.claims[P].state, State::FinishingTree { .. }));
+        if active_goal {
+            s.m.records.get_mut(P).unwrap().goal_active = true;
+        }
+        let result = abandon(&mut s);
+        assert_eq!(
+            result["childrenStop"]["rootRelease"]["released"],
+            !active_goal
+        );
+        assert_eq!(s.run_ended(&s.log), usize::from(!active_goal));
+    }
+}
+
+#[test]
+fn lim_b_abandon自然收尾根后台受限也提交中断() {
+    for status in ["completed", "failed", "interrupted"] {
+        let mut s = Sim::new();
+        s.spawn_v1("子", "派生", "子轮");
+        s.background_supported = false;
+        s.turn_completed(P, T, status);
+        s.advance(40_000);
+        assert_ne!(s.record().state, RunState::Ended);
+        let result = abandon(&mut s);
+        assert_eq!(
+            result["childrenStop"]["rootRelease"]["released"], true,
+            "{status}: {result}"
+        );
+        assert_eq!(result["run"]["status"], "interrupted", "{status}");
+        assert_eq!(s.run_ended(&s.log), 1);
+        assert!(!s.m.claims.contains_key(P));
+    }
+}
+
+#[test]
+fn lim_b_abandon已提交根或外部新认领均不重复结束() {
+    for foreign in [false, true] {
+        let mut s = Sim::new();
+        s.spawn_v1("子", "派生", "子轮");
+        s.never.insert("子".into());
+        let mut old_claim = s.m.claims[P].clone();
+        stop(&mut s, true);
+        s.advance(40_000);
+        assert_eq!(s.record().state, RunState::Ended);
+        if foreign {
+            old_claim.run_id = Some("外部新运行".into());
+            s.m.claims.insert(P.into(), old_claim.clone());
+        }
+        let result = abandon(&mut s);
+        assert_eq!(result["childrenStop"]["rootRelease"]["released"], !foreign);
+        assert_eq!(s.run_ended(&s.log), 1);
+        if foreign {
+            assert_eq!(s.m.claims[P], old_claim);
+        }
+    }
 }
 
 #[test]
@@ -223,7 +392,8 @@ fn fx_abandon多个等待者都获未确认且不续期() {
             .first_delivery_deadline_ms,
         deadline
     );
-    abandon(&mut s);
+    let result = abandon(&mut s);
+    assert_eq!(result["childrenStop"]["rootRelease"]["released"], true);
     for id in [first, second] {
         assert_eq!(
             s.response(&s.log, id).unwrap()["result"]["stopOutcome"],

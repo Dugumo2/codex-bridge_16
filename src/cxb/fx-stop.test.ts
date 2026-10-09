@@ -70,6 +70,31 @@ test.each(["show", "ls", "stop", "wait"] as const)("fx：%s 文本和 JSON 保�
   for (const value of ["child-x", "attachmentMissing", "Background", "读取失败", "Codex 受管的后台命令"]) expect(t.notices.join("\n")).toContain(value);
 });
 
+for (const released of [true, false]) test.each(["stop", "show", "wait"] as const)(`lim-b：%s 放弃后显示根释放=${released}，保留 JSON 且不要求再次核实`, async command => {
+  const tree = report();
+  tree.cleanupState = "abandoned";
+  tree.rootRelease = { thread: "thread-test", released, reason: released ? "根轮次已结束且 goal 已制动" : "根轮次仍活动或缺少结束证据，保留占用" };
+  const run = runResult({ status: "interrupted", stopOutcome: "unconfirmed", childrenStop: tree });
+  ledger(dir, [run]);
+  const t = context(dir, [command, "abcd1234", ...(command === "stop" ? ["--run", "run-test", "--abandon"] : []), "--json"]);
+  t.fake.handle = m => {
+    if (m === "broker/threads/list") return { threads: [summary()] };
+    if (m === "broker/threads/watch") return { thread: summary(), run, pending: [] };
+    return { threadId: "thread-test", runId: "run-test", interruptSent: false, goal: "unchanged", alreadyStopped: false,
+      stopOutcome: "unconfirmed", actionApplied: true, reason: "abandoned", childrenStop: tree, run };
+  };
+  const code = await ({ stop, show, wait })[command](t.ctx);
+  if (command === "stop") {
+    expect(code).toBe(3);
+    expect(t.json.at(-1)).toMatchObject({ ok: false, actionApplied: true, reason: "abandoned" });
+  }
+  expect(t.json.at(-1).childrenStop.rootRelease).toEqual(tree.rootRelease);
+  expect(t.notices.join("\n")).toContain(released ? "已释放，可在同线程发起新运行" : "仍被占用");
+  expect(t.notices.join("\n")).toContain(tree.rootRelease.reason);
+  expect(t.notices.join("\n")).not.toContain("先 cxb stop");
+  expect(t.notices.join("\n")).not.toContain("或 cxb stop");
+});
+
 
 test.each(["thread/closed", "thread/read:notLoaded"])("已卸载确认报告保留依据 %s 与退出码", async source => {
   ledger(dir); const t = context(dir, ["stop", "abcd1234", "--json"]);

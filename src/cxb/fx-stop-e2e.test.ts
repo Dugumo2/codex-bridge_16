@@ -174,10 +174,11 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     }
   }, 90_000);
 
-  test("树停止 unconfirmed 后 --abandon：保留诊断、解除屏障且可再派单", async () => {
+  for (const rootLimited of [false, true]) test(`树停止 unconfirmed 后 --abandon（根受限=${rootLimited}）：保留诊断、解除屏障且可再派单`, async () => {
     const run = await start();
     await commandEvents(PARENT, "turn-001", sessions);
     await child();
+    if (rootLimited) await set(PARENT, { sessions, fault: "unsupported" });
     await set(CHILD, { sessions: [{ itemId: "child-command", processId: "31001", termination: "remaining" }] });
     const stopped = await cli("stop", PARENT, "--run", run.runId, "--json");
     expect(stopped.code, JSON.stringify(stopped)).toBe(3);
@@ -187,13 +188,19 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     expect(stopped.json().childrenStop.members[CHILD].backgroundCleanup.remaining).toEqual(["31001"]);
     const blocked = await cli("run", "--resume", PARENT, "--json", "屏障期间不能派单");
     expect(blocked.code, JSON.stringify(blocked)).toBe(8);
+    if (rootLimited) {
+      expect((await rpc("broker/threads/watch", { threadId: PARENT })).run.state).not.toBe("ended");
+      expect((await rpc("broker/health")).claims).toBeGreaterThan(0);
+    }
     const abandoned = await cli("stop", PARENT, "--run", run.runId, "--abandon", "--json");
     expect(abandoned.code, JSON.stringify(abandoned)).toBe(3);
     expect(abandoned.json()).toMatchObject({ stopOutcome: "unconfirmed", actionApplied: true,
-      childrenStop: { cleanupState: "abandoned", phase: "unconfirmed" } });
+      childrenStop: { cleanupState: "abandoned", phase: "unconfirmed", rootRelease: { thread: PARENT, released: true } } });
+    expect(abandoned.stderr).toContain("已释放，可在同线程发起新运行");
+    expect((await rpc("broker/health")).claims).toBe(0);
     expect(abandoned.stderr).toContain("可能仍有子代理或命令在运行");
     const watched = await rpc("broker/threads/watch", { threadId: PARENT });
-    expect(watched.run).toMatchObject({ runId: run.runId, stopOutcome: "unconfirmed", childrenStop: { cleanupState: "abandoned" } });
+    expect(watched.run).toMatchObject({ runId: run.runId, state: "ended", status: "interrupted", stopOutcome: "unconfirmed", childrenStop: { cleanupState: "abandoned" } });
     const before = (await state()).calls.length;
     const repeated = await cli("stop", PARENT, "--run", run.runId, "--json");
     expect(repeated.code).toBe(3);

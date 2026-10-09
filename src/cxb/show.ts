@@ -30,6 +30,7 @@ function printLine(ctx: CommandContext, line: { ts: string; kind: string; text: 
 
 function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
   showSubagents(ctx, run);
+  if (run.childrenStop?.cleanupState === "abandoned") return;
   if (run.state === "lost" || run.stopOutcome === "unconfirmed") {
     ctx.out.notice(`停止中（未确认），先 cxb stop ${id} 核实`);
   } else if (run.status === "interrupted") {

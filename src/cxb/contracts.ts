@@ -501,6 +501,7 @@ export interface RootStopReport {
   clearRequested: boolean; clearConfirmed: boolean; error: string | null;
 }
 export interface ChildrenStopReport {
+  rootRelease?: { thread: string; released: boolean; reason: string };
   members?: Record<string, RootStopReport>; cleanupState?: string; abandonReason?: string | null; abandonedAt?: number | null;
   trigger: "userStop" | "ownerGone" | "parentFinishedEarly" | "loopGuard" | "parentFailed" | "parentInterrupted";
   phase: TreePhase; version: number; root: RootStopReport;
