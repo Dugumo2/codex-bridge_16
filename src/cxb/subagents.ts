@@ -34,6 +34,7 @@ export function stopReportLines(report: ChildrenStopReport): string[] {
   const lines = [parts.join("；")];
   if (report.cleanupState === "released") lines.push("  历史清理核验已释放：未加载成员缺少完整停止证据；本次不再占用线程或周期重试。");
   if (report.cleanupState === "abandoned") lines.push(`  清理已放弃：${safe(report.abandonReason ?? "显式放弃")}；可能仍有子代理或命令在运行，请换新线程，必要时换隔离工作目录。`);
+  if (report.cleanupState === "abandoned" && report.rootRelease) lines.push(`  本次放弃时根线程 ${safe(report.rootRelease.thread)}${report.rootRelease.released ? "已释放，可在同线程发起新运行" : "仍被占用"}：${safe(report.rootRelease.reason)}。`);
   for (const member of [report.root, ...Object.values(report.members ?? {})]) {
     if (member.step || member.lastVerifiedAt != null || member.error) lines.push(`  成员 ${safe(member.thread)}：步骤 ${safe(member.step ?? "未知")}；检查 ${safe(JSON.stringify(member.check))}；最近核实 ${member.lastVerifiedAt == null ? "无" : new Date(member.lastVerifiedAt).toISOString()}${member.error ? `；错误 ${safe(member.error)}` : ""}`);
     if (member.backgroundCleanup) lines.push(...backgroundLines(member.thread, member.backgroundCleanup));

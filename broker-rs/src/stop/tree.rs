@@ -69,6 +69,8 @@ pub struct StopConflict {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChildrenStopReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_release: Option<RootRelease>,
     #[serde(default)]
     pub members: BTreeMap<String, RootStopReport>,
     #[serde(default)]
@@ -88,6 +90,15 @@ pub struct ChildrenStopReport {
     pub capability_limited: Vec<String>,
     pub discovery: DiscoveryState,
     pub unsettled_spawns: usize,
+}
+
+/// 显式放弃时的根占用结论；不代表子代理或后台命令已退出。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RootRelease {
+    pub thread: String,
+    pub released: bool,
+    pub reason: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TreeScope {
@@ -435,6 +446,7 @@ impl Machine {
             generation,
             round: 1,
             children: ChildrenStopReport {
+                root_release: None,
                 members: BTreeMap::new(),
                 cleanup_state: "active".into(),
                 abandon_reason: None,
@@ -1933,7 +1945,11 @@ impl Machine {
             snapshot.parent_status = record.and_then(|r| r.turns.last()).map(|t| t.status);
         }
         let existing = record.and_then(|r| r.interrupt_reason);
-        let (status, interrupt_reason) = commit_status(&snapshot, trigger, existing);
+        let (status, interrupt_reason) = if op.report.children.cleanup_state == "abandoned" {
+            (RunStatus::Interrupted, Some(InterruptReason::Stop))
+        } else {
+            commit_status(&snapshot, trigger, existing)
+        };
         let mut report = op.report.clone();
         report.committed = true;
         let commit = TreeFinishCommit {
@@ -2291,6 +2307,84 @@ pub(crate) fn commit_status(
 }
 
 impl Machine {
+    /// 只采用当前停止操作的证据，不用可能已过期的展示报告释放认领。
+    fn tree_abandon_root(&self, tree_op: u64) -> RootRelease {
+        let op = &self.trees.operations[&tree_op];
+        let work = &self.trees.aux.work[&tree_op];
+        let run = &op.request.snapshot.identity.run_id;
+        let claim = self.claims.get(&work.root_thread);
+        let stop = self
+            .stops
+            .operations
+            .values()
+            .find(|s| Some(s.generation) == work.root_stop_gen && s.thread == work.root_thread);
+        let check = stop
+            .filter(|s| s.connection_epoch == self.relations.conn_epoch)
+            .map(|s| self.stop_check(s))
+            .or_else(|| {
+                self.trees
+                    .aux
+                    .derived
+                    .get(&(tree_op, work.root_thread.clone()))
+                    .filter(|d| d.connection_epoch == self.relations.conn_epoch)
+                    .map(|d| StopCheck {
+                        // 后台接口受限或仍在读取后台列表，不否定已经成立的轮次与 goal 证据。
+                        goal_braked: d.goal_checked && d.goal_braked,
+                        settled: (!d.slot || d.stage == DerivedStage::Background)
+                            && d.interrupts_pending == 0,
+                        ..d.check()
+                    })
+            });
+        let claim_id = stop.and_then(|s| s.claim_id).or_else(|| {
+            op.request
+                .snapshot
+                .token
+                .as_ref()
+                .filter(|t| t.thread_id == work.root_thread)
+                .map(|t| t.claim_id)
+        });
+        let terminal = self.runs.runs.get(run).is_some_and(|r| {
+            matches!(
+                r.state,
+                crate::runs::RunState::Ended | crate::runs::RunState::Lost
+            )
+        });
+        let (released, reason) = if claim.is_some_and(|c| {
+            c.run_id.as_ref() != Some(run)
+                || Some(c.claim_id) != claim_id
+                || c.joined()
+                || c.settling()
+        }) {
+            (false, "根认领已变更或存在共享归属冲突，保留现有认领")
+        } else if terminal && claim.is_none() {
+            (true, "根运行此前已结束，根认领已释放")
+        } else if check.as_ref().is_none_or(|c| !c.ownership) {
+            (false, "根所有权证据不足，保留占用")
+        } else if check.as_ref().is_none_or(|c| !c.turn_ended) {
+            (false, "根轮次仍活动或缺少结束证据，保留占用")
+        } else if check.as_ref().is_none_or(|c| !c.goal_braked)
+            || self
+                .records
+                .get(&work.root_thread)
+                .is_some_and(|r| r.goal_active)
+        {
+            (false, "根 goal 尚未确认制动，保留占用")
+        } else if check.as_ref().is_none_or(|c| !c.settled)
+            || claim.is_some_and(|c| c.request_pending)
+        {
+            (false, "根仍有未落定请求，保留占用")
+        } else if terminal {
+            (false, "根运行已结束但仍有认领，保留占用以免释放其他工作")
+        } else {
+            (true, "根轮次已结束且 goal 已制动，提交中断并释放根认领")
+        };
+        RootRelease {
+            thread: work.root_thread.clone(),
+            released,
+            reason: reason.into(),
+        }
+    }
+
     /// SA-b：客户端树等待者必须在单线程 alreadyStopped 快捷出口之前登记。
     fn tree_abandoned(&self, run: &str) -> bool {
         self.runs
@@ -2366,7 +2460,10 @@ impl Machine {
         if abandoned {
             reason = "alreadyAbandoned";
         } else if let Some(tree_op) = tree {
+            let root_release = self.tree_abandon_root(tree_op);
+            let release = root_release.released;
             let op = self.trees.operations.get_mut(&tree_op).expect("树停止存在");
+            op.report.children.root_release = Some(root_release);
             op.report.children.phase = TreePhase::Unconfirmed;
             op.report.children.cleanup_state = "abandoned".into();
             op.report.children.abandon_reason =
@@ -2374,6 +2471,9 @@ impl Machine {
             op.report.children.abandoned_at = Some(self.clock.now_ms);
             op.report.children.version += 1;
             self.tree_publish(tree_op, actions);
+            if release {
+                self.tree_commit(tree_op, actions);
+            }
             report = Some(self.trees.operations[&tree_op].report.children.clone());
             self.trees
                 .operations
