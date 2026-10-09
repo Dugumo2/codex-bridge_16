@@ -46,7 +46,7 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 
 ## 3. 规划简报
 
-- 简报里不要要求 Codex 使用子代理或多代理并行：broker 目前不转发子代理的提问与审批，`cxb stop` 也不会连带停止子代理。
+- 简报里可以让 Codex 使用子代理：子代理的提问与审批同样进收件箱（第 5 节）；`cxb stop` 连带停止整棵子树；父线程不等子代理就结束时，cxb 停掉残留子代理并以退出 4 结束。v2 子线程不能直接 `--resume`（退出 1），从父线程继续。
 
 每次 run 写清：要做什么；已定的设计决定；要改哪些文件、为什么；参考哪个既有实现（「照 `path/X` 里的 Y 写」）；约束与不许做的事；验证命令与完成标准。
 
@@ -93,13 +93,14 @@ Codex 需要人回应时，cxb 把线程交给 broker 托管、以退出码 5 �
 |---|---|---|
 | 0 | 成功 | 核对结果（第 8 节） |
 | 2 | 找不到、有歧义，或事项已过期/撤销 | `cxb ls` 找对 ID；必要时加 `-d <目录>` |
-| 3 | 超时 | `cxb show <线程ID> --tail` 看进展；长任务改 `--detach` 或加大 `--timeout`；stop 未确认可再发一次 |
+| 3 | 超时 | `cxb show <线程ID> --tail` 看进展；长任务改 `--detach` 或加大 `--timeout`；stop 未确认按第 7 节「停止未确认时」处理，不要循环重发 |
+| 4 | 运行被中断 | 看输出的中断原因；`subagentsUnfinished` 表示父线程没等子代理就结束、残留子代理已被停下，按需 `--resume --continue` 让父线程重新派生或汇总 |
 | 5 | 等待回应（不是失败） | 第 5 节 |
 | 6 | broker 不可用 | `cxb doctor`；`cxb ls --local`、`cxb show <线程ID>` 读本地记录 |
 | 7 | Codex 失败 | 读 stderr；MCP 被拒就改 `--approval auto` |
 | 8 | 线程被占、停止中或待核实 | 按 stderr 提示做（`cxb stop`、`cxb stop <线程> --run <runId>`、重试 `cxb rm`），不要硬重试 |
 | 9 | 目标受阻或空转刹车 | `cxb show <线程ID> --log` 看原因；继续用 `--continue [新指示]`，放弃用 `cxb stop <线程ID> --clear` |
-| 1、4、10、12、130、143 | 用法错误、被中断、空闲、协议不匹配、信号 | 按 stderr 处理 |
+| 1、10、12、130、143 | 用法错误、空闲、协议不匹配、信号 | 按 stderr 处理 |
 
 ## 7. 等待、查看与线程管理
 
@@ -107,8 +108,16 @@ Codex 需要人回应时，cxb 把线程交给 broker 托管、以退出码 5 �
 - `cxb show <线程ID>`：默认最近一轮结果；`--tail` 最近进展；`--log` 完整本地日志（权威记录）；`--follow` 实时跟随（尽力而为，`--json` 时每行一个 JSON）；`--server` 从服务器读。
 - `cxb ls`：列线程（合并服务器信息）；`--local` 只读本地。
 - 续聊还是新开：同一件事、同一项目接着做 → `--resume`；被停下或刹车 → `--resume --continue`；不相关的事或换项目 → 新线程；线程卡住 → 先 `cxb stop` 再决定。
-- `cxb stop <线程ID>`：等 Codex 确认停下（最多约 40 秒），未确认退出 3，可再发一次；默认只暂停目标，`--clear` 放弃目标；`--run <runId>` 核实某次历史失联运行。
-- `cxb rm <线程ID>`：归档（可恢复）；`--purge` 永久删除，不可恢复。有未结束的运行时退出 8 并逐条给出下一步，按提示照做，不要自行重放。
+- `cxb stop <线程ID>`：等 Codex 确认停下（最多约 40 秒）；有子代理时连带停整棵子树；确认还要求该线程（及子线程）由 Codex 管理的后台命令已清理。未确认退出 3，见下面「停止未确认时」。默认只暂停目标，`--clear` 放弃目标；`--run <runId>` 核实某次历史失联运行。
+- `cxb rm <线程ID>`：归档（可恢复）；`--purge` 永久删除，不可恢复。有未结束的运行或仍有子代理子树时退出 8 并逐条给出下一步，按提示照做，不要自行重放。
+
+**停止未确认时**（`stopOutcome:"unconfirmed"`、退出 3）：
+
+- 先看报告：卡在哪个成员（`childrenStop.members`）、发现缺什么（`discovery.missing`）、当前步骤、后台命令清理状态（`backgroundCleanup.state` 与 `failureReason`）。
+- 临时故障（超时、断连）可等 broker 后台复核，隔一段时间 `cxb show <线程ID>` 看结论；不要在原线程循环 stop/resume。
+- 子代理整树停止确认无法补齐证据时，执行一次 `cxb stop <线程> --run <运行> --abandon`，显式放弃本次树清理责任：仍退出 3，`actionApplied:true` 只表示放弃已应用，**不表示已经停止**；之后换新线程，必要时换隔离工作目录，避免残留工作互相覆盖。重复 stop 不会重启已放弃的清理。`--abandon` 只作用于整树停止：单线程返回 `treeStopNotFound`；放弃后未结束的父运行不一定已放开。
+- `backgroundCleanup.state` 为 `capabilityLimited`（服务器不支持后台命令接口）时，重复 stop 补不了证据，线程会一直处于停止中直到 broker 重启（已知限制）：告诉用户，可改用私有档（`cxb config server private`）。
+- 停止确认的后台清理范围仅为「Codex 受管的后台命令」；空列表不保证操作系统没有残留后代进程。
 
 ## 8. 结果核对与汇报
 
@@ -126,7 +135,7 @@ cxb ls [--all|--limit <数量>] [--local]
 cxb inbox [--kind <类型>] [--limit <数量>]
 cxb reply <事项ID> <内容>|-
 cxb wait [线程ID|事项ID] [--timeout <秒>]
-cxb stop <ID> [--clear] [--run <runId>]
+cxb stop <ID> [--clear] [--run <runId> [--abandon]]
 cxb rm <ID> [--purge]
 cxb config [<键> [值]] [--unset] | cxb config templates
 cxb doctor
@@ -139,10 +148,3 @@ cxb doctor
 - 不把令牌、Cookie、完整环境变量写进提示词或交给 MCP。
 - `cxb rm --purge` 不可恢复。
 - 不逆向 Claude 的内部认证，不读取会话令牌。
-
-
-### 停止未确认时的恢复规则
-
-`cxb stop` 返回 `unconfirmed`（退出 3）时，先看报告中的具体成员、发现缺失项、当前核实步骤与后台命令清理原因。临时故障可等待后台复核；确认无法补齐证据时，执行 `cxb stop <线程> --run <运行> --abandon`，显式放弃本次树清理责任。该操作仍退出 3，`actionApplied:true` 只表示放弃已应用，不表示已经停止。之后换新线程，必要时换隔离工作目录，避免残留工作互相覆盖；不要在原线程循环 stop/resume。重复 stop 不会重新启动已放弃的清理。
-
-停止确认的后台清理范围仅为「Codex 受管的后台命令」。空列表和 terminate 回包都不保证操作系统没有残留后代进程。
