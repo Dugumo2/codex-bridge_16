@@ -168,6 +168,8 @@ pub struct Trees {
 /// 树停止的协调进度（按 tree_op）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeWork {
+    /// 仅在已结束、无根认领的历史核验中允许卸载无法核实时释放。
+    pub historical_unloaded: bool,
     /// 停止范围内的运行；首个是提交终态的主运行。`--run R` 时只有 R。
     pub runs: BTreeSet<String>,
     pub root_thread: String,
@@ -471,6 +473,12 @@ impl Machine {
         self.trees.aux.work.insert(
             tree_op,
             TreeWork {
+                historical_unloaded: previously_ended
+                    && self.trees.operations[&tree_op]
+                        .request
+                        .snapshot
+                        .token
+                        .is_none(),
                 runs,
                 root_thread: root_thread.clone(),
                 root_derived,
@@ -1334,6 +1342,14 @@ impl Machine {
         }
         self.tree_pump(tree_op, actions);
         self.tree_update_report(tree_op, &members, actions);
+        if self.trees.aux.work[&tree_op].historical_unloaded
+            && self.trees.aux.derived.iter().any(|(k, d)| {
+                k.0 == tree_op && !d.stopped && d.background.report.state == "notLoaded"
+            })
+        {
+            self.tree_release_unloaded_history(tree_op, actions);
+            return;
+        }
         if self.tree_confirmable(tree_op, &members) {
             self.tree_confirmed(tree_op, actions);
             return;
@@ -1747,6 +1763,77 @@ impl Machine {
             op.cancelled = true;
             op.report.cancelled = true;
         }
+        self.tree_finish(tree_op, actions);
+    }
+
+    fn tree_cancel_work(&mut self, tree_op: u64, actions: &mut Vec<Action>) {
+        let root_generation = self.trees.aux.work[&tree_op].root_stop_gen;
+        let roots: Vec<_> = self
+            .stops
+            .operations
+            .iter()
+            .filter(|(_, op)| Some(op.generation) == root_generation)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in roots {
+            if let Some(mut op) = self.stops.operations.remove(&id) {
+                for waiter in &op.waiters {
+                    actions.push(Action::Unschedule {
+                        key: TimerKey::Stop(
+                            id.clone(),
+                            op.generation,
+                            super::StopTimer::Waiter(waiter.id),
+                        ),
+                    });
+                }
+                self.answer_waiters(&mut op, None, "unconfirmed", actions);
+                for kind in [super::StopTimer::Deadline, super::StopTimer::Verify] {
+                    if let Some(key) = TimerKind::Stop(op.tag(&id, 0), kind).key(&op.token()) {
+                        actions.push(Action::Unschedule { key });
+                    }
+                }
+            }
+        }
+        self.cancel_tree_reads(tree_op, root_generation, actions);
+        let discoveries: Vec<_> = self.relations.discoveries.iter().filter(|(_, op)| matches!(op.caller, DiscoveryCaller::TreeStop { tree_op: id, .. } if id == tree_op)).map(|(id, _)| *id).collect();
+        for id in discoveries {
+            self.relations.discoveries.remove(&id);
+            self.relations.aux.work.remove(&id);
+            actions.push(Action::Unschedule {
+                key: TimerKey::DiscoveryDeadline(id),
+            });
+        }
+        let runs = self.trees.aux.work[&tree_op].runs.clone();
+        for run in runs {
+            self.relations_end_cleanup(&run, actions);
+        }
+    }
+
+    /// 历史树遇到无法核验的卸载成员，交付快照后释放；不等同于停止或显式 abandon。
+    pub(crate) fn tree_release_unloaded_history(
+        &mut self,
+        tree_op: u64,
+        actions: &mut Vec<Action>,
+    ) {
+        if !self
+            .trees
+            .aux
+            .work
+            .get(&tree_op)
+            .is_some_and(|w| w.historical_unloaded)
+        {
+            return;
+        }
+        let members = self.tree_scope_members(tree_op);
+        self.tree_update_report(tree_op, &members, actions);
+        let op = self.trees.operations.get_mut(&tree_op).expect("树停止存在");
+        op.report.children.phase = TreePhase::Unconfirmed;
+        op.report.children.cleanup_state = "released".into();
+        op.report.children.version += 1;
+        op.cancelled = true;
+        self.tree_publish(tree_op, actions);
+        self.tree_cancel_work(tree_op, actions);
+        self.tree_answer(tree_op, None, "unconfirmed", actions);
         self.tree_finish(tree_op, actions);
     }
 
@@ -2293,46 +2380,7 @@ impl Machine {
                 .get_mut(&tree_op)
                 .expect("树停止存在")
                 .cancelled = true;
-            let root_generation = self.trees.aux.work[&tree_op].root_stop_gen;
-            let roots: Vec<_> = self
-                .stops
-                .operations
-                .iter()
-                .filter(|(_, op)| Some(op.generation) == root_generation)
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in roots {
-                if let Some(mut op) = self.stops.operations.remove(&id) {
-                    for waiter in &op.waiters {
-                        actions.push(Action::Unschedule {
-                            key: TimerKey::Stop(
-                                id.clone(),
-                                op.generation,
-                                super::StopTimer::Waiter(waiter.id),
-                            ),
-                        });
-                    }
-                    self.answer_waiters(&mut op, None, "unconfirmed", actions);
-                    for kind in [super::StopTimer::Deadline, super::StopTimer::Verify] {
-                        if let Some(key) = TimerKind::Stop(op.tag(&id, 0), kind).key(&op.token()) {
-                            actions.push(Action::Unschedule { key });
-                        }
-                    }
-                }
-            }
-            self.cancel_tree_reads(tree_op, root_generation, actions);
-            let discoveries: Vec<_> = self.relations.discoveries.iter().filter(|(_, op)| matches!(op.caller, DiscoveryCaller::TreeStop { tree_op: id, .. } if id == tree_op)).map(|(id, _)| *id).collect();
-            for id in discoveries {
-                self.relations.discoveries.remove(&id);
-                self.relations.aux.work.remove(&id);
-                actions.push(Action::Unschedule {
-                    key: TimerKey::DiscoveryDeadline(id),
-                });
-            }
-            let runs = self.trees.aux.work[&tree_op].runs.clone();
-            for run in runs {
-                self.relations_end_cleanup(&run, actions);
-            }
+            self.tree_cancel_work(tree_op, actions);
             self.tree_answer(tree_op, None, "unconfirmed", actions);
             self.tree_finish(tree_op, actions);
             applied = true;

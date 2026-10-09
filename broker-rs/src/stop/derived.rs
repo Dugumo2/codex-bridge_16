@@ -69,6 +69,7 @@ pub enum DerivedStage {
 /// 一个派生停止的内部状态（SA-b 内部登记，不属于冻结契约）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedOp {
+    pub unloaded_read: bool,
     pub background: super::background::Background,
     pub last_verified_at: Option<u64>,
     pub connection_epoch: u64,
@@ -104,6 +105,7 @@ pub struct DerivedOp {
 impl DerivedOp {
     pub fn new(target: DerivedTarget, root: bool) -> Self {
         Self {
+            unloaded_read: false,
             background: Default::default(),
             last_verified_at: None,
             connection_epoch: 0,
@@ -214,6 +216,7 @@ impl Machine {
         };
         let key = (*tree_op, thread.clone());
         let authority = self.derived_background_authority(&key);
+        let closed = self.closed_runtime(thread);
         let Some(op) = self.trees.aux.derived.get_mut(&key) else {
             return;
         };
@@ -229,6 +232,13 @@ impl Machine {
         {
             return;
         }
+        let historical = self
+            .trees
+            .aux
+            .work
+            .get(tree_op)
+            .is_some_and(|w| w.historical_unloaded);
+        let was_probe = historical && !op.goal_checked;
         op.read_id = None;
         op.last_verified_at = Some(self.clock.now_ms);
         op.verified = true;
@@ -239,6 +249,23 @@ impl Machine {
                 op.conflicts.clear();
                 op.backoff = 0;
                 op.error = None;
+                if op.unloaded_read && (historical || op.goal_ok()) {
+                    if let Some(proof) = closed {
+                        op.background.confirm_closed(proof, self.clock.now_ms);
+                        if historical {
+                            op.goal_braked = true;
+                            op.capability_limited = false;
+                        }
+                        op.stopped = !op.target.clear || op.clear_done;
+                        self.derived_release_slot(&key);
+                        self.derived_report(&key, actions);
+                        return;
+                    }
+                }
+                if was_probe {
+                    self.derived_goal_read(&key, actions);
+                    return;
+                }
                 if op.goal_ok() && !op.background.verifying && !op.background.failed {
                     self.derived_background_next(&key, actions);
                     return;
@@ -291,6 +318,16 @@ impl Machine {
                 op.retry_at_ms = Some(now + TREE_VERIFY_MS);
                 self.derived_release_slot(&key);
             }
+            StatusResult::Unknown(reason) if was_probe => {
+                op.background.fail(
+                    "unknown",
+                    format!("历史成员当前运行时无法核验：{reason:?}；本次核验已释放"),
+                );
+                op.error = op.background.report.failure_reason.clone();
+                self.derived_release_slot(&key);
+                self.tree_release_unloaded_history(key.0, actions);
+                return;
+            }
             StatusResult::Unknown(reason) => {
                 op.turn_ended = false;
                 op.stopped = false;
@@ -334,7 +371,13 @@ impl Machine {
         op.connection_epoch = self.relations.conn_epoch;
         op.goal_checked = false;
         op.retry_at_ms = None;
-        if op.goal_checked {
+        if self
+            .trees
+            .aux
+            .work
+            .get(&key.0)
+            .is_some_and(|w| w.historical_unloaded)
+        {
             self.derived_verify(key, actions);
         } else {
             self.derived_goal_read(key, actions);
@@ -351,6 +394,7 @@ impl Machine {
 
     fn derived_verify(&mut self, key: &(u64, String), actions: &mut Vec<Action>) {
         let op = self.trees.aux.derived.get_mut(key).expect("派生停止存在");
+        op.unloaded_read = false;
         op.stage = DerivedStage::Verify;
         op.request_round += 1;
         let caller = StatusCaller::DerivedStopVerify {
@@ -521,6 +565,30 @@ impl Machine {
                 op.background.reply(result, self.clock.now_ms, |item| {
                     !narrow || allowed.contains(item)
                 });
+            }
+            if op.background.report.state == "notLoaded"
+                && (op.goal_ok()
+                    || self
+                        .trees
+                        .aux
+                        .work
+                        .get(tree_op)
+                        .is_some_and(|w| w.historical_unloaded))
+            {
+                let proof = self.closed_runtime(thread);
+                let op = self.trees.aux.derived.get_mut(&key).expect("派生停止存在");
+                if let Some(proof) = proof {
+                    op.background.confirm_closed(proof, self.clock.now_ms);
+                    op.goal_braked = true;
+                    op.stopped = !op.target.clear || op.clear_done;
+                } else {
+                    op.error = op.background.report.failure_reason.clone();
+                    op.stopped = false;
+                    op.retry_at_ms = Some(self.clock.mono_ms + TREE_VERIFY_MS);
+                }
+                self.derived_release_slot(&key);
+                self.derived_report(&key, actions);
+                return;
             }
             if op.background.verifying {
                 // 空列表之后重新读取 goal 和活动轮次，仍保留当前总期限。

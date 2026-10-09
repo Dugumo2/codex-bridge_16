@@ -1874,6 +1874,7 @@ impl Machine {
 
     /// #5 的到达阶段先于 completed 查重与 goal 学习。
     fn arrive_notification(&mut self, event: HeldNotification, actions: &mut Vec<Action>) {
+        self.runtime_notification(&event);
         // 先撤销历史根的旧证据，避免关系通知中的同步协调提前确认树停止。
         if !self.closing {
             if let Some(thread) = thread_id(&event.params)
@@ -2369,6 +2370,14 @@ impl Machine {
             context.method.as_str(),
             "thread/start" | "thread/resume" | "thread/fork"
         ) {
+            if let Some(id) = value
+                .get("thread")
+                .and_then(|t| t.get("id"))
+                .and_then(Value::as_str)
+            {
+                self.forget_closed_runtime(id);
+                self.status_activity_changed(id);
+            }
             // 裸 resume 已有确切的请求线程，成功就恢复订阅事实，不依赖服务器
             // 是否在回包里重复给出 thread.id；普通创建请求仍从回包学习新线程。
             if matches!(

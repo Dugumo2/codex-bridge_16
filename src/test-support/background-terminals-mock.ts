@@ -10,6 +10,8 @@ export interface BackgroundTerminalSeed {
 export interface BackgroundThreadScenario {
   sessions?: BackgroundTerminalSeed[];
   fault?: "unsupported" | "hang" | "notFound";
+  /** 卸载场景的只读元数据；没有提供时交回原夹具。 */
+  metadataStatus?: "notLoaded" | "idle";
   /** 缺省故障作用于三个接口，也可只挂起某一个步骤。 */
   faultMethod?: "list" | "terminate" | "clean";
 }
@@ -40,6 +42,20 @@ export function createBackgroundTerminalsMock(send: (message: unknown) => unknow
         reply({ calls: structuredClone(calls), threads: Object.fromEntries([...threads].map(([id, t]) =>
           [id, (t.sessions ?? []).map(terminal)])) });
         return true;
+      }
+      if (options.enabled && (msg.method === "thread/resume" || msg.method === "thread/start")) {
+        calls.push({ method: msg.method, params: structuredClone(p) });
+        const old = threads.get(p.threadId);
+        if (old?.fault === "notFound") { delete old.fault; delete old.metadataStatus; }
+        return false;
+      }
+      if (options.enabled && msg.method === "thread/read") {
+        const status = threads.get(p.threadId)?.metadataStatus;
+        if (status) {
+          calls.push({ method: msg.method, params: structuredClone(p) });
+          reply({ thread: { id: p.threadId, status: { type: status }, turns: [] } });
+          return true;
+        }
       }
       if (!msg.method.startsWith(prefix)) return false;
       calls.push({ method: msg.method, params: structuredClone(p) });

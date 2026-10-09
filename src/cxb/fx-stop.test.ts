@@ -69,3 +69,27 @@ test.each(["show", "ls", "stop", "wait"] as const)("fx：%s 文本和 JSON 保�
   expect(t.notices.join("\n")).toContain("缺证据：child-x（attachmentMissing）");
   for (const value of ["child-x", "attachmentMissing", "Background", "读取失败", "Codex 受管的后台命令"]) expect(t.notices.join("\n")).toContain(value);
 });
+
+
+test.each(["thread/closed", "thread/read:notLoaded"])("已卸载确认报告保留依据 %s 与退出码", async source => {
+  ledger(dir); const t = context(dir, ["stop", "abcd1234", "--json"]);
+  const bg: BackgroundCleanup = { ...background, state: "notLoaded", discovered: 0, remaining: [], terminationResults: {}, failureReason: null,
+    verificationBasis: { source, connectionEpoch: 4, observedAt: 1_700_000_000_000 } };
+  t.fake.handle = m => m === "broker/threads/list" ? { threads: [summary()] } : { threadId: "thread-test", runId: "run-test",
+    stopOutcome: "confirmed", alreadyStopped: true, interruptSent: false, goal: "unchanged", cleanupState: "completed", backgroundCleanup: bg };
+  expect(await stop(t.ctx)).toBe(0);
+  expect(t.json[0]).toMatchObject({ cleanupState: "completed", backgroundCleanup: bg });
+  expect(t.notices.join("\n")).toContain(source === "thread/closed" ? "运行时已关闭" : "当前连接未加载运行时");
+  expect(t.notices.join("\n")).toContain(`依据 ${source}`);
+});
+
+test("已卸载未知历史停止报告明确不占用且不提示等待后台核实", async () => {
+  ledger(dir); const t = context(dir, ["stop", "abcd1234", "--json"]);
+  t.fake.handle = m => m === "broker/threads/list" ? { threads: [summary()] } : { threadId: "thread-test", runId: "run-test",
+    stopOutcome: "unconfirmed", alreadyStopped: true, interruptSent: false, goal: "unchanged", cleanupState: "released",
+    backgroundCleanup: { ...background, state: "notLoaded", verificationBasis: undefined } };
+  expect(await stop(t.ctx)).toBe(3);
+  expect(t.json[0].cleanupState).toBe("released");
+  expect(t.notices.join("\n")).toContain("不占用线程，不作周期重试");
+  expect(t.notices.join("\n")).not.toContain("可等待后台核实");
+});

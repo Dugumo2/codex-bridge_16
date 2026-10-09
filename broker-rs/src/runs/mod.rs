@@ -1456,6 +1456,7 @@ impl Machine {
         }
         if op.already_stopped && op.background.confirmed {
             run.stop_outcome = Some(StopOutcome::Confirmed);
+            self.runs.verifying_history.remove(id);
         }
         self.runs.put(id, actions);
     }

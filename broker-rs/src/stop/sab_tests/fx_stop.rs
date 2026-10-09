@@ -867,3 +867,354 @@ fn fx_review2_自然完成但已撤权上下文尚未回收仍按历史成员停
     assert!(s.background["子"].is_empty());
     assert_eq!(s.record().children.len(), 1);
 }
+
+#[test]
+fn fx_unloaded_重复停止有关闭通知应确认且立即释放() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.background_missing.insert(P.into());
+    s.metadata_unloaded.insert(P.into());
+    s.notify(json!({"method":"thread/closed","params":{"threadId":P}}));
+    let id = stop(&mut s, false);
+    let result = &s.response(&s.log, id).expect("关闭证据成立应立即回答")["result"];
+    assert_eq!(result["stopOutcome"], "confirmed");
+    assert_eq!(result["backgroundCleanup"]["state"], "notLoaded");
+    assert_eq!(
+        result["backgroundCleanup"]["verificationBasis"]["source"],
+        "thread/closed"
+    );
+    assert!(!s.m.stop_busy(P));
+    let a = s.client(
+        OWNER,
+        "turn/start",
+        json!({"threadId":P,"input":[]}),
+        Some("新运行"),
+    );
+    assert!(a
+        .iter()
+        .any(|a| matches!(a, Action::Request(c) if c.method == "turn/start")));
+}
+
+#[test]
+fn fx_unloaded_重复停止缺关闭证据未确认也不留屏障或周期重试() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.background_missing.insert(P.into());
+    let id = stop(&mut s, false);
+    assert_eq!(
+        s.response(&s.log, id).expect("未加载且缺证据应立即返回")["result"]["stopOutcome"],
+        "unconfirmed"
+    );
+    assert!(!s.m.stop_busy(P));
+    let from = s.log.len();
+    s.advance(60_000);
+    assert!(!s.log[from..].iter().any(
+        |a| matches!(a, Action::Request(c) if c.method.starts_with("thread/backgroundTerminals/"))
+    ));
+    assert!(s.m.stops.operations.is_empty());
+}
+
+#[test]
+fn fx_unloaded_重复停树未知卸载成员应立即解除树屏障() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    stop(&mut s, true);
+    s.background_missing.insert("子".into());
+    let id = stop(&mut s, true);
+    let reply = s
+        .response(&s.log, id)
+        .expect("历史树遇到未知卸载不留下无限核验");
+    assert_eq!(reply["result"]["stopOutcome"], "unconfirmed");
+    assert_eq!(reply["result"]["childrenStop"]["cleanupState"], "released");
+    assert!(!s.m.tree_busy(Some(P)));
+    assert!(s.tree_op().is_none());
+}
+
+#[test]
+fn fx_unloaded_新鲜notloaded元数据可单独确认不需要resume() {
+    for narrow in [false, true] {
+        let mut s = Sim::new();
+        stop(&mut s, false);
+        s.background_missing.insert(P.into());
+        s.metadata_unloaded.insert(P.into());
+        let start = s.log.len();
+        let id = stop(&mut s, narrow);
+        let result = &s.response(&s.log, id).unwrap()["result"];
+        assert_eq!(result["stopOutcome"], "confirmed");
+        assert_eq!(
+            result["backgroundCleanup"]["verificationBasis"]["source"],
+            "thread/read:notLoaded"
+        );
+        assert!(!s.log[start..].iter().any(|a| matches!(a, Action::Request(c)
+            if matches!(c.method.as_str(), "thread/resume" | "thread/goal/set" | "thread/goal/clear"))));
+        assert!(!s.m.stop_busy(P));
+        assert!(!s.m.runs.verifying_history.contains(R));
+    }
+}
+
+#[test]
+fn fx_unloaded_已卸载父子都按新鲜关闭证据确认历史树() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    stop(&mut s, true);
+    for thread in [P, "子"] {
+        s.background_missing.insert(thread.into());
+        s.metadata_unloaded.insert(thread.into());
+    }
+    let id = stop(&mut s, true);
+    let result = &s.response(&s.log, id).unwrap()["result"];
+    assert_eq!(result["stopOutcome"], "confirmed");
+    assert_eq!(
+        result["childrenStop"]["root"]["backgroundCleanup"]["state"],
+        "notLoaded"
+    );
+    assert_eq!(
+        result["childrenStop"]["members"]["子"]["backgroundCleanup"]["state"],
+        "notLoaded"
+    );
+    assert!(!s.m.tree_busy(Some(P)));
+    assert_eq!(s.record().children.len(), 1);
+    assert_eq!(s.run_ended(&s.log), 1);
+}
+
+#[test]
+fn fx_unloaded_首次活动停止缺关闭证据仍保留严格屏障() {
+    for tree in [false, true] {
+        let mut s = Sim::new();
+        let target = if tree {
+            s.spawn_v1("子", "派生", "子轮");
+            "子"
+        } else {
+            P
+        };
+        s.background_missing.insert(target.into());
+        let id = stop(&mut s, false);
+        assert!(s.response(&s.log, id).is_none());
+        s.advance(40_000);
+        assert_eq!(
+            s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+            "unconfirmed"
+        );
+        s.advance(15_000);
+        assert!(
+            s.m.stop_busy(P) || s.m.tree_busy(Some(P)),
+            "首次停止不适用历史释放例外"
+        );
+    }
+}
+
+#[test]
+fn fx_unloaded_初次停树已关闭子成员有强证据仍可确认() {
+    let mut s = Sim::new();
+    s.spawn_v1("子", "派生", "子轮");
+    s.turn_completed("子", "子轮", "completed");
+    s.background_missing.insert("子".into());
+    s.metadata_unloaded.insert("子".into());
+    s.notify(json!({"method":"thread/closed","params":{"threadId":"子"}}));
+    let id = stop(&mut s, false);
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "confirmed"
+    );
+}
+
+#[test]
+fn fx_unloaded_连接换代和重新加载使旧关闭证据失效() {
+    for epoch in [true, false] {
+        let mut s = Sim::new();
+        stop(&mut s, false);
+        s.notify(json!({"method":"thread/closed","params":{"threadId":P}}));
+        assert!(s.m.closed_runtime(P).is_some());
+        if epoch {
+            s.m.relations.conn_epoch += 1;
+        } else {
+            s.learn_thread(P);
+        }
+        assert!(s.m.closed_runtime(P).is_none());
+        s.background_missing.insert(P.into());
+        let id = stop(&mut s, false);
+        assert_eq!(
+            s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+            "unconfirmed"
+        );
+        assert!(!s.m.stop_busy(P));
+    }
+}
+
+#[test]
+fn fx_unloaded_旧closed不能覆盖新鲜的已加载元数据() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.notify(json!({"method":"thread/closed","params":{"threadId":P}}));
+    s.background
+        .insert(P.into(), vec![json!({"itemId":"75","processId":"75"})]);
+    let id = stop(&mut s, false);
+    let result = &s.response(&s.log, id).unwrap()["result"];
+    assert_eq!(result["backgroundCleanup"]["state"], "confirmed");
+    assert_eq!(
+        result["backgroundCleanup"]["terminationResults"]["75"],
+        true
+    );
+    assert!(s.background[P].is_empty());
+    assert!(s.m.closed_runtime(P).is_none());
+}
+
+#[test]
+fn fx_unloaded_元数据未知历史核验立即释放且迟到回包不影响新运行() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.hold.push(("thread/read".into(), P.into()));
+    let id = stop(&mut s, false);
+    let old = s
+        .held
+        .iter()
+        .find(|c| c.method == "thread/read")
+        .unwrap()
+        .clone();
+    s.reply_status_read(
+        "thread/read",
+        P,
+        Err(json!({"code":-32000,"message":"无法读取"})),
+    );
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "unconfirmed"
+    );
+    assert!(!s.m.stop_busy(P));
+    s.client(
+        OWNER,
+        "turn/start",
+        json!({"threadId":P,"input":[]}),
+        Some("新运行"),
+    );
+    let claim = s.m.claims[P].clone();
+    s.apply(Event::Reply {
+        context: old,
+        result: Ok(meta(P, "notLoaded")),
+    });
+    assert_eq!(s.m.claims[P], claim);
+    assert!(s.m.closed_runtime(P).is_none());
+    assert!(s.m.stops.operations.is_empty());
+}
+
+#[test]
+fn fx_unloaded_关闭不能冒充已完成clear且同样不占用历史线程() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.metadata_unloaded.insert(P.into());
+    let (id, _) = s.call(
+        OWNER,
+        "broker/threads/stop",
+        json!({"threadId":P,"clear":true}),
+    );
+    let result = &s.response(&s.log, id).unwrap()["result"];
+    assert_eq!(result["stopOutcome"], "unconfirmed");
+    assert_ne!(result["goal"], "cleared");
+    assert!(!s.m.stop_busy(P));
+}
+
+#[test]
+fn fx_unloaded_重复停止接口不支持仍沿用原来的未确认策略() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.background_supported = false;
+    let id = stop(&mut s, false);
+    assert!(s.response(&s.log, id).is_none());
+    s.advance(40_000);
+    let result = &s.response(&s.log, id).unwrap()["result"];
+    assert_eq!(result["stopOutcome"], "unconfirmed");
+    assert_eq!(result["backgroundCleanup"]["state"], "capabilityLimited");
+    assert!(s.m.stop_busy(P));
+}
+
+#[test]
+fn fx_unloaded_只读历史预检不挡新派单并取消旧核验() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.hold.push(("thread/read".into(), P.into()));
+    let id = stop(&mut s, false);
+    let old = s
+        .held
+        .iter()
+        .find(|c| c.method == "thread/read")
+        .unwrap()
+        .clone();
+    assert!(!s.m.stop_busy(P), "只读预检不取得运行占用");
+    let a = s.client(
+        OWNER,
+        "turn/start",
+        json!({"threadId":P,"input":[]}),
+        Some("新运行"),
+    );
+    assert!(a
+        .iter()
+        .any(|a| matches!(a, Action::Request(c) if c.method == "turn/start")));
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "unconfirmed"
+    );
+    let current = s.m.claims[P].clone();
+    s.apply(Event::Reply {
+        context: old,
+        result: Ok(meta(P, "notLoaded")),
+    });
+    assert_eq!(s.m.claims[P], current);
+    assert!(s.m.stops.operations.is_empty());
+    assert!(s.m.closed_runtime(P).is_none());
+}
+
+#[test]
+fn fx_unloaded_身份缺失或不匹配的元数据不能作为关闭依据() {
+    for thread in [
+        json!({"status":{"type":"notLoaded"}}),
+        json!({"id":"其他线程","status":{"type":"notLoaded"}}),
+    ] {
+        let mut s = Sim::new();
+        stop(&mut s, false);
+        s.background_missing.insert(P.into());
+        s.hold.push(("thread/read".into(), P.into()));
+        let id = stop(&mut s, false);
+        s.reply_status_read("thread/read", P, Ok(json!({"thread":thread})));
+        assert_eq!(
+            s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+            "unconfirmed"
+        );
+        assert!(!s.m.stop_busy(P));
+        assert!(s.m.closed_runtime(P).is_none());
+    }
+}
+
+#[test]
+fn fx_unloaded_旧连接的在途元数据不得生成新连接关闭证据() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.hold.push(("thread/read".into(), P.into()));
+    let id = stop(&mut s, false);
+    s.m.relations.conn_epoch += 1;
+    s.reply_status_read("thread/read", P, Ok(meta(P, "notLoaded")));
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "unconfirmed"
+    );
+    assert!(s.m.closed_runtime(P).is_none());
+    assert!(!s.m.stop_busy(P));
+}
+
+#[test]
+fn fx_unloaded_历史预检发现实际活动仍走严格停止流程() {
+    let mut s = Sim::new();
+    stop(&mut s, false);
+    s.turn_started(P, "后续活动");
+    s.background_missing.insert(P.into());
+    let id = stop(&mut s, false);
+    assert!(
+        s.response(&s.log, id).is_none(),
+        "发现活动不能套用空闲历史核验例外"
+    );
+    s.advance(40_000);
+    assert_eq!(
+        s.response(&s.log, id).unwrap()["result"]["stopOutcome"],
+        "unconfirmed"
+    );
+    assert!(s.m.stop_busy(P));
+}

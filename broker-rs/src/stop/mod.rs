@@ -4,6 +4,7 @@
 pub mod background;
 pub mod derived;
 pub mod tree;
+mod unloaded;
 
 use crate::claim::{
     status_read::{StatusCaller, StatusDone, StatusQuery, StatusResult, StatusTurn},
@@ -59,6 +60,9 @@ pub struct Waiter {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopOp {
+    pub history_released: bool,
+    pub unloaded_read: bool,
+    pub historical_probe: bool,
     pub background: background::Background,
     pub narrow: bool,
     pub connection_epoch: u64,
@@ -145,6 +149,7 @@ pub struct BreakerProbe {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stops {
+    pub closed_runtimes: HashMap<String, unloaded::ClosedRuntime>,
     pub command_owners: HashMap<(String, String), String>,
     pub command_turns: HashMap<(String, String), String>,
     pub probe: BreakerProbe,
@@ -183,6 +188,7 @@ impl Stops {
 }
 impl StopOp {
     fn invalidate_round(&mut self) {
+        self.unloaded_read = false;
         self.background.invalidate();
         if self.verifying {
             self.verification_pending = true;
@@ -221,8 +227,16 @@ impl StopOp {
         }
     }
     fn result(&self, outcome: &str) -> Value {
-        json!({"threadId":self.thread,"runId":self.run_id,"interruptSent":self.interrupt_sent,
-            "backgroundCleanup":self.background.report,"goal":self.goal,"alreadyStopped":self.already_stopped,"stopOutcome":outcome,"run":null})
+        let mut result = json!({"threadId":self.thread,"runId":self.run_id,"interruptSent":self.interrupt_sent,
+            "backgroundCleanup":self.background.report,"goal":self.goal,"alreadyStopped":self.already_stopped,"stopOutcome":outcome,"run":null});
+        if self.history_released {
+            result["cleanupState"] = json!(if outcome == "confirmed" {
+                "completed"
+            } else {
+                "released"
+            });
+        }
+        result
     }
 }
 
@@ -374,12 +388,13 @@ impl Machine {
             .map(|(id, _)| id.clone())
     }
     pub(crate) fn stop_busy(&self, thread: &str) -> bool {
-        self.stop_key(thread).is_some()
+        self.stop_key(thread)
+            .is_some_and(|id| !self.stops.operations[&id].historical_probe)
             || self.latest_run(thread).is_some_and(|run| {
                 self.stops
                     .operations
                     .values()
-                    .any(|op| op.run_id.as_deref() == Some(&run.run_id))
+                    .any(|op| !op.historical_probe && op.run_id.as_deref() == Some(&run.run_id))
             })
     }
     pub(crate) fn stops_busy(&self) -> bool {
@@ -443,7 +458,10 @@ impl Machine {
         let turn_absent = claim.is_none_or(|c| {
             c.pending_start.is_some() || matches!(c.state, State::AwaitingContinuation { .. })
         });
-        let op = StopOp {
+        let mut op = StopOp {
+            history_released: false,
+            unloaded_read: false,
+            historical_probe: false,
             background: background::Background::new(self.clock.mono_ms + CONFIRM_MS),
             narrow: true,
             connection_epoch: self.relations.conn_epoch,
@@ -484,6 +502,10 @@ impl Machine {
             waiters: Vec::new(),
             already_stopped: claim.is_none(),
         };
+        // 历史停止先只读当前加载/活动状态；这一阶段不占用线程。
+        if self.historical_stop(&op) {
+            self.start_history_probe(&id, &mut op, actions);
+        }
         actions.push(Action::Schedule {
             token: op.token(),
             kind: TimerKind::Stop(op.tag(&id, 0), StopTimer::Deadline),
@@ -844,12 +866,32 @@ impl Machine {
             .get(run)
             .is_some_and(|r| r.state == RunState::Ended);
         op.ended.clear();
-        self.start_verification(&id, &mut op, actions);
+        if !op.historical_probe {
+            self.start_verification(&id, &mut op, actions);
+        }
         self.stops.operations.insert(id.clone(), op);
         id
     }
 
+    fn start_history_probe(&mut self, id: &str, op: &mut StopOp, actions: &mut Vec<Action>) {
+        self.cancel_stop_reads(op.generation, actions);
+        op.historical_probe = true;
+        op.verifying = true;
+        op.read_done = false;
+        op.goal_read_done = true;
+        self.begin_status_read(
+            &op.thread,
+            Some(op.token()),
+            StatusQuery::Activity,
+            StatusCaller::StopVerify {
+                tag: op.tag(id, op.round),
+            },
+            actions,
+        );
+    }
+
     fn start_verification(&mut self, id: &str, op: &mut StopOp, actions: &mut Vec<Action>) {
+        op.historical_probe = false;
         op.invalidate_round();
         op.verifying = true;
         op.verification_pending = true;
@@ -897,6 +939,20 @@ impl Machine {
             {
                 op.foreign_claim = true;
                 op.background.fail("conflict", "线程所有权已变化".into());
+            }
+            if self.historical_stop(&op) && self.claims.contains_key(&op.thread) {
+                op.background.fail(
+                    "conflict",
+                    "历史核验期间已有新运行取得认领；已结束旧核验".into(),
+                );
+                self.retire_history_stop(&id, &mut op, actions);
+                continue;
+            }
+            if op.historical_probe && !op.verifying {
+                self.start_history_probe(&id, &mut op, actions);
+            }
+            if self.finish_unloaded_history(&id, &mut op, actions) {
+                continue;
             }
             // review 迁移后的子线程也必须先分配版本，再发出目标读取。
             self.stops.ensure_version(&op.thread);
@@ -1317,6 +1373,14 @@ impl Machine {
                         op.background.reply(result, self.clock.now_ms, |item| {
                             !op.narrow || self.background_item_owned(&op.thread, item, &runs)
                         });
+                    }
+                    if op.background.report.state == "notLoaded"
+                        && !self.historical_stop(&op)
+                        && self.stop_ready(&op)
+                    {
+                        if let Some(proof) = self.closed_runtime(&op.thread) {
+                            op.background.confirm_closed(proof, self.clock.now_ms);
+                        }
                     }
                     if op.background.verifying {
                         let background = op.background.clone();
@@ -3220,6 +3284,15 @@ impl Machine {
             return;
         }
         op.read_done = true;
+        if op.historical_probe && matches!(done.result, StatusResult::Unknown(_)) {
+            op.background.fail(
+                "unknown",
+                "历史线程的当前运行时无法核验；本次核验已释放".into(),
+            );
+            self.retire_history_stop(&tag.id, &mut op, actions);
+            return;
+        }
+        op.historical_probe = false;
         match done.result {
             StatusResult::Idle => {
                 op.turn_absent = true;

@@ -18,8 +18,11 @@ export function subagentThreads(run: RunResult): string[] {
 export function backgroundLines(thread: string, report: BackgroundCleanup): string[] {
   const states: Record<string, string> = { pending: "待核验", listing: "正在列举", terminating: "正在终止受管命令", verifying: "后置核验",
     confirmed: "已核验为空", capabilityLimited: "能力受限", notLoaded: "线程未加载，无法核验", unknown: "未知", conflict: "归属冲突", unconfirmed: "尚未确认" };
+  const basis = report.verificationBasis;
+  if (basis && report.state === "notLoaded") states.notLoaded = basis.source === "thread/closed"
+    ? "运行时已关闭，受管后台命令无存活登记" : "当前连接未加载运行时，无存活受管后台命令登记";
   return [`  ${safe(thread)}：${safe(report.scope)}，${states[report.state] ?? "未知"}（${safe(report.state)}）；发现 ${report.discovered}，剩余 ${report.remaining.map(safe).join("、") || "无"}`,
-    `    终止回包：${safe(JSON.stringify(report.terminationResults))}；最后核验：${report.lastVerifiedAt == null ? "尚未核验" : new Date(report.lastVerifiedAt).toISOString()}${report.failureReason ? `；${safe(report.failureReason)}` : ""}`];
+    `    终止回包：${safe(JSON.stringify(report.terminationResults))}；最后核验：${report.lastVerifiedAt == null ? "尚未核验" : new Date(report.lastVerifiedAt).toISOString()}${basis ? `；依据 ${safe(basis.source)}（连接代际 ${basis.connectionEpoch}，观察于 ${new Date(basis.observedAt).toISOString()}）` : ""}${report.failureReason ? `；${safe(report.failureReason)}` : ""}`];
 }
 
 /** 停止报告的一行摘要：「父线程已停；3 个子代理已停；1 个尚未确认」，冲突、失败与能力限制另起一行列出。 */
@@ -29,6 +32,7 @@ export function stopReportLines(report: ChildrenStopReport): string[] {
   if (report.unconfirmed.length) parts.push(`${report.unconfirmed.length} 个尚未确认`);
   if (report.failed.length) parts.push(`${report.failed.length} 个核实失败`);
   const lines = [parts.join("；")];
+  if (report.cleanupState === "released") lines.push("  历史清理核验已释放：未加载成员缺少完整停止证据；本次不再占用线程或周期重试。");
   if (report.cleanupState === "abandoned") lines.push(`  清理已放弃：${safe(report.abandonReason ?? "显式放弃")}；可能仍有子代理或命令在运行，请换新线程，必要时换隔离工作目录。`);
   for (const member of [report.root, ...Object.values(report.members ?? {})]) {
     if (member.step || member.lastVerifiedAt != null || member.error) lines.push(`  成员 ${safe(member.thread)}：步骤 ${safe(member.step ?? "未知")}；检查 ${safe(JSON.stringify(member.check))}；最近核实 ${member.lastVerifiedAt == null ? "无" : new Date(member.lastVerifiedAt).toISOString()}${member.error ? `；错误 ${safe(member.error)}` : ""}`);
@@ -64,7 +68,7 @@ export function unfinishedNotice(run: RunResult, label: string): string[] {
     lines.push("部分子代理尚未确认停下，不能当作已经停下：");
   }
   lines.push(...stopReportLines(report));
-  if (report.phase !== "confirmed" && report.cleanupState !== "abandoned") lines.push(`子代理树的停止尚未确认，请先 cxb wait ${label} 或 cxb stop ${label} 核实，再决定是否继续。`);
+  if (report.phase !== "confirmed" && report.cleanupState !== "abandoned" && report.cleanupState !== "released") lines.push(`子代理树的停止尚未确认，请先 cxb wait ${label} 或 cxb stop ${label} 核实，再决定是否继续。`);
   return lines;
 }
 

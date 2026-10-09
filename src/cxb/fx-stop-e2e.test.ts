@@ -204,4 +204,32 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     expect(resumed.json().runId).not.toBe(run.runId);
     expect((await state()).threads[CHILD]).toHaveLength(1);
   }, 150_000);
+
+  for (const evidence of ["closed", "metadata", "unknown"] as const) test(`已卸载历史线程 ${evidence}：重复 stop 不锁线程，随后同线程派单成功`, async () => {
+    const run = await start();
+    await commandEvents(PARENT, "turn-001", sessions);
+    expect((await cli("stop", PARENT, "--json")).code).toBe(0);
+    await set(PARENT, { sessions: [], fault: "notFound", metadataStatus: evidence === "unknown" ? "idle" : "notLoaded" });
+    if (evidence === "closed") await rpc("fixture/inject", { threadId: PARENT, kind: "notification", payload: {
+      method: "thread/closed", params: { threadId: PARENT } } });
+    const before = (await state()).calls.length;
+    const started = performance.now();
+    const repeated = await cli("stop", PARENT, "--json");
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(repeated.code, JSON.stringify(repeated)).toBe(evidence === "unknown" ? 3 : 0);
+    expect(repeated.json().backgroundCleanup.state).toBe("notLoaded");
+    if (evidence === "unknown") expect(repeated.json().backgroundCleanup.verificationBasis).toBeUndefined();
+    else {
+      const source = evidence === "closed" ? "thread/closed" : "thread/read:notLoaded";
+      expect(repeated.json().backgroundCleanup.verificationBasis).toMatchObject({ source });
+      expect(repeated.stderr).toContain(source);
+    }
+    const calls = (await state()).calls.slice(before);
+    expect(calls.some((c: any) => c.method === "thread/resume")).toBe(false);
+    expect(calls.some((c: any) => c.method === PREFIX + "terminate")).toBe(false);
+    const resumed = await cli("run", "--resume", PARENT, "--detach", "--json", "卸载后重新派单");
+    expect(resumed.code, JSON.stringify(resumed)).toBe(0);
+    expect(resumed.json().runId).not.toBe(run.runId);
+  }, 90_000);
+
 });

@@ -33,6 +33,8 @@ pub(super) struct Sim {
     pub goals: BTreeMap<String, Value>,
     pub background: BTreeMap<String, Vec<Value>>,
     pub background_supported: bool,
+    pub background_missing: BTreeSet<String>,
+    pub metadata_unloaded: BTreeSet<String>,
     pub terminate_false: bool,
     /// 中断永不生效的线程。
     pub never: BTreeSet<String>,
@@ -59,6 +61,8 @@ impl Sim {
             goals: BTreeMap::new(),
             background: BTreeMap::new(),
             background_supported: true,
+            background_missing: BTreeSet::new(),
+            metadata_unloaded: BTreeSet::new(),
             terminate_false: false,
             never: BTreeSet::new(),
             hold: Vec::new(),
@@ -401,7 +405,9 @@ impl Sim {
         let inner = unwrap_operation(&context.operation);
         let mut events = Vec::new();
         match (context.method.as_str(), inner) {
-            ("thread/backgroundTerminals/list", _) => events.push(reply(if self.background_supported {
+            ("thread/backgroundTerminals/list", _) => events.push(reply(if self.background_missing.contains(&thread) {
+                    Err(json!({"code":-32600,"message":"thread not found"}))
+                } else if self.background_supported {
                 Ok(json!({"data":self.background.get(&thread).cloned().unwrap_or_default(),"nextCursor":null}))
             } else { Err(json!({"code":-32601,"message":"方法不存在"})) })),
             ("thread/backgroundTerminals/terminate", _) => {
@@ -443,7 +449,7 @@ impl Sim {
                 }
             }
             ("thread/read", Operation::StatusRead { .. }) => {
-                let status = if self.active(&thread).is_empty() {
+                let status = if self.metadata_unloaded.contains(&thread) { "notLoaded" } else if self.active(&thread).is_empty() {
                     "idle"
                 } else {
                     "active"
@@ -493,7 +499,7 @@ impl Sim {
                 }
             }
             ("thread/loaded/list", _) => {
-                let data: Vec<String> = self.mock.threads.keys().cloned().collect();
+                let data: Vec<String> = self.mock.threads.keys().filter(|t| !self.metadata_unloaded.contains(*t)).cloned().collect();
                 events.push(reply(Ok(json!({"data": data, "nextCursor": null}))));
             }
             _ => return None,

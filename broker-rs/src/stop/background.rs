@@ -10,6 +10,8 @@ pub const TERMINATE: &str = "thread/backgroundTerminals/terminate";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_basis: Option<super::unloaded::ClosedRuntime>,
     pub scope: String,
     pub state: String,
     pub discovered: usize,
@@ -21,6 +23,7 @@ pub struct BackgroundReport {
 impl Default for BackgroundReport {
     fn default() -> Self {
         Self {
+            verification_basis: None,
             scope: "Codex 受管的后台命令".into(),
             state: "pending".into(),
             discovered: 0,
@@ -70,10 +73,12 @@ impl Background {
         self.cursor = None;
         self.cursors.clear();
         self.terminating = None;
+        self.report.verification_basis = None;
         self.report.state = "pending".into();
         self.report.failure_reason = None;
     }
     pub fn fail(&mut self, state: &str, reason: String) {
+        self.report.verification_basis = None;
         self.busy = false;
         self.verifying = false;
         self.confirmed = false;
@@ -215,6 +220,18 @@ impl Background {
             self.fail("unconfirmed", "受管后台命令仍在列表中".into());
         }
     }
+    pub fn confirm_closed(&mut self, proof: super::unloaded::ClosedRuntime, now: u64) {
+        self.busy = false;
+        self.verifying = false;
+        self.failed = false;
+        self.confirmed = true;
+        self.report.state = "notLoaded".into();
+        self.report.remaining.clear();
+        self.report.failure_reason = None;
+        self.report.last_verified_at = Some(now);
+        self.report.verification_basis = Some(proof);
+    }
+
     pub fn finish(&mut self) {
         self.verifying = false;
         self.confirmed = true;

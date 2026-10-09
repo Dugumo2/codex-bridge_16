@@ -410,10 +410,12 @@ export type WaitRun = (rpc: BrokerRpc, opts: WaitRunOptions) => Promise<RunResul
 
 /** `broker/threads/stop` 的回包：确认已停或 40 秒窗口到了才回。 */
 export interface BackgroundCleanup {
+  verificationBasis?: { source: string; connectionEpoch: number; observedAt: number };
   scope: string; state: string; discovered: number; terminationResults: Record<string, boolean | null>;
   remaining: string[]; lastVerifiedAt: number | null; failureReason: string | null;
 }
 export interface StopReply {
+  cleanupState?: "completed" | "released";
   backgroundCleanup?: BackgroundCleanup;
   actionApplied?: boolean;
   reason?: string;

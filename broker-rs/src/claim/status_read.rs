@@ -125,6 +125,7 @@ pub(crate) enum ReadStage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReadState {
+    connection_epoch: u64,
     pub(crate) thread: String,
     token: Option<ClaimToken>,
     pub(crate) query: StatusQuery,
@@ -231,6 +232,7 @@ impl Machine {
         self.status_reads.reads.insert(
             read_id,
             ReadState {
+                connection_epoch: self.relations.conn_epoch,
                 thread: thread.to_owned(),
                 token,
                 query,
@@ -447,6 +449,17 @@ impl Machine {
             .retain(|(read, _), _| *read != id);
     }
 
+    pub(crate) fn cancel_stop_reads(&mut self, generation: u64, actions: &mut Vec<Action>) {
+        let ids: Vec<_> = self.status_reads.reads.iter().filter(|(_, read)|
+            matches!(&read.caller, StatusCaller::StopVerify { tag } if tag.generation == generation))
+            .map(|(id, _)| *id).collect();
+        for id in ids {
+            self.cancel_status_read(id, actions);
+        }
+        self.status_reads.deadline_rpcs.retain(|_, caller|
+            !matches!(caller, StatusCaller::StopVerify { tag } if tag.generation == generation));
+    }
+
     pub(crate) fn cancel_tree_reads(
         &mut self,
         tree_op: u64,
@@ -516,6 +529,14 @@ impl Machine {
         }
         // 回包只消费一次；重复的同代号回包随后按代号不符丢弃。
         read.generation = 0;
+        if read.connection_epoch != self.relations.conn_epoch {
+            self.finish_status_read(
+                read_id,
+                StatusResult::Unknown(StatusUnknown::Changed),
+                actions,
+            );
+            return;
+        }
         let (thread, version, stage) = (read.thread.clone(), read.version, read.stage.clone());
         if self.status_reads.version(&thread) != version {
             self.status_version_changed(read_id, actions);
@@ -535,6 +556,43 @@ impl Machine {
                 return;
             }
         };
+        // 只接纳身份、请求代号及活动版本都通过校验的元数据；notLoaded 不等同一般 Idle。
+        if matches!(stage, ReadStage::Metadata | ReadStage::TurnMetadata)
+            && thread_active(&value, &thread).is_some()
+        {
+            if value["thread"]["status"]["type"] == "notLoaded" {
+                if value["thread"]["id"].as_str() == Some(thread.as_str()) {
+                    self.record_closed_runtime(&thread, "thread/read:notLoaded");
+                    match self.status_reads.reads[&read_id].caller.clone() {
+                        StatusCaller::StopVerify { tag } => {
+                            if let Some(op) = self.stops.operations.get_mut(&tag.id).filter(|op| {
+                                op.generation == tag.generation && op.round == tag.round
+                            }) {
+                                op.unloaded_read = true;
+                            }
+                        }
+                        StatusCaller::DerivedStopVerify {
+                            tree_op,
+                            thread,
+                            round,
+                        } => {
+                            if let Some(op) = self
+                                .trees
+                                .aux
+                                .derived
+                                .get_mut(&(tree_op, thread))
+                                .filter(|op| op.request_round == round)
+                            {
+                                op.unloaded_read = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                self.forget_closed_runtime(&thread);
+            }
+        }
         let outcome = match stage {
             ReadStage::Metadata => self.status_metadata(read_id, &value),
             ReadStage::TurnMetadata => match thread_active(&value, &thread) {
