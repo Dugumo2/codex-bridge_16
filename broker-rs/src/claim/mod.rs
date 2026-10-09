@@ -2415,7 +2415,23 @@ impl Machine {
                 if context.method != "thread/fork" {
                     self.record(thread_id).subscribed = true;
                 }
-                self.run_learn_thread(thread_id, value, actions);
+                // broker 自发的恢复（屏障、续跑预检、inbox）不带模型，回包里是服务器默认模型，
+                // 不代表本线程实际用的模型，只有客户端请求的回包才改写索引模型。
+                let learn_model = context.operation == Operation::Forward;
+                self.run_learn_thread(thread_id, value, learn_model, actions);
+            }
+        } else if context.method == "turn/start" {
+            // 开轮显式带模型时，该轮按此模型执行；索引记最近一轮实际指定的模型。
+            if let (Some(thread), Some(model)) = (
+                thread_id(&context.params),
+                context
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("model"))
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty()),
+            ) {
+                self.run_learn_model(thread, model, actions);
             }
         } else if matches!(context.method.as_str(), "thread/archive" | "thread/delete")
             && context.operation == Operation::Forward

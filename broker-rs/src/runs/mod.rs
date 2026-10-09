@@ -1002,6 +1002,7 @@ impl Machine {
         &mut self,
         thread: &str,
         response: &Value,
+        learn_model: bool,
         actions: &mut Vec<Action>,
     ) {
         self.runs.trace("run_learn_thread");
@@ -1028,15 +1029,40 @@ impl Machine {
             .threads
             .get_mut(&short)
             .expect("线程索引存在");
-        entry.model = response
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        if learn_model {
+            entry.model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
         entry.preview = info
             .get("preview")
             .and_then(Value::as_str)
             .map(state::index_preview);
         entry.cwd = info.get("cwd").and_then(Value::as_str).map(str::to_owned);
+        entry.updated_at = self.clock.now_ms;
+        self.runs.put_threads(actions);
+    }
+
+    /// 开轮成功且显式指定了模型：只改已登记线程的索引模型，不为陌生线程建索引。
+    pub(crate) fn run_learn_model(&mut self, thread: &str, model: &str, actions: &mut Vec<Action>) {
+        self.runs.trace("run_learn_model");
+        if self.runs.phase != Phase::Open {
+            return;
+        }
+        let Some(entry) = self
+            .runs
+            .index
+            .threads
+            .values_mut()
+            .find(|entry| entry.thread_id == thread)
+        else {
+            return;
+        };
+        if entry.model.as_deref() == Some(model) {
+            return;
+        }
+        entry.model = Some(model.to_owned());
         entry.updated_at = self.clock.now_ms;
         self.runs.put_threads(actions);
     }
