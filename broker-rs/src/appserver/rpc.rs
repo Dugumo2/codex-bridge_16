@@ -1460,6 +1460,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn 后台能力拒绝只交给匹配请求id() {
+        use crate::stop::background::{LIST, TERMINATE};
+        for method in [LIST, TERMINATE] {
+            for error in [
+                json!({"code":-32601,"message":"Method not found"}),
+                json!({"code":-32600,"message":format!("Invalid request: unknown variant `{method}`, expected `initialize`")}),
+                json!({"code":-32600,"message":format!("{method} requires experimentalApi capability")}),
+            ] {
+                let mut m = Memory::new(None);
+                let mut request = m.client.request(method, None, None);
+                let sent = m.sent().await;
+                let id = sent["id"].as_u64().unwrap();
+                for wrong in [json!(id + 100), json!(id.to_string()), Value::Null] {
+                    m.feed(json!({"id":wrong,"error":error}));
+                }
+                m.barrier().await;
+                assert!(matches!(
+                    request.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+                m.feed(json!({"id":id,"error":error}));
+                assert!(matches!(
+                    request.await.unwrap(),
+                    Err(AppError::Rpc {
+                        code: -32601 | -32600,
+                        ..
+                    })
+                ));
+                m.client.close().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn 未知_id_及坏消息不影响后续回包和事件() {
         let mut m = Memory::new(None);
         let request = m.client.request("good", None, None);

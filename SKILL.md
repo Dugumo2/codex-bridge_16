@@ -117,7 +117,7 @@ Codex 需要人回应时，cxb 把线程交给 broker 托管、以退出码 5 �
 - 已结束运行的历史核验若返回 `cleanupState:"released"`（整树见 `childrenStop.cleanupState`），本次核验已结束，不占用线程，也不会后台重试；可以直接发起新工作，不必对单线程调用 `--abandon`。这仍是未确认，不能据此宣称进程已经退出。
 - 临时故障（超时、断连）可等 broker 后台复核，隔一段时间 `cxb show <线程ID>` 看结论；不要在原线程循环 stop/resume。
 - 子代理整树停止确认无法补齐证据时，执行一次 `cxb stop <线程> --run <运行> --abandon`，显式放弃本次树清理责任：仍退出 3，`actionApplied:true` 只表示放弃已应用，**不表示已经停止**；之后换新线程，必要时换隔离工作目录，避免残留工作互相覆盖。重复 stop 不会重启已放弃的清理。`--abandon` 只作用于整树停止：单线程返回 `treeStopNotFound`；放弃后未结束的父运行不一定已放开。
-- `backgroundCleanup.state` 为 `capabilityLimited`（服务器不支持后台命令接口）时，重复 stop 补不了证据，线程会一直处于停止中直到 broker 重启（已知限制）：告诉用户，可改用私有档（`cxb config server private`）。
+- `backgroundCleanup.state` 为 `capabilityLimited`（本次后台方法不存在，或当前连接缺少其 `experimentalApi` 能力）时，重复 stop 补不了证据，线程会一直处于停止中直到 broker 重启（已知限制）：告诉用户，可改用私有档（`cxb config server private`）。判定仅接受匹配本次请求 ID 的 `-32601`，或 `-32600` 且顶层消息为 ``Invalid request: unknown variant `<本次方法>`, expected …`` / 精确为 `<本次方法> requires experimentalApi capability`；其他含 experimental、unsupported、not supported 的消息不据此判为能力受限。
 - 停止确认的后台清理范围仅为「Codex 受管的后台命令」；空列表不保证操作系统没有残留后代进程。
 
 已卸载线程若有当前 app-server 连接的关闭依据，可返回 `confirmed`；`backgroundCleanup.state` 仍为 `notLoaded`，`verificationBasis` 写明 `thread/closed` 或 `thread/read:notLoaded` 的来源和观察时间。stop 不会为了取得空列表而 resume；正常新派单的 resume 不受此限制。

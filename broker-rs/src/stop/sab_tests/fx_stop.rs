@@ -158,10 +158,7 @@ fn fx_分页后必须从头复查() {
 fn fx_能力卸载断连均保留不同失败原因() {
     for (error, state) in [
         (json!({"code":-32601}), "capabilityLimited"),
-        (
-            json!({"message":"experimental API disabled"}),
-            "capabilityLimited",
-        ),
+        (json!({"message":"experimental API disabled"}), "unknown"),
         (json!({"message":"thread not found"}), "notLoaded"),
         (json!({"message":"connection closed"}), "unknown"),
     ] {

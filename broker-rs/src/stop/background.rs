@@ -7,6 +7,28 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const LIST: &str = "thread/backgroundTerminals/list";
 pub const TERMINATE: &str = "thread/backgroundTerminals/terminate";
 
+#[cfg(test)]
+#[path = "background_tests.rs"]
+mod tests;
+
+fn capability_limited(error: &Value, method: &str) -> bool {
+    if error["code"] == -32601 {
+        return true;
+    }
+    if error["code"] != -32600 {
+        return false;
+    }
+    let Some(message) = error["message"].as_str() else {
+        return false;
+    };
+    message == format!("{method} requires experimentalApi capability")
+        || message
+            .strip_prefix(&format!(
+                "Invalid request: unknown variant `{method}`, expected "
+            ))
+            .is_some_and(|expected| !expected.is_empty())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackgroundReport {
@@ -124,16 +146,18 @@ impl Background {
         let value = match result {
             Ok(v) => v,
             Err(e) => {
+                // RPC 层已匹配请求 ID，调用方已校验轮次；在清除终止目标前确定本次方法。
+                let method = if self.terminating.is_some() {
+                    TERMINATE
+                } else {
+                    LIST
+                };
                 if let Some(id) = self.terminating.take() {
                     self.report.termination_results.insert(id, None);
                 }
                 let message = e.to_string();
                 let lower = message.to_ascii_lowercase();
-                let state = if e["code"] == -32601
-                    || lower.contains("experimental")
-                    || lower.contains("not supported")
-                    || lower.contains("unsupported")
-                {
+                let state = if capability_limited(&e, method) {
                     "capabilityLimited"
                 } else if lower.contains("thread not found") {
                     "notLoaded"
