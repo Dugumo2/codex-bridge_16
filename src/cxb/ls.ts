@@ -1,12 +1,13 @@
 import { sanitizeForTerminal } from "../questions";
-import { CxbError, type LifecycleInfo, type ThreadSummary } from "./contracts";
-import { readLifecycle, readRunRecord, readThreadIndex, type ThreadIndexEntry } from "./ledger";
+import { CxbError, type BrokerRpc, type LifecycleInfo, type RunResult, type ThreadSummary } from "./contracts";
+import { readAllRuns, readLifecycle, readThreadIndex, type ThreadIndexEntry } from "./ledger";
+import { modelLabel, threadModelDisplay, type ModelDisplay } from "./show-model";
 import { backgroundLines, derivedOnly, stopReportLines } from "./subagents";
 import { lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
 import { commandSession } from "./command-session";
 
-interface ListItem {
+interface ListItem extends ModelDisplay {
   threadId: string; shortId: string | null; status: string; lastRunId: string | null;
   updatedAt: number; model: string | null; preview: string | null; goal: string | null;
   /** 待核实的归档或删除（`--json` 原样带出）。 */
@@ -27,14 +28,14 @@ const sorted = (items: Iterable<ListItem>) => [...items].sort((a, b) => b.update
 type LocalThread = Pick<ThreadSummary, "threadId" | "shortId" | "lastRunId" | "updatedAt" | "model" | "preview" | "meta">
   & { state?: ThreadSummary["state"]; lifecycle?: LifecycleInfo };
 
-function localItems(ctx: CommandContext, threads: LocalThread[]): ListItem[] {
+function localItems(threads: LocalThread[], runs: RunResult[]): ListItem[] {
+  const byId = new Map(runs.map((run) => [run.runId, run]));
   return threads.map((thread) => {
     // 待核实的归档或删除优先显示（门禁挡着，线程不能照常使用）；只剩记录的线程没有运行可读。
-    const run = thread.lastRunId
-      ? readRunRecord(ctx.workspace.workspaceDir, thread.lastRunId) : null;
+    const run = thread.lastRunId ? byId.get(thread.lastRunId) : null;
     const status = thread.lifecycle ? lifecycleLabel(thread.lifecycle) : thread.state && thread.state !== "idle" ? thread.state
       : run?.state === "running" || run?.state === "stopping" || run?.state === "lost" ? run.state : run?.status ?? "idle";
-    return { ...thread, ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
+    return { ...thread, ...threadModelDisplay(thread.threadId, thread.model, []), ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
   });
 }
 
@@ -73,9 +74,12 @@ export const ls: CommandHandler = async (ctx) => {
     let source: "local" | "merged" = "local";
     let items: ListItem[];
     let more = false;
+    // 全部线程共享一次磁盘扫描，不能只看索引的 lastRunId。
+    const diskRuns = readAllRuns(ctx.workspace.workspaceDir);
+    let onlineRpc: BrokerRpc | undefined;
     const limit = Number(ctx.parsed.options.limit);
     if (ctx.parsed.options.local) {
-      items = localItems(ctx, localThreads(ctx.workspace.workspaceDir));
+      items = localItems(localThreads(ctx.workspace.workspaceDir), diskRuns);
       ctx.out.progress("已跳过服务器查询：指定了 --local");
     } else {
       let rpc;
@@ -87,8 +91,9 @@ export const ls: CommandHandler = async (ctx) => {
         if (session.signal.aborted || error instanceof CxbError && error.code === "LOCAL_ERROR") throw error;
         ctx.out.notice("无法连接或读取 broker，改为显示本地账本");
       }
-      items = localItems(ctx, summaries ?? localThreads(ctx.workspace.workspaceDir));
+      items = localItems(summaries ?? localThreads(ctx.workspace.workspaceDir), diskRuns);
       if (rpc && summaries) {
+        onlineRpc = rpc;
         const started = Date.now();
         const merged = new Map(items.map((item) => [item.threadId, item]));
         const seen = new Set<string>();
@@ -108,7 +113,7 @@ export const ls: CommandHandler = async (ctx) => {
             for (const thread of page.data) {
               if (merged.has(thread.id)) { ctx.out.progress(`跳过重复线程 ${thread.id}：保留本地摘要`); continue; }
               merged.set(thread.id, { threadId: thread.id, shortId: null, status: `server:${thread.status?.type ?? "notLoaded"}`,
-                lastRunId: null, updatedAt: thread.updatedAt * 1000, model: thread.model ?? null, preview: preview(thread.preview), goal: thread.goal ?? null });
+                lastRunId: null, updatedAt: thread.updatedAt * 1000, ...threadModelDisplay(thread.id, thread.model ?? null, []), preview: preview(thread.preview), goal: thread.goal ?? null });
             }
             cursor = page.nextCursor;
             more = cursor !== null;
@@ -135,9 +140,24 @@ export const ls: CommandHandler = async (ctx) => {
     const ranked = sorted(items);
     const truncated = more || ranked.length > limit;
     items = ctx.parsed.options.all ? ranked : ranked.slice(0, limit);
+    for (const item of items) {
+      const indexModel = item.model;
+      Object.assign(item, threadModelDisplay(item.threadId, indexModel, diskRuns));
+      if (!onlineRpc) continue;
+      try {
+        const snapshot = await onlineRpc.request<{ thread?: ThreadSummary; run?: RunResult | null; runs?: RunResult[] }>(
+          "broker/threads/watch", { threadId: item.threadId, includeRuns: true });
+        const online = [...snapshot.runs ?? [], ...snapshot.run ? [snapshot.run] : []];
+        // 同一运行的在线状态覆盖磁盘旧快照；不合格的最近运行不能遮住更早的合格记录。
+        Object.assign(item, threadModelDisplay(item.threadId, snapshot.thread?.model ?? indexModel, diskRuns, online, snapshot.thread));
+      } catch (error) {
+        if (session.signal.aborted) throw error;
+        ctx.out.notice(`无法读取线程 ${item.shortId ?? item.threadId} 的在线运行，模型来源按本地账本显示`);
+      }
+    }
     ctx.out.progress(`共发现 ${ranked.length} 条线程，显示 ${items.length} 条`);
-    ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL PREVIEW\n");
-    for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${item.model ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
+    ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL REASONING PREVIEW\n");
+    for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${modelLabel(item)} ${item.reasoning ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
     for (const item of items) if (item.childrenStop) for (const line of stopReportLines(item.childrenStop)) ctx.out.notice(`${item.shortId ?? item.threadId} ${line}`);
     for (const item of items) if (item.backgroundCleanup && !item.childrenStop) for (const line of backgroundLines(item.threadId, item.backgroundCleanup)) ctx.out.notice(line);
     ctx.out.resultJson({ ok: true, command: "ls", workspace: ctx.workspace.root, source, items, truncated });
