@@ -55,6 +55,7 @@ export const CONFIG_SCHEMA = Object.freeze({
   sandbox: enumeration(config.sandboxModes),
   approval: enumeration(config.approvalModes),
   timeout: seconds(config.maxTimeoutSeconds),
+  "converge-timeout": seconds(Math.floor(Number.MAX_SAFE_INTEGER / 1000)),
   memory: spec("true 或 false", (value) => typeof value === "boolean",
     (value) => value === "true", (value) => value === "true" || value === "false"),
   server: enumeration(SERVER_PREFERENCES),

@@ -28,6 +28,7 @@ export interface GlobalOptions {
 
 /** 只含当前命令的选项；未指定且没有静态默认值的字段不出现。 */
 export interface CommandOptions {
+  "converge-timeout"?: number;
   file?: string;
   resume?: string;
   continue?: boolean;
@@ -176,6 +177,13 @@ export const GLOBAL_OPTIONS: readonly OptionSpec[] = [
 const COMMON: readonly (keyof GlobalOptions)[] = ["help", "version", "verbose", "json", "dir"];
 const EXECUTION: readonly (keyof GlobalOptions)[] = [...COMMON, "timeout", "model", "reasoning", "sandbox", "approval"];
 const resume = value("resume", ["--resume"], "线程ID", "恢复已有线程。", id);
+const convergeTimeout = value("converge-timeout", ["--converge-timeout"], "秒",
+  "子代理收敛总期限，默认 3600 秒；首次收敛起算，跨汇总、detach、待答不重置，独立于 --timeout。",
+  (value) => CONFIG_SCHEMA["converge-timeout"].parse(value), 3600);
+const convergenceRules = ["子代理运行会等待受管后代收敛，再自动汇总到同一运行；期间上一轮输出只是阶段结果。",
+  "最多新开 5 次汇总轮、50 个自动父轮；连续 3 轮无动作会刹车。达到最后一次额度仍允许当前轮完成核实。",
+  "期限、预算、次数或归属核实异常会停止已确认自有范围并报告原因；未确认停止不等于已清理。",
+  "--timeout 沿用命令等待期限；wait 超时只结束等待，未 detach 的前台 run 断开可能触发停止。"];
 const REVIEW_MODES = ["pr", "uncommitted", "commit", "custom"] as const;
 
 export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
@@ -184,6 +192,7 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
     usage: ["cxb run [提示词 ...] [选项]", "cxb run - | --file <文件> [选项]", "cxb run --resume <线程ID> --continue [补充说明 ...] [选项]"],
     globals: EXECUTION,
     options: [
+      convergeTimeout,
       value("file", ["-f", "--file"], "文件", "从 UTF-8 文件读取提示词。"), resume,
       flag("continue", ["--continue"], "按原运行续跑，位置参数作为本次补充。"),
       value("run", ["--run"], "运行ID", "指定续跑来源，默认最近一次运行。", id),
@@ -197,20 +206,20 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
       "--resume 需要新提示词或 --continue；--continue 必须配合 --resume。",
       "--continue 仅接受位置补充，不接受标准输入或文件；补充不替换原始要求；不能与 --goal、--template 同用。",
       "--run 必须配合 --continue；--budget 必须配合 --goal。",
-      "空白提示词无效；文件与标准输入的内容由执行层读取并校验。"],
+      "空白提示词无效；文件与标准输入的内容由执行层读取并校验。", ...convergenceRules],
     validate: validateRun,
   },
   review: {
     description: "执行一次只读代码审查",
     usage: ["cxb review [审查说明 ...] [选项]", "cxb review --mode <模式> [--ref <引用>] [--base <分支>]", "cxb review --resume <线程ID> [审查说明 ...] [选项]"],
     globals: EXECUTION,
-    options: [value("mode", ["--mode"], "模式", `审查模式：${REVIEW_MODES.join("|")}；默认 pr。`, choice(REVIEW_MODES), "pr"),
+    options: [convergeTimeout, value("mode", ["--mode"], "模式", `审查模式：${REVIEW_MODES.join("|")}；默认 pr。`, choice(REVIEW_MODES), "pr"),
       value("ref", ["--ref"], "引用", "仅 commit 模式可用，默认 HEAD。", gitRef),
       value("base", ["--base"], "分支", "仅 pr 模式可用，默认自动检测，失败回退 main。", gitRef), resume],
     rules: ["未显式设置模式时，提供审查说明会选择 custom；custom 必须有说明。",
       "显式 pr、uncommitted、commit 均不接受位置说明。",
       "显式 sandbox 或 approval 先校验，再始终告警并忽略；固定 read-only 和 never。",
-      "不接受 --goal 或 --budget；引用不能包含 shell 元字符。"],
+      "不接受 --goal 或 --budget；引用不能包含 shell 元字符。", ...convergenceRules],
     validate: validateReview,
   },
   show: {

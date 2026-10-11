@@ -11,7 +11,8 @@ export const ASK_RULES = `能通过检查文件、运行验证或已有上下文
 export const SUBAGENT_RULES_VERSION = 1;
 
 /**
- * 甲：条件式的子代理收尾规则（SA1 接口第 8.6 节，唤醒讨论第 6 节）。cxb 自有的根运行统一注入，
+ * 甲：条件式的子代理收尾规则（SA1b 接口第 7、11 节，唤醒讨论第 6 节）。v1 已覆盖后代、待答与限制，无需改版。
+ * cxb 自有的根运行统一注入；已加载恢复仍提交并登记，不保证当轮实际重载开发者指令。
  * 不启用多代理、也不授权主动派生；正确性靠 broker 的自然结束门禁，不靠这段一定被加载。
  */
 export const SUBAGENT_RULES = `【cxb 子代理规则 v${SUBAGENT_RULES_VERSION}】

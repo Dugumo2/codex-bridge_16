@@ -8,6 +8,9 @@ import type { CommandContext, CommandHandler } from "./main";
 import { redactParams } from "./server-requests";
 import { resolveThreadLocal, resolveThreadViaBroker, type ThreadRef } from "./thread-ref";
 import { waitRun } from "./wait-run";
+import { convergenceFields, resultPending, resultTurn, selectedResultFields } from "./run-result";
+import { observeConvergence } from "./convergence";
+import type { ConvergenceSummary } from "./sa1b-contracts";
 import { commandSession, wireMessage } from "./command-session";
 
 function unsupported(error: unknown): boolean {
@@ -78,17 +81,20 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
   const model = await readThreadModel(ctx, ref, connect, index.model, disk);
   modelNotice(ctx, model);
   if (!run) throw new CxbError("NOT_FOUND", "线程没有运行记录", { id: ref.threadId });
-  const last = run.turns.at(-1);
+  const last = resultTurn(run);
   resultNotice(ctx, run, ref.shortId ?? ref.threadId);
-  if (run.state === "running" || run.state === "stopping" || last?.ready === "pending") {
+  if (run.state === "running" || run.state === "stopping" || resultPending(run)) {
+    const stage = run.subagentJoin && run.finalTurnId === undefined && last?.ready === "ready" ? last : undefined;
+    if (stage) { ctx.out.notice("阶段结果（运行尚未完成）"); ctx.out.result(stage.output); }
     ctx.out.notice(`结果尚未就绪，请用 cxb wait ${ref.shortId ?? ref.threadId}`);
     ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: run.runId, state: run.state,
+      ...convergenceFields(run), ...selectedResultFields(run), ...(stage ? { result: stage.output, stageResult: true } : {}),
       stopOutcome: run.stopOutcome, childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup });
     return 5 as const;
   }
   ctx.out.result(last?.output ?? "");
   ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: run.runId, state: run.state,
-    status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none",
+    status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none", ...convergenceFields(run), ...selectedResultFields(run),
     childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup, interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
   if (!last) {
     const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)
@@ -218,7 +224,7 @@ async function showLog(ctx: CommandContext, ref: ThreadRef, connect: () => Promi
   const runs = records.map((run) => {
     const lines = linesOfRun(all, run.runId).filter((line) => ctx.parsed.options.full || SUMMARY_EVENTS.has(line.event)).map(eventLine);
     const entry = { runId: run.runId, state: run.state, status: run.status, startedAt: run.startedAt,
-      ...runModelDisplay(run), pendingReroute: run.pendingReroute ?? null,
+      ...runModelDisplay(run), ...convergenceFields(run), pendingReroute: run.pendingReroute ?? null,
       input: clean(run.input), items: lines, turns: run.turns.map((turn) => ({ ...turn, output: clean(turn.output), error: redactParams(turn.error) })),
       ...(ctx.parsed.options.full ? { meta: redactParams(run.meta), interruptReason: run.interruptReason, stopOutcome: run.stopOutcome,
         progress: redactParams(run.progress) } : {}) };
@@ -238,7 +244,7 @@ async function showLog(ctx: CommandContext, ref: ThreadRef, connect: () => Promi
   return 0 as const;
 }
 
-interface Snapshot { thread: ThreadSummary; run: RunResult | null }
+interface Snapshot extends ConvergenceSummary { thread: ThreadSummary; run: RunResult | null; revision?: number }
 const PROGRESS_LABELS: Record<string, string> = { "turn/started": "轮次开始", "turn/completed": "轮次完成", "item/started": "条目开始", "item/completed": "条目完成" };
 /** 上游进展通知 → 显示行；只认 `source` 线程上的（null 表示还不知道该认哪个线程，一律丢弃）。 */
 function renderNotification(method: string, raw: unknown, source: string | null) {
@@ -276,6 +282,7 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
   let finished = false;
   let snapshot: Snapshot | undefined;
   let runId: string | null = null;
+  const convergence = observeConvergence(rpc, () => runId, (line) => ctx.out.notice(line));
   /** 已显示行的出现次数（同一毫秒可以有内容相同的多行）。 */
   const printed = new Map<string, number>();
   let lastTs = "";
@@ -344,6 +351,7 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
   try {
     snapshot = await Promise.race([rpc.request<Snapshot>("broker/threads/watch", { threadId: ref.threadId }), failure]);
     runId = snapshot.run?.runId ?? snapshot.thread.lastRunId;
+    convergence.accept({ ...snapshot.run, ...snapshot, runId: runId ?? undefined });
     for (const line of tail(ctx, ref)) emit(line);
     // 先把快照前后同批通知交给等待器，再清空缓冲；不能以 await 返回时刻划分通知新旧。
     const replayRpc: BrokerRpc = { ...rpc, on(method, handler) {
@@ -351,7 +359,7 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
       for (const event of buffered) if (event.method === method) handler(event.params);
       return dispose;
     } };
-    const ready = snapshot.run && (snapshot.run.state === "ended" || snapshot.run.state === "lost") && snapshot.run.turns.at(-1)?.ready !== "pending";
+    const ready = snapshot.run && (snapshot.run.state === "ended" || snapshot.run.state === "lost") && !resultPending(snapshot.run);
     const waiting = runId && !ready ? waitRun(replayRpc, { threadId: ref.threadId, runId, timeoutMs: null, signal,
       workspaceDir: ctx.workspace.workspaceDir }) : Promise.resolve(snapshot.run);
     void waiting.catch(() => undefined);
@@ -372,9 +380,12 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
     const model = await Promise.race([readThreadModel(ctx, ref, async () => rpc, snapshot.thread.model), failure]);
     modelNotice(ctx, model);
     ctx.out.result(`运行结束：${run?.status ?? "无运行"}${runId ? `（${runId}）` : ""}\n`);
-    ctx.out.resultJson({ terminal: true, status: run?.status ?? null, runId, ...model });
+    const hasConvergence = run && (run.finalTurnId !== undefined || run.subagentJoin);
+    if (hasConvergence) { showSubagents(ctx, run); ctx.out.result(resultTurn(run)?.output ?? ""); }
+    ctx.out.resultJson({ terminal: true, status: run?.status ?? null, runId, ...model,
+      ...(hasConvergence ? { result: resultTurn(run)?.output ?? "", ...convergenceFields(run), ...selectedResultFields(run) } : {}) });
     return 0 as const;
-  } finally { finished = true; off(); close(); buffered.length = 0; }
+  } finally { finished = true; off(); close(); convergence.dispose(); buffered.length = 0; }
 }
 
 export const show: CommandHandler = async (ctx) => {
