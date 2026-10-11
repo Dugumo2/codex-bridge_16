@@ -17,7 +17,10 @@
 // 服务端请求的回包到达前，本轮一直保持运行（不像 harness 默认 mock 那样到点就完成）。
 // MOCK_BACKGROUND_TERMINALS：独立后台命令场景（JSON），默认关闭时三个接口均回 -32601。
 // MOCK_E2E_PENDING_METADATA=1：结果扣包时仍提供元数据和轮次分页，只有条目补读等待放行。
+// MOCK_E2E_MODEL_INHERIT：模型沿用黑盒选项（目录 models、固定回包 responseModel/responseEffort）；
+//   启用后记录上游发出的帧，并开放 fixture/modelNextTurn，仅控制下一次开轮失败或改道。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 // CXB_INLINE_RESUME_HISTORY_BEGIN
 import { fixtureSender, longResumeTurns } from "../../test-support/resume-history";
 // CXB_INLINE_RESUME_HISTORY_END
@@ -41,6 +44,10 @@ const logPath = process.env.MOCK_E2E_LOG;
 const trigger = process.env.MOCK_E2E_TRIGGER;
 const busyFlag = process.env.MOCK_E2E_BUSY;
 const gateDir = process.env.MOCK_E2E_GATE_DIR;
+const modelOptions: { models: unknown[]; responseModel: string; responseEffort: string } | null =
+  process.env.MOCK_E2E_MODEL_INHERIT ? JSON.parse(process.env.MOCK_E2E_MODEL_INHERIT) : null;
+const modelTurnPrefix = modelOptions ? `${randomUUID()}-` : "";
+let nextModelTurn: { fail?: boolean; reroute?: { toModel: string; reason: string } } = {};
 
 function log(entry: unknown): void {
   if (logPath) appendFileSync(logPath, JSON.stringify(entry) + "\n");
@@ -48,7 +55,11 @@ function log(entry: unknown): void {
 log({ kind: "boot", pid: process.pid });
 const statusReadOptions = JSON.parse(process.env.MOCK_STATUS_READ ?? "{}");
 // 只有一个写出队列；状态历史从包装后的发送函数学习本模拟发出的轮次与条目。
-const rawSend = fixtureSender();
+const queuedSend = fixtureSender();
+const rawSend: typeof queuedSend = (message) => {
+  if (modelOptions) log({ kind: "sent", message });
+  return queuedSend(message);
+};
 const statusHistory = createStatusHistory(statusReadOptions, rawSend, longResumeTurns);
 const send = statusHistory.wrap(rawSend);
 const subagents = createSubagentMock(send, JSON.parse(process.env.MOCK_SUBAGENTS ?? "{}"), JSON.parse(process.env.MOCK_BACKGROUND_TERMINALS ?? "{}"));
@@ -235,6 +246,7 @@ const thread = (id: string) => ({
   id, preview: "", modelProvider: "openai", createdAt: 1, updatedAt: 1, status: { type: "idle" },
   path: null, cwd: "D:\\", cliVersion: "0.160.0", source: "mock", name: null, agentNickname: null,
   agentRole: null, gitInfo: null, turns: [],
+  ...(modelOptions ? { model: modelOptions.responseModel, reasoningEffort: modelOptions.responseEffort } : {}),
 });
 
 let buffer = "";
@@ -256,7 +268,7 @@ process.stdin.on("data", (chunk: string) => {
       if (waiter) { waiting.delete(String(msg.id)); waiter(msg); }
       continue;
     }
-    log({ kind: "request", method: msg.method, params: msg.params ?? null });
+    log({ kind: "request", id: msg.id, method: msg.method, params: msg.params ?? null });
     if (statusHistory.handle(msg)) continue;
     const threadId: string = msg.params?.threadId ?? "thread-e2e";
     switch (msg.method) {
@@ -268,7 +280,9 @@ process.stdin.on("data", (chunk: string) => {
         send({ id: msg.id, result: { thread: { ...thread(msg.method === "thread/start" ? "thread-e2e" : threadId),
           ...((process.env.MOCK_E2E_LONG_HISTORY === "1" || statusReadOptions.longHistory) && msg.method === "thread/resume"
             ? { turns: msg.params?.excludeTurns === true ? [] : longResumeTurns() } : {}) },
-          model: "gpt-mock", modelProvider: "openai", cwd: "D:\\", approvalPolicy: msg.params?.approvalPolicy ?? "never", sandbox: { type: msg.params?.sandbox === "read-only" ? "readOnly" : "workspaceWrite" } } });
+          model: modelOptions?.responseModel ?? "gpt-mock",
+          ...(modelOptions ? { reasoningEffort: modelOptions.responseEffort } : {}),
+          modelProvider: "openai", cwd: "D:\\", approvalPolicy: msg.params?.approvalPolicy ?? "never", sandbox: { type: msg.params?.sandbox === "read-only" ? "readOnly" : "workspaceWrite" } } });
         break;
       case "thread/memoryMode/set":
         send({ id: msg.id, result: {} });
@@ -293,7 +307,15 @@ process.stdin.on("data", (chunk: string) => {
         send({ id: msg.id, result: { data: [], nextCursor: null, backwardsCursor: null } });
         break;
       case "model/list":
-        send({ id: msg.id, result: { data: [], nextCursor: null } });
+        send({ id: msg.id, result: { data: modelOptions?.models ?? [], nextCursor: null } });
+        break;
+      case "fixture/modelNextTurn":
+        if (!modelOptions) {
+          send({ id: msg.id, error: { code: -32601, message: "模型测试控制未启用" } });
+          break;
+        }
+        nextModelTurn = msg.params ?? {};
+        send({ id: msg.id, result: {} });
         break;
       case "thread/goal/get":
         if (holdRootGoalReads) { heldRootGoalReads.push(msg.id); break; }
@@ -384,12 +406,22 @@ process.stdin.on("data", (chunk: string) => {
         break;
       }
       case "turn/start": {
-        const turnId = `turn-${String(++turnCounter).padStart(3, "0")}`;
+        const control = nextModelTurn;
+        nextModelTurn = {};
+        if (control.fail) {
+          send({ id: msg.id, error: { code: -32600, message: "模型沿用测试：本次开轮失败" } });
+          break;
+        }
+        // 模型黑盒跨进程重启，轮次标识不能与旧进程的轮次碰撞。
+        const turnId = `turn-${modelTurnPrefix}${String(++turnCounter).padStart(3, "0")}`;
         let early: Promise<{ result?: unknown }> | null = null;
         if (scenario === "early-ask") early = ask("item/tool/requestUserInput", questionParams(threadId, turnId));
         const reply = () => {
           send({ id: msg.id, result: { turn: { id: turnId, items: [], status: "inProgress", error: null } } });
           send({ method: "turn/started", params: { threadId, turn: { id: turnId, items: [], status: "inProgress", error: null } } });
+          if (control.reroute) send({ method: "model/rerouted", params: {
+            threadId, turnId, fromModel: msg.params?.model, ...control.reroute,
+          } });
           void runTurn(threadId, turnId, early);
         };
         if (early) setTimeout(reply, 200); else reply();
