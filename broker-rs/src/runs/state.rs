@@ -220,7 +220,7 @@ impl Runs {
         }
     }
 
-    pub(super) fn put(&self, run: &str, actions: &mut Vec<Action>) {
+    pub(crate) fn put(&self, run: &str, actions: &mut Vec<Action>) {
         if self.phase != Phase::Finalized {
             if let Some(record) = self.runs.get(run) {
                 actions.push(Action::Store(StoreOp::PutRun(Box::new(record.clone()))));

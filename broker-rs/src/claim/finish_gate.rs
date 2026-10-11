@@ -75,7 +75,10 @@ impl Machine {
         };
         // 弃管根走普通收尾，不重新创建树；goal 写尚未落定时保留可由 goal 回包推进的状态。
         if self.tree_abandoned(&run) {
-            if claim.request_pending || self.stops.changes.values().any(|c| c.thread == thread) {
+            if claim.request_pending
+                || self.stops.changes.values().any(|c| c.thread == thread)
+                || self.convergence_root_unsettled(&run)
+            {
                 let owner = claim.owner().cloned().expect("自有收尾有 owner");
                 self.claims.get_mut(thread).expect("根认领存在").state =
                     State::AwaitingContinuation { owner };
@@ -87,7 +90,9 @@ impl Machine {
         if self.tree_for_run(&run).is_some() || self.stop_busy(thread) {
             return ReleaseDecision::Release;
         }
-        if self.has_managed_activity(&run) == Activity::None {
+        // SA1a 的未接线分支保持原行为；新事实入口缺上下文始终为 Unknown。
+        if self.manage_context(&run).is_none() || self.has_managed_activity(&run) == Activity::None
+        {
             return ReleaseDecision::Release;
         }
         let trigger = match turn_status {
@@ -164,11 +169,45 @@ impl Machine {
             )));
             return;
         };
+        // SA1b 不能把单独的迟到 started 学成自有轮；仍撤销旧停止快照并重新核实。
+        let own = self
+            .claims
+            .get(thread)
+            .is_some_and(|c| c.owned_turns.contains(turn));
+        if !started && own {
+            let status = self
+                .claims
+                .get(thread)
+                .and_then(|c| c.run_id.as_ref())
+                .and_then(|r| self.runs.runs.get(r))
+                .and_then(|r| r.turns.iter().find(|t| t.turn_id == turn))
+                .map(|t| t.status);
+            if let Some(State::FinishingTree { parent_status, .. }) =
+                self.claims.get_mut(thread).map(|c| &mut c.state)
+            {
+                if status == Some(TurnStatus::Failed)
+                    || (*parent_status != Some(TurnStatus::Failed)
+                        && status == Some(TurnStatus::Interrupted))
+                {
+                    *parent_status = status;
+                }
+            }
+        }
+        let guarded = self
+            .claims
+            .get(thread)
+            .and_then(|c| c.run_id.as_ref())
+            .is_some_and(|r| {
+                self.runs
+                    .runs
+                    .get(r)
+                    .is_some_and(|r| r.subagent_join.is_some())
+            });
         let key = (tree_op, thread.to_owned());
         self.invalidate_finishing_root(tree_op, thread);
         self.derived_invalidate_background(&key, actions);
         if let Some(op) = self.trees.aux.derived.get_mut(&key) {
-            if started && !turn.is_empty() {
+            if started && !turn.is_empty() && (!guarded || own) {
                 // 结束快照持有线程：期间开始的轮次属于本运行，可以中断。
                 op.target.proven_turns.insert(turn.into());
             }
@@ -177,7 +216,7 @@ impl Machine {
                 op.turn_ended = false;
             }
         }
-        if started {
+        if started && (!guarded || own) {
             if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
                 if !turn.is_empty() {
                     self.run_turn_started(&run, thread, turn, actions);

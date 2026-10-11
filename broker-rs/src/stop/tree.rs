@@ -407,7 +407,10 @@ impl Machine {
             goal_braked: root.goal_braked
                 && children.capability_limited.is_empty()
                 && all(&|c| c.goal_braked),
-            settled: root.settled && children.unsettled_spawns == 0 && all(&|c| c.settled),
+            settled: root.settled
+                && children.unsettled_spawns == 0
+                && all(&|c| c.settled)
+                && !self.convergence_root_unsettled(&op.request.snapshot.identity.run_id),
             verify_done: children.discovery.complete && root.verify_done && all(&|c| c.verify_done),
         }
     }
@@ -416,6 +419,17 @@ impl Machine {
 
     /// 发起整树停止（第 8.3 节）：立根屏障、冻结清理策略、停根、对已知成员发起派生停止、发现扩展集合。
     pub fn begin_tree_stop(&mut self, request: TreeStopRequest, actions: &mut Vec<Action>) -> u64 {
+        if let Some(join) = self
+            .runs
+            .runs
+            .get_mut(&request.snapshot.identity.run_id)
+            .and_then(|r| r.subagent_join.as_mut())
+        {
+            if join.terminal_reason.is_none() {
+                join.terminal_reason =
+                    crate::claim::converge::terminal::trigger_reason(request.trigger);
+            }
+        }
         self.convergence_cancel_for_thread(
             &request.snapshot.identity.execution_thread_id,
             crate::sa1b::ReconcileCancel::Stop,
@@ -1439,8 +1453,26 @@ impl Machine {
     fn tree_unsettled_spawns(&self, tree_op: u64) -> usize {
         self.tree_scope_runs(tree_op)
             .iter()
-            .filter_map(|run| self.manage_context(run))
-            .map(|c| c.in_flight_spawns.len())
+            .map(|run| {
+                let Some(context) = self.manage_context(run) else {
+                    return 0;
+                };
+                if self
+                    .runs
+                    .runs
+                    .get(run)
+                    .is_some_and(|r| r.subagent_join.is_some())
+                {
+                    self.convergences
+                        .ledgers
+                        .get(run)
+                        .map_or(context.in_flight_spawns.len(), |l| {
+                            l.pending.union(&context.in_flight_spawns).count()
+                        })
+                } else {
+                    context.in_flight_spawns.len()
+                }
+            })
             .sum()
     }
 
@@ -1649,6 +1681,7 @@ impl Machine {
         let work = &self.trees.aux.work[&tree_op];
         let op = &self.trees.operations[&tree_op];
         work.root_done
+            && !self.convergence_root_unsettled(&op.request.snapshot.identity.run_id)
             && (!work.root_derived
                 || self
                     .trees
@@ -1967,6 +2000,14 @@ impl Machine {
         let existing = record.and_then(|r| r.interrupt_reason);
         let terminal = self.convergence_run_terminal(&run, snapshot.parent_status);
         let (status, interrupt_reason) = if let Some(terminal) = terminal {
+            if let Some(join) = self
+                .runs
+                .runs
+                .get_mut(&run)
+                .and_then(|r| r.subagent_join.as_mut())
+            {
+                join.terminal_reason = Some(terminal.terminal_reason);
+            }
             (terminal.status, terminal.interrupt_reason)
         } else if op.report.children.cleanup_state == "abandoned" {
             (RunStatus::Interrupted, Some(InterruptReason::Stop))
@@ -2291,82 +2332,35 @@ impl Machine {
     }
 }
 
-/// 专用提交的终态优先级（第 8.4 节）：父 failed → failed；父 interrupted → interrupted（保留已有
-/// stop/clientDisconnected/goalLoop，否则 null）；其余有 loopGuard → interrupted/goalLoop；其余按树触发原因。
-/// SA1a 触发仍不会落到 goalBlocked 或父 completed；新增 SA1b 原因仅预留保守映射，尚无生产触发源。
-/// A 接线后普通释放与树提交共用 convergence_run_terminal，不能继续维护两份终态优先级。
+/// 两个释放出口共用 SA1b 终态表；旧 ParentFinishedEarly 保留 SA1a 的中断语义。
 pub(crate) fn commit_status(
     snapshot: &ReleaseSnapshot,
     trigger: TreeTrigger,
     existing: Option<InterruptReason>,
 ) -> (RunStatus, Option<InterruptReason>) {
-    let kept = existing.filter(|r| {
-        matches!(
-            r,
-            InterruptReason::Stop | InterruptReason::ClientDisconnected | InterruptReason::GoalLoop
+    use crate::claim::converge::terminal::{terminal, trigger_reason};
+    use crate::sa1b::{TerminalInput, TerminalReason};
+    let reason = if snapshot.loop_guard {
+        TerminalReason::NoAction
+    } else {
+        trigger_reason(trigger).unwrap_or(TerminalReason::ParentInterrupted)
+    };
+    let mut result = terminal(&TerminalInput {
+        reason,
+        parent_status: snapshot.parent_status,
+        existing_interrupt: existing,
+    })
+    .expect("树提交不处理 lost");
+    if trigger == TreeTrigger::ParentFinishedEarly
+        && !snapshot.loop_guard
+        && !matches!(
+            snapshot.parent_status,
+            Some(TurnStatus::Failed | TurnStatus::Interrupted)
         )
-    });
-    match snapshot.parent_status {
-        Some(TurnStatus::Failed) => return (RunStatus::Failed, kept),
-        Some(TurnStatus::Interrupted) => return (RunStatus::Interrupted, kept),
-        _ => {}
+    {
+        result.interrupt_reason = Some(InterruptReason::SubagentsUnfinished);
     }
-    if snapshot.loop_guard {
-        return (RunStatus::Interrupted, Some(InterruptReason::GoalLoop));
-    }
-    match trigger {
-        TreeTrigger::ParentFinishedEarly => (
-            RunStatus::Interrupted,
-            Some(InterruptReason::SubagentsUnfinished),
-        ),
-        TreeTrigger::UserStop => (RunStatus::Interrupted, Some(InterruptReason::Stop)),
-        TreeTrigger::OwnerGone => (
-            RunStatus::Interrupted,
-            Some(InterruptReason::ClientDisconnected),
-        ),
-        TreeTrigger::LoopGuard => (RunStatus::Interrupted, Some(InterruptReason::GoalLoop)),
-        TreeTrigger::ParentFailed => (RunStatus::Failed, kept),
-        TreeTrigger::ParentInterrupted => (RunStatus::Interrupted, kept),
-        TreeTrigger::BudgetExhausted => (
-            RunStatus::GoalBlocked,
-            Some(InterruptReason::BudgetExhausted),
-        ),
-        TreeTrigger::BudgetIncomplete => (
-            RunStatus::GoalBlocked,
-            Some(InterruptReason::BudgetIncomplete),
-        ),
-        TreeTrigger::ConvergeDeadline => (
-            RunStatus::Interrupted,
-            Some(InterruptReason::ConvergeDeadline),
-        ),
-        TreeTrigger::WakeLimit => (RunStatus::GoalBlocked, Some(InterruptReason::WakeLimit)),
-        TreeTrigger::AutoTurnLimit => {
-            (RunStatus::GoalBlocked, Some(InterruptReason::AutoTurnLimit))
-        }
-        TreeTrigger::DiscoveryIncomplete => (
-            RunStatus::Interrupted,
-            Some(InterruptReason::DiscoveryIncomplete),
-        ),
-        TreeTrigger::OwnershipConflict => (
-            RunStatus::Interrupted,
-            Some(InterruptReason::OwnershipConflict),
-        ),
-        TreeTrigger::WakeUnknown => (RunStatus::Interrupted, Some(InterruptReason::WakeUnknown)),
-        TreeTrigger::WakeFailed => (RunStatus::Failed, Some(InterruptReason::WakeFailed)),
-        TreeTrigger::GoalPaused => (RunStatus::Interrupted, Some(InterruptReason::GoalInactive)),
-        TreeTrigger::GoalBlocked => (RunStatus::GoalBlocked, Some(InterruptReason::GoalInactive)),
-        TreeTrigger::GoalBudgetLimited => (
-            RunStatus::GoalBlocked,
-            Some(InterruptReason::BudgetExhausted),
-        ),
-        TreeTrigger::GoalUsageLimited => {
-            (RunStatus::GoalBlocked, Some(InterruptReason::GoalInactive))
-        }
-        TreeTrigger::RootNoDirectInput => (
-            RunStatus::Interrupted,
-            Some(InterruptReason::RootNoDirectInput),
-        ),
-    }
+    (result.status, result.interrupt_reason)
 }
 
 impl Machine {
@@ -2441,6 +2435,7 @@ impl Machine {
             (false, "根 goal 尚未确认制动，保留占用")
         } else if check.as_ref().is_none_or(|c| !c.settled)
             || claim.is_some_and(|c| c.request_pending)
+            || self.convergence_root_unsettled(run)
         {
             (false, "根仍有未落定请求，保留占用")
         } else if terminal {

@@ -149,11 +149,13 @@ impl Machine {
                         event.method == "item/completed",
                         actions,
                     );
+                    self.convergence_agent_states(&thread, turn, item, actions);
                 }
                 relevant
             }
             "turn/started" => {
                 if let (false, Some(turn)) = (claimed, &turn) {
+                    self.convergence_observe_activity(&thread, turn, "running", false);
                     self.observe_turn(&thread, turn, true, false, actions);
                 }
                 true
@@ -161,6 +163,12 @@ impl Machine {
             "turn/completed" => {
                 if let Some(turn) = &turn {
                     if !claimed {
+                        let status = params
+                            .and_then(|p| p.get("turn"))
+                            .and_then(|t| t.get("status"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        self.convergence_observe_activity(&thread, turn, status, false);
                         self.observe_turn(&thread, turn, true, true, actions);
                     }
                     self.parent_turn_ended(&thread, turn, actions);
@@ -182,6 +190,7 @@ impl Machine {
                 true
             }
             "thread/closed" => {
+                self.convergence_observation_gap(&thread, actions);
                 self.detach_evidence(&thread);
                 false
             }
@@ -192,6 +201,7 @@ impl Machine {
                     .and_then(Value::as_str)
                     == Some("notLoaded")
                 {
+                    self.convergence_observation_gap(&thread, actions);
                     self.detach_evidence(&thread);
                 }
                 false
@@ -1396,6 +1406,18 @@ impl Machine {
         };
         context.revision = context.revision.saturating_add(1);
         let revision = context.revision;
+        // 同一 revision 的首条通知就必须携带新摘要，客户端可能丢弃后续同号通知。
+        self.convergence_sync_facts(run);
+        if let Some(epoch) = self.convergences.ledgers.get(run).map(|l| l.work_epoch) {
+            if let Some(join) = self
+                .runs
+                .runs
+                .get_mut(run)
+                .and_then(|r| r.subagent_join.as_mut())
+            {
+                join.work_epoch = epoch;
+            }
+        }
         self.persist_children(run, actions);
         self.notify_child_changed(run, thread, actions);
         self.on_member_changed(run, revision, change, actions);
