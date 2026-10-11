@@ -19,7 +19,12 @@ struct Pages {
 
 impl Pages {
     /// 完整遍历的末页才产生证据；中途失败不能把已读前缀冒充完整输出。
-    fn accept(&mut self, value: &Value, turn: &str) -> Option<bool> {
+    fn accept(
+        &mut self,
+        value: &Value,
+        turn: &str,
+        sources: &[crate::sa1b::InputSource],
+    ) -> Option<bool> {
         let data = value.get("data")?.as_array()?;
         if data.len() > PAGE_SIZE || self.count >= MAX_PAGES {
             return None;
@@ -37,14 +42,23 @@ impl Pages {
             }
             _ => return None,
         };
-        for entry in data {
+        let mut activity = self.output.activity;
+        for (index, entry) in data.iter().enumerate() {
             if entry.get("turnId")?.as_str()? != turn {
                 return None;
             }
             let item = entry.get("item")?;
             item.as_object()?;
+            activity.observe_with_source(
+                item,
+                sources
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(|| crate::results::classify_untrusted_input(item)),
+            );
             self.output.extend(std::slice::from_ref(item));
         }
+        self.output.activity = activity;
         self.count += 1;
         self.cursor = next;
         Some(self.cursor.is_none())
@@ -226,6 +240,7 @@ impl Runs {
         &mut self,
         read: ResultRead,
         result: Result<Value, Value>,
+        sources: &[crate::sa1b::InputSource],
         now: u64,
         actions: &mut Vec<Action>,
     ) {
@@ -275,7 +290,7 @@ impl Runs {
         let complete = result
             .as_ref()
             .ok()
-            .and_then(|value| pending.pages.accept(value, &read.turn_id));
+            .and_then(|value| pending.pages.accept(value, &read.turn_id, sources));
         if complete == Some(false) && self.phase == Phase::Open {
             self.next_page(pending, actions);
             return;
@@ -751,14 +766,14 @@ mod tests {
             ..Pages::default()
         };
         assert_eq!(
-            pages.accept(&page(vec![msg("内容")], Some("还有")).unwrap(), "轮"),
+            pages.accept(&page(vec![msg("内容")], Some("还有")).unwrap(), "轮", &[]),
             None
         );
         assert_eq!(
-            pages.accept(&page(vec![msg("内容")], None).unwrap(), "轮"),
+            pages.accept(&page(vec![msg("内容")], None).unwrap(), "轮", &[]),
             Some(true)
         );
-        assert_eq!(pages.accept(&page(vec![], None).unwrap(), "轮"), None);
+        assert_eq!(pages.accept(&page(vec![], None).unwrap(), "轮", &[]), None);
     }
 
     #[test]

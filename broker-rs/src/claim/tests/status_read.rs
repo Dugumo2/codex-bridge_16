@@ -1399,3 +1399,101 @@ fn 单步驱动只回答本层请求() {
     assert!(debug_contains(&actions, "已完成或已取消"));
     assert_eq!(live_status_requests(&m).len(), 1);
 }
+
+#[test]
+fn client_id_逐页扫描且只认user_message的client_id() {
+    for forged in [true, false] {
+        let mut m = Machine::new(false);
+        begin(
+            &mut m,
+            StatusQuery::ClientMessage {
+                client_user_message_id: "唯一输入".into(),
+                expected_previous_turn_id: Some("前轮".into()),
+            },
+        );
+        let item = if forged {
+            json!({"type":"userMessage","id":"唯一输入","clientId":"别的","content":[{"type":"text","text":"唯一输入"}]})
+        } else {
+            json!({"type":"userMessage","id":"不重要","clientId":"唯一输入","content":[]})
+        };
+        let mut script = vec![
+            r(
+                StatusPhase::Turns,
+                turns_page(&[("新轮", "inProgress")], Some("轮次续页")),
+            ),
+            r(
+                StatusPhase::Turns,
+                turns_page(&[("前轮", "completed"), ("更旧", "completed")], None),
+            ),
+            ri(
+                "新轮",
+                items_page("新轮", &[agent_message("唯一输入")], Some("条目续页")),
+            ),
+            ri("新轮", items_page("新轮", &[item], None)),
+        ];
+        if forged {
+            script.push(ri("前轮", items_page("前轮", &[], None)));
+        }
+        let (_, done) = drive(&mut m, script);
+        assert_eq!(
+            only(&done),
+            &if forged {
+                StatusResult::NoCarrier
+            } else {
+                StatusResult::Carrier("新轮".into())
+            }
+        );
+    }
+}
+#[test]
+fn client_id_前轮被steer也能检出而非跳过() {
+    let mut m = Machine::new(false);
+    begin(
+        &mut m,
+        StatusQuery::ClientMessage {
+            client_user_message_id: "合并输入".into(),
+            expected_previous_turn_id: Some("前轮".into()),
+        },
+    );
+    let (_, done) = drive(
+        &mut m,
+        vec![
+            r(
+                StatusPhase::Turns,
+                turns_page(&[("前轮", "inProgress")], None),
+            ),
+            ri(
+                "前轮",
+                items_page(
+                    "前轮",
+                    &[json!({"type":"userMessage","clientId":"合并输入","content":[]})],
+                    None,
+                ),
+            ),
+        ],
+    );
+    assert_eq!(only(&done), &StatusResult::Carrier("前轮".into()));
+}
+#[test]
+fn client_id_超出候选预算不能假称不存在() {
+    let mut m = Machine::new(false);
+    let (id, _) = begin(
+        &mut m,
+        StatusQuery::ClientMessage {
+            client_user_message_id: "输入".into(),
+            expected_previous_turn_id: None,
+        },
+    );
+    let data: Vec<_> = (0..17)
+        .map(|i| json!({"id":format!("轮{i}"),"status":"completed"}))
+        .collect();
+    let (_, done) = drive(
+        &mut m,
+        vec![r(
+            StatusPhase::Turns,
+            json!({"data":data,"nextCursor":null}),
+        )],
+    );
+    assert_eq!(only(&done), &unknown(StatusUnknown::PageBudget));
+    assert!(!m.status_reads.reads.contains_key(&id));
+}
