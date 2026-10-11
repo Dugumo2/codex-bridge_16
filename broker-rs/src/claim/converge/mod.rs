@@ -340,6 +340,10 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
+            // 没有子代理的运行不参与协调：停止、插话都按原流程记原因（如 goalLoop），不改写为协调终态。
+            if !self.run_has_subagents(&run) {
+                return;
+            }
             self.convergence_revoke(&run, reason, actions);
             if matches!(
                 reason,
