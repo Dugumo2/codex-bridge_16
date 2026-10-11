@@ -159,14 +159,17 @@ fn mi_rpc超时后迟到回包只补原运行不能借当前认领() {
 
 fn stale_start_reply(late: bool) {
     let (mut m, old) = start(false, "turn/start");
-    // 完成先到而开轮证据尚未到；旧运行仍在等待结果补读，故不会被淘汰。
-    apply(
+    // 完整结果先到，普通释放且没有补读；原请求仍在途，新运行创建会触发淘汰。
+    let completed = apply(
         &mut m,
         notify(
             "turn/completed",
-            json!({"threadId":"线程","turn":{"id":"旧轮","status":"completed"}}),
+            json!({"threadId":"线程","turn":{"id":"旧轮","status":"completed","items":[{"id":"输出","type":"agentMessage","phase":"final_answer","text":"完整结果"}]}}),
         ),
     );
+    assert!(m.claims.is_empty());
+    assert!(m.runs.verifying_history.is_empty());
+    assert!(!completed.iter().any(|action| matches!(action, Action::Request(context) if matches!(context.operation, Operation::ResultRead(_)))));
     assert!(!confirmed(&m));
     m.record("线程").subscribed = true;
     apply(
@@ -198,6 +201,92 @@ fn stale_start_reply(late: bool) {
     );
     assert!(!m.runs.runs["run-new"].start_confirmation.confirmed);
     assert!(m.runs.runs["run-new"].start_confirmation.turn_id.is_none());
+    assert!(!m.runs.inflight_starts.contains(RUN));
+    assert!(!m.runs.late_starts.contains(RUN));
+    apply(
+        &mut m,
+        Event::ClientRequest {
+            request: request(2, 44, "turn/start", json!({"threadId":"其他线程"})),
+            run_id: Some("run-other".into()),
+        },
+    );
+    assert!(
+        !m.runs.runs.contains_key(RUN),
+        "回包消费后解除保护，后续创建可正常淘汰原运行"
+    );
+}
+
+#[test]
+fn mi_旧轮迟到started不能确认新运行或改变新认领() {
+    let (mut m, _old) = start(false, "turn/start");
+    apply(
+        &mut m,
+        notify(
+            "turn/completed",
+            json!({"threadId":"线程","turn":{"id":"旧轮","status":"completed","items":[{"id":"输出","type":"agentMessage","phase":"final_answer","text":"完整结果"}]}}),
+        ),
+    );
+    apply(
+        &mut m,
+        Event::ClientRequest {
+            request: request(2, 43, "turn/start", json!({"threadId":"线程"})),
+            run_id: Some("run-new".into()),
+        },
+    );
+    let claim = m.claims["线程"].clone();
+    let record = m.runs.runs["run-new"].clone();
+    apply(&mut m, turn("turn/started", "旧轮"));
+    assert_eq!(m.claims["线程"], claim);
+    assert_eq!(m.runs.runs["run-new"], record);
+    assert!(!m.runs.runs["run-new"].start_confirmation.confirmed);
+}
+
+#[test]
+fn mi_恢复屏障前外部started不能确认尚未提交的新运行() {
+    let mut m = Machine::new(false);
+    m.record("线程").subscribed = false;
+    let actions = apply(
+        &mut m,
+        client(request(1, 1, "turn/start", json!({"threadId":"线程"}))),
+    );
+    assert_eq!(first_request(&actions).operation, Operation::ResumeBarrier);
+    apply(&mut m, turn("turn/started", "外部轮"));
+    assert!(!confirmed(&m));
+    assert!(m.runs.runs[RUN].start_confirmation.turn_id.is_none());
+}
+
+#[test]
+fn mi_当前轮只前进且迟到回包通知完成均不回退() {
+    for reply_first in [false, true] {
+        let (mut m, context) = start(false, "turn/start");
+        if reply_first {
+            reply(&mut m, &context, Ok(json!({"turn":{"id":"首轮"}})));
+        }
+        let actions = apply(&mut m, turn("turn/started", "首轮"));
+        assert_eq!(m.runs.runs[RUN].current_turn_id.as_deref(), Some("首轮"));
+        if !reply_first {
+            assert_eq!(
+                persisted(&actions, RUN).current_turn_id.as_deref(),
+                Some("首轮")
+            );
+        }
+        // 故意缺首轮 completed，检验开始通知的历史而不是只查已完成结果。
+        let actions = apply(&mut m, turn("turn/started", "次轮"));
+        assert_eq!(
+            persisted(&actions, RUN).current_turn_id.as_deref(),
+            Some("次轮")
+        );
+        apply(&mut m, rerouted("线程", "次轮"));
+        reply(&mut m, &context, Ok(json!({"turn":{"id":"首轮"}})));
+        apply(&mut m, turn("turn/started", "首轮"));
+        assert_eq!(m.runs.runs[RUN].current_turn_id.as_deref(), Some("次轮"));
+        assert_eq!(
+            m.runs.runs[RUN].pending_reroute.as_ref().unwrap().turn_id,
+            "次轮"
+        );
+        apply(&mut m, turn("turn/completed", "首轮"));
+        assert_eq!(m.runs.runs[RUN].current_turn_id.as_deref(), Some("次轮"));
+    }
 }
 
 fn rerouted(thread: &str, turn: &str) -> Event {

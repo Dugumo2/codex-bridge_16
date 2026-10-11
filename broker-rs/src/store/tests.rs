@@ -70,6 +70,7 @@ impl Drop for Temp {
 
 pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
+        current_turn_id: None,
         pending_reroute: None,
         creation_order: None,
         start_confirmation: Default::default(),

@@ -16,6 +16,8 @@ pub const MAX_WATCHERS: usize = 64;
 pub const MAX_WATCHERS_PER_CONN: usize = 256;
 pub const MAX_WATCHERS_TOTAL: usize = 4096;
 pub const MAX_META_BYTES: usize = 16 * 1024;
+/// 批量一次性查询的输入预算，与既有扩展方法一样超限返回参数错误。
+pub const MAX_MODEL_SUMMARY_THREADS: usize = 4096;
 pub const MAX_PENDING_META: usize = 1024;
 pub const DETACH_WAIT_MS: u64 = 30_000;
 pub const RECLAIM_MS: u64 = 86_400_000;
@@ -217,6 +219,33 @@ impl Machine {
             invalid(&request, actions);
             return;
         }
+        if request.method == "broker/runs/modelSummaries" {
+            let Some(ids) = params
+                .get("threadIds")
+                .and_then(Value::as_array)
+                .filter(|ids| ids.len() <= MAX_MODEL_SUMMARY_THREADS)
+            else {
+                invalid(&request, actions);
+                return;
+            };
+            let Some(ids) = ids
+                .iter()
+                .map(|id| id.as_str().filter(|id| !id.is_empty()))
+                .collect::<Option<HashSet<_>>>()
+            else {
+                invalid(&request, actions);
+                return;
+            };
+            let runs: Vec<_> = self
+                .runs
+                .runs
+                .values()
+                .filter(|run| ids.contains(run.thread_id.as_str()))
+                .map(|run| run.model_summary())
+                .collect();
+            ok(&request, json!({"runs":runs}), actions);
+            return;
+        }
         if request.method == "broker/threads/list" {
             let limit = match params.get("limit") {
                 None => usize::MAX,
@@ -392,10 +421,7 @@ impl Machine {
                         Some(id) => self.thread_run(thread, id),
                         None => self.latest_run(thread),
                     }},
-                    "pending":self.inbox_pending(thread),"lifecycle":self.lifecycle_projection(thread),
-                    "runs": if params.get("includeRuns").and_then(Value::as_bool) == Some(true) {
-                        Some(self.runs.runs.values().filter(|run| run.thread_id == thread).collect::<Vec<_>>())
-                    } else { None }})),
+                    "pending":self.inbox_pending(thread),"lifecycle":self.lifecycle_projection(thread)})),
                     actions,
                 );
             }

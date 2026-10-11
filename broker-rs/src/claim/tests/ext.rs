@@ -55,7 +55,7 @@ fn mi_模型强度遵循既有元数据字符集类型与总长度预算() {
 }
 
 #[test]
-fn mi_watch按需返回线程全部内存运行且确认不可由客户端伪造() {
+fn mi_摘要返回线程全部内存运行且确认不可由客户端伪造() {
     let mut m = Machine::new(false);
     m.record("线程").subscribed = true;
     let meta = json!({"source":"run","model":"astra","effort":"high","startConfirmation":{"confirmed":true},"creationOrder":{"epoch":999,"sequence":999}});
@@ -88,8 +88,8 @@ fn mi_watch按需返回线程全部内存运行且确认不可由客户端伪造
     let result = response(&call(
         &mut m,
         1,
-        "broker/threads/watch",
-        json!({"threadId":"线程","includeRuns":true}),
+        "broker/runs/modelSummaries",
+        json!({"threadIds":["线程","线程"]}),
     ));
     let runs = result["result"]["runs"].as_array().unwrap();
     assert_eq!(runs.len(), 2);
@@ -98,7 +98,84 @@ fn mi_watch按需返回线程全部内存运行且确认不可由客户端伪造
         .iter()
         .any(|run| run["runId"] == "run-one" && run["meta"]["model"] == "astra"));
     let result = response(&watch(&mut m, 1, "线程"));
-    assert!(result["result"]["runs"].is_null());
+    assert!(result["result"].get("runs").is_none());
+}
+
+#[test]
+fn mi_摘要批量查询超过256线程且不占订阅配额() {
+    let mut m = Machine::new(false);
+    let threads: Vec<_> = (0..300).map(|i| format!("线程-{i}")).collect();
+    for thread in &threads {
+        m.run_opened(
+            RunOpen {
+                run_id: format!("run-{thread}"),
+                thread_id: thread.clone(),
+                conn: None,
+                kind: ReqKind::TurnStart,
+                joined: false,
+                input: String::new(),
+                continued_from: None,
+            },
+            &mut vec![],
+        );
+    }
+    let before = m.records.clone();
+    for _ in 0..2 {
+        let result = response(&call(
+            &mut m,
+            1,
+            "broker/runs/modelSummaries",
+            json!({"threadIds":threads}),
+        ));
+        assert_eq!(result["result"]["runs"].as_array().unwrap().len(), 300);
+        assert_eq!(m.records, before, "一次性读取不建立线程记录或订阅");
+    }
+    // 查完仍可用满原有的 256 个 watch 槽位。
+    for thread in threads.iter().take(MAX_WATCHERS_PER_CONN) {
+        assert!(response(&watch(&mut m, 1, thread)).get("error").is_none());
+    }
+    let result = response(&call(
+        &mut m,
+        1,
+        "broker/runs/modelSummaries",
+        json!({"threadIds":threads}),
+    ));
+    assert_eq!(result["result"]["runs"].as_array().unwrap().len(), 300);
+}
+
+#[test]
+fn mi_摘要参数空数组去重及类型数量校验() {
+    let mut m = Machine::new(false);
+    for ids in [
+        json!([]),
+        json!(["不存在", "不存在"]),
+        json!(vec!["不存在"; MAX_MODEL_SUMMARY_THREADS]),
+    ] {
+        assert_eq!(
+            response(&call(
+                &mut m,
+                1,
+                "broker/runs/modelSummaries",
+                json!({"threadIds":ids})
+            ))["result"],
+            json!({"runs":[]})
+        );
+    }
+    for params in [
+        json!({}),
+        json!([]),
+        json!({"threadIds":null}),
+        json!({"threadIds":"线程"}),
+        json!({"threadIds":[""]}),
+        json!({"threadIds":[1]}),
+        json!({"threadIds":[null]}),
+        json!({"threadIds":vec!["线程"; MAX_MODEL_SUMMARY_THREADS+1]}),
+    ] {
+        assert_eq!(
+            response(&call(&mut m, 1, "broker/runs/modelSummaries", params))["error"]["code"],
+            -32602
+        );
+    }
 }
 
 fn connected(machine: &mut Machine, conn: u64, cxb: bool) {
