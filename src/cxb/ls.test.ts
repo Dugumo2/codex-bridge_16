@@ -42,7 +42,7 @@ describe("ls", () => {
     const t = context(dir, ["ls", "--json"]);
     t.fake.handle = (method, p) => {
       if (method === "broker/threads/list") return { threads: [summary({ state: "awaiting" })] };
-      if (method === "broker/threads/watch") return { runs: [] };
+      if (method === "broker/runs/modelSummaries") return { runs: [] };
       expect(p).toEqual({ cwd: dir, cursor: null, limit: 50, sortKey: "updated_at", sortDirection: "desc", sourceKinds: ["cli", "vscode", "exec", "appServer"] });
       return { data: [{ id: "server", updatedAt: 3, status: { type: "notLoaded" } }, { id: "thread-test", updatedAt: 2, preview: "不采用" }], nextCursor: null };
     };
@@ -67,7 +67,7 @@ describe("ls", () => {
     const t = context(dir, ["ls", "--limit", "2", "--json"]);
     t.fake.handle = (m, p) => {
       if (m === "broker/threads/list") return { threads: [summary({ lastRunId: null, updatedAt: 1000 })] };
-      if (m === "broker/threads/watch") return { runs: [] };
+      if (m === "broker/runs/modelSummaries") return { runs: [] };
       return p.cursor === null ? { data: [{ id: "z", updatedAt: 9 }, { id: "y", updatedAt: 8 }], nextCursor: "下一页" }
         : { data: [{ id: "a", updatedAt: 8 }, { id: "b", updatedAt: 7 }], nextCursor: "更老" };
     };
@@ -79,7 +79,7 @@ describe("ls", () => {
   test("all 不截断且不设页数上限", async () => {
     const t = context(dir, ["ls", "--all", "--json"]);
     let pages = 0;
-    t.fake.handle = (m) => m === "broker/threads/list" ? { threads: [] } : m === "broker/threads/watch" ? { runs: [] }
+    t.fake.handle = (m) => m === "broker/threads/list" ? { threads: [] } : m === "broker/runs/modelSummaries" ? { runs: [] }
       : { data: [{ id: `线程-${++pages}`, updatedAt: 100 - pages }], nextCursor: pages < 30 ? String(pages) : null };
     expect(await ls(t.ctx)).toBe(0);
     expect(pages).toBe(30);

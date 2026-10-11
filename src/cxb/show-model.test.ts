@@ -1,14 +1,16 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { RunResult } from "./contracts";
+import { CxbError, type RunResult } from "./contracts";
 import * as ledgerModule from "./ledger";
 import { ls } from "./ls";
 import { show } from "./show";
 import { context, ledger, summary } from "./test-fixtures/n4a-unit";
 import { removeTemp } from "./test-fixtures/main-test-support";
-import { runResult } from "./test-fixtures/run-fakes";
+import { runResult, modelSummary } from "./test-fixtures/run-fakes";
+import { resolveRunModel } from "./run-model";
+import { runModelDisplay } from "./show-model";
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-show-model-")); });
@@ -19,6 +21,68 @@ const qualified = (patch: Partial<RunResult> = {}) => runResult({
   startConfirmation: { confirmed: true, owned: true, threadId: "thread-test", turnId: "turn-test" },
   creationOrder: { epoch: 1, sequence: 1 }, ...patch,
 });
+
+test("模型专用容错不改变 ls/show 对损坏账本的严格检查", async () => {
+  ledger(dir, [qualified()]);
+  writeFileSync(join(dir, "runs", "run-bad.json"), '{"损坏');
+  for (const args of [["ls", "--local"], ["show", "abcd"], ["show", "abcd", "--log"], ["show", "abcd", "--tail"]]) {
+    const t = context(dir, args);
+    await expect((args[0] === "ls" ? ls : show)(t.ctx)).rejects.toMatchObject({ code: "LOCAL_ERROR", exitCode: 1 });
+    expect(t.connects).toBe(0);
+  }
+}, 30_000);
+
+for (const asSummary of [false, true]) test(`改道按当前轮判断（${asSummary ? "摘要" : "完整记录"}），旧记录退回末轮`, () => {
+  const run = qualified({ pendingReroute: { ...reroute, turnId: "新轮", toModel: "待定-C" } });
+  run.turns[0]!.reroute = reroute;
+  const display = () => runModelDisplay(asSummary ? modelSummary(run) : run);
+  expect(display().reroute).toEqual(reroute);
+  run.currentTurnId = null;
+  expect(display().reroute).toEqual(reroute);
+  run.currentTurnId = "turn-test";
+  expect(display().reroute).toEqual(reroute);
+  run.currentTurnId = "新轮";
+  expect(display().reroute).toEqual({ ...reroute, toModel: "待定-C" });
+  run.currentTurnId = "再下一轮";
+  expect(display().reroute).toBeNull();
+}, 30_000);
+
+for (const mode of ["", "--tail", "--log"]) test(`show ${mode || "默认"} 连接失败明确提示本地降级`, async () => {
+  ledger(dir, [qualified()]);
+  const t = context(dir, ["show", "abcd", ...mode ? [mode] : [], "--json"]);
+  t.ctx.connect = async () => { throw new CxbError("BROKER_UNAVAILABLE", "离线"); };
+  expect(await show(t.ctx)).toBe(0);
+  expect(t.json.at(-1)).toMatchObject({ model: "请求-A", reasoning: "high", modelSource: "run" });
+  expect(t.notices.join()).toContain("模型来源降级为本地账本");
+}, 30_000);
+
+for (const mode of ["", "--tail", "--log", "--server", "--follow"]) test(`show ${mode || "默认"} 同 runId 在线撤销资格覆盖磁盘`, async () => {
+  ledger(dir, [qualified()]);
+  const t = context(dir, ["show", "abcd", ...mode ? [mode] : [], "--json"]);
+  t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] }
+    : method === "broker/threads/watch" ? { thread: summary(), run: runResult() }
+    : method === "broker/runs/modelSummaries" ? { runs: [modelSummary(qualified({ startConfirmation: undefined }))] }
+    : { data: [], nextCursor: null };
+  expect(await show(t.ctx)).toBe(0);
+  expect(t.json.at(-1)).toMatchObject({ model: "模型", modelSource: "index", reasoning: null });
+}, 30_000);
+
+for (const command of ["ls", "show"] as const) for (const online of [false, true]) {
+  test(`${command} ${online ? "在线" : "本地"} 同一运行 N 轮改道、N+1 轮进行中不残留`, async () => {
+    const run = qualified({ state: "running", status: null, currentTurnId: "下一轮", pendingReroute: { ...reroute, turnId: "turn-test" } });
+    run.turns[0]!.reroute = reroute;
+    // 在线用例保留磁盘旧当前轮，确保摘要的 currentTurnId 真正覆盖磁盘。
+    ledger(dir, [{ ...run, currentTurnId: online ? "turn-test" : "下一轮" }]);
+    const t = context(dir, [...command === "ls" ? ["ls", ...online ? [] : ["--local"]] : ["show", "abcd"], "--json"]);
+    if (!online) t.ctx.connect = async () => { throw new CxbError("BROKER_UNAVAILABLE", "离线"); };
+    t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] }
+      : method === "broker/runs/modelSummaries" ? { runs: [modelSummary(run)] }
+      : { data: [], nextCursor: null };
+    expect(await (command === "ls" ? ls : show)(t.ctx)).toBe(command === "show" ? 5 : 0);
+    expect(command === "ls" ? t.json[0].items[0] : t.json[0]).toMatchObject({ model: "请求-A", reasoning: "high", reroute: null });
+    expect(t.notices.join()).not.toContain("服务器改道");
+  }, 30_000);
+}
 
 for (const command of ["ls", "show"] as const) describe(`${command} 模型显示`, () => {
   async function display(json = true) {
@@ -105,13 +169,16 @@ describe("ls 批量与在线快照", () => {
     ledger(dir, [qualified(), qualified({ runId: "run-other", threadId: "other", meta: { source: "run", model: "另一模型" } })]);
     const t = context(dir, ["ls", "--json"]);
     t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] }
-      : method === "broker/threads/watch" ? { runs: [] }
+      : method === "broker/runs/modelSummaries" ? { runs: [] }
       : { data: [{ id: "other", updatedAt: 1, model: "错误索引" }], nextCursor: null };
     const scan = spyOn(ledgerModule, "readAllRuns");
     try {
       expect(await ls(t.ctx)).toBe(0);
       expect(scan).toHaveBeenCalledTimes(1);
       expect(t.json[0].items.map((item: any) => item.model)).toEqual(["请求-A", "另一模型"]);
+      expect(t.fake.calls.filter((call) => call.method === "broker/runs/modelSummaries").map((call) => call.params))
+        .toEqual([{ threadIds: ["thread-test", "other"] }]);
+      expect(t.fake.calls.some((call) => call.method === "broker/threads/watch")).toBe(false);
     } finally { scan.mockRestore(); }
   });
 
@@ -121,10 +188,11 @@ describe("ls 批量与在线快照", () => {
     t.fake.handle = (method, params) => {
       if (method === "broker/threads/list") return { threads: [summary()] };
       if (method === "thread/list") return { data: [], nextCursor: null };
-      expect(params).toEqual({ threadId: "thread-test", includeRuns: true });
+      expect(method).toBe("broker/runs/modelSummaries");
+      expect(params).toEqual({ threadIds: ["thread-test"] });
       const invalid = qualified({ startConfirmation: undefined });
-      return { thread: summary(), run: invalid, runs: [invalid,
-        qualified({ runId: "run-memory", creationOrder: { epoch: 1, sequence: 2 } })] };
+      return { runs: [invalid,
+        qualified({ runId: "run-memory", creationOrder: { epoch: 1, sequence: 2 } })].map(modelSummary) };
     };
     expect(await ls(t.ctx)).toBe(0);
     expect(t.json[0].items[0]).toMatchObject({ model: "请求-A", modelSource: "run" });
@@ -135,7 +203,7 @@ describe("ls 批量与在线快照", () => {
     const t = context(dir, ["ls", "--json"]);
     t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] }
       : method === "thread/list" ? { data: [], nextCursor: null }
-      : { runs: [qualified({ startConfirmation: undefined })] };
+      : { runs: [modelSummary(qualified({ startConfirmation: undefined }))] };
     expect(await ls(t.ctx)).toBe(0);
     expect(t.json[0].items[0]).toMatchObject({ model: "模型", modelSource: "index" });
   });
@@ -147,7 +215,7 @@ describe("ls 批量与在线快照", () => {
     const t = context(dir, ["ls", "--json"]);
     t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] }
       : method === "thread/list" ? { data: [], nextCursor: null }
-      : { thread: summary({ turnId: "新轮" }), runs: [qualified({ runId: "run-failed", startConfirmation: undefined })] };
+      : { runs: [modelSummary({ ...run, currentTurnId: "新轮" }), modelSummary(qualified({ runId: "run-failed", startConfirmation: undefined }))] };
     expect(await ls(t.ctx)).toBe(0);
     expect(t.json[0].items[0]).toMatchObject({ model: "请求-A", modelSource: "run", reroute: null });
   });
@@ -157,33 +225,40 @@ describe("ls 批量与在线快照", () => {
     const t = context(dir, ["ls", "--json"]);
     t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] }
       : method === "thread/list" ? { data: [], nextCursor: null }
-      : { thread: summary({ turnId: "当前轮" }), run: qualified({ state: "running", status: null,
-        pendingReroute: { ...reroute, turnId: "当前轮" } }) };
+      : { runs: [modelSummary(qualified({ state: "running", status: null, currentTurnId: "当前轮",
+        pendingReroute: { ...reroute, turnId: "当前轮" } }))] };
     expect(await ls(t.ctx)).toBe(0);
     expect(t.json[0].items[0]).toMatchObject({ model: "请求-A", reasoning: "high", reroute });
   });
 });
 
-for (const mode of ["--tail", "--log", "--server", "--follow"]) test(`show ${mode} 线程级 JSON 与提示使用共同来源`, async () => {
+for (const mode of ["", "--tail", "--log", "--server", "--follow"]) test(`show ${mode || "默认"} 磁盘 A 在线 B 与续跑一致`, async () => {
   ledger(dir, [qualified()]);
-  const t = context(dir, ["show", "abcd", mode, "--json"]);
+  const t = context(dir, ["show", "abcd", ...mode ? [mode] : [], "--json"]);
   t.fake.handle = (method, params) => {
     if (method === "broker/threads/list") return { threads: [summary()] };
     if (method === "broker/threads/watch") {
-      expect(params).toEqual({ threadId: "thread-test", includeRuns: true });
-      return { thread: summary(), run: runResult(), runs: [qualified({ runId: "run-online", creationOrder: { epoch: 2, sequence: 1 },
-        meta: { source: "run", model: "在线-A", effort: "xhigh" } })] };
+      expect(params).toEqual({ threadId: "thread-test" });
+      return { thread: summary(), run: runResult() };
+    }
+    if (method === "broker/runs/modelSummaries") {
+      expect(params).toEqual({ threadIds: ["thread-test"] });
+      return { runs: [modelSummary(qualified({ runId: "run-online", creationOrder: { epoch: 2, sequence: 1 },
+        meta: { source: "run", model: "在线-B", effort: "xhigh" } }))] };
     }
     return { data: [], nextCursor: null };
   };
   expect(await show(t.ctx)).toBe(0);
-  const online = mode === "--server" || mode === "--follow";
-  expect(t.json.at(-1)).toMatchObject({ model: online ? "在线-A" : "请求-A", reasoning: online ? "xhigh" : "high", modelSource: "run", reroute: null });
-  expect(t.notices.join()).toContain(online ? "在线-A（请求值）" : "请求-A（请求值）");
+  expect(t.json.at(-1)).toMatchObject({ model: "在线-B", reasoning: "xhigh", modelSource: "run", reroute: null });
+  expect(t.notices.join()).toContain("在线-B（请求值）");
+  expect(t.fake.calls.filter((call) => call.method === "broker/runs/modelSummaries")).toHaveLength(1);
+  const selected = await resolveRunModel({ request: t.fake.rpc.request, workspaceDir: dir, threadId: "thread-test", shared: false,
+    explicit: new Set(), out: t.ctx.out, readThread: async () => undefined, rethrow: () => {} });
+  expect(selected).toMatchObject({ model: t.json.at(-1).model, reasoning: t.json.at(-1).reasoning, modelSource: "沿用线程" });
 });
 
 test("show 运行中结果带来源与暂存改道，仍保留退出码 5 和空正文", async () => {
-  ledger(dir, [qualified({ state: "running", status: null, pendingReroute: { ...reroute, turnId: "当前轮" } })]);
+  ledger(dir, [qualified({ state: "running", status: null, currentTurnId: "当前轮", pendingReroute: { ...reroute, turnId: "当前轮" } })]);
   const t = context(dir, ["show", "abcd", "--json"]);
   expect(await show(t.ctx)).toBe(5);
   expect(t.json[0]).toMatchObject({ model: "请求-A", reasoning: "high", modelSource: "run", reroute, state: "running" });

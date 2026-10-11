@@ -2,8 +2,8 @@
 import { resolveModel, validateEffort } from "../config";
 import { fetchModels, pickAutoEffort, pickBestModel } from "../models";
 import type { Model } from "../types";
-import { CxbError, rpcFailure, type BrokerRpc, type RunResult } from "./contracts";
-import { latestModelRun, readAllRuns } from "./ledger";
+import { CxbError, type BrokerRpc, type RunModelSummary } from "./contracts";
+import { latestModelRun, readModelRuns } from "./ledger";
 import type { Output } from "./output";
 
 export interface ThreadModel { model?: string | null; reasoningEffort?: string | null }
@@ -58,7 +58,7 @@ export function selectRunModel(options: {
       if (!resume) {
         reasoningSource = "服务器默认";
         out.notice("推理强度由服务器默认决定");
-      } else if (model && model === inherited?.model) {
+      } else if (model && inherited?.source === "沿用线程" && model === inherited.model) {
         reasoningSource = "上游当前设置";
         out.notice("推理强度沿用上游当前设置（未核实）");
       } else throw new CxbError("LOCAL_ERROR", `无法确定 ${model ?? "所选模型"} 支持的推理强度，请用 -r 指定`);
@@ -76,17 +76,15 @@ export async function resolveRunModel(options: {
   const { request, threadId, out } = options;
   let inherited: InheritedModel | undefined;
   if (threadId) {
-    const disk = readAllRuns(options.workspaceDir);
-    let online: RunResult[] = [];
-    try {
-      const snapshot = await request<{ run?: RunResult | null; runs?: RunResult[] | null }>("broker/threads/watch", { threadId, includeRuns: true });
-      online = snapshot.runs ?? (snapshot.run ? [snapshot.run] : []);
-    } catch (error) {
-      options.rethrow(error);
-      // 索引缺失或仅在上游存在的线程还不能 watch，仍可读磁盘与 thread/read。
-      if (rpcFailure(error).reason !== "unknownThread") throw error;
+    const disk = readModelRuns(options.workspaceDir, (message) => out.notice(message));
+    // 摘要查询不订阅线程；不存在的线程返回空集合，连接失败仍须上抛。
+    const { runs: online } = await request<{ runs: RunModelSummary[] }>("broker/runs/modelSummaries", { threadIds: [threadId] });
+    const unresolved = disk.unreadable.some((bad) => (!bad.threadId || bad.threadId === threadId)
+      && !online.some((run) => run.runId === bad.runId));
+    if (unresolved && !(options.explicit.has("model") && options.explicit.has("reasoning"))) {
+      throw new CxbError("LOCAL_ERROR", "存在可能属于目标线程的损坏运行记录，无法可靠确定沿用值，请用 -m 和 -r 显式指定");
     }
-    const run = latestModelRun(threadId, disk, online);
+    const run = latestModelRun(threadId, disk.runs, online);
     if (run) inherited = { model: run.meta!.model!, effort: run.meta!.effort, source: "沿用线程" };
     if (!inherited) {
       let upstream: ThreadModel | undefined;

@@ -1,4 +1,4 @@
-import type { Reroute, RunResult } from "./contracts";
+import type { Reroute, ModelRun } from "./contracts";
 import { latestModelRun } from "./ledger";
 
 /** 展示的是请求值；服务器改道单独注明，不覆盖请求模型。 */
@@ -9,20 +9,21 @@ export interface ModelDisplay {
   reroute: Reroute | null;
 }
 
-export function runModelDisplay(run: RunResult, currentTurnId?: string | null): ModelDisplay {
-  const last = run.turns.at(-1);
+export function runModelDisplay(run: ModelRun): ModelDisplay {
+  const last = "turns" in run ? run.turns.at(-1) : run.lastTurn;
+  const currentTurnId = run.currentTurnId;
   const pending = run.pendingReroute;
-  // 在线摘要已进入下一轮时，不把上一轮的改道挂在新轮上。
-  const reroute = pending && (!currentTurnId || pending.turnId === currentTurnId) ? pending
-    : currentTurnId && currentTurnId !== last?.turnId ? null : last?.reroute ?? null;
+  // 只显示本运行当前轮的改道；旧记录没有当前轮时退回最后一轮结果。
+  const reroute = currentTurnId == null ? last?.reroute ?? null
+    : pending?.turnId === currentTurnId ? pending
+    : last?.turnId === currentTurnId ? last.reroute ?? null : null;
   return { model: run.meta?.model ?? null, reasoning: run.meta?.effort ?? null, modelSource: "run",
     reroute: reroute ? { fromModel: reroute.fromModel, toModel: reroute.toModel, reason: reroute.reason } : null };
 }
 
-export function threadModelDisplay(threadId: string, indexModel: string | null, disk: RunResult[], online: RunResult[] = [],
-  current?: { lastRunId: string | null; turnId: string | null }): ModelDisplay {
+export function threadModelDisplay(threadId: string, indexModel: string | null, disk: ModelRun[], online: ModelRun[] = []): ModelDisplay {
   const run = latestModelRun(threadId, disk, online);
-  return run ? runModelDisplay(run, current?.lastRunId === run.runId ? current.turnId : null)
+  return run ? runModelDisplay(run)
     : { model: indexModel, reasoning: null, modelSource: "index", reroute: null };
 }
 
