@@ -16,7 +16,11 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 
 ## 2. 按场景选参数
 
-默认：最新模型、`medium` 推理（`cxb config` 里的持久默认）、`workspace-write`、`--approval never`。命令行参数优先于持久默认。
+新开线程默认：按 `cxb config` 持久默认选择模型和强度；未配置时自动选择最新模型及目录支持的最高强度（不超过 `xhigh`）。沙箱默认 `workspace-write`，审批默认 `--approval never`。显式命令行参数优先。
+
+- `cxb run --resume`（含 `--continue`）默认沿用线程原模型与强度，优先于 config 默认；`-m`、`-r` 可显式覆盖。换模型不带 `-r` 时按 config 或自动选择，无法确定支持的强度时要求用 `-r` 指定（退出 1）。
+- 沿用以本线程最近一次经 broker 确认开出自有轮次的普通 run 请求记录为准；失败开轮、joined、review 和父子线程记录不作为沿用来源。没有合格记录时尝试上游记录，再按 config 或自动选择，并显示提示。
+- JSON 的 `model`、`reasoning` 是本次实际提交的请求值（未发送为 null），`modelSource`、`reasoningSource` 说明来源；服务器可能改道或换算强度，joined 时这些值也只表示请求值。`--detach` 保持运行句柄输出；`cxb review` 不适用这套沿用规则。
 
 | 场景 | 参数组合 | 要点 |
 |---|---|---|

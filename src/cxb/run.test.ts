@@ -270,7 +270,8 @@ function unitExecution(args: string[], server: "private" | "shared" = "private")
   const ctx: CommandContext = { parsed, out, workspace: h.workspace, connect: async () => connection,
     registerCleanup(callback) { callbacks.add(callback); return () => { callbacks.delete(callback); }; } };
   fake.handle = (method) => {
-    if (method === "model/list") return { data: [], nextCursor: null };
+    if (method === "model/list") return { data: [{ id: "mock-model", isDefault: true, upgrade: null,
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
     if (method === "thread/start") return { thread: { id: "thread-test" } };
     if (method === "broker/threads/annotate") return { shortId: "abcd1234" };
     if (method === "thread/goal/get") return { goal: null };
@@ -523,13 +524,14 @@ function writeRunRecord(run: RunResult) {
   writeFileSync(join(dir, `${run.runId}.json`), JSON.stringify({ epoch: 1, revision: 1, payload: run }));
 }
 
-/** 续跑桩：第一次 watch 返回被中断的原运行，之后返回续跑出的新运行。 */
+/** 续跑桩：模型历史查询独立；第一次普通 watch 返回原运行，之后返回新运行。 */
 function continueUnit(args: string[], opts: { from?: RunResult; server?: "private" | "shared"; turnStart?: (params: any) => unknown } = {}) {
   const unit = unitExecution(["run", "--resume", "abcd1234", "--continue", ...args], opts.server);
   const original = unit.fake.handle;
   let watches = 0;
   unit.fake.handle = (method, params) => {
     if (method === "broker/threads/list") return { threads: [{ threadId: "thread-test", shortId: "abcd1234" }] };
+    if (method === "broker/threads/watch" && params.includeRuns) return { runs: [], run: null };
     if (method === "broker/threads/watch") return { run: watches++ === 0 ? (opts.from ?? interrupted()) : runResult({ continuedFrom: "run-old" }) };
     if (method === "thread/goal/get") return { goal: { objective: "目标原文", status: "paused" } };
     if (method === "turn/start" && opts.turnStart) return opts.turnStart(params);
@@ -602,7 +604,7 @@ test("续跑 --detach：交接完成后返回新运行句柄且不停止、不�
   await unit.out.flush();
   expect(JSON.parse(unit.output().stdout)).toEqual({ threadId: "thread-test", shortId: "abcd1234", runId: "run-test", status: "running" });
   expect(unit.fake.calls.find((c) => c.method === "broker/threads/detach")?.params).toMatchObject({ threadId: "thread-test", runId: "run-test" });
-  expect(unit.fake.calls.filter((c) => c.method === "broker/threads/watch")).toHaveLength(1);
+  expect(unit.fake.calls.filter((c) => c.method === "broker/threads/watch" && !c.params?.includeRuns)).toHaveLength(1);
   expect(methods(unit)).not.toContain("broker/threads/stop");
   expect(unit.fake.subscriptions).toBe(0);
   expect(unit.closed()).toBe(true);
@@ -634,7 +636,7 @@ for (const [stage, method, hasRun] of [
   unit.fake.handle = (called, params) => {
     const afterStart = unit.fake.calls.some((c) => c.method === "turn/start");
     if (called === "broker/threads/stop") return { stopOutcome: "confirmed" };
-    if (called === method && (method !== "broker/threads/watch" || afterStart === hasRun)) {
+    if (called === method && (method !== "broker/threads/watch" || (!params.includeRuns && afterStart === hasRun))) {
       if (hasRun && called === "turn/start") unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
       reached.resolve();
       return release.promise;
@@ -785,7 +787,7 @@ test("共享服务器：回包 absorbedBy 为字符串退出 8，不再等待结
     return { runId: "run-test", absorbedBy: "turn-外部" };
   } });
   await expect(createRunHandler(fakeServerRequests())(unit.ctx)).rejects.toMatchObject({ code: "THREAD_HELD", exitCode: 8 });
-  expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
+  expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch" && !call.params?.includeRuns)).toHaveLength(1);
   expect(unit.closed()).toBe(true);
 });
 
@@ -800,10 +802,10 @@ test("共享服务器：回包没有 absorbedBy 时扣住到 broker/run/settled�
     await until(() => unit.fake.calls.some((call) => call.method === "turn/start"));
     // turn/start 已到达；按内存夹具调度假设观察连续三轮状态稳定后，只有目标定案才能放行。
     await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]);
-    expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
+    expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch" && !call.params?.includeRuns)).toHaveLength(1);
     unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-另一次", absorbedBy: null });
     await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]);
-    expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
+    expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch" && !call.params?.includeRuns)).toHaveLength(1);
     unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-test", absorbedBy });
     if (absorbedBy === null) expect(await work).toBe(0);
     else await expect(work).rejects.toMatchObject({ code: "THREAD_HELD", exitCode: 8 });
@@ -859,7 +861,7 @@ test("共享服务器：定案通知缺 absorbedBy 不算定案，继续等明�
   unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-test" });
   // 缺字段通知处理后连续三轮状态稳定；它不能放行到结果等待。
   await messageBarrier(() => [unit.fake.calls.length, unit.fake.replies.length, unit.fake.inFlightServerRequests]);
-  expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
+  expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch" && !call.params?.includeRuns)).toHaveLength(1);
   unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-test", absorbedBy: "turn-外部" });
   await expect(bounded(work, 5000)).rejects.toMatchObject({ code: "THREAD_HELD", exitCode: 8 });
 });

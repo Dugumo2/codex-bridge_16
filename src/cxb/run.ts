@@ -5,6 +5,7 @@ import { config, interpolateTemplate, loadTemplateWithMeta, resolveModel, valida
 import { builtinTemplatesDir } from "./config-cmd";
 import { sandboxModeOf, sandboxPolicyFor } from "../config";
 import { resolveModelDefaults } from "../models";
+import { resolveRunModel, type ThreadModel } from "./run-model";
 import { sanitizeForTerminal } from "../questions";
 import { NO_RESPONSE, type AnyServerRequestHandler } from "../rpc";
 import { askOverrides } from "./ask-instructions";
@@ -208,16 +209,14 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     try { reasoning = validateEffort(globals.reasoning); } catch (error) {
       throw new CxbError("USAGE", "推理强度无效", { cause: error });
     }
-    try {
-      const defaults = await resolveModelDefaults({ request }, { model, effort: reasoning });
-      model ??= defaults?.model;
-      reasoning ??= defaults?.effort;
-    } catch (error) {
+    const rethrow = (error: unknown) => {
       if (controller.signal.aborted || (error instanceof CxbError && error.code === "TIMEOUT")) throw error;
-      out.progress("无法读取模型列表，使用服务器默认模型");
-    }
-    if (reasoning) overrides.config!.model_reasoning_effort = reasoning;
-    if (plan.command === "review" && model) overrides.config!.review_model = model;
+    };
+    type ThreadMetadata = ThreadModel & { canAcceptDirectInput?: boolean; parentThreadId?: string;
+      source?: { subAgent?: { thread_spawn?: { parent_thread_id?: string } } } };
+    // 能力预检和模型核对共用一次只读请求；失败也保留给解析器发出可见提示。
+    let metadataRead: Promise<ThreadMetadata | undefined> | undefined;
+    const readThread = () => metadataRead ??= request<{ thread?: ThreadMetadata }>("thread/read", { threadId }).then((value) => value.thread);
     if (options.resume) {
       // 索引里没有的 ID 原样交给服务器判定（只在服务器上的线程）；不存在时上游报 no rollout found，退出 2。
       const ref = await resolveThreadViaBroker({ request }, options.resume, { passThrough: true });
@@ -228,15 +227,36 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       let parent = child?.parentThreadId;
       if (capability == null) {
         // 冷恢复 v2 子线程会被上游拒绝；先只读元数据，避免把能力拒绝误报为执行失败。
-        const metadata = await request<{ thread: { canAcceptDirectInput?: boolean; parentThreadId?: string;
-          source?: { subAgent?: { thread_spawn?: { parent_thread_id?: string } } } } }>(
-          "thread/read", { threadId });
-        capability = metadata.thread?.canAcceptDirectInput;
-        parent = metadata.thread?.parentThreadId ?? metadata.thread?.source?.subAgent?.thread_spawn?.parent_thread_id ?? parent;
+        let metadata: ThreadMetadata | undefined;
+        try { metadata = await readThread(); } catch (error) {
+          if (plan.command === "review") throw error;
+          rethrow(error);
+        }
+        capability = metadata?.canAcceptDirectInput;
+        parent = metadata?.parentThreadId ?? metadata?.source?.subAgent?.thread_spawn?.parent_thread_id ?? parent;
       }
       if (capability === false) throw new CxbError("LOCAL_ERROR", `子代理线程 ${safe(label)} 不接受直接输入，请从父线程继续`
         + (parent ? `：cxb run --resume ${safe(parent)} <要求>。` : "。"), { id: label });
     }
+    let modelSource: string | undefined;
+    let reasoningSource: string | undefined;
+    if (plan.command === "run") {
+      ({ model, reasoning, modelSource, reasoningSource } = await resolveRunModel({ request,
+        workspaceDir: ctx.workspace.workspaceDir, threadId, shared: !!threadId && connection.handshake.server.kind === "shared",
+        model: globals.model, reasoning: globals.reasoning, explicit: ctx.parsed.explicit, out, readThread, rethrow }));
+    } else {
+      // review 保持原有选择规则，也不登记普通 run 的请求模型与强度。
+      try {
+        const defaults = await resolveModelDefaults({ request }, { model, effort: reasoning });
+        model ??= defaults?.model;
+        reasoning ??= defaults?.effort;
+      } catch (error) {
+        rethrow(error);
+        out.progress("无法读取模型列表，使用服务器默认模型");
+      }
+    }
+    if (reasoning) overrides.config!.model_reasoning_effort = reasoning;
+    if (plan.command === "review" && model) overrides.config!.review_model = model;
     type ThreadResponse = { thread: { id: string }; model?: string; reasoningEffort?: string };
     let response: ThreadResponse | undefined;
     if (plan.continue) {
@@ -276,6 +296,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       approval: policy, ...(policy === "auto" ? { approvalsReviewer: "auto_review" } : {}), sandbox: plan.sandbox,
       ...(options.template ? { template: options.template } : {}), ...(options.goal ? { goal: options.goal } : {}),
       ...(typeof inheritedGoal === "string" ? { goal: inheritedGoal } : {}), source: plan.command,
+      ...(plan.command === "run" ? { model: model ?? null, effort: reasoning ?? null } : {}),
     } });
     shortId = annotation.shortId;
     label = shortId;
@@ -476,7 +497,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       ...(result.childrenStop ? { childrenStop: result.childrenStop, stopOutcome: result.stopOutcome } : {}),
       ...(result.loopGuard ? { loopGuard: result.loopGuard } : {}) };
     if (plan.command === "review") out.resultJson({ ...common, mode: plan.review!.mode, ref: plan.review!.ref, base: plan.review!.base });
-    else out.resultJson({ ...common, model: response?.model ?? model ?? null, reasoning: response?.reasoningEffort ?? reasoning ?? null,
+    else out.resultJson({ ...common, model: model ?? null, reasoning: reasoning ?? null, modelSource, reasoningSource,
       sandbox: plan.sandbox, approval: policy, startedAt: new Date(result.startedAt).toISOString(),
       completedAt: result.endedAt === null ? null : new Date(result.endedAt).toISOString(), joined: result.joined, goal,
       ...(continued ? { continuedFrom: continued.from.runId } : {}) });
