@@ -5,10 +5,37 @@ use crate::relations::convergence::settled;
 use crate::stop::tree::TreeScope;
 
 impl Machine {
-    fn convergence_begin(&mut self, thread: &str, actions: &mut Vec<Action>) -> Option<String> {
+    pub(crate) fn convergence_begin(
+        &mut self,
+        thread: &str,
+        actions: &mut Vec<Action>,
+    ) -> Option<String> {
         let claim = self.claims.get(thread)?;
         let run = claim.run_id.clone()?;
-        if self.convergences.runs.contains_key(&run) {
+        if let Some(runtime) = self.convergences.runs.get_mut(&run) {
+            if runtime.deadline_mono_ms == u64::MAX {
+                let config = self.runs.runs[&run]
+                    .convergence_config
+                    .clone()
+                    .unwrap_or_default();
+                runtime.started_mono_ms = self.clock.mono_ms;
+                runtime.deadline_mono_ms = self.clock.mono_ms.saturating_add(config.timeout_ms);
+                if let Some(join) = self
+                    .runs
+                    .runs
+                    .get_mut(&run)
+                    .and_then(|r| r.subagent_join.as_mut())
+                {
+                    join.deadline_at = self.clock.now_ms.saturating_add(config.timeout_ms);
+                }
+                actions.push(Action::Schedule {
+                    token: runtime.token.claim.clone(),
+                    kind: TimerKind::ConvergeDeadline {
+                        token: runtime.token.clone(),
+                    },
+                    delay_ms: config.timeout_ms,
+                });
+            }
             return Some(run);
         }
         if self.tree_abandoned(&run)
@@ -65,7 +92,7 @@ impl Machine {
         let epoch = self.convergences.ledgers[&run].work_epoch;
         let record = self.runs.runs.get_mut(&run)?;
         record.convergence_config = Some(config.clone());
-        record.auto_turns_started.get_or_insert(0);
+        // 计数和预算由 C 的运行初始化共同建立。
         record.subagent_join = Some(SubagentJoin {
             phase: JoinPhase::WaitingSubtree,
             wakeups_started: 0,
@@ -80,6 +107,8 @@ impl Machine {
             result_coverage: None,
             automatic_control_revoked: false,
         });
+        let budget = self.initial_convergence_budget(thread);
+        self.initialize_run_safeguards(&token, budget, actions);
         actions.push(Action::Schedule {
             token: token.claim.clone(),
             kind: TimerKind::ConvergeDeadline { token },
@@ -216,6 +245,16 @@ impl Machine {
                     return true;
                 }
                 if !own {
+                    if !revoked
+                        && matches!(
+                            self.claims[thread].state,
+                            State::AwaitingContinuation { .. }
+                        )
+                    {
+                        return false;
+                    }
+                    let token = self.convergences.runs[&run].token.clone();
+                    self.reconcile_observe_parent_started(&token, turn);
                     if revoked || self.convergence_root_unsettled(&run) {
                         return true;
                     }
@@ -309,8 +348,20 @@ impl Machine {
         {
             *state_token = token.clone();
         }
-        // 旧操作只保留副作用核实；不把旧回包变成新代际的投递证据。
-        self.cancel_subagent_reconcile(&old, ReconcileCancel::AuthorityChanged, actions);
+        // detach 是授权交接；保留原提交，只以新身份重新读取承载证据。
+        self.cancel_child_results(&old, actions);
+        self.rebind_run_safeguards(&old, &token);
+        let ids: Vec<_> = self
+            .runs
+            .reconciliation
+            .operations
+            .values()
+            .filter(|p| p.verify_token == old && p.operation.outcome_unknown)
+            .map(|p| p.operation.op_id)
+            .collect();
+        for id in ids {
+            let _ = self.reverify_subagent_reconcile(&token, id, actions);
+        }
         if let Some(progress) = self.convergences.progress.get_mut(run) {
             progress.discovery = None;
             progress.reading = None;
@@ -610,6 +661,13 @@ impl Machine {
 
     pub fn convergence_timer(&mut self, kind: TimerKind, actions: &mut Vec<Action>) {
         match kind {
+            TimerKind::BudgetVerifyDeadline { token } => {
+                if self.convergence_token_current(&token)
+                    && self.budget_verification_expired(&token)
+                {
+                    self.convergence_fail(&token.run_id, TerminalReason::BudgetIncomplete, actions);
+                }
+            }
             TimerKind::ConvergeDeadline { token } => {
                 if self.convergence_token_current(&token)
                     && self.clock.mono_ms >= self.convergences.runs[&token.run_id].deadline_mono_ms
@@ -640,8 +698,12 @@ impl Machine {
                     .covered_epoch = None;
                 self.convergence_drive(&token.run_id, actions);
             }
-            // 这两类期限由 B 的账本驱动；集成接线见交付说明，不能在 A 伪造读取成功。
-            TimerKind::ChildResultsDeadline { .. } | TimerKind::ReconcileVerifyDeadline { .. } => {}
+            TimerKind::ChildResultsDeadline { token, read_id } => {
+                self.child_results_deadline(&token, read_id, actions)
+            }
+            TimerKind::ReconcileVerifyDeadline { token, op_id } => {
+                self.subagent_reconcile_timer(&token, op_id, actions)
+            }
             _ => {}
         }
     }
@@ -900,7 +962,13 @@ impl Machine {
             .operations
             .get(&op_id.0)
             .is_some_and(|o| {
-                o.token == *token
+                (o.token == *token
+                    || self
+                        .runs
+                        .reconciliation
+                        .operations
+                        .get(&op_id.0)
+                        .is_some_and(|p| p.verify_token == *token && p.operation == *o))
                     && o.work_epoch == epoch
                     && o.target_turn_id.as_deref() == Some(turn)
                     && !o.outcome_unknown

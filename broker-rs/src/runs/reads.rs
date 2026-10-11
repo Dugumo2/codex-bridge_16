@@ -291,6 +291,13 @@ impl Runs {
             .as_ref()
             .ok()
             .and_then(|value| pending.pages.accept(value, &read.turn_id, sources));
+        if complete.is_some() && pending.pages.output.activity.user_input {
+            self.guard_evidence.push((
+                read.run_id.clone(),
+                read.turn_id.clone(),
+                Some(pending.pages.output.activity),
+            ));
+        }
         if complete == Some(false) && self.phase == Phase::Open {
             self.next_page(pending, actions);
             return;

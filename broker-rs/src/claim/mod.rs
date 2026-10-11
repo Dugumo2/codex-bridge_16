@@ -268,6 +268,9 @@ pub struct ClaimToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
+    BudgetVerify {
+        verification: crate::runs::budget::BudgetVerification,
+    },
     StartReconciliation {
         token: crate::sa1b::ConvergeToken,
         op_id: crate::sa1b::ReconcileOpId,
@@ -375,6 +378,9 @@ pub struct RequestContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
+    BudgetVerifyDeadline {
+        token: crate::sa1b::ConvergeToken,
+    },
     ConvergeDeadline {
         token: crate::sa1b::ConvergeToken,
     },
@@ -454,6 +460,7 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    BudgetVerifyDeadline(String, u64),
     ConvergeDeadline(String, u64),
     ConvergeRetry(String, u64),
     ChildResultsDeadline(crate::sa1b::BatchReadId),
@@ -482,6 +489,10 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::BudgetVerifyDeadline { token } => Some(TimerKey::BudgetVerifyDeadline(
+                token.run_id.clone(),
+                token.generation,
+            )),
             TimerKind::ConvergeDeadline { token } => Some(TimerKey::ConvergeDeadline(
                 token.run_id.clone(),
                 token.generation,
@@ -845,7 +856,13 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             context,
             error,
         } => {
-            if state.overflowed_start(&context) {
+            if matches!(context.operation, Operation::StartReconciliation { .. }) {
+                state.subagent_reconcile_transport(
+                    &context,
+                    crate::sa1b::ReconcileTransportEvent::TimedOut,
+                    &mut actions,
+                );
+            } else if state.overflowed_start(&context) {
                 // 已放弃归属的启动超时不能继续占用认领或转入自有停止对账。
                 state.apply_reply(context, Err(error), &mut actions);
                 actions.push(Action::ForgetLate { tag });
@@ -853,13 +870,35 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
                 state.timeout_reply(context, error, tag, deadline, &mut actions);
             }
         }
-        Event::LateDiscarded { context } => state.discard_late_context(&context, &mut actions),
+        Event::LateDiscarded { context } => {
+            if matches!(context.operation, Operation::StartReconciliation { .. }) {
+                state.subagent_reconcile_transport(
+                    &context,
+                    crate::sa1b::ReconcileTransportEvent::LateDiscarded,
+                    &mut actions,
+                );
+            } else {
+                state.discard_late_context(&context, &mut actions);
+            }
+        }
         Event::LateEvicted { context, deadline } => {
-            state.evict_late_context(&context, deadline, &mut actions)
+            if matches!(context.operation, Operation::StartReconciliation { .. }) {
+                state.subagent_reconcile_transport(
+                    &context,
+                    crate::sa1b::ReconcileTransportEvent::LateEvicted,
+                    &mut actions,
+                );
+            } else {
+                state.evict_late_context(&context, deadline, &mut actions);
+            }
         }
         Event::LateReply { context, result } => {
             state.observe_app_response(&mut actions);
-            state.late_reply(context, result, &mut actions);
+            if matches!(context.operation, Operation::StartReconciliation { .. }) {
+                state.subagent_reconcile_reply(&context, result, &mut actions);
+            } else {
+                state.late_reply(context, result, &mut actions);
+            }
         }
         Event::ClientRequest { request, run_id } => {
             state.client_request(request, run_id, &mut actions)
@@ -941,7 +980,13 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
         state.abandoned_root_goal_settled(&thread, &mut actions);
     }
     // 空转刹车在停止驱动之前结算，触发的停止当场发出请求。
+    state.drive_convergence_safeguards(&mut actions);
     state.drive_loop_guards(&mut actions);
+    state.drive_child_results(&mut actions);
+    state.drive_subagent_reconcile(&mut actions);
+    for run in state.take_reconcile_changes() {
+        state.convergence_changed(&run, &mut actions);
+    }
     state.drive_convergences(&mut actions);
     // stop 的取消屏障与超时对账可能直接结束 settling；在同一事件内清掉旧缓冲，
     // 再驱动停止后继。stop 模块保持 M4 的接口与行为。
@@ -1441,18 +1486,22 @@ impl Machine {
         {
             *submitted_at = held.len();
         }
+        let stream_id = claim.stream_id;
+        let claim_id = claim.claim_id;
+        let run_id = claim.run_id.clone();
+        if let (Some(run), Some(params)) = (&run_id, &request.params) {
+            self.run_save_execution_config(run, params, actions);
+        }
         actions.push(Action::Request(RequestContext {
             resume_retried: false,
-            stream_id: claim.stream_id,
+            stream_id,
             review_id: None,
             client: Some(request.clone()),
             token: Some(ClaimToken {
                 thread_id: thread_id.into(),
-                claim_id: claim.claim_id,
+                claim_id,
             }),
-            operation: Operation::Stream {
-                run_id: claim.run_id.clone(),
-            },
+            operation: Operation::Stream { run_id },
             method: request.method,
             params: request.params,
         }));
@@ -1485,6 +1534,10 @@ impl Machine {
         result: Result<Value, Value>,
         actions: &mut Vec<Action>,
     ) {
+        if let Operation::BudgetVerify { verification } = &context.operation {
+            self.convergence_budget_reply(verification, result, actions);
+            return;
+        }
         if let Operation::Lifecycle {
             thread,
             operation,
@@ -1620,7 +1673,9 @@ impl Machine {
             | Operation::Discovery { .. }
             | Operation::AttachThread { .. } => self.relation_reply(&context, result, actions),
             Operation::DerivedStop { .. } => self.tree_reply(&context, result, actions),
-            Operation::StartReconciliation { .. } | Operation::ChildResultRead { .. } => {
+            Operation::BudgetVerify { .. }
+            | Operation::StartReconciliation { .. }
+            | Operation::ChildResultRead { .. } => {
                 actions.push(Action::Warn("SA1b 回包重复分派，已忽略".into()));
             }
             Operation::BreakerProbe { generation } => {
@@ -2351,7 +2406,11 @@ impl Machine {
                     self.stop_completed_turn(thread_id, id, actions);
                 }
             } else {
-                self.completed(thread_id, actions);
+                self.completed(
+                    thread_id,
+                    notification_turn_id(&event.params).unwrap_or_default(),
+                    actions,
+                );
             }
         }
     }
@@ -2513,6 +2572,24 @@ impl Machine {
         }
         if own {
             self.remember_owned_turn(thread_id, id);
+            if let Some(token) = self
+                .claims
+                .get(thread_id)
+                .and_then(|c| c.run_id.as_ref())
+                .and_then(|run| self.convergences.runs.get(run))
+                .map(|r| r.token.clone())
+            {
+                self.reconcile_parent_started(
+                    &token,
+                    id,
+                    if auto {
+                        crate::sa1b::TurnOrigin::Goal
+                    } else {
+                        crate::sa1b::TurnOrigin::User
+                    },
+                    actions,
+                );
+            }
         }
         // #2e：本认领的 turn/started 之后带防护地恢复 goal（乙路判断全部条件）。
         self.maybe_restore_goal(thread_id, actions);
@@ -2522,17 +2599,20 @@ impl Machine {
         self.stop_started(thread_id, id);
     }
 
-    fn completed(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
-        let convergence_turn = self
-            .claims
-            .get(thread_id)
-            .and_then(Claim::turn_id)
-            .unwrap_or_default()
-            .to_owned();
+    fn completed(&mut self, thread_id: &str, convergence_turn: &str, actions: &mut Vec<Action>) {
+        if self.convergence_enabled()
+            && self
+                .claims
+                .get(thread_id)
+                .and_then(Claim::turn_id)
+                .is_some_and(|id| id != convergence_turn)
+        {
+            return;
+        }
         if self.convergence_event(
             thread_id,
             converge::ConvergeEvent::ParentTurn {
-                turn: &convergence_turn,
+                turn: convergence_turn,
                 started: false,
             },
             actions,
@@ -2660,7 +2740,7 @@ impl Machine {
                 .get(thread_id)
                 .and_then(|c| c.run_id.as_ref())
                 .and_then(|run| self.runs.runs.get(run))
-                .and_then(|r| r.turns.last())
+                .and_then(|r| r.selected_parent_result())
                 .map(|t| t.status);
             if self.natural_release_gate(thread_id, goal.as_deref(), status, actions)
                 == finish_gate::ReleaseDecision::Release
@@ -2934,7 +3014,8 @@ impl Machine {
             return;
         }
         match kind {
-            TimerKind::ConvergeDeadline { .. }
+            TimerKind::BudgetVerifyDeadline { .. }
+            | TimerKind::ConvergeDeadline { .. }
             | TimerKind::ConvergeRetry { .. }
             | TimerKind::ChildResultsDeadline { .. }
             | TimerKind::ReconcileVerifyDeadline { .. } => self.convergence_timer(kind, actions),

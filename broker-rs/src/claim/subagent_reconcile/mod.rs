@@ -80,7 +80,31 @@ impl Machine {
                 return InputSource::TrustedReconcile;
             }
         }
-        self.classify_run_input(run, thread, turn, item)
+        let source = self.classify_run_input(run, thread, turn, item);
+        if source == InputSource::ExternalUser
+            && self.reconcile_candidate_input(run, thread, turn, item)
+        {
+            return InputSource::TrustedReconcile;
+        }
+        source
+    }
+    /// 暂存候选输入只豁免精确登记项；不会授予该轮归属或投递覆盖。
+    fn reconcile_candidate_input(&self, run: &str, thread: &str, turn: &str, item: &Value) -> bool {
+        self.runs.reconciliation.operations.values().any(|p| {
+            p.verify_token.run_id == run
+                && p.verify_token.claim.thread_id == thread
+                && p.operation.outcome_unknown
+                && !p.operation.automatic_control_revoked
+                && self.reconcile_token_current(&p.verify_token)
+                && (p.observed_starts.contains(turn) || p.started.contains_key(turn))
+                && self.safeguards(&p.verify_token).is_some_and(|s| {
+                    s.trusted.iter().any(|r| {
+                        r.token == p.verify_token
+                            && r.op_id == p.operation.op_id
+                            && item["clientId"].as_str() == Some(r.client_user_message_id.as_str())
+                    })
+                })
+        })
     }
     pub(crate) fn reconcile_facts(&self, run: &str) -> Option<ConvergenceFacts> {
         #[cfg(test)]
@@ -191,6 +215,11 @@ impl Machine {
             .ready
             .insert(token.run_id.clone(), (token.clone(), batch));
         self.reconcile_changed(&token.run_id, actions);
+        if self.convergences.progress.contains_key(&token.run_id) {
+            if let Some(batch) = self.take_child_results(&token) {
+                self.convergence_results_ready(token, read_id, batch, actions);
+            }
+        }
     }
     /// A 完成准入复查后取走该批；读取完成本身绝不自动发 start。
     pub fn take_child_results(&mut self, token: &ConvergeToken) -> Option<ReconcileBatch> {
@@ -304,6 +333,17 @@ impl Machine {
         }
     }
     pub(crate) fn reconcile_changed(&mut self, run: &str, actions: &mut Vec<Action>) {
+        let operations: Vec<_> = self
+            .runs
+            .reconciliation
+            .operations
+            .values()
+            .filter(|p| p.operation.token.run_id == run)
+            .map(|p| p.operation.clone())
+            .collect();
+        for operation in operations {
+            self.convergence_operation_changed(operation);
+        }
         self.persist_reconciliation(run, actions);
         // revision 由 A 唯一推进；step 末尾合并本步变化后统一发布。
         self.runs.reconciliation.changed.insert(run.into());
@@ -353,6 +393,7 @@ impl Machine {
             r.automatic_control_revoked = true;
         }
         self.reconcile_changed(&token.run_id, actions);
+        self.convergence_fail(&token.run_id, reason, actions);
     }
     pub fn subagent_reconcile_transport(
         &mut self,
@@ -568,6 +609,13 @@ impl Machine {
         if !self.reconcile_register_auto(token, turn, origin, actions) {
             return;
         }
+        #[cfg(test)]
+        let harness = self.runs.reconciliation.harness.is_some();
+        #[cfg(not(test))]
+        let harness = false;
+        if !harness && !self.bind_reconcile_input(token, op_id, turn) {
+            return;
+        }
         let pending = self
             .runs
             .reconciliation
@@ -612,8 +660,27 @@ impl Machine {
         if let Some(shell) = completed_shell {
             self.run_turn_completed(&token.claim.thread_id, Some(&token.run_id), &shell, actions);
         }
-        self.reconcile_parent_completed(&token.run_id, turn, actions);
         self.reconcile_changed(&token.run_id, actions);
+        if self.convergences.progress.contains_key(&token.run_id) {
+            self.convergence_event(
+                &token.claim.thread_id,
+                crate::claim::converge::ConvergeEvent::ParentTurn {
+                    turn,
+                    started: true,
+                },
+                actions,
+            );
+            self.convergence_delivered(token, op_id, turn, epoch, actions);
+            if self.runs.runs[&token.run_id]
+                .turns
+                .iter()
+                .any(|t| t.turn_id == turn)
+            {
+                self.completed(&token.claim.thread_id, turn, actions);
+            }
+        } else {
+            self.reconcile_parent_completed(&token.run_id, turn, actions);
+        }
     }
     /// completed 可以先于 clientId 核实到达；两条入口都调用，覆盖单调且旧轮不改最终指针。
     pub fn reconcile_parent_completed(&mut self, run: &str, turn: &str, actions: &mut Vec<Action>) {
@@ -640,6 +707,11 @@ impl Machine {
         parent.completed = status;
         if status == Some(TurnStatus::Completed) && parent.delivered_epoch != 0 {
             let epoch = parent.delivered_epoch;
+            if self.convergences.progress.contains_key(run) {
+                let token = self.convergences.runs[run].token.clone();
+                self.convergence_parent_reconciled(&token, turn, actions);
+                return;
+            }
             if let Some(join) = self
                 .runs
                 .runs

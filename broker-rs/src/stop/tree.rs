@@ -1044,7 +1044,7 @@ impl Machine {
             .runs
             .runs
             .get(&run)
-            .and_then(|r| r.turns.last())
+            .and_then(|r| r.selected_parent_result())
             .map(|t| t.status);
         let goal_status = self
             .records
@@ -1995,7 +1995,9 @@ impl Machine {
             }
         }
         if snapshot.parent_status.is_none() {
-            snapshot.parent_status = record.and_then(|r| r.turns.last()).map(|t| t.status);
+            snapshot.parent_status = record
+                .and_then(|r| r.selected_parent_result())
+                .map(|t| t.status);
         }
         let existing = record.and_then(|r| r.interrupt_reason);
         let terminal = self.convergence_run_terminal(&run, snapshot.parent_status);

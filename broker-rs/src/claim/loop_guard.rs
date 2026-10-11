@@ -320,7 +320,7 @@ impl Machine {
             .map(|run| {
                 (
                     run.clone(),
-                    self.classify_run_input(run, thread, turn, item),
+                    self.classify_result_input(run, thread, turn, item),
                 )
             })
             .collect();
@@ -339,10 +339,13 @@ impl Machine {
         turn: &str,
         activity: Activity,
     ) {
+        let original_user_turn = self.runs.runs.get(run).is_some_and(|r| {
+            r.start_confirmation.turn_id.as_deref() == Some(turn) && r.start_confirmation.confirmed
+        });
         let Some(guard) = self.loop_guards.get_mut(run).filter(|g| g.thread == thread) else {
             return;
         };
-        if activity.user_input {
+        if activity.user_input && !original_user_turn {
             if let Some(safeguards) = &mut guard.safeguards {
                 safeguards.revoked = true;
                 if let Some(runtime) = self.convergences.runs.get_mut(run) {
@@ -397,6 +400,11 @@ impl Machine {
     ///   客户端轮里就授予（模型自己建 goal；迟到的旧写入回包不算），是本 broker 未回包的授予写入请求的目标就等它的回包，否则视为外部替换，
     ///   撤销并推进代号（外部改走再改回也不能让旧回包恢复资格）。客户端设置与 #2e 恢复的授予见 [`Self::grant_goal_control`]。
     pub(super) fn guard_goal(&mut self, thread: &str, goal: Option<&Value>, source: GoalSource) {
+        if let Some(goal) = goal.filter(|g| g.is_object()) {
+            self.convergences
+                .goal_evidence
+                .insert(thread.into(), goal.clone());
+        }
         let goal = goal.filter(|g| g.is_object());
         let (objective, created) = identity(goal);
         let status = goal

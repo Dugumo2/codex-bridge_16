@@ -245,6 +245,11 @@ impl Machine {
                 expired: false,
             },
         );
+        self.convergence_operation_changed(
+            self.runs.reconciliation.operations[&op_id.0]
+                .operation
+                .clone(),
+        );
         Ok(op_id)
     }
     /// detach/重连后由 A 用新的有效身份显式接续只读核实，不改原提交或刷新期限。
@@ -416,6 +421,16 @@ impl Machine {
                 }
                 _ => {}
             }
+        }
+        let operations: Vec<_> = self
+            .runs
+            .reconciliation
+            .operations
+            .values()
+            .map(|p| p.operation.clone())
+            .collect();
+        for operation in operations {
+            self.convergence_operation_changed(operation);
         }
     }
     fn submit_reconciliation(&mut self, id: ReconcileOpId, actions: &mut Vec<Action>) {

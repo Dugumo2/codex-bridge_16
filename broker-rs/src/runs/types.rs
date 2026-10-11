@@ -307,7 +307,7 @@ impl RunRecord {
                 effort: meta.get("effort").and_then(Value::as_str),
             }),
             current_turn_id: self.current_turn_id.as_deref(),
-            last_turn: self.turns.last().map(|turn| ModelTurn {
+            last_turn: self.selected_parent_result().map(|turn| ModelTurn {
                 turn_id: &turn.turn_id,
                 reroute: turn.reroute.as_ref(),
             }),

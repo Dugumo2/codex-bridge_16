@@ -363,6 +363,9 @@ impl Runs {
                         RunNotice::TurnResult { run_id, .. }
                         | RunNotice::RunEnded { run_id, .. } => run_id == &r.run_id,
                     }) || self.tree_retention_required(&r.run_id)
+                        || self.reconciliation.operations.values().any(|p| {
+                            p.operation.token.run_id == r.run_id && p.operation.outcome_unknown
+                        })
                         || self.verifying_history.contains(&r.run_id)
                         || self.inflight_starts.contains(&r.run_id)
                         || self.late_starts.contains(&r.run_id)

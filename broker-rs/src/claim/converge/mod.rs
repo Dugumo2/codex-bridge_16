@@ -5,6 +5,7 @@ use crate::runs::{InterruptReason, ReleaseKind, TurnStatus};
 use crate::sa1b::*;
 use std::collections::{BTreeMap, HashMap};
 
+mod budget;
 mod drive;
 pub(crate) mod terminal;
 #[cfg(test)]
@@ -51,6 +52,7 @@ pub struct Convergences {
     pub ledgers: HashMap<String, crate::relations::convergence::ConvergenceLedger>,
     pub goals: BTreeMap<String, (u64, bool)>,
     pub capabilities: BTreeMap<String, (u64, bool)>,
+    pub goal_evidence: BTreeMap<String, serde_json::Value>,
     pub observations:
         BTreeMap<(String, String), crate::relations::convergence::ActivityObservation>,
     pub progress: HashMap<String, Progress>,
@@ -504,10 +506,11 @@ impl Machine {
     }
 
     pub(crate) fn convergence_root_unsettled(&self, run: &str) -> bool {
-        self.convergences.progress.get(run).is_some_and(|p| {
-            p.operations
-                .values()
-                .any(|o| o.outcome_unknown || o.submission == ReconcileSubmission::OutcomeUnknown)
-        })
+        self.reconcile_unresolved(run)
+            || self.convergences.progress.get(run).is_some_and(|p| {
+                p.operations.values().any(|o| {
+                    o.outcome_unknown || o.submission == ReconcileSubmission::OutcomeUnknown
+                })
+            })
     }
 }
