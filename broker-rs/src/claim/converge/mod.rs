@@ -216,6 +216,15 @@ impl Machine {
             self.notify_convergence_changed(run, actions);
         }
         if !matches!(reason, MemberChange::ConvergencePhase) {
+            // 新活动、结果和回答允许立即重核实；已有发现仍由单一在途登记合并。
+            if matches!(
+                reason,
+                MemberChange::Activity | MemberChange::ResultReady | MemberChange::Goal
+            ) {
+                if let Some(progress) = self.convergences.progress.get_mut(run) {
+                    progress.retry_at = None;
+                }
+            }
             self.convergence_drive(run, actions);
         }
     }

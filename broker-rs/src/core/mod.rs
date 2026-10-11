@@ -165,8 +165,19 @@ impl Core {
         mailbox: mpsc::UnboundedSender<CoreMsg>,
         accept: AcceptControl,
     ) -> Self {
+        let mut machine = Machine::new(config.server.is_shared());
+        // 生产接线已完成：可信输入、预算准入、异步读取、终态及取消共用同一状态机。
+        assert!(
+            machine.enable_convergence(crate::claim::converge::ConvergenceReadiness {
+                trusted_inputs: true,
+                budget_admission: true,
+                asynchronous_results: true,
+                terminal_mapping: true,
+                cancellation_verified: true,
+            })
+        );
         Self {
-            machine: Machine::new(config.server.is_shared()),
+            machine,
             config,
             app,
             mailbox,

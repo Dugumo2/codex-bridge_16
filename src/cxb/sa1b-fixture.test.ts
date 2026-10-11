@@ -33,7 +33,9 @@ describe("SA1b 夹具自身契约", () => {
   for (const mode of ["normal", "delayed", "dropped"] as const) test(`完成消息 ${mode} 与可读结果独立`, () => {
     const f = fixture(); const c = f.spawn(); f.ctl("delivery", { childThreadId: "C", mode });
     f.ctl("turn", { threadId: "C", action: "complete", output: "随机结果" });
-    expect(f.call("thread/items/list", { threadId: "C", turnId: c.turnId })!.result.data[0].text).toBe("随机结果");
+    const entry = f.call("thread/items/list", { threadId: "C", turnId: c.turnId })!.result.data[0];
+    expect(entry.turnId).toBe(c.turnId);
+    expect(entry.item.text).toBe("随机结果");
     expect(f.out.filter(x => x.method === "turn/completed")).toHaveLength(1);
     expect(f.out.filter(x => x.method === "fixture/sa1b/completionMessage")).toHaveLength(mode === "normal" ? 1 : 0);
     const released = f.ctl("release", { name: "completion:C" }); expect(released.released).toBe(mode === "delayed" ? 1 : 0);
@@ -75,7 +77,7 @@ describe("SA1b 夹具自身契约", () => {
     for (let i = 0; i < 5; i++) f.ctl("item", { threadId: "P", item: { id: `f-${i}`, type: "reasoning", summary: [] } });
     f.call("turn/steer", { threadId: "P", expectedTurnId: f.root, clientUserMessageId: "last-page" });
     let cursor = null, items: any[] = [], pages = 0;
-    do { const page: any = f.call("thread/items/list", { threadId: "P", turnId: f.root, cursor })!.result; items.push(...page.data); cursor = page.nextCursor; pages++; } while (cursor);
+    do { const page: any = f.call("thread/items/list", { threadId: "P", turnId: f.root, cursor })!.result; for (const entry of page.data) { expect(entry.turnId).toBe(f.root); items.push(entry.item); } cursor = page.nextCursor; pages++; } while (cursor);
     expect(pages).toBe(4); expect(items.filter(x => x.clientId === "last-page")).toHaveLength(1);
   });
   for (const mode of ["error", "notFound", "notLoaded", "duplicateCursor", "dropped"]) test(`读取故障 ${mode} 有界次数与复原`, () => {

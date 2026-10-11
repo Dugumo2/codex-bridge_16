@@ -701,6 +701,10 @@ impl Machine {
                     .ledgers
                     .get(&token.run_id)
                     .is_some_and(|l| l.work_epoch > 0));
+        // 在传输包装 GoalRead 前建立版本；首次读取不能把“无版本”误判成竞态。
+        for thread in &threads {
+            self.goal_fact_version(thread);
+        }
         let work = self.relations.aux.work.get_mut(&op_id).unwrap();
         if root_check {
             let key = (root.clone(), "thread/read".to_owned());

@@ -234,7 +234,7 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
         const turns = p.sortDirection === "asc" ? t!.turns : [...t!.turns].reverse();
         page(msg.id, turns.map(x => ({ ...x, items: p.itemsView === "full" ? x.items : [], itemsView: p.itemsView === "full" ? "full" : "notLoaded" })), p); break;
       }
-      case "thread/items/list": page(msg.id, t!.turns.find(x => x.id === p.turnId)?.items ?? [], p); break;
+      case "thread/items/list": page(msg.id, (t!.turns.find(x => x.id === p.turnId)?.items ?? []).map(item => ({ turnId: p.turnId, item, startedAtMs: null, completedAtMs: null })), p); break;
       case "turn/start": case "turn/steer": {
         if (t!.canAcceptDirectInput === false) { error(msg.id, "agent thread does not accept direct input"); break; }
         let turn = t!.turns.findLast(x => x.status === "inProgress");

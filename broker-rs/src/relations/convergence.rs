@@ -342,7 +342,7 @@ impl Machine {
                             turn_id: turn.clone(),
                             result_version: *version,
                         },
-                        available: false,
+                        available: turn.is_some(),
                     });
                 }
                 fact.activity = activity;

@@ -1534,10 +1534,6 @@ impl Machine {
         result: Result<Value, Value>,
         actions: &mut Vec<Action>,
     ) {
-        if let Operation::BudgetVerify { verification } = &context.operation {
-            self.convergence_budget_reply(verification, result, actions);
-            return;
-        }
         if let Operation::Lifecycle {
             thread,
             operation,
@@ -1546,21 +1542,6 @@ impl Machine {
         {
             self.lifecycle_reply(thread, operation, *attempt, result, true, actions);
             return;
-        }
-        // 收敛发现回包先校验全身份，再由发现层学习；旧代际不得进入公共 learn_traffic。
-        if let Operation::Discovery { op_id, generation } = context.operation {
-            if let Some(crate::relations::DiscoveryCaller::Converge { token, .. }) = self
-                .relations
-                .discoveries
-                .get(&op_id)
-                .map(|o| o.caller.clone())
-            {
-                if self.convergence_token_current(&token) && !self.closing && !self.quiescing {
-                    self.relation_reply(&context, result, actions);
-                }
-                let _ = generation;
-                return;
-            }
         }
         self.release_stream_slot(context.stream_id);
         if self.closing {
@@ -1587,6 +1568,25 @@ impl Machine {
         }
         if self.unwrap_goal_reply(&mut context, &result, false, actions) {
             return;
+        }
+        if let Operation::BudgetVerify { verification } = &context.operation {
+            self.convergence_budget_reply(verification, result, actions);
+            return;
+        }
+        // 收敛发现回包先校验全身份，再由发现层学习；旧代际不得进入公共 learn_traffic。
+        if let Operation::Discovery { op_id, generation } = context.operation {
+            if let Some(crate::relations::DiscoveryCaller::Converge { token, .. }) = self
+                .relations
+                .discoveries
+                .get(&op_id)
+                .map(|o| o.caller.clone())
+            {
+                if self.convergence_token_current(&token) && !self.closing && !self.quiescing {
+                    self.relation_reply(&context, result, actions);
+                }
+                let _ = generation;
+                return;
+            }
         }
         // 清理已撤销或代号已换代的内部回包在事实学习之前隔离，不能污染后续运行。
         let stale = match &context.operation {
