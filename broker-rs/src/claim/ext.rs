@@ -390,7 +390,10 @@ impl Machine {
                         Some(id) => self.thread_run(thread, id),
                         None => self.latest_run(thread),
                     }},
-                    "pending":self.inbox_pending(thread),"lifecycle":self.lifecycle_projection(thread)})),
+                    "pending":self.inbox_pending(thread),"lifecycle":self.lifecycle_projection(thread),
+                    "runs": if params.get("includeRuns").and_then(Value::as_bool) == Some(true) {
+                        Some(self.runs.runs.values().filter(|run| run.thread_id == thread).collect::<Vec<_>>())
+                    } else { None }})),
                     actions,
                 );
             }

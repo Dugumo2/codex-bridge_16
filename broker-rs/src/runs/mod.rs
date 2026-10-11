@@ -149,6 +149,8 @@ pub enum ReleaseKind {
 /// 内存账本。活动记录随认领，历史最多 200 个线程；内部登记的清理随结果、释放和淘汰。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Runs {
+    pub(crate) epoch: u64,
+    next_creation_sequence: u64,
     pub(crate) verifying_history: std::collections::HashSet<RunId>,
     pub(crate) lifecycle_gates: std::collections::BTreeMap<String, String>,
     purge: Option<purge::PendingPurge>,
@@ -274,6 +276,8 @@ impl Machine {
                 .remove(&conn)
         });
         let run_id = open.run_id.clone();
+        self.runs.next_creation_sequence = self.runs.next_creation_sequence.checked_add(1)
+            .expect("运行创建序号已耗尽");
         let entry = self
             .runs
             .index
@@ -288,6 +292,11 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                creation_order: Some(CreationOrder { epoch: self.runs.epoch, sequence: self.runs.next_creation_sequence }),
+                start_confirmation: StartConfirmation {
+                    owned: if open.joined { Some(false) } else if !self.shared { Some(true) } else { None },
+                    ..Default::default()
+                },
                 children: Vec::new(),
                 children_stop: None,
                 background_cleanup: None,
@@ -346,14 +355,26 @@ impl Machine {
             return;
         }
         if let Some(record) = self.runs.runs.get_mut(run) {
-            if matches!(record.state, RunState::Running | RunState::Stopping)
-                && record.joined != joined
-            {
+            if matches!(record.state, RunState::Running | RunState::Stopping) {
                 record.joined = joined;
+                record.start_confirmation.owned = Some(!joined);
+                record.start_confirmation.confirmed = !joined && record.start_confirmation.turn_id.is_some();
                 self.runs.updated.insert(run.into(), self.clock.now_ms);
                 self.runs.put(run, actions);
             }
         }
+    }
+
+    /// 只接收成功 turn/start 回包或 turn/started；请求回包必须使用原请求保存的 runId。
+    pub(crate) fn run_start_evidence(&mut self, run: &str, thread: &str, turn: &str, actions: &mut Vec<Action>) {
+        if self.runs.phase != Phase::Open || turn.is_empty() { return; }
+        let Some(record) = self.runs.runs.get_mut(run) else { return; };
+        if record.state == RunState::Lost || record.thread_id != thread || record.start_confirmation.confirmed { return; }
+        let evidence = &mut record.start_confirmation;
+        evidence.thread_id = Some(thread.into());
+        evidence.turn_id = Some(turn.into());
+        evidence.confirmed = evidence.owned == Some(true);
+        self.runs.put(run, actions);
     }
 
     pub(crate) fn run_turn_started(
@@ -1040,29 +1061,6 @@ impl Machine {
             .and_then(Value::as_str)
             .map(state::index_preview);
         entry.cwd = info.get("cwd").and_then(Value::as_str).map(str::to_owned);
-        entry.updated_at = self.clock.now_ms;
-        self.runs.put_threads(actions);
-    }
-
-    /// 开轮成功且显式指定了模型：只改已登记线程的索引模型，不为陌生线程建索引。
-    pub(crate) fn run_learn_model(&mut self, thread: &str, model: &str, actions: &mut Vec<Action>) {
-        self.runs.trace("run_learn_model");
-        if self.runs.phase != Phase::Open {
-            return;
-        }
-        let Some(entry) = self
-            .runs
-            .index
-            .threads
-            .values_mut()
-            .find(|entry| entry.thread_id == thread)
-        else {
-            return;
-        };
-        if entry.model.as_deref() == Some(model) {
-            return;
-        }
-        entry.model = Some(model.to_owned());
         entry.updated_at = self.clock.now_ms;
         self.runs.put_threads(actions);
     }

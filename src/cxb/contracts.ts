@@ -219,6 +219,8 @@ export type ApprovalPolicyName = "never" | "auto" | "on-request" | "on-failure" 
 
 /** 2.3 节 RunMeta：annotate 登记、随运行记录返回。 */
 export interface RunMeta {
+  model?: string | null;
+  effort?: string | null;
   approval?: ApprovalPolicyName;
   approvalsReviewer?: string;
   sandbox?: string;
@@ -237,7 +239,11 @@ export interface TurnResult {
   /** 原样的上游 TurnError 或启动失败的 RPC 错误对象。 */
   error: unknown;
   completedAt: number;
+  /** 本轮收到的 model/rerouted；只用于显示注明，不改变沿用值。 */
+  reroute?: Reroute | null;
 }
+
+export interface Reroute { fromModel: string; toModel: string; reason: string }
 
 export interface ProgressItem { itemId: string; type: string; summary: string }
 
@@ -252,6 +258,10 @@ export interface LoopGuardReport {
 }
 
 export interface RunResult {
+  creationOrder?: { epoch: number; sequence: number };
+  startConfirmation?: { confirmed: boolean; owned: boolean | null; threadId: string | null; turnId: string | null };
+  /** 运行中的轮尚无 TurnResult 时暂存的改道；轮结束并入该轮结果后清空。 */
+  pendingReroute?: (Reroute & { turnId: string }) | null;
   children?: ChildRecord[];
   backgroundCleanup?: BackgroundCleanup;
   childrenStop?: ChildrenStopReport;

@@ -182,6 +182,12 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    /// 创建时固定；文件外壳的 epoch/revision 随重写变化，不能用来判断运行先后。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_order: Option<CreationOrder>,
+    /// 只由 broker 更新，旧记录缺省为未确认；重启不得从结果或 joined 反推。
+    #[serde(default)]
+    pub start_confirmation: StartConfirmation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_cleanup: Option<crate::stop::background::BackgroundReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -328,6 +334,10 @@ pub struct PurgeFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunMeta {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -346,6 +356,24 @@ pub struct RunMeta {
 pub enum RunSource {
     Run,
     Review,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreationOrder {
+    pub epoch: u64,
+    pub sequence: u64,
+}
+
+/// 开轮证据与归属定案分开保存，允许两者以任意顺序到达。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartConfirmation {
+    pub confirmed: bool,
+    /// null：尚未定案；true：自有；false：被吸收/旁观。
+    pub owned: Option<bool>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
 }
 
 /// 2.3 节 ThreadSummary 的 state。

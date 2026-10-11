@@ -210,6 +210,7 @@ impl Core {
             loaded.lifecycle = Some(Err("存储初始化失败，无法核实旧生命周期记录".into()));
         }
         self.epoch = loaded.epoch;
+        self.machine.runs.epoch = loaded.epoch;
         self.store = store;
         self.loaded = loaded;
         self

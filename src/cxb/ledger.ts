@@ -163,15 +163,37 @@ export function readRunRecord(workspaceDir: string, runId: string): RunResult | 
 /** 该线程的全部运行记录（运行属于它，或它是运行的 review 子线程），按 startedAt 升序。
  *  任何一条损坏都抛 LOCAL_ERROR（规格 3.3 节：日志损坏为 1）。 */
 export function listThreadRuns(workspaceDir: string, threadId: string): RunResult[] {
+  return readAllRuns(workspaceDir).filter((run) => run.threadId === threadId || run.reviewThreadId === threadId)
+    .sort(compareRunCreation);
+}
+
+/** 一次扫描全部保留记录；沿用与批量显示共用，不能依赖线程索引或内存保留窗口。 */
+export function readAllRuns(workspaceDir: string): RunResult[] {
   const dir = join(workspaceDir, "runs");
   if (!existsSync(dir)) return [];
   const runs: RunResult[] = [];
   for (const name of readdirSync(dir)) {
     if (!name.endsWith(".json")) continue;
     const run = readRunRecord(workspaceDir, name.slice(0, -".json".length));
-    if (run && (run.threadId === threadId || run.reviewThreadId === threadId)) runs.push(run);
+    if (run) runs.push(run);
   }
-  return runs.sort((a, b) => a.startedAt - b.startedAt || a.runId.localeCompare(b.runId));
+  return runs;
+}
+
+/** 创建顺序不受墙钟回拨、同毫秒随机 runId、重写文件影响；旧记录统一排在新格式之前。 */
+export function compareRunCreation(a: RunResult, b: RunResult): number {
+  const x = a.creationOrder, y = b.creationOrder;
+  if (x && y) return x.epoch - y.epoch || x.sequence - y.sequence || a.runId.localeCompare(b.runId);
+  if (x || y) return x ? 1 : -1;
+  return a.startedAt - b.startedAt || a.runId.localeCompare(b.runId);
+}
+
+/** 在线状态覆盖同一运行的磁盘旧快照；根线程严格匹配，review/血缘不是继承关系。 */
+export function latestModelRun(threadId: string, disk: RunResult[], online: RunResult[] = []): RunResult | undefined {
+  const runs = new Map([...disk, ...online].map((run) => [run.runId, run]));
+  return [...runs.values()].filter((run) => run.threadId === threadId && run.meta?.source === "run"
+    && run.startConfirmation?.confirmed === true && !!run.meta.model)
+    .sort(compareRunCreation).at(-1);
 }
 
 function parseLog(text: string, label: string): LogLine[] {
