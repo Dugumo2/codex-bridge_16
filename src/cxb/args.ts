@@ -167,8 +167,8 @@ export const GLOBAL_OPTIONS: readonly OptionSpec[] = [
   { ...flag("json", ["--json"], "输出机器可读 JSON；可与 verbose 同用。"), repeat: "idempotent" },
   value("dir", ["-d", "--dir"], "目录", "工作区目录，默认当前目录。", (v, l) => resolve(nonempty(v, l))),
   value("timeout", ["--timeout"], "秒", `等待期限，默认 ${config.defaultTimeout} 秒；最大 ${config.maxTimeoutSeconds} 秒。`, integer(config.maxTimeoutSeconds), config.defaultTimeout),
-  { ...value("model", ["-m", "--model"], "名称", "模型名，默认自动选择；允许字母、数字及 . _ - / : [ ]。", model), repeat: "overwrite" },
-  { ...value("reasoning", ["-r", "--reasoning"], "级别", `推理级别：${config.reasoningEfforts.join("|")}；默认自动至 xhigh。`, choice(config.reasoningEfforts)), repeat: "overwrite" },
+  { ...value("model", ["-m", "--model"], "名称", "模型名；run 续跑默认沿用线程原模型，新开按 config 或自动选择；允许字母、数字及 . _ - / : [ ]。", model), repeat: "overwrite" },
+  { ...value("reasoning", ["-r", "--reasoning"], "级别", `推理级别：${config.reasoningEfforts.join("|")}；run 续跑默认沿用原强度；换模型不带 -r 时按 config 或自动选择（最高 xhigh），无法确定时要求 -r。`, choice(config.reasoningEfforts)), repeat: "overwrite" },
   { ...value("sandbox", ["-s", "--sandbox"], "模式", `沙箱：${config.sandboxModes.join("|")}；默认 workspace-write。`, choice(config.sandboxModes), config.defaultSandbox), repeat: "overwrite" },
   { ...value("approval", ["--approval"], "策略", `审批：${config.approvalModes.join("|")}；默认 never。`, choice(config.approvalModes), config.defaultApprovalPolicy), repeat: "overwrite" },
 ];

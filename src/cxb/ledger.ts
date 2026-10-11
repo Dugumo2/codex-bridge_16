@@ -160,7 +160,7 @@ export function readRunRecord(workspaceDir: string, runId: string): RunResult | 
   return payload;
 }
 
-/** 该线程的全部运行记录（运行属于它，或它是运行的 review 子线程），按 startedAt 升序。
+/** 该线程的全部运行记录（运行属于它，或它是运行的 review 子线程），按创建顺序升序。
  *  任何一条损坏都抛 LOCAL_ERROR（规格 3.3 节：日志损坏为 1）。 */
 export function listThreadRuns(workspaceDir: string, threadId: string): RunResult[] {
   return readAllRuns(workspaceDir).filter((run) => run.threadId === threadId || run.reviewThreadId === threadId)

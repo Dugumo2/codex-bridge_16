@@ -307,7 +307,10 @@ process.stdin.on("data", (chunk: string) => {
         send({ id: msg.id, result: { data: [], nextCursor: null, backwardsCursor: null } });
         break;
       case "model/list":
-        send({ id: msg.id, result: { data: modelOptions?.models ?? [], nextCursor: null } });
+        // 模型沿用黑盒用自己的目录；其余生命周期/停止用例使用正常目录，确保续跑能进入待验证的 broker 门禁。
+        // 空目录与无法确定强度的退出 1 由 run-model 用例单独覆盖。
+        send({ id: msg.id, result: { data: modelOptions?.models ?? [{ id: "gpt-mock", isDefault: true, upgrade: null,
+          supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null } });
         break;
       case "fixture/modelNextTurn":
         if (!modelOptions) {

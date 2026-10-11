@@ -2,7 +2,7 @@
 import { resolveModel, validateEffort } from "../config";
 import { fetchModels, pickAutoEffort, pickBestModel } from "../models";
 import type { Model } from "../types";
-import { CxbError, type BrokerRpc, type RunResult } from "./contracts";
+import { CxbError, rpcFailure, type BrokerRpc, type RunResult } from "./contracts";
 import { latestModelRun, readAllRuns } from "./ledger";
 import type { Output } from "./output";
 
@@ -17,7 +17,10 @@ export function selectRunModel(options: {
 }): ModelSelection {
   const { explicit, inherited, models, out, resume } = options;
   const configuredModel = resolveModel(options.model);
-  const configuredEffort = validateEffort(options.reasoning);
+  let configuredEffort: string | undefined;
+  try { configuredEffort = validateEffort(options.reasoning); } catch (cause) {
+    throw new CxbError("USAGE", "推理强度无效", { cause });
+  }
   const model = (explicit.has("model") ? configuredModel : undefined) ?? inherited?.model ?? configuredModel ?? pickBestModel(models ?? []);
   const modelSource = explicit.has("model") ? "-m 指定" : inherited ? inherited.source : configuredModel ? "config 默认" : "自动选择";
   const entry = models?.find((item) => item.id === model);
@@ -46,7 +49,11 @@ export function selectRunModel(options: {
         if (!known) out.notice(`无法从目录核实强度，使用 config 默认 ${reasoning}`);
       } else out.notice(`${model} 目录未列出 config 强度 ${configuredEffort}，改为自动选择`);
     }
-    if (!reasoning && known) reasoning = pickAutoEffort(supported!);
+    if (!reasoning && known) {
+      reasoning = pickAutoEffort(supported!);
+      // 新目录可能只列出高于自动上限或尚不认识的值，不能误报为已经自动选定。
+      if (!reasoning) out.notice(`${model} 目录中没有可自动选择的推理强度（最高 xhigh）`);
+    }
     if (!reasoning) {
       if (!resume) {
         reasoningSource = "服务器默认";
@@ -70,18 +77,21 @@ export async function resolveRunModel(options: {
   let inherited: InheritedModel | undefined;
   if (threadId) {
     const disk = readAllRuns(options.workspaceDir);
-    const snapshot = await request<{ run?: RunResult | null; runs?: RunResult[] | null }>("broker/threads/watch", { threadId, includeRuns: true });
-    const run = latestModelRun(threadId, disk, snapshot.runs ?? (snapshot.run ? [snapshot.run] : []));
+    let online: RunResult[] = [];
+    try {
+      const snapshot = await request<{ run?: RunResult | null; runs?: RunResult[] | null }>("broker/threads/watch", { threadId, includeRuns: true });
+      online = snapshot.runs ?? (snapshot.run ? [snapshot.run] : []);
+    } catch (error) {
+      options.rethrow(error);
+      // 索引缺失或仅在上游存在的线程还不能 watch，仍可读磁盘与 thread/read。
+      if (rpcFailure(error).reason !== "unknownThread") throw error;
+    }
+    const run = latestModelRun(threadId, disk, online);
     if (run) inherited = { model: run.meta!.model!, effort: run.meta!.effort, source: "沿用线程" };
-    if (!inherited || options.shared) {
+    if (!inherited) {
       let upstream: ThreadModel | undefined;
       try { upstream = await options.readThread(); } catch (error) { options.rethrow(error); }
-      if (inherited) {
-        if (!upstream?.model) out.notice("未能与上游核对线程当前模型与强度");
-        else if (inherited.model !== upstream.model || (inherited.effort ?? null) !== (upstream.reasoningEffort ?? null)) {
-          out.notice(`沿用 cxb 最近记录 ${inherited.model}/${inherited.effort ?? "未登记"}，上游当前配置为 ${upstream.model}/${upstream.reasoningEffort ?? "未登记"}`);
-        }
-      } else if (upstream?.model) {
+      if (upstream?.model) {
         inherited = { model: upstream.model, effort: upstream.reasoningEffort, source: "沿用上游记录" };
         out.notice("没有合格的 cxb 模型记录，沿用上游记录");
       } else out.notice("无法确定线程原模型，退回显式参数、config 默认或自动选择");
@@ -93,6 +103,16 @@ export async function resolveRunModel(options: {
     out.notice("无法读取模型目录，无法核实模型与推理强度");
   }
   const selection = selectRunModel({ ...options, resume: !!threadId, inherited, models });
+  // 只有本次确实沿用 cxb 值才核对；显式换模型不能提示成「沿用」旧模型。
+  if (options.shared && inherited?.source === "沿用线程"
+    && (selection.modelSource === "沿用线程" || selection.reasoningSource === "沿用线程")) {
+    let upstream: ThreadModel | undefined;
+    try { upstream = await options.readThread(); } catch (error) { options.rethrow(error); }
+    if (!upstream?.model) out.notice("未能与上游核对线程当前模型与强度");
+    else if (inherited.model !== upstream.model || (inherited.effort ?? null) !== (upstream.reasoningEffort ?? null)) {
+      out.notice(`沿用 cxb 最近记录 ${inherited.model}/${inherited.effort ?? "未登记"}，上游当前配置为 ${upstream.model}/${upstream.reasoningEffort ?? "未登记"}`);
+    }
+  }
   out.progress(`模型：${selection.model ?? "服务器自动选择"}（${selection.modelSource}）；推理强度：${selection.reasoning ?? "未发送"}（${selection.reasoningSource}）`);
   return selection;
 }
