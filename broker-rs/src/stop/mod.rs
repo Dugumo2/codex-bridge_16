@@ -410,7 +410,14 @@ impl Machine {
         clear: bool,
         actions: &mut Vec<Action>,
     ) -> Option<String> {
-        self.convergence_cancel_for_thread(thread, crate::sa1b::ReconcileCancel::Stop, actions);
+        self.convergence_cancel_for_thread(
+            thread,
+            match reason {
+                StopReason::ClientDisconnected => crate::sa1b::ReconcileCancel::OwnerGone,
+                _ => crate::sa1b::ReconcileCancel::Stop,
+            },
+            actions,
+        );
         if self.tree_stop_gate(thread, reason, clear, actions) {
             return None;
         }
@@ -817,7 +824,11 @@ impl Machine {
         let turn = op.turn_absent || op.target.as_ref().is_some_and(|t| op.ended.contains(t));
         let brake = op.brake_version == Some(self.stops.version(&op.thread));
         let settled = claim.is_none_or(|c| !c.request_pending)
-            && !self.stops.changes.values().any(|c| c.thread == op.thread);
+            && !self.stops.changes.values().any(|c| c.thread == op.thread)
+            && op
+                .run_id
+                .as_deref()
+                .is_none_or(|run| !self.convergence_root_unsettled(run));
         StopCheck {
             ownership,
             turn_ended: turn,
@@ -1911,6 +1922,7 @@ impl Machine {
                         | Operation::ContinueRead(_)
                         | Operation::GoalRestore(_)
                         | Operation::DerivedStop { .. }
+                        | Operation::Discovery { .. }
                 )
             {
                 // 续跑核实读、goal 恢复读与派生停止的 goal 读由各自持有版本并核对，公共过滤不得吞掉它们的回包。

@@ -216,13 +216,21 @@ impl Machine {
         })
     }
     pub fn thread_capability(&self, thread_id: &str) -> Option<bool> {
-        self.thread_relation(thread_id)?.can_accept_direct_input
+        self.convergences
+            .capabilities
+            .get(thread_id)
+            .filter(|(epoch, _)| *epoch == self.relations.conn_epoch)
+            .map(|(_, capability)| *capability)
+            .or_else(|| {
+                self.thread_relation(thread_id)
+                    .and_then(|r| r.can_accept_direct_input)
+            })
     }
     /// 给自然结束门禁用：活动成员、待答请求、在途派生、未决候选算 some；
     /// 成员上有未归属的活动轮次、或可能属于本运行的回查未决算 unknown。
     pub fn has_managed_activity(&self, run_id: &str) -> Activity {
         let Some(context) = self.relations.contexts.get(run_id) else {
-            return Activity::None;
+            return Activity::Unknown;
         };
         let now = self.clock.mono_ms;
         let mut unknown = false;
@@ -302,7 +310,16 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         if let DiscoveryCaller::Converge { token, work_epoch } = caller {
-            self.convergence_discovery_done(token, work_epoch, result, actions);
+            if self
+                .convergences
+                .progress
+                .get(&token.run_id)
+                .and_then(|p| p.discovery)
+                .map(|p| p.0)
+                == Some(op_id)
+            {
+                self.convergence_discovery_done(token, work_epoch, result, actions);
+            }
         } else {
             self.discovery_apply(op_id, caller, result, actions);
         }
@@ -319,6 +336,9 @@ impl Machine {
         self.ensure_sweep(actions);
     }
     pub fn on_handoff(&mut self, run_id: &str, kind: HandoffKind, actions: &mut Vec<Action>) {
+        if matches!(kind, HandoffKind::Joined | HandoffKind::External) {
+            self.convergence_authority_lost(run_id, actions);
+        }
         self.routing_handoff(run_id, kind, actions)
     }
     pub fn on_unclaimed_turn(

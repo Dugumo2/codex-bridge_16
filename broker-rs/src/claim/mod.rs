@@ -921,7 +921,13 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             state.inbox_reply_written(op, outcome, &mut actions)
         }
         Event::Restore { index, runs, inbox } => {
+            let previous: Vec<_> = runs
+                .iter()
+                .filter(|r| r.subagent_join.is_some())
+                .map(|r| (r.run_id.clone(), r.interrupt_reason))
+                .collect();
             state.restore_runs(index, runs, &mut actions);
+            state.convergence_restored(&previous, &mut actions);
             state.inbox_restore(inbox, &mut actions);
         }
         Event::RunsFinalize => {
@@ -936,6 +942,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     }
     // 空转刹车在停止驱动之前结算，触发的停止当场发出请求。
     state.drive_loop_guards(&mut actions);
+    state.drive_convergences(&mut actions);
     // stop 的取消屏障与超时对账可能直接结束 settling；在同一事件内清掉旧缓冲，
     // 再驱动停止后继。stop 模块保持 M4 的接口与行为。
     state.clear_cancelled_settling(&mut actions);
@@ -956,6 +963,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.lifecycle_drive(&mut actions);
     state.prune_goal_versions();
     state.prune_contexts();
+    state.convergence_prune();
     if let Some((run, timeout_tag)) = finished_start {
         if timeout_tag.is_none_or(|tag| actions.iter().any(|action| matches!(action, Action::ForgetLate { tag: forgotten } if *forgotten == tag))) {
             state.runs.inflight_starts.remove(&run);
@@ -1337,6 +1345,57 @@ impl Machine {
 
     /// #2 的屏障：只有 resume 回包进入邮箱后才取出流式请求。
     fn submit_stream(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
+        // 独立收敛配置只在 broker 内保存，不能作为未知扩展参数发给上游。
+        if let Some(value) = self
+            .claims
+            .get(thread_id)
+            .and_then(|c| c.pending_start.as_ref())
+            .and_then(|r| r.params.as_ref())
+            .and_then(|p| p.get("cxbConvergence"))
+            .cloned()
+        {
+            let config = serde_json::from_value::<crate::sa1b::ConvergenceConfig>(value)
+                .ok()
+                .filter(|c| {
+                    c.timeout_ms > 0
+                        && c.discovery_timeout_ms > 0
+                        && c.discovery_max_interval_ms > 0
+                        && c.discovery_backoff_ms.iter().all(|v| *v > 0)
+                        && c.result_limits.read_timeout_ms > 0
+                        && c.result_limits.max_concurrent_reads > 0
+                });
+            let Some(config) = config else {
+                if let Some(request) = self.claims.get_mut(thread_id).and_then(|c| {
+                    c.request_pending = false;
+                    c.pending_start.take()
+                }) {
+                    send_error(
+                        &request,
+                        -32602,
+                        "cxbConvergence 必须是有效的独立收敛配置",
+                        actions,
+                    );
+                }
+                self.release_with_kind(thread_id, ReleaseKind::StartFailed, actions);
+                return;
+            };
+            if let Some(run) = self.claims.get(thread_id).and_then(|c| c.run_id.clone()) {
+                if let Some(record) = self.runs.runs.get_mut(&run) {
+                    record.convergence_config = Some(config);
+                }
+                self.runs.put(&run, actions);
+            }
+            if let Some(params) = self
+                .claims
+                .get_mut(thread_id)
+                .and_then(|c| c.pending_start.as_mut())
+                .and_then(|r| r.params.as_mut())
+                .and_then(Value::as_object_mut)
+            {
+                params.remove("cxbConvergence");
+            }
+        }
+
         if let Some(error) = self.lifecycle_error(thread_id) {
             if let Some(request) = self
                 .claims
@@ -1434,6 +1493,21 @@ impl Machine {
         {
             self.lifecycle_reply(thread, operation, *attempt, result, true, actions);
             return;
+        }
+        // 收敛发现回包先校验全身份，再由发现层学习；旧代际不得进入公共 learn_traffic。
+        if let Operation::Discovery { op_id, generation } = context.operation {
+            if let Some(crate::relations::DiscoveryCaller::Converge { token, .. }) = self
+                .relations
+                .discoveries
+                .get(&op_id)
+                .map(|o| o.caller.clone())
+            {
+                if self.convergence_token_current(&token) && !self.closing && !self.quiescing {
+                    self.relation_reply(&context, result, actions);
+                }
+                let _ = generation;
+                return;
+            }
         }
         self.release_stream_slot(context.stream_id);
         if self.closing {
@@ -2261,6 +2335,17 @@ impl Machine {
                 self.started(thread_id, id, actions);
             }
         } else if event.method == "turn/completed" {
+            if self.claims.get(thread_id).is_some_and(|c| {
+                c.run_id.as_ref().is_some_and(|run| {
+                    self.runs
+                        .runs
+                        .get(run)
+                        .is_some_and(|r| r.subagent_join.is_some())
+                }) && notification_turn_id(&event.params)
+                    .is_some_and(|t| !c.owned_turns.contains(t))
+            }) {
+                return;
+            }
             if self.stop_busy(thread_id) {
                 if let Some(id) = notification_turn_id(&event.params) {
                     self.stop_completed_turn(thread_id, id, actions);
@@ -2468,7 +2553,12 @@ impl Machine {
             .get(thread_id)
             .and_then(|c| c.run_id.as_ref())
             .and_then(|run| self.runs.runs.get(run))
-            .and_then(|r| r.turns.last())
+            .and_then(|r| {
+                r.current_turn_id
+                    .as_ref()
+                    .and_then(|id| r.turns.iter().find(|t| &t.turn_id == id))
+                    .or_else(|| r.turns.last())
+            })
             .map(|t| t.status);
         let goal_status = self
             .records
@@ -2538,6 +2628,7 @@ impl Machine {
     pub(crate) fn learn_goal(&mut self, thread_id: &str, active: bool, actions: &mut Vec<Action>) {
         self.record(thread_id).goal_active = active;
         self.observe_goal(thread_id, active);
+        self.convergence_observe_goal(thread_id, active, actions);
         if self.convergence_event(
             thread_id,
             converge::ConvergeEvent::GoalChanged { active },
@@ -2748,6 +2839,43 @@ impl Machine {
         kind: ReleaseKind,
         actions: &mut Vec<Action>,
     ) {
+        if kind == ReleaseKind::Natural {
+            if let Some(run) = self.claims.get(thread_id).and_then(|c| c.run_id.clone()) {
+                let waiting = self
+                    .convergences
+                    .runs
+                    .get(&run)
+                    .is_some_and(|r| !r.automatic_control_revoked)
+                    && self
+                        .runs
+                        .runs
+                        .get(&run)
+                        .and_then(|r| r.subagent_join.as_ref())
+                        .is_some_and(|j| j.phase != crate::sa1b::JoinPhase::Released);
+                if waiting && self.trees.aux.committing.as_deref() != Some(thread_id) {
+                    let status = self
+                        .runs
+                        .runs
+                        .get(&run)
+                        .and_then(|r| {
+                            r.current_turn_id
+                                .as_ref()
+                                .and_then(|id| r.turns.iter().find(|t| &t.turn_id == id))
+                        })
+                        .map(|t| t.status);
+                    let goal = self
+                        .records
+                        .get(thread_id)
+                        .and_then(|r| r.goal_status.clone());
+                    if self
+                        .convergence_release_gate(thread_id, goal.as_deref(), status, actions)
+                        .is_some()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
         if self.tree_release_gate(thread_id, kind, actions) {
             return;
         }
