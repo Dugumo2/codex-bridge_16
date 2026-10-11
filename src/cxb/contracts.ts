@@ -219,6 +219,8 @@ export type ApprovalPolicyName = "never" | "auto" | "on-request" | "on-failure" 
 
 /** 2.3 节 RunMeta：annotate 登记、随运行记录返回。 */
 export interface RunMeta {
+  model?: string | null;
+  effort?: string | null;
   approval?: ApprovalPolicyName;
   approvalsReviewer?: string;
   sandbox?: string;
@@ -237,7 +239,11 @@ export interface TurnResult {
   /** 原样的上游 TurnError 或启动失败的 RPC 错误对象。 */
   error: unknown;
   completedAt: number;
+  /** 本轮收到的 model/rerouted；只用于显示注明，不改变沿用值。 */
+  reroute?: Reroute | null;
 }
+
+export interface Reroute { fromModel: string; toModel: string; reason: string }
 
 export interface ProgressItem { itemId: string; type: string; summary: string }
 
@@ -252,6 +258,12 @@ export interface LoopGuardReport {
 }
 
 export interface RunResult {
+  /** 最近一次已开始的轮次；结束后保留，旧记录缺省为 null。 */
+  currentTurnId?: string | null;
+  creationOrder?: { epoch: number; sequence: number };
+  startConfirmation?: { confirmed: boolean; owned: boolean | null; threadId: string | null; turnId: string | null };
+  /** 运行中的轮尚无 TurnResult 时暂存的改道；轮结束并入该轮结果后清空。 */
+  pendingReroute?: (Reroute & { turnId: string }) | null;
   children?: ChildRecord[];
   backgroundCleanup?: BackgroundCleanup;
   childrenStop?: ChildrenStopReport;
@@ -277,6 +289,23 @@ export interface RunResult {
   turns: TurnResult[];
   turnsTotal: number;
 }
+
+/** broker/runs/modelSummaries 的轻量回包，不含输入、输出正文。 */
+export interface RunModelSummary {
+  runId: string;
+  threadId: string;
+  reviewThreadId: string | null;
+  state: RunResult["state"];
+  startedAt: number;
+  creationOrder: NonNullable<RunResult["creationOrder"]> | null;
+  startConfirmation: NonNullable<RunResult["startConfirmation"]>;
+  meta: Pick<RunMeta, "source" | "model" | "effort"> | null;
+  currentTurnId: string | null;
+  lastTurn: { turnId: string; reroute: Reroute | null } | null;
+  pendingReroute: NonNullable<RunResult["pendingReroute"]> | null;
+}
+
+export type ModelRun = RunResult | RunModelSummary;
 
 export type InboxKind = "approval" | "question" | "mcp" | "guardian";
 

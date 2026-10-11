@@ -113,6 +113,8 @@ pub struct GoalChange {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LateStart {
+    /// 原请求的运行身份，认领释放或换代后仍可补写原记录。
+    pub run_id: Option<String>,
     pub stream_id: Option<u64>,
     pub review_id: Option<u64>,
     pub token: ClaimToken,
@@ -2120,6 +2122,10 @@ impl Machine {
         let review = context.method == "review/start";
         let reconciling = review || target.is_none() || self.claims[&token.thread_id].settling();
         let registration = LateStart {
+            run_id: match &context.operation {
+                Operation::Stream { run_id } => run_id.clone(),
+                _ => None,
+            },
             stream_id: context.stream_id,
             review_id: context.review_id,
             token: token.clone(),
@@ -2524,6 +2530,8 @@ impl Machine {
         if self.closing {
             return;
         }
+        // 旧认领已释放或迟到追踪已收尾时，仍可补原运行的开轮事实，不能借用当前认领。
+        self.record_start_reply(&context, &result, actions);
         self.release_stream_slot(context.stream_id);
         context.client = None;
         if self.unwrap_goal_reply(&mut context, &result, false, actions) {
@@ -2704,6 +2712,9 @@ impl Machine {
         if owned {
             reg.ownership_proven = true;
             reg.late_settling = false;
+            if let Some(run) = &reg.run_id {
+                self.run_late_owned(run, actions);
+            }
             self.push_late(reg, actions);
             self.interrupt_late(generation, actions);
         } else {

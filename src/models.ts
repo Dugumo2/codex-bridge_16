@@ -60,7 +60,7 @@ export function pickBestModel(models: Model[]): string | undefined {
 
 /** Pick the highest reasoning effort a model supports, capped at the
  *  auto-select ceiling. */
-function pickAutoEffort(supported: Array<{ reasoningEffort: string }>): ReasoningEffort | undefined {
+export function pickAutoEffort(supported: Array<{ reasoningEffort: string }>): ReasoningEffort | undefined {
   const available = new Set(supported.map(s => s.reasoningEffort));
   const ceiling = config.reasoningEfforts.indexOf(config.autoEffortCeiling);
   for (let i = ceiling; i >= 0; i--) {
@@ -78,7 +78,7 @@ export async function resolveModelDefaults(
   client: RequestClient,
   preset: { model?: string; effort?: string },
 ): Promise<{ model?: string; effort?: string } | null> {
-  const models = await fetchAllPages<Model>(client, "model/list", { includeHidden: true });
+  const models = await fetchModels(client);
   if (models.length === 0) return null;
   const model = preset.model ?? pickBestModel(models);
   let effort = preset.effort;
@@ -87,4 +87,8 @@ export async function resolveModelDefaults(
     if (data?.supportedReasoningEfforts?.length) effort = pickAutoEffort(data.supportedReasoningEfforts);
   }
   return { model, effort };
+}
+
+export function fetchModels(client: RequestClient): Promise<Model[]> {
+  return fetchAllPages<Model>(client, "model/list", { includeHidden: true });
 }

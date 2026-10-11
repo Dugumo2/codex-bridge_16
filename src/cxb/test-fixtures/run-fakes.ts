@@ -1,4 +1,4 @@
-import { CxbError, type BrokerRpc, type RunResult } from "../contracts";
+import { CxbError, type BrokerRpc, type RunResult, type RunModelSummary } from "../contracts";
 import { NO_RESPONSE } from "../../rpc";
 import { watchdog } from "./test-watchdog";
 
@@ -74,4 +74,15 @@ export function runResult(patch: Partial<RunResult> = {}): RunResult {
 
 export function wireError(code: number, message: string) {
   return new CxbError("BROKER_UNAVAILABLE", "远端请求失败", { cause: { rpcCode: code, detail: message } });
+}
+
+/** 严格按公共摘要接口构造回包，避免测试意外依赖完整记录的正文或 turns。 */
+export function modelSummary(run: RunResult): RunModelSummary {
+  const last = run.turns.at(-1);
+  return { runId: run.runId, threadId: run.threadId, reviewThreadId: run.reviewThreadId, state: run.state,
+    startedAt: run.startedAt, creationOrder: run.creationOrder ?? null,
+    startConfirmation: run.startConfirmation ?? { confirmed: false, owned: null, threadId: null, turnId: null },
+    meta: run.meta ? { source: run.meta.source, model: run.meta.model ?? null, effort: run.meta.effort ?? null } : null,
+    currentTurnId: run.currentTurnId ?? null, lastTurn: last ? { turnId: last.turnId, reroute: last.reroute ?? null } : null,
+    pendingReroute: run.pendingReroute ?? null };
 }

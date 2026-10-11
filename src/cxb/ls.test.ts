@@ -42,6 +42,7 @@ describe("ls", () => {
     const t = context(dir, ["ls", "--json"]);
     t.fake.handle = (method, p) => {
       if (method === "broker/threads/list") return { threads: [summary({ state: "awaiting" })] };
+      if (method === "broker/runs/modelSummaries") return { runs: [] };
       expect(p).toEqual({ cwd: dir, cursor: null, limit: 50, sortKey: "updated_at", sortDirection: "desc", sourceKinds: ["cli", "vscode", "exec", "appServer"] });
       return { data: [{ id: "server", updatedAt: 3, status: { type: "notLoaded" } }, { id: "thread-test", updatedAt: 2, preview: "不采用" }], nextCursor: null };
     };
@@ -59,13 +60,14 @@ describe("ls", () => {
     expect(await ls(t.ctx)).toBe(0);
     expect(t.json[0]).toMatchObject({ source: "local", truncated: false });
     expect(t.json[0].items).toHaveLength(1);
-    expect(t.notices).toHaveLength(1);
+    expect(t.notices).toHaveLength(disconnected ? 1 : 2);
   });
   test("分页相等边界继续翻，老线程后页仍进入前 N", async () => {
     ledger(dir, [], [summary({ lastRunId: null, updatedAt: 1000 })]);
     const t = context(dir, ["ls", "--limit", "2", "--json"]);
     t.fake.handle = (m, p) => {
       if (m === "broker/threads/list") return { threads: [summary({ lastRunId: null, updatedAt: 1000 })] };
+      if (m === "broker/runs/modelSummaries") return { runs: [] };
       return p.cursor === null ? { data: [{ id: "z", updatedAt: 9 }, { id: "y", updatedAt: 8 }], nextCursor: "下一页" }
         : { data: [{ id: "a", updatedAt: 8 }, { id: "b", updatedAt: 7 }], nextCursor: "更老" };
     };
@@ -77,7 +79,7 @@ describe("ls", () => {
   test("all 不截断且不设页数上限", async () => {
     const t = context(dir, ["ls", "--all", "--json"]);
     let pages = 0;
-    t.fake.handle = (m) => m === "broker/threads/list" ? { threads: [] }
+    t.fake.handle = (m) => m === "broker/threads/list" ? { threads: [] } : m === "broker/runs/modelSummaries" ? { runs: [] }
       : { data: [{ id: `线程-${++pages}`, updatedAt: 100 - pages }], nextCursor: pages < 30 ? String(pages) : null };
     expect(await ls(t.ctx)).toBe(0);
     expect(pages).toBe(30);

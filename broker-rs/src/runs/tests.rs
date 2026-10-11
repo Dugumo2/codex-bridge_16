@@ -58,6 +58,8 @@ use crate::results::{Snapshot, MAX_TEXT_BYTES};
 use crate::store::{StoreOp, RETENTION_MS};
 use serde_json::json;
 
+mod model_inherit;
+
 #[test]
 fn n7_每类日志带运行编号且内容清洗与空内容符合四段格式() {
     let mut m = machine();
@@ -333,7 +335,7 @@ fn short_id_collision_and_reply_field_locations() {
     assert_ne!(m.runs.runs["甲"].short_id, m.runs.runs["乙"].short_id);
     assert_eq!(m.runs.runs["乙"].short_id.len(), 8);
     let mut actions = Vec::new();
-    m.run_learn_thread("提示参数", &json!({"model":"模型","cwd":"错误位置","thread":{"id":"真线程","cwd":"真实目录","preview":"预览"}}), &mut actions);
+    m.run_learn_thread("提示参数", &json!({"model":"模型","cwd":"错误位置","thread":{"id":"真线程","cwd":"真实目录","preview":"预览"}}), true, &mut actions);
     let entry = m
         .runs
         .index
@@ -343,7 +345,12 @@ fn short_id_collision_and_reply_field_locations() {
         .unwrap();
     assert_eq!(entry.cwd.as_deref(), Some("真实目录"));
     assert_eq!(entry.model.as_deref(), Some("模型"));
-    m.run_learn_thread("真线程", &json!({"thread":{"id":"真线程"}}), &mut actions);
+    m.run_learn_thread(
+        "真线程",
+        &json!({"thread":{"id":"真线程"}}),
+        true,
+        &mut actions,
+    );
     let entry = m
         .runs
         .index
@@ -993,7 +1000,7 @@ fn shutdown_accepts_only_inflight_then_finalized_is_silent() {
     actions.clear();
     m.run_timer(retry.clone(), &mut actions);
     m.run_timer(RunTimer::DailyCleanup, &mut actions);
-    m.run_learn_thread("线程", &json!({"thread":{"id":"线程"}}), &mut actions);
+    m.run_learn_thread("线程", &json!({"thread":{"id":"线程"}}), true, &mut actions);
     m.run_forget_thread("线程", &mut actions);
     m.run_released("运行", ReleaseKind::Shutdown, &mut actions);
     actions.extend(complete(&mut m, "运行", "线程", "迟到", json!([])));
@@ -1241,7 +1248,7 @@ fn all_finalized_hooks_produce_no_actions_and_keep_records() {
     m.run_stop_check("运行", check(), &mut actions);
     m.run_stop_confirmed("运行", &mut actions);
     m.run_released("运行", ReleaseKind::Natural, &mut actions);
-    m.run_learn_thread("线程", &json!({"thread":{"id":"线程"}}), &mut actions);
+    m.run_learn_thread("线程", &json!({"thread":{"id":"线程"}}), true, &mut actions);
     m.run_forget_thread("线程", &mut actions);
     m.run_result_reply(read.clone(), success(&read, "迟到成功"), &mut actions);
     m.run_timer(RunTimer::ResultRetry(read), &mut actions);
@@ -1567,6 +1574,7 @@ fn 索引预览按字符保留二百字符且回包不改变其他字段() {
         m.run_learn_thread(
             "线程",
             &json!({"thread":{"id":"线程","preview":preview,"cwd":"目录"},"model":"模型"}),
+            true,
             &mut actions,
         );
         let entry = m.runs.index.threads.values().next().unwrap();

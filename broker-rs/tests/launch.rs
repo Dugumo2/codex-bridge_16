@@ -743,6 +743,99 @@ fn pid_of(value: &Value) -> u32 {
 }
 
 #[test]
+fn mi_命名管道六兆输出摘要无正文且批量超过256线程不占配额() {
+    let _serial = serial();
+    let env = Env::new();
+    let cwd = env.workspace("模型摘要");
+    let endpoint = env.endpoint("model-summary");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let turns: Vec<_> = (0..6).map(|i| json!({
+        "turnId":format!("轮-{i}"),"ready":"ready","status":"completed",
+        "output":"x".repeat(1024*1024),"outputSource":"finalAnswer","error":null,"completedAt":now,
+    })).collect();
+    let record: cxb_broker::runs::RunRecord = serde_json::from_value(json!({
+        "runId":"run-big","threadId":"大输出线程","shortId":"12345678","joined":false,
+        "state":"ended","status":"completed","startedAt":now,"endedAt":now,
+        "meta":{"source":"run","model":"astra","effort":"high","goal":{"text":"不应出现在摘要"}},
+        "reviewThreadId":null,"reviewShortId":null,"input":"不应出现在摘要的输入",
+        "continuedFrom":null,"interruptReason":null,"stopOutcome":null,"stopCheck":null,
+        "progress":{"done":[],"doneTotal":0,"unconfirmed":[],"observedFiles":[]},
+        "turns":turns,"turnsTotal":6,"currentTurnId":"轮-5",
+        "startConfirmation":{"confirmed":true,"owned":true,"threadId":"大输出线程","turnId":"轮-0"},
+    }))
+    .unwrap();
+    let runs = cxb_broker::store::workspace_dir(&env.cxb_home, &cwd).join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    std::fs::write(
+        runs.join("run-big.json"),
+        serde_json::to_vec(&json!({"epoch":0,"revision":1,"payload":record})).unwrap(),
+    )
+    .unwrap();
+    let (_, broker) = env.launch(&endpoint, &cwd, &[]);
+    let broker = broker.expect("broker 应存活");
+    block_on(async {
+        let mut client = Client::connect(&endpoint, REQUEST_LIMIT).await;
+        let summary = client
+            .request(
+                "broker/runs/modelSummaries",
+                json!({"threadIds":["大输出线程"]}),
+            )
+            .await;
+        assert!(summary.to_string().len() < 2048);
+        let run = &summary["result"]["runs"][0];
+        assert_eq!(run["runId"], "run-big");
+        assert_eq!(run["currentTurnId"], "轮-5");
+        assert_eq!(run["lastTurn"], json!({"turnId":"轮-5","reroute":null}));
+        assert_eq!(
+            run["meta"],
+            json!({"source":"run","model":"astra","effort":"high"})
+        );
+        for field in ["input", "turns", "progress", "output"] {
+            assert!(run.get(field).is_none());
+        }
+        // 旧客户端即使仍携带已删除的参数，也不能再收到重复正文。
+        let snapshot = client
+            .request(
+                "broker/threads/watch",
+                json!({"threadId":"大输出线程","includeRuns":true}),
+            )
+            .await;
+        assert!(snapshot["result"].get("runs").is_none());
+        let bytes = snapshot.to_string().len();
+        assert!(
+            (6 * 1024 * 1024..10 * 1024 * 1024).contains(&bytes),
+            "watch 不得重复发送正文：{bytes}"
+        );
+        let threads: Vec<_> = (0..300).map(|i| format!("线程-{i}")).collect();
+        for thread in &threads {
+            let started = client
+                .request("turn/start", json!({"threadId":thread,"input":[]}))
+                .await;
+            assert!(started.get("error").is_none(), "{started}");
+        }
+        let summary = client
+            .request("broker/runs/modelSummaries", json!({"threadIds":threads}))
+            .await;
+        assert_eq!(summary["result"]["runs"].as_array().unwrap().len(), 300);
+        // 大输出线程已占一个 watch 槽；摘要不能消费余下 255 个。
+        for thread in threads.iter().take(255) {
+            let watched = client
+                .request("broker/threads/watch", json!({"threadId":thread}))
+                .await;
+            assert!(watched.get("error").is_none(), "{watched}");
+        }
+        let summary = client
+            .request("broker/runs/modelSummaries", json!({"threadIds":threads}))
+            .await;
+        assert_eq!(summary["result"]["runs"].as_array().unwrap().len(), 300);
+    });
+    block_on(shutdown(&endpoint, &broker));
+}
+
+#[test]
 fn launch_立即退出_输出与额外句柄都不泄漏给_serve_且依据一致() {
     let _guard = serial();
     let env = Env::new();

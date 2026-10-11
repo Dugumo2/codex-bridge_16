@@ -270,7 +270,9 @@ function unitExecution(args: string[], server: "private" | "shared" = "private")
   const ctx: CommandContext = { parsed, out, workspace: h.workspace, connect: async () => connection,
     registerCleanup(callback) { callbacks.add(callback); return () => { callbacks.delete(callback); }; } };
   fake.handle = (method) => {
-    if (method === "model/list") return { data: [], nextCursor: null };
+    if (method === "broker/runs/modelSummaries") return { runs: [] };
+    if (method === "model/list") return { data: [{ id: "mock-model", isDefault: true, upgrade: null,
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
     if (method === "thread/start") return { thread: { id: "thread-test" } };
     if (method === "broker/threads/annotate") return { shortId: "abcd1234" };
     if (method === "thread/goal/get") return { goal: null };
@@ -523,13 +525,14 @@ function writeRunRecord(run: RunResult) {
   writeFileSync(join(dir, `${run.runId}.json`), JSON.stringify({ epoch: 1, revision: 1, payload: run }));
 }
 
-/** 续跑桩：第一次 watch 返回被中断的原运行，之后返回续跑出的新运行。 */
+/** 续跑桩：模型历史查询独立；第一次普通 watch 返回原运行，之后返回新运行。 */
 function continueUnit(args: string[], opts: { from?: RunResult; server?: "private" | "shared"; turnStart?: (params: any) => unknown } = {}) {
   const unit = unitExecution(["run", "--resume", "abcd1234", "--continue", ...args], opts.server);
   const original = unit.fake.handle;
   let watches = 0;
   unit.fake.handle = (method, params) => {
     if (method === "broker/threads/list") return { threads: [{ threadId: "thread-test", shortId: "abcd1234" }] };
+    if (method === "broker/runs/modelSummaries") return { runs: [] };
     if (method === "broker/threads/watch") return { run: watches++ === 0 ? (opts.from ?? interrupted()) : runResult({ continuedFrom: "run-old" }) };
     if (method === "thread/goal/get") return { goal: { objective: "目标原文", status: "paused" } };
     if (method === "turn/start" && opts.turnStart) return opts.turnStart(params);
@@ -634,7 +637,7 @@ for (const [stage, method, hasRun] of [
   unit.fake.handle = (called, params) => {
     const afterStart = unit.fake.calls.some((c) => c.method === "turn/start");
     if (called === "broker/threads/stop") return { stopOutcome: "confirmed" };
-    if (called === method && (method !== "broker/threads/watch" || afterStart === hasRun)) {
+    if (called === method && (method !== "broker/threads/watch" || (afterStart === hasRun))) {
       if (hasRun && called === "turn/start") unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
       reached.resolve();
       return release.promise;

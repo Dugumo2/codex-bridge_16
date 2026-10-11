@@ -578,3 +578,138 @@ fn 尚未知轮次的认领允许本轮完成回退并生成结果() {
     assert_eq!(record.turns[0].ready, Ready::Ready);
     assert_eq!(record.turns[0].output, "补全输出");
 }
+
+fn index_model(m: &Machine, thread: &str) -> Option<String> {
+    m.runs
+        .index
+        .threads
+        .values()
+        .find(|entry| entry.thread_id == thread)
+        .and_then(|entry| entry.model.clone())
+}
+
+#[test]
+fn mi_内部恢复屏障前后模型不同仍不改索引() {
+    let mut m = Machine::new(false);
+    let started = apply(
+        &mut m,
+        client(request(1, 1, "thread/start", json!({"model":"指定模型"}))),
+    );
+    reply(
+        &mut m,
+        &first_request(&started),
+        Ok(json!({"thread":{"id":"线程"},"model":"指定模型"})),
+    );
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("指定模型"));
+    // 未订阅时开轮先由 broker 自发恢复（屏障），回包带的是服务器默认模型。
+    m.record("线程").subscribed = false;
+    let actions = apply(
+        &mut m,
+        client(request(
+            1,
+            2,
+            "turn/start",
+            json!({"threadId":"线程","model":"开轮新模型","input":[{"type":"text","text":"输入"}]}),
+        )),
+    );
+    let barrier = first_request(&actions);
+    assert_eq!(barrier.operation, Operation::ResumeBarrier);
+    let actions = reply(
+        &mut m,
+        &barrier,
+        Ok(json!({"thread":{"id":"线程"},"model":"默认模型"})),
+    );
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("指定模型"));
+    let turn = first_request(&actions);
+    assert_eq!(turn.method, "turn/start");
+    reply(&mut m, &turn, Ok(json!({"turn":{"id":"本轮"}})));
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("指定模型"));
+}
+
+#[test]
+fn mi_仅客户端线程回包学习模型而开轮成功失败均不学习() {
+    let mut m = Machine::new(false);
+    let started = apply(&mut m, client(request(1, 1, "thread/start", json!({}))));
+    reply(
+        &mut m,
+        &first_request(&started),
+        Ok(json!({"thread":{"id":"线程"},"model":"原模型"})),
+    );
+    let context = |operation: Operation, method: &str, params: Value| RequestContext {
+        resume_retried: false,
+        stream_id: None,
+        review_id: None,
+        client: None,
+        token: None,
+        operation,
+        method: method.into(),
+        params: Some(params),
+    };
+    let mut actions = Vec::new();
+    for operation in [Operation::ContinueResume, Operation::ResumeBarrier] {
+        m.learn_traffic(
+            &context(operation, "thread/resume", json!({"threadId":"线程"})),
+            &Ok(json!({"thread":{"id":"线程"},"model":"默认模型"})),
+            &mut actions,
+        );
+    }
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("原模型"));
+    let stream = || Operation::Stream { run_id: None };
+    // 开轮失败、未指定模型、空模型都不改索引。
+    m.learn_traffic(
+        &context(
+            stream(),
+            "turn/start",
+            json!({"threadId":"线程","model":"新模型"}),
+        ),
+        &Err(json!({"code":-32600,"message":"拒绝"})),
+        &mut actions,
+    );
+    for params in [
+        json!({"threadId":"线程"}),
+        json!({"threadId":"线程","model":""}),
+    ] {
+        m.learn_traffic(
+            &context(stream(), "turn/start", params),
+            &Ok(json!({"turn":{"id":"轮"}})),
+            &mut actions,
+        );
+    }
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("原模型"));
+    m.learn_traffic(
+        &context(
+            stream(),
+            "turn/start",
+            json!({"threadId":"线程","model":"新模型"}),
+        ),
+        &Ok(json!({"turn":{"id":"轮"}})),
+        &mut actions,
+    );
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("原模型"));
+    // 陌生线程开轮不新建索引；客户端自己的恢复回包仍按回包改写。
+    m.learn_traffic(
+        &context(
+            stream(),
+            "turn/start",
+            json!({"threadId":"陌生线程","model":"新模型"}),
+        ),
+        &Ok(json!({"turn":{"id":"轮"}})),
+        &mut actions,
+    );
+    assert!(m
+        .runs
+        .index
+        .threads
+        .values()
+        .all(|e| e.thread_id != "陌生线程"));
+    m.learn_traffic(
+        &context(
+            Operation::Forward,
+            "thread/resume",
+            json!({"threadId":"线程"}),
+        ),
+        &Ok(json!({"thread":{"id":"线程"},"model":"客户端模型"})),
+        &mut actions,
+    );
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("客户端模型"));
+}

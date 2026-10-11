@@ -6,7 +6,7 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CxbError, type LifecycleInfo, type RunMeta, type RunResult } from "./contracts";
+import { CxbError, type LifecycleInfo, type RunMeta, type RunResult, type RunModelSummary, type ModelRun } from "./contracts";
 
 /** threads.json 里的一项（Rust runs::types::ThreadIndexEntry，只取 CLI 用到的字段）。 */
 export interface ThreadIndexEntry {
@@ -160,18 +160,73 @@ export function readRunRecord(workspaceDir: string, runId: string): RunResult | 
   return payload;
 }
 
-/** 该线程的全部运行记录（运行属于它，或它是运行的 review 子线程），按 startedAt 升序。
+/** 该线程的全部运行记录（运行属于它，或它是运行的 review 子线程），按创建顺序升序。
  *  任何一条损坏都抛 LOCAL_ERROR（规格 3.3 节：日志损坏为 1）。 */
 export function listThreadRuns(workspaceDir: string, threadId: string): RunResult[] {
+  return readAllRuns(workspaceDir).filter((run) => run.threadId === threadId || run.reviewThreadId === threadId)
+    .sort(compareRunCreation);
+}
+
+/** 一次扫描全部保留记录；沿用与批量显示共用，不能依赖线程索引或内存保留窗口。 */
+export function readAllRuns(workspaceDir: string): RunResult[] {
   const dir = join(workspaceDir, "runs");
   if (!existsSync(dir)) return [];
   const runs: RunResult[] = [];
   for (const name of readdirSync(dir)) {
     if (!name.endsWith(".json")) continue;
     const run = readRunRecord(workspaceDir, name.slice(0, -".json".length));
-    if (run && (run.threadId === threadId || run.reviewThreadId === threadId)) runs.push(run);
+    if (run) runs.push(run);
   }
-  return runs.sort((a, b) => a.startedAt - b.startedAt || a.runId.localeCompare(b.runId));
+  return runs;
+}
+
+/** 创建顺序不受墙钟回拨、同毫秒随机 runId、重写文件影响；旧记录统一排在新格式之前。 */
+export function compareRunCreation(a: ModelRun, b: ModelRun): number {
+  const x = a.creationOrder, y = b.creationOrder;
+  if (x && y) return x.epoch - y.epoch || x.sequence - y.sequence || a.runId.localeCompare(b.runId);
+  if (x || y) return x ? 1 : -1;
+  return a.startedAt - b.startedAt || a.runId.localeCompare(b.runId);
+}
+
+/** 在线状态覆盖同一运行的磁盘旧快照；根线程严格匹配，review/血缘不是继承关系。 */
+export function latestModelRun(threadId: string, disk: ModelRun[], online: ModelRun[] = []): ModelRun | undefined {
+  const runs = new Map([...disk, ...online].map((run) => [run.runId, run]));
+  return [...runs.values()].filter((run) => run.threadId === threadId && run.meta?.source === "run"
+    && run.startConfirmation?.confirmed === true && !!run.meta.model)
+    .sort(compareRunCreation).at(-1);
+}
+
+/** 模型沿用专用扫描：坏文件告警后跳过，不改变其他命令的严格账本校验。 */
+export function readModelRuns(workspaceDir: string, notice: (message: string) => void): {
+  runs: RunModelSummary[]; unreadable: Array<{ runId: string; threadId: string | null }>;
+} {
+  const runs: RunModelSummary[] = [];
+  const unreadable: Array<{ runId: string; threadId: string | null }> = [];
+  const dir = join(workspaceDir, "runs");
+  if (!existsSync(dir)) return { runs, unreadable };
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith(".json")) continue;
+    const runId = name.slice(0, -5);
+    let payload: unknown;
+    try {
+      payload = readPayload(join(dir, name), `运行记录 ${runId} `);
+      if (!isRunRecord(payload, runId)) throw new CxbError("LOCAL_ERROR", "运行记录结构损坏");
+      // 逐文件丢弃正文，避免保留整个工作区的历史输出。
+      const last = payload.turns.at(-1);
+      runs.push({ runId, threadId: payload.threadId, reviewThreadId: payload.reviewThreadId, state: payload.state,
+        startedAt: payload.startedAt, creationOrder: payload.creationOrder ?? null,
+        startConfirmation: payload.startConfirmation ?? { confirmed: false, owned: null, threadId: null, turnId: null },
+        meta: payload.meta ? { source: payload.meta.source, model: payload.meta.model, effort: payload.meta.effort } : null,
+        currentTurnId: payload.currentTurnId ?? null, lastTurn: last ? { turnId: last.turnId, reroute: last.reroute ?? null } : null,
+        pendingReroute: payload.pendingReroute ?? null });
+    } catch {
+      const threadId = isObject(payload) && payload.runId === runId && typeof payload.threadId === "string" && payload.threadId
+        ? payload.threadId : null;
+      unreadable.push({ runId, threadId });
+      notice(`运行记录 ${name} 无法解析，已跳过模型沿用读取`);
+    }
+  }
+  return { runs, unreadable };
 }
 
 function parseLog(text: string, label: string): LogLine[] {

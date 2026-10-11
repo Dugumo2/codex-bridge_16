@@ -149,7 +149,13 @@ pub enum ReleaseKind {
 /// 内存账本。活动记录随认领，历史最多 200 个线程；内部登记的清理随结果、释放和淘汰。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Runs {
+    pub(crate) epoch: u64,
+    next_creation_sequence: u64,
     pub(crate) verifying_history: std::collections::HashSet<RunId>,
+    /// 从开轮发出保留至回包或线上迟到等待结束；不依赖认领生命周期。
+    pub(crate) inflight_starts: std::collections::HashSet<RunId>,
+    /// 每次状态迁移末尾从迟到核实登记刷新，核实过程也不得淘汰原运行。
+    pub(crate) late_starts: std::collections::HashSet<RunId>,
     pub(crate) lifecycle_gates: std::collections::BTreeMap<String, String>,
     purge: Option<purge::PendingPurge>,
     pub runs: HashMap<RunId, RunRecord>,
@@ -274,6 +280,11 @@ impl Machine {
                 .remove(&conn)
         });
         let run_id = open.run_id.clone();
+        self.runs.next_creation_sequence = self
+            .runs
+            .next_creation_sequence
+            .checked_add(1)
+            .expect("运行创建序号已耗尽");
         let entry = self
             .runs
             .index
@@ -288,6 +299,22 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                current_turn_id: None,
+                pending_reroute: None,
+                creation_order: Some(CreationOrder {
+                    epoch: self.runs.epoch,
+                    sequence: self.runs.next_creation_sequence,
+                }),
+                start_confirmation: StartConfirmation {
+                    owned: if open.joined {
+                        Some(false)
+                    } else if !self.shared {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                },
                 children: Vec::new(),
                 children_stop: None,
                 background_cleanup: None,
@@ -346,14 +373,101 @@ impl Machine {
             return;
         }
         if let Some(record) = self.runs.runs.get_mut(run) {
-            if matches!(record.state, RunState::Running | RunState::Stopping)
-                && record.joined != joined
-            {
+            if matches!(record.state, RunState::Running | RunState::Stopping) {
                 record.joined = joined;
+                record.start_confirmation.owned = Some(!joined);
+                record.start_confirmation.confirmed = !joined
+                    && record.start_confirmation.thread_id.as_deref() == Some(&record.thread_id)
+                    && record.start_confirmation.turn_id.is_some();
                 self.runs.updated.insert(run.into(), self.clock.now_ms);
                 self.runs.put(run, actions);
             }
         }
+    }
+
+    /// 只接收成功 turn/start 回包或 turn/started；请求回包必须使用原请求保存的 runId。
+    pub(crate) fn run_start_evidence(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        if self.runs.phase != Phase::Open
+            || turn.is_empty()
+            || self.runs.find_run(thread, turn, Some(run)).as_deref() != Some(run)
+        {
+            return;
+        }
+        if self.runs.runs[run].state == RunState::Lost
+            || self.runs.runs[run].thread_id != thread
+            || self.runs.runs[run].joined
+            || self.runs.runs[run].start_confirmation.owned == Some(false)
+        {
+            return;
+        }
+        // 启动回包只描述本次请求的首轮；通知可能已推进多轮，迟到回包绝不回退当前轮。
+        if self.runs.runs[run].current_turn_id.is_none() {
+            self.run_current_turn_started(run, thread, turn, actions);
+        }
+        let record = self.runs.runs.get_mut(run).expect("运行存在");
+        if record.start_confirmation.confirmed {
+            return;
+        }
+        let evidence = &mut record.start_confirmation;
+        evidence.thread_id = Some(thread.into());
+        evidence.turn_id = Some(turn.into());
+        evidence.confirmed = evidence.owned == Some(true);
+        self.runs.put(run, actions);
+    }
+
+    /// 迟到归属核实可补已结束的原运行；失联和吸收不能获得新的自有资格。
+    pub(crate) fn run_late_owned(&mut self, run: &str, actions: &mut Vec<Action>) {
+        if self.runs.phase != Phase::Open {
+            return;
+        }
+        let Some(record) = self.runs.runs.get_mut(run) else {
+            return;
+        };
+        if record.state == RunState::Lost
+            || record.joined
+            || record.start_confirmation.owned == Some(false)
+        {
+            return;
+        }
+        record.start_confirmation.owned = Some(true);
+        record.start_confirmation.confirmed = record.start_confirmation.thread_id.as_deref()
+            == Some(&record.thread_id)
+            && record.start_confirmation.turn_id.is_some();
+        self.runs.put(run, actions);
+    }
+
+    fn run_current_turn_started(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        let record = &self.runs.runs[run];
+        if record.current_turn_id.as_deref() == Some(turn)
+            || self.runs.superseded_turn(run, thread, turn)
+        {
+            return;
+        }
+        self.runs.link_turn(run, thread, turn, false);
+        if let Some(link) = self
+            .runs
+            .turn_runs
+            .get_mut(thread)
+            .and_then(|links| links.iter_mut().find(|link| link.turn == turn))
+        {
+            link.started = true;
+        }
+        let record = self.runs.runs.get_mut(run).expect("运行存在");
+        record.current_turn_id = Some(turn.into());
+        record.pending_reroute = None;
+        self.runs.put(run, actions);
     }
 
     pub(crate) fn run_turn_started(
@@ -374,14 +488,73 @@ impl Machine {
         if self.runs.runs[run].turns.iter().any(|t| t.turn_id == turn) {
             return;
         }
+        self.run_current_turn_started(run, thread, turn, actions);
+        if self.runs.runs[run].current_turn_id.as_deref() != Some(turn) {
+            return;
+        }
         self.runs.link_turn(run, thread, turn, false);
         let active = self.runs.active.get_mut(run).expect("活动运行存在");
         let key = (thread.to_owned(), turn.to_owned());
         if active.current_turn.as_ref() != Some(&key) {
+            // 新轮开始时淘汰旧轮暂存，哪怕旧轮完成通知缺失也不串轮。
+            if self
+                .runs
+                .runs
+                .get_mut(run)
+                .expect("运行存在")
+                .pending_reroute
+                .take()
+                .is_some()
+            {
+                self.runs.put(run, actions);
+            }
+            let active = self.runs.active.get_mut(run).expect("活动运行存在");
             active.current_turn = Some(key);
             active.snapshot = Snapshot::default();
             self.runs
                 .log(run, self.clock.now_ms, "轮次开始", turn, actions);
+        }
+    }
+
+    pub(crate) fn run_rerouted(&mut self, params: &Option<Value>, actions: &mut Vec<Action>) {
+        if self.runs.phase != Phase::Open {
+            return;
+        }
+        let Some(params) = params.as_ref() else {
+            return;
+        };
+        let (Some(thread), Some(turn)) = (
+            params.get("threadId").and_then(Value::as_str),
+            params.get("turnId").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        // 必须已有当前轮关联；不能借当前认领或通知自报的轮次建立归属。
+        let Some(run) = self.runs.find_run(thread, turn, None) else {
+            return;
+        };
+        if !self.runs.active.get(&run).is_some_and(|active| {
+            active
+                .current_turn
+                .as_ref()
+                .is_some_and(|key| key.0 == thread && key.1 == turn)
+        }) || !matches!(
+            self.runs.runs[&run].state,
+            RunState::Running | RunState::Stopping
+        ) {
+            return;
+        }
+        let Ok(reroute) = serde_json::from_value::<Reroute>(params.clone()) else {
+            return;
+        };
+        let pending = PendingReroute {
+            turn_id: turn.into(),
+            reroute,
+        };
+        let record = self.runs.runs.get_mut(&run).expect("运行存在");
+        if record.pending_reroute.as_ref() != Some(&pending) {
+            record.pending_reroute = Some(pending);
+            self.runs.put(&run, actions);
         }
     }
 
@@ -588,7 +761,18 @@ impl Machine {
         let record = self.runs.runs.get_mut(&run).expect("运行存在");
         let turn_index = usize::try_from(record.turns_total).expect("轮次总数超出本机容量");
         record.turns_total = record.turns_total.checked_add(1).expect("轮次总数已耗尽");
+        // 迟到的旧轮完成不消费当前轮改道；对应轮完成则转入结果并清空暂存。
+        let reroute = if record
+            .pending_reroute
+            .as_ref()
+            .is_some_and(|p| p.turn_id == id)
+        {
+            record.pending_reroute.take().map(|p| p.reroute)
+        } else {
+            None
+        };
         record.turns.push(TurnResult {
+            reroute,
             turn_id: id.into(),
             ready: if pending {
                 Ready::Pending
@@ -640,6 +824,7 @@ impl Machine {
         }
         record.turns_total = record.turns_total.checked_add(1).expect("轮次总数已耗尽");
         record.turns.push(TurnResult {
+            reroute: None,
             turn_id: String::new(),
             ready: Ready::Ready,
             status: TurnStatus::Failed,
@@ -1002,6 +1187,7 @@ impl Machine {
         &mut self,
         thread: &str,
         response: &Value,
+        learn_model: bool,
         actions: &mut Vec<Action>,
     ) {
         self.runs.trace("run_learn_thread");
@@ -1028,10 +1214,12 @@ impl Machine {
             .threads
             .get_mut(&short)
             .expect("线程索引存在");
-        entry.model = response
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        if learn_model {
+            entry.model = response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
         entry.preview = info
             .get("preview")
             .and_then(Value::as_str)

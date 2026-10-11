@@ -728,6 +728,20 @@ pub struct Machine {
 /// 所有输入通过同一个纯函数迁移；运行时只持有返回的新状态。
 pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     let mut actions = Vec::new();
+    // 先保留身份，事件完全处理后才撤销线上保护，避免回包处理中的释放触发淘汰。
+    let finished_start = match &event {
+        Event::Reply { context, .. }
+        | Event::TransportFailed { context, .. }
+        | Event::LateReply { context, .. }
+        | Event::LateDiscarded { context }
+        | Event::LateEvicted { context, .. } => {
+            start_request_run(context).map(|run| (run.to_owned(), None))
+        }
+        Event::TimedOut { context, tag, .. } => {
+            start_request_run(context).map(|run| (run.to_owned(), Some(*tag)))
+        }
+        _ => None,
+    };
     // goal 通知可能早于写回包；请求落定后再推进已弃管根，不能依赖第二条 inactive 通知。
     let settled_goal = match &event {
         Event::Reply { context, .. }
@@ -879,6 +893,29 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.lifecycle_drive(&mut actions);
     state.prune_goal_versions();
     state.prune_contexts();
+    if let Some((run, timeout_tag)) = finished_start {
+        if timeout_tag.is_none_or(|tag| actions.iter().any(|action| matches!(action, Action::ForgetLate { tag: forgotten } if *forgotten == tag))) {
+            state.runs.inflight_starts.remove(&run);
+        }
+    }
+    for action in &actions {
+        if let Action::Request(context) = action {
+            if let Some(run) = start_request_run(context) {
+                state.runs.inflight_starts.insert(run.to_owned());
+            }
+        }
+    }
+    state.runs.late_starts = state
+        .stops
+        .late
+        .iter()
+        .chain(state.stops.reconciliations.values())
+        .filter_map(|registration| registration.run_id.clone())
+        .collect();
+    if state.closing {
+        state.runs.inflight_starts.clear();
+        state.runs.late_starts.clear();
+    }
     // 资格代号只服务于产生它的那一次回包处理。
     state.grant_intent = None;
     #[cfg(test)]
@@ -895,6 +932,13 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     #[cfg(test)]
     state.assert_held_accounting();
     (state, actions)
+}
+
+fn start_request_run(context: &RequestContext) -> Option<&str> {
+    match &context.operation {
+        Operation::Stream { run_id } if context.method == "turn/start" => run_id.as_deref(),
+        _ => None,
+    }
 }
 
 impl Machine {
@@ -1032,6 +1076,7 @@ impl Machine {
             request.method.as_str(),
             "broker/threads/watch"
                 | "broker/threads/list"
+                | "broker/runs/modelSummaries"
                 | "thread/read"
                 | "thread/turns/list"
                 | "thread/items/list"
@@ -1060,6 +1105,7 @@ impl Machine {
                     | "broker/inbox/list"
                     | "broker/inbox/wait"
                     | "broker/threads/list"
+                    | "broker/runs/modelSummaries"
                     | "broker/health"
             )
         {
@@ -1089,7 +1135,8 @@ impl Machine {
             | "broker/threads/annotate"
             | "broker/threads/detach"
             | "broker/threads/watch"
-            | "broker/threads/list" => {
+            | "broker/threads/list"
+            | "broker/runs/modelSummaries" => {
                 self.ext_request(request, actions);
                 return;
             }
@@ -1289,6 +1336,26 @@ impl Machine {
         }));
     }
 
+    /// 正常和 RPC 超时后的迟到回包共用；只取发请求时保存的运行身份。
+    pub(crate) fn record_start_reply(
+        &mut self,
+        context: &RequestContext,
+        result: &Result<Value, Value>,
+        actions: &mut Vec<Action>,
+    ) {
+        if context.method != "turn/start" {
+            return;
+        }
+        if let Operation::Stream { run_id: Some(run) } = &context.operation {
+            if let (Some(thread), Some(turn)) = (
+                thread_id(&context.params),
+                result.as_ref().ok().and_then(response_turn_id),
+            ) {
+                self.run_start_evidence(run, thread, turn, actions);
+            }
+        }
+    }
+
     /// #7–#11、#24、#27：回包交付独立于认领；事实学习独立于运行阶段。
     pub(crate) fn apply_reply(
         &mut self,
@@ -1453,6 +1520,7 @@ impl Machine {
                 }
             }
             Operation::Stream { run_id } => {
+                self.record_start_reply(&context, &result, actions);
                 let review_child = result
                     .as_ref()
                     .ok()
@@ -2180,6 +2248,7 @@ impl Machine {
             })
             .and_then(|claim| claim.run_id.clone());
         match event.method.as_str() {
+            "model/rerouted" => self.run_rerouted(&event.params, actions),
             "item/started" | "item/completed" => {
                 if let (Some(turn), Some(item)) =
                     (turn, event.params.as_ref().and_then(|p| p.get("item")))
@@ -2204,6 +2273,23 @@ impl Machine {
     }
 
     pub(crate) fn started(&mut self, thread_id: &str, id: &str, actions: &mut Vec<Action>) {
+        // 必须在改变认领轮次及写开轮证据之前隔离旧轮；通知自报 threadId 不证明归属。
+        if id.is_empty()
+            || self.claims.get(thread_id).is_some_and(|claim| {
+                self.records.get(thread_id).is_some_and(|record| {
+                    record
+                        .ended_turns
+                        .iter()
+                        .chain(&record.released_turns)
+                        .any(|turn| turn == id)
+                }) || claim.run_id.as_deref().is_some_and(|run| {
+                    self.runs.find_run(thread_id, id, Some(run)).as_deref() != Some(run)
+                        || self.runs.superseded_turn(run, thread_id, id)
+                })
+            })
+        {
+            return;
+        }
         if self
             .claims
             .get(thread_id)
@@ -2219,6 +2305,10 @@ impl Machine {
         let Some(claim) = self.claims.get_mut(thread_id) else {
             return;
         };
+        // 恢复屏障尚未放行时，还没有本认领提交的开轮请求。
+        if claim.pending_start.is_some() {
+            return;
+        }
         let auto = matches!(claim.state, State::AwaitingContinuation { .. });
         match &mut claim.state {
             State::Starting { turn_id, .. } => *turn_id = Some(id.into()),
@@ -2237,9 +2327,12 @@ impl Machine {
             }
         }
         let run = claim.run_id.clone();
-        let own = !claim.joined() && !claim.settling();
+        let own = !claim.joined() && !claim.settling() && claim.pending_start.is_none();
         let gone = claim.owner_gone && !claim.joined();
         if let Some(run) = run {
+            if own {
+                self.run_start_evidence(&run, thread_id, id, actions);
+            }
             self.run_turn_started(&run, thread_id, id, actions);
             if auto {
                 self.guard_auto_started(&run, thread_id, id, actions);
@@ -2415,7 +2508,10 @@ impl Machine {
                 if context.method != "thread/fork" {
                     self.record(thread_id).subscribed = true;
                 }
-                self.run_learn_thread(thread_id, value, actions);
+                // broker 自发恢复（屏障、续跑预检、inbox）的回包反映上游会话配置，
+                // 不代表本次开轮的请求值；只有客户端线程请求的回包才改写索引模型。
+                let learn_model = context.operation == Operation::Forward;
+                self.run_learn_thread(thread_id, value, learn_model, actions);
             }
         } else if matches!(context.method.as_str(), "thread/archive" | "thread/delete")
             && context.operation == Operation::Forward

@@ -1201,6 +1201,105 @@ fn 超时对账没有活动释放登记迟到按编号中断不碰新认领() {
     assert!(m.stops.late.is_empty());
     assert_eq!(m.claims["线程"], new);
 }
+
+#[test]
+fn mi_真实超时对账释放后迟到成功只确认原运行且lost不补确认() {
+    for lost in [false, true] {
+        let (mut m, context) = started(false, "turn/start");
+        let run = m.claims["线程"].run_id.clone().unwrap();
+        let actions = apply(
+            &mut m,
+            Event::TimedOut {
+                tag: 0,
+                deadline: Instant::now() + std::time::Duration::from_millis(LATE_MS),
+                context: context.clone(),
+                error: err(),
+            },
+        );
+        snapshot(&mut m, &req(&actions, "thread/read"), &[]);
+        assert!(m.claims.is_empty());
+        assert!(!m.runs.runs[&run].start_confirmation.confirmed);
+        assert!(m.runs.verifying_history.is_empty());
+        if lost {
+            m.runs.runs.get_mut(&run).unwrap().state = RunState::Lost;
+        }
+        client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
+        let newer = m.claims["线程"].run_id.clone().unwrap();
+        assert_ne!(newer, run);
+        apply(
+            &mut m,
+            Event::LateReply {
+                context,
+                result: Ok(json!({"turn":{"id":"旧轮"}})),
+            },
+        );
+        assert_eq!(m.runs.runs[&run].start_confirmation.confirmed, !lost);
+        assert!(!m.runs.runs[&newer].start_confirmation.confirmed);
+        assert!(m.runs.runs[&newer].start_confirmation.turn_id.is_none());
+    }
+}
+
+#[test]
+fn mi_共享真实超时释放后迟到归属核实补写已结束原运行() {
+    for disposition in ["自有", "lost", "吸收"] {
+        let (mut m, context) = started(true, "turn/start");
+        let run = m.claims["线程"].run_id.clone().unwrap();
+        let actions = apply(
+            &mut m,
+            Event::TimedOut {
+                tag: 0,
+                deadline: Instant::now() + std::time::Duration::from_millis(LATE_MS),
+                context: context.clone(),
+                error: err(),
+            },
+        );
+        snapshot(&mut m, &req(&actions, "thread/read"), &[]);
+        assert!(m.claims.is_empty());
+        assert_eq!(m.runs.runs[&run].state, RunState::Ended);
+        assert!(m.runs.verifying_history.is_empty());
+        if disposition == "lost" {
+            m.runs.runs.get_mut(&run).unwrap().state = RunState::Lost;
+        }
+        client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
+        let newer = m.claims["线程"].clone();
+        let result = if disposition == "吸收" {
+            json!({"turn":{"id":"旧轮"},"absorbedBy":"外轮"})
+        } else {
+            json!({"turn":{"id":"旧轮"}})
+        };
+        let actions = apply(
+            &mut m,
+            Event::LateReply {
+                context,
+                result: Ok(result),
+            },
+        );
+        assert!(!m.runs.runs[&run].start_confirmation.confirmed);
+        if disposition != "吸收" {
+            // 线上回包已经消费，继续由迟到归属核实登记保护；再创建一次运行触发淘汰。
+            client(&mut m, "turn/start", 10, json!({"threadId":"其他线程"}));
+            assert!(m.runs.runs.contains_key(&run));
+            let actions = snapshot(
+                &mut m,
+                &req(&actions, "thread/turns/list"),
+                &[("旧轮", "inProgress")],
+            );
+            let record = &m.runs.runs[&run];
+            assert_eq!(record.start_confirmation.confirmed, disposition == "自有");
+            if disposition == "自有" {
+                assert_eq!(record.start_confirmation.owned, Some(true));
+                assert!(actions.iter().any(|action| matches!(action,
+                    Action::Store(crate::store::StoreOp::PutRun(record)) if record.run_id == run && record.start_confirmation.confirmed)));
+            }
+        }
+        assert_eq!(m.claims["线程"], newer);
+        assert!(
+            !m.runs.runs[newer.run_id.as_ref().unwrap()]
+                .start_confirmation
+                .confirmed
+        );
+    }
+}
 #[test]
 fn 迟到登记期间旧轮次启动只中断旧轮次且完成清除登记() {
     let (mut m, c) = started(false, "turn/start");
