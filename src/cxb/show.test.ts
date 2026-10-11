@@ -22,6 +22,7 @@ describe("show 本地读取", () => {
     expect(await show(t.ctx)).toBe(0);
     expect(t.connects).toBe(0);
     expect(t.json[0]).toEqual({ ok: true, command: "show", threadId: "thread-test", shortId: "abcd1234", mode: "result", runId: "run-test",
+      model: "模型", reasoning: null, modelSource: "index", reroute: null,
       state: "ended", status: "completed", ready: "ready", result: "中文结果", outputSource: "finalAnswer", interruptReason: null,
       stopOutcome: null, continuedFrom: null, updatedAt: 2000 });
     expect(t.cleanup.size).toBe(0);
@@ -143,7 +144,7 @@ describe("show 真 broker", () => {
       expect(t.json[0].terminal).toBeUndefined();
       await broker.request("n4a/release");
       expect(await bounded(work, 10_000, "真实跟随未结束")).toBe(0);
-      expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: started.runId });
+      expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: started.runId, model: "本地模型", reasoning: null, modelSource: "index", reroute: null });
       expect(t.json.some((line) => line.kind === "item/completed")).toBe(true);
     } finally { for (const cleanup of t.cleanup) await cleanup(); await bounded(work.catch(() => undefined), 2000, "跟随取消后未结束"); }
   }, 30_000);
@@ -154,13 +155,14 @@ describe("show 服务器与跟随", () => {
     const t = context(dir, ["show", "server-only", "--server", "--json"]);
     t.fake.handle = (method, p) => {
       if (method === "broker/threads/list") return { threads: [] };
+      if (method === "broker/threads/watch") return { runs: [] };
       if (method === "thread/turns/list") { expect(p).toEqual({ threadId: "server-only", cursor: null, limit: 1, sortDirection: "desc", itemsView: "notLoaded" }); return { data: [{ id: "last", status: "completed", items: [], itemsView: "notLoaded" }], nextCursor: "更早" }; }
       expect(p).toEqual({ threadId: "server-only", turnId: "last", cursor: p.cursor, limit: 64, sortDirection: "asc" });
       return { data: [{ turnId: "last", item: p.cursor ? { type: "exitedReviewMode", review: "审查结果" } : { type: "agentMessage", text: "最终回答", phase: "final_answer" } }], nextCursor: p.cursor ? null : "第二页" };
     };
     expect(await show(t.ctx)).toBe(0);
     expect(t.json[0]).toMatchObject({ result: "审查结果", outputSource: "review", shortId: null });
-    expect(t.fake.calls).toHaveLength(4);
+    expect(t.fake.calls).toHaveLength(5);
     expect(t.fake.calls.every((c) => c.options.timeoutMs === 30_000)).toBe(true);
     expect(serverOutput([{ type: "agentMessage", text: "甲" }, { type: "agentMessage", text: "乙", phase: "final_answer" }]).output).toBe("乙");
     expect(serverOutput([{ type: "agentMessage", text: "甲" }, { type: "agentMessage", text: "乙" }]).output).toBe("甲\n乙");
@@ -186,6 +188,7 @@ describe("show 服务器与跟随", () => {
       const t = context(dir, ["show", "abcd", "--server", "--json"]);
       t.fake.handle = (method, p) => {
         if (method === "broker/threads/list") return { threads: [summary()] };
+        if (method === "broker/threads/watch") return { runs: [] };
         if (method === "thread/items/list") throw wireError(-32601, "Method not found: thread/items/list");
         if (p.itemsView === "notLoaded") return { data: [{ id: "last", status: "completed", items: [], itemsView: "notLoaded" }], nextCursor: null };
         expect(p).toEqual({ threadId: "thread-test", cursor: null, limit: 1, sortDirection: "desc", itemsView: "full" });
@@ -266,7 +269,7 @@ describe("show 服务器与跟随", () => {
     const work = show(t.ctx);
     try {
       expect(await bounded(work, 1000, "早到终态丢失")).toBe(0);
-      expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: "run-test" });
+      expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: "run-test", model: "模型", reasoning: null, modelSource: "index", reroute: null });
     } finally { for (const cleanup of t.cleanup) await cleanup(); await bounded(work.catch(() => undefined), 1000, "取消失败"); }
   });
   test("follow 内存快照为空时用 lastRunId 从磁盘取得终态", async () => {
@@ -305,7 +308,7 @@ describe("show 服务器与跟随", () => {
     t.emit("item/completed", { item: { type: "agentMessage", text: "不应显示" } });
     t.emit("broker/thread/result", { runId: "run-test", turn: 0, result: runResult().turns[0] });
     expect(await bounded(running, 1000, "跟随未结束")).toBe(0);
-    expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: "run-test" });
+    expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: "run-test", model: "模型", reasoning: null, modelSource: "index", reroute: null });
     expect(JSON.stringify(t.json)).not.toContain("结束后本线程");
     expect(JSON.stringify(t.json)).not.toContain("不应显示");
     expect(t.fake.subscriptions + t.any.size + t.cleanup.size).toBe(0);
@@ -506,7 +509,7 @@ describe("show 服务器与跟随", () => {
     t.emit("broker/thread/result", { runId: "run-test", turn: 0, result: runResult().turns[0] });
     expect(await bounded(running, 1000, "跟随未结束")).toBe(0);
     expect(JSON.stringify(t.json)).not.toContain("后继运行进展");
-    expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: "run-test" });
+    expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: "run-test", model: "模型", reasoning: null, modelSource: "index", reroute: null });
   });
 
   test("follow 在目标运行结束、等结果补齐期间不显示子线程上后继运行的进展", async () => {
@@ -571,7 +574,7 @@ describe("show 服务器与跟随", () => {
     t.fake.handle = (m) => m === "broker/threads/list" ? { threads: [summary()] }
       : { thread: summary({ lastRunId: noRun ? null : "run-test" }), run: noRun ? null : runResult() };
     expect(await show(t.ctx)).toBe(0);
-    expect(t.json.at(-1)).toEqual({ terminal: true, status: noRun ? null : "completed", runId: noRun ? null : "run-test" });
+    expect(t.json.at(-1)).toEqual({ terminal: true, status: noRun ? null : "completed", runId: noRun ? null : "run-test", model: "模型", reasoning: null, modelSource: "index", reroute: null });
     expect(t.fake.calls.filter((c) => c.method === "broker/threads/watch")).toHaveLength(1);
   });
   test("follow 断线退出 6 并撤销全部订阅", async () => {
