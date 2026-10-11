@@ -1,4 +1,6 @@
 import { showSubagents } from "./subagents";
+import { convergenceFields, resultTurn, selectedResultFields } from "./run-result";
+import { convergenceLines, observeConvergence } from "./convergence";
 import { CxbError, EXIT, rpcFailure, type BrokerRpc, type InboxItem, type InboxWaitReply, type RunResult, type ThreadSummary } from "./contracts";
 import { presentItem, safeLine } from "./inbox";
 import { commandSession } from "./command-session";
@@ -53,8 +55,9 @@ async function waitInbox(ctx: CommandContext, rpc: BrokerRpc, deadline: number, 
 async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSignal, deadline: number, id: string) {
   const ref = await resolveThreadViaBroker(rpc, id);
   const label = ref.shortId ?? ref.threadId.slice(0, 8);
-  let snapshot: { thread: ThreadSummary; run: RunResult | null; pending: InboxItem[] } | undefined;
+  let snapshot: { thread: ThreadSummary; run: RunResult | null; pending: InboxItem[]; revision?: number } & import("./sa1b-contracts").ConvergenceSummary | undefined;
   let runId: string | null = null;
+  const convergence = observeConvergence(rpc, () => runId, (line) => ctx.out.notice(line));
   const buffered: InboxItem[] = [];
   let found!: (items: InboxItem[]) => void;
   const pending = new Promise<InboxItem[]>((resolve) => { found = resolve; });
@@ -96,12 +99,14 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   const outputPending = (items: InboxItem[]) => {
     const rendered = renderPending(items, { threadId: ref.threadId, shortId: label });
     ctx.out.result(rendered.text);
-    ctx.out.resultJson(rendered.json as object);
+    for (const line of convergenceLines(convergence.fields(), items.length)) ctx.out.notice(line);
+    ctx.out.resultJson({ ...rendered.json as object, ...convergence.fields() });
     return EXIT.WAITING_RESPONSE;
   };
   try {
     snapshot = await rpc.request("broker/threads/watch", { threadId: ref.threadId });
     runId = snapshot!.run?.runId ?? snapshot!.thread.lastRunId;
+    convergence.accept({ ...snapshot!.run, ...snapshot, runId: runId ?? undefined });
     if (!runId) throw new CxbError("NOT_FOUND", "线程没有运行记录", { id });
     // 快照、缓冲、实时三处事项统一只认目标运行（终审讨论：别的运行的事项不能让 wait 误退 5）。
     const initial = snapshot!.pending.filter((i) => i.kind !== "guardian" && i.runId === runId);
@@ -113,7 +118,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     moves.length = 0;
     const atSnapshot = snapshot!.run ?? readRunRecord(ctx.workspace.workspaceDir, runId);
     const alreadyDone = atSnapshot?.state === "ended" || atSnapshot?.state === "lost";
-    running = waitRun(rpc, { threadId: ref.threadId, runId, workspaceDir: ctx.workspace.workspaceDir,
+    running = waitRun(convergence.rpc, { threadId: ref.threadId, runId, workspaceDir: ctx.workspace.workspaceDir,
       timeoutMs: Math.max(0, deadline - performance.now()), signal: controller.signal,
       log: (text) => ctx.out.progress(text) });
     const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure]);
@@ -121,16 +126,17 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     const run = winner.run;
     showSubagents(ctx, run);
     const code = exitCodeForRun(run);
-    ctx.out.result(run.turns.at(-1)?.output ?? "");
+    ctx.out.result(resultTurn(run)?.output ?? "");
     ctx.out.resultJson({ ok: code === EXIT.OK, command: "wait", waitFor: "thread", threadId: ref.threadId,
-      shortId: ref.shortId, runId, status: run.status, result: run.turns.at(-1)?.output ?? "", alreadyDone,
+      shortId: ref.shortId, runId, status: run.status, result: resultTurn(run)?.output ?? "", alreadyDone, ...convergenceFields(run), ...selectedResultFields(run),
+      ...(run.interruptReason ? { interruptReason: run.interruptReason } : {}),
       ...(run.loopGuard ? { loopGuard: run.loopGuard } : {}),
       // 子代理停止报告与中断原因（subagentsUnfinished 等）原样带出；没有子代理时字段缺省，旧输出不变。
       ...(run.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}),
       ...(run.childrenStop ? { interruptReason: run.interruptReason, childrenStop: run.childrenStop } : {}) });
     return code;
   } finally {
-    off(); offMoved(); signal.removeEventListener("abort", abort); controller.abort();
+    off(); offMoved(); convergence.dispose(); signal.removeEventListener("abort", abort); controller.abort();
     // 交接胜出时仍等取消收束，避免遗留 waitRun 的订阅和计时器。
     await running?.catch(() => undefined);
   }

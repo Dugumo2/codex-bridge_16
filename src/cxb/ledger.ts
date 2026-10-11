@@ -6,6 +6,7 @@
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { modelTurn } from "./run-result";
 import { CxbError, type LifecycleInfo, type RunMeta, type RunResult, type RunModelSummary, type ModelRun } from "./contracts";
 
 /** threads.json 里的一项（Rust runs::types::ThreadIndexEntry，只取 CLI 用到的字段）。 */
@@ -64,6 +65,7 @@ function isRunRecord(value: unknown, runId: string): value is RunResult {
     || typeof value.input !== "string" || !optionalString(value.reviewThreadId) || !optionalString(value.continuedFrom)
     // status 只能是 null（运行中）或合法终态；缺失（undefined）同样拒绝，否则会被退出码映射当成「中断」。
     || (value.status !== null && !RUN_STATUSES.has(value.status as string))
+    || (value.finalTurnId !== undefined && typeof value.finalTurnId !== "string")
     || !isProgress(value.progress) || !Array.isArray(value.turns)) return false;
   return value.turns.every((turn) => isObject(turn) && typeof turn.turnId === "string" && TURN_READY.has(turn.ready as string)
     && TURN_STATUSES.has(turn.status as string) && typeof turn.output === "string");
@@ -212,13 +214,14 @@ export function readModelRuns(workspaceDir: string, notice: (message: string) =>
       payload = readPayload(join(dir, name), `运行记录 ${runId} `);
       if (!isRunRecord(payload, runId)) throw new CxbError("LOCAL_ERROR", "运行记录结构损坏");
       // 逐文件丢弃正文，避免保留整个工作区的历史输出。
-      const last = payload.turns.at(-1);
+      const last = modelTurn(payload);
       runs.push({ runId, threadId: payload.threadId, reviewThreadId: payload.reviewThreadId, state: payload.state,
         startedAt: payload.startedAt, creationOrder: payload.creationOrder ?? null,
         startConfirmation: payload.startConfirmation ?? { confirmed: false, owned: null, threadId: null, turnId: null },
         meta: payload.meta ? { source: payload.meta.source, model: payload.meta.model, effort: payload.meta.effort } : null,
         currentTurnId: payload.currentTurnId ?? null, lastTurn: last ? { turnId: last.turnId, reroute: last.reroute ?? null } : null,
-        pendingReroute: payload.pendingReroute ?? null });
+        pendingReroute: payload.pendingReroute ?? null,
+        ...(payload.finalTurnId !== undefined ? { finalTurnId: payload.finalTurnId } : {}) });
     } catch {
       const threadId = isObject(payload) && payload.runId === runId && typeof payload.threadId === "string" && payload.threadId
         ? payload.threadId : null;

@@ -57,9 +57,9 @@ function snapshot(root: string, prefix = ""): Record<string, string> {
 }
 
 describe("配置键表", () => {
-  test("仅有八个键，字符串转换为各自的存储类型", () => {
-    expect(CONFIG_KEYS).toEqual(["model", "reasoning", "sandbox", "approval", "timeout", "memory", "server", "broker-idle-timeout"]);
-    const values = { model: "模型", reasoning: "ultra", sandbox: "read-only", approval: "auto", timeout: "3600", memory: "false", server: "private", "broker-idle-timeout": "300" };
+  test("包含独立收敛期限的九个键，字符串转换为各自的存储类型", () => {
+    expect(CONFIG_KEYS).toEqual(["model", "reasoning", "sandbox", "approval", "timeout", "converge-timeout", "memory", "server", "broker-idle-timeout"]);
+    const values = { model: "模型", reasoning: "ultra", sandbox: "read-only", approval: "auto", timeout: "3600", memory: "false", server: "private", "converge-timeout": "3600", "broker-idle-timeout": "300" };
     values.model = "provider/model:[v1]";
     for (const key of CONFIG_KEYS) {
       const spec = CONFIG_SCHEMA[key];

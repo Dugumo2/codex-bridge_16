@@ -1,5 +1,6 @@
 import type { Reroute, ModelRun } from "./contracts";
 import { latestModelRun } from "./ledger";
+import { modelTurn } from "./run-result";
 
 /** 展示的是请求值；服务器改道单独注明，不覆盖请求模型。 */
 export interface ModelDisplay {
@@ -10,8 +11,8 @@ export interface ModelDisplay {
 }
 
 export function runModelDisplay(run: ModelRun): ModelDisplay {
-  const last = "turns" in run ? run.turns.at(-1) : run.lastTurn;
-  const currentTurnId = run.currentTurnId;
+  const last = "turns" in run ? modelTurn(run) : run.lastTurn;
+  const currentTurnId = run.finalTurnId ?? run.currentTurnId;
   const pending = run.pendingReroute;
   // 只显示本运行当前轮的改道；旧记录没有当前轮时退回最后一轮结果。
   const reroute = currentTurnId == null ? last?.reroute ?? null

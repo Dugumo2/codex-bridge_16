@@ -291,7 +291,7 @@ export interface RunResult extends ConvergenceSummary {
   stopCheck?: unknown;
   loopGuard?: LoopGuardReport;
   progress: { done: ProgressItem[]; doneTotal: number; unconfirmed: ProgressItem[]; observedFiles: string[]; incomplete?: boolean };
-  /** 最近一轮在最后；最多保留 100 轮。 */
+  /** 最多保留 100 轮；迟到旧结果可追加，最终交付以 finalTurnId 为准。 */
   turns: TurnResult[];
   turnsTotal: number;
 }
@@ -436,7 +436,7 @@ export interface WaitRunOptions {
   workspaceDir?: string;
 }
 
-/** 等整次运行结束（`broker/run/ended`，认领释放）且最后一轮结果不再是 pending（`broker/thread/result`，
+/** 等整次运行结束（`broker/run/ended`，认领释放）且最终指向轮结果不再是 pending（旧记录回退最后一轮；`broker/thread/result`，
  *  只发给 watcher，所以内部先 `broker/threads/watch{threadId, runId}`，快照给的就是这次运行，不受线程上更新的运行影响）。
  *  快照里已经结束且就绪的直接返回；快照 run 为 null 时按 workspaceDir 读磁盘记录，没有则 NOT_FOUND。
  *  连接断开抛 BROKER_UNAVAILABLE。不处理服务端请求（那是 AttachServerRequests 的事）。 */
