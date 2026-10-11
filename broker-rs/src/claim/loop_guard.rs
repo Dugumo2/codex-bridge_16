@@ -1,18 +1,18 @@
 //! 自动续跑空转刹车（S1-评审第 26 节）。
 //!
-//! 只看服务器在认领处于 AwaitingContinuation 时自开、接进同一运行的轮（自动续跑候选），按运行计数：
+//! 兼容旧的 AwaitingContinuation 自动候选路径；SA1b 启用后另纳入已确认自有汇总轮：
 //! - 刹车一：连续 [`NO_ACTION_LIMIT`] 个证据完整的自动轮都没有外部动作；
 //! - 刹车二：本次运行合格的自动轮（结算时不含用户输入；共享模式还要求证据完整）达到 [`CONTINUATION_LIMIT`]。
 //!
 //! 证据只认完整条目（completed 自带 full，或结果补读读回的 full 轮次，经 `Runs.guard_evidence` 交回）；
 //! 条目通知只能证明「有」动作或用户输入，不能证明「没有」。按开始顺序结算，前面的轮证据未到时后面的排队。
 //! 用户输入是立即生效的否决：一看到（条目通知或完整证据）就清空无动作计数、丢掉排在它之前的候选，
-//! 共享模式还当场撤销控制资格，不等按序结算。计数只在 goal 身份（目标原文＋createdAt）或状态真正变化时
-//! 整体清零；普通的用量记账更新不算。
+//! 共享模式还当场撤销控制资格，不等按序结算。goal 身份或状态真正变化只清除旧结算计数及连续无动作计数；
+//! SA1b 的 autoTurnsStarted、输入能力和预算独立保留，最后获准的第 50 轮可完成最终核实。
 //!
 //! 触发后：
-//! - 私有模式走现有停止流程（暂停 goal 并中断，`StopReason::GoalLoop`）；
-//! - 共享模式只对本次运行控制的 goal（`ThreadRecord.goal_controlled`）发 `thread/goal/set paused`，
+//! - 私有模式及已启用、授权仍有效的 SA1b 运行走现有停止流程（`StopReason::GoalLoop`）；
+//! - 旧共享模式只对本次运行控制的 goal（`ThreadRecord.goal_controlled`）发 `thread/goal/set paused`，
 //!   不中断任何轮、不重试：正在跑的轮可能是别的客户端的。控制资格只来自本 broker 的客户端把 goal
 //!   设成 active、#2e 恢复成功（回包身份与当前事实一致，且发出后资格代号未变），或已知 goal 在自有的
 //!   客户端轮内换成新的（模型自己建 goal）；goal 变为非 active、自动轮出现用户输入时撤销并推进代号，
@@ -47,6 +47,8 @@ struct PendingTurn {
 /// 一次运行的刹车状态；认领不再属于该运行时删除。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guard {
+    /// SA1b 的运行级能力与水位；goal 变化不能清除，历史恢复不能重建。
+    pub(crate) safeguards: Option<super::loop_guard_input::Safeguards>,
     pub thread: String,
     /// 本次运行合格的自动轮数（刹车二），结算时累计。
     pub continuations: u32,
@@ -91,8 +93,9 @@ pub struct PauseTarget {
 }
 
 impl Guard {
-    fn new(thread: &str) -> Self {
+    pub(crate) fn new(thread: &str) -> Self {
         Self {
+            safeguards: None,
             thread: thread.into(),
             continuations: 0,
             idle: Vec::new(),
@@ -107,7 +110,9 @@ impl Guard {
     fn reset(&mut self) {
         let auto_turns = std::mem::take(&mut self.auto_turns);
         let next_seq = self.next_seq;
+        let safeguards = self.safeguards.take();
         *self = Self::new(&self.thread);
+        self.safeguards = safeguards;
         self.auto_turns = auto_turns;
         self.next_seq = next_seq;
     }
@@ -177,7 +182,8 @@ impl Guard {
             // 共享模式拿不到完整证据就无法排除别的客户端的输入，不计入上限。
             if complete || !shared {
                 self.continuations = self.continuations.saturating_add(1);
-                if self.continuations >= CONTINUATION_LIMIT {
+                // 新路径由开始时的持久化总数准入；第 50 轮仍可完成最终核实。
+                if self.safeguards.is_none() && self.continuations >= CONTINUATION_LIMIT {
                     return Some(report(
                         LoopGuardKind::ContinuationLimit,
                         self.continuations,
@@ -238,6 +244,21 @@ impl Machine {
         if turn.is_empty() {
             return;
         }
+        // 新运行的 goal 自动轮与汇总轮共享开始计数；旧路径仍保留原结算语义。
+        if let Some(token) = self.convergences.runs.get(run).map(|r| r.token.clone()) {
+            if self
+                .safeguards(&token)
+                .is_some_and(|s| !s.counted.contains_key(turn))
+            {
+                self.register_auto_parent_turn(
+                    &token,
+                    turn,
+                    crate::sa1b::TurnOrigin::Goal,
+                    actions,
+                );
+                return;
+            }
+        }
         let guard = self
             .loop_guards
             .entry(run.into())
@@ -293,21 +314,52 @@ impl Machine {
 
     /// 线程上提交的条目通知：只记「有」动作或用户输入；自动候选里出现用户输入立即否决。
     pub(super) fn guard_item(&mut self, thread: &str, turn: &str, item: &Value) {
-        let mut vetoed = false;
-        for guard in self.loop_guards.values_mut() {
-            if guard.thread != thread || !guard.is_auto(turn) {
-                continue;
-            }
-            let mut seen = Activity::default();
-            seen.observe(item);
-            if let Some(pending) = guard.pending.iter_mut().find(|p| p.turn == turn) {
-                pending.seen.observe(item);
-            }
-            if seen.user_input && guard.veto(turn) {
-                vetoed = true;
+        let sources: Vec<_> = self
+            .loop_guards
+            .keys()
+            .map(|run| {
+                (
+                    run.clone(),
+                    self.classify_run_input(run, thread, turn, item),
+                )
+            })
+            .collect();
+        for (run, source) in sources {
+            let mut activity = Activity::default();
+            activity.observe_with_source(item, source);
+            self.guard_activity(&run, thread, turn, activity);
+        }
+    }
+
+    /// 已通过分页身份校验且逐条分类后的正面证据；前页可立即否决，但不代表完整轮次。
+    pub(crate) fn guard_activity(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        activity: Activity,
+    ) {
+        let Some(guard) = self.loop_guards.get_mut(run).filter(|g| g.thread == thread) else {
+            return;
+        };
+        if activity.user_input {
+            if let Some(safeguards) = &mut guard.safeguards {
+                safeguards.revoked = true;
+                if let Some(runtime) = self.convergences.runs.get_mut(run) {
+                    runtime.automatic_control_revoked = true;
+                }
             }
         }
-        if vetoed && self.shared {
+        if !guard.is_auto(turn) {
+            return;
+        }
+        if let Some(pending) = guard.pending.iter_mut().find(|p| p.turn == turn) {
+            pending.seen.action |= activity.action;
+            pending.seen.user_input |= activity.user_input;
+            pending.seen.special |= activity.special;
+            pending.seen.unknown |= activity.unknown;
+        }
+        if activity.user_input && guard.veto(turn) && self.shared {
             self.revoke_goal_control(thread);
         }
     }
@@ -456,6 +508,12 @@ impl Machine {
             if activity.is_some_and(|a| a.user_input) && guard.is_auto(&turn) {
                 // 被挤出队列或已排到后面的轮也照样否决；通知已否决过的不重复。
                 let newly = guard.veto(&turn);
+                if let Some(safeguards) = &mut guard.safeguards {
+                    safeguards.revoked = true;
+                }
+                if let Some(runtime) = self.convergences.runs.get_mut(&run) {
+                    runtime.automatic_control_revoked = true;
+                }
                 let thread = guard.thread.clone();
                 if newly && self.shared {
                     self.revoke_goal_control(&thread);
@@ -474,6 +532,30 @@ impl Machine {
         runs.sort();
         let shared = self.shared;
         for run in runs {
+            let revoked = self.loop_guards[&run]
+                .safeguards
+                .as_ref()
+                .is_some_and(|s| s.revoked);
+            if revoked {
+                let join = self
+                    .runs
+                    .runs
+                    .get_mut(&run)
+                    .and_then(|r| r.subagent_join.as_mut());
+                if let Some(join) = join.filter(|j| !j.automatic_control_revoked) {
+                    join.automatic_control_revoked = true;
+                    self.persist_safeguards(&run, actions);
+                }
+            }
+            // 迟到的开始事实可以记账，但撤权或授权换代后不能再替用户发起刹车。
+            if self.loop_guards[&run].safeguards.is_some()
+                && !self.convergences.runs.get(&run).is_some_and(|runtime| {
+                    !runtime.automatic_control_revoked
+                        && self.safeguards(&runtime.token).is_some_and(|s| !s.revoked)
+                })
+            {
+                continue;
+            }
             let guard = self.loop_guards.get_mut(&run).expect("刚取出的运行");
             if guard.tripped {
                 continue;
@@ -505,7 +587,11 @@ impl Machine {
             )));
             return;
         }
-        if !self.shared {
+        let managed = self
+            .loop_guards
+            .get(run)
+            .is_some_and(|g| g.safeguards.is_some());
+        if !self.shared || managed {
             actions.push(Action::Warn(format!(
                 "线程 {thread} 自动续跑空转（{:?}，{} 轮），暂停 goal 并停止本次运行",
                 report.kind, report.count
