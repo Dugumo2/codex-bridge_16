@@ -868,7 +868,7 @@ fn 预算未核实不把零读号当成功() {
         }
     }
     let (mut m, mut mock) = setup();
-    m.convergences.test_read = None;
+    m.convergences.test_read = Some(BatchReadId::DISABLED);
     spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
     complete(&mut m, &mut mock, "子", "子轮", "completed");
     complete(&mut m, &mut mock, P, T, "completed");
