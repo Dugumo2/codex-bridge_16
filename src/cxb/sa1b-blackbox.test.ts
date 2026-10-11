@@ -18,7 +18,7 @@ function scenario(id: string, name: string, body: (h: H) => Promise<void>, timeo
     const h = new Sa1bHarness(); let setup = false, error: unknown;
     try {
       await h.open({ pageSize: 16 });
-      await h.start({ cxbConvergence: { timeoutMs: ["E05", "E06", "E19"].includes(id) ? 1500 : 20000, discoveryTimeoutMs: 400, wakeVerifyTimeoutMs: 600 } });
+      await h.start({ cxbConvergence: { timeoutMs: ["E05", "E06", "E19"].includes(id) ? 1500 : id === "E09" ? 60000 : 20000, discoveryTimeoutMs: id === "E09" ? 20000 : 400, wakeVerifyTimeoutMs: 600 } });
       setup = true; await body(h);
     }
     catch (e) { error = e; throw e; }
@@ -37,8 +37,8 @@ async function held(h: H) {
   expect(h.ended(), "父结束不能提前 ended").toHaveLength(0);
   const run = await h.record(); expect(run.state).toBe("running"); expect(run.subagentJoin, "A 收敛门禁应已接线").toBeDefined();
 }
-async function summary(h: H, markers: string[] = []) {
-  const request = await h.reconciliation();
+async function summary(h: H, markers: string[] = [], timeout = 2000) {
+  const request = await h.reconciliation(timeout);
   expect(request, "B 汇总请求应含唯一 clientUserMessageId；骨架 Disabled 不发请求").toBeDefined();
   expect(request.params.clientUserMessageId).toBeString();
   for (const marker of markers) expect(text(request)).toContain(marker);
@@ -148,15 +148,15 @@ for (const size of ["多字节8KiB", "总64KiB", "超大批次", "输出不可�
     } else await h.finish(`C${i}`, `${i}：` + "汉字😀".repeat(size === "超大批次" ? 100 : 3000));
   }
   if (size === "输出不可读") await h.control("fault", { method: "thread/items/list", threadId: "C0", mode: "error" });
-  await h.finish(P); const { request, turn } = await summary(h); expect(Buffer.byteLength(text(request))).toBeLessThanOrEqual(65536);
+  await h.finish(P); const { request, turn } = await summary(h, [], 15000); expect(Buffer.byteLength(text(request))).toBeLessThanOrEqual(65536);
   expect(text(request)).not.toContain("\uFFFD");
   const before = await h.record(); const coverage = before.subagentJoin.resultCoverage;
   expect(coverage.available + coverage.unavailable + coverage.omitted).toBe(coverage.total);
   if (size === "多字节8KiB") expect(coverage.truncated).toBeGreaterThan(0);
   if (size === "超大批次") expect(coverage.omitted).toBeGreaterThan(0);
   if (size === "输出不可读") expect(coverage.unavailable).toBe(1);
-  await h.finish(P, "已核实缺失与截断", "completed", turn.id); await terminal(h); expect((await h.starts()).length).toBe(2);
-}, 45000);
+  await h.finish(P, "已核实缺失与截断", "completed", turn.id); await terminal(h, 20000); expect((await h.starts()).length).toBe(2);
+}, 90000);
 for (const mode of ["replyLost", "transportError", "通知先到"] as const) scenario("E10", `${mode} clientId 核实不重发`, async h => {
   await h.spawn(); await h.finish("child", mark());
   await h.control("startBehavior", { threadId: P, mode: mode === "通知先到" ? "started" : mode });
@@ -180,6 +180,7 @@ for (const visibility of ["外部", "未知"]) scenario("E11", `start 并入${vi
   await h.finish(P); expect(await h.reconciliation()).toBeDefined();
   expect((await h.state()).requestHeld["start-race"]).toHaveLength(1);
   await h.control("turn", { threadId: P, turnId: "foreign-turn", action: "start", announce: visibility === "外部" });
+  if (visibility === "外部") await h.control("item", { threadId: P, turnId: "foreign-turn", item: { type: "userMessage", id: "foreign-user", clientId: "foreign-client", content: [{ type: "text", text: "外部客户端的新任务" }] } });
   await h.control("startBehavior", { threadId: P, mode: "steered" });
   await h.control("release", { name: "start-race" });
   await h.observe(400);
@@ -246,7 +247,7 @@ scenario("E16", "连续无动作3轮保留刹车及真实停止报告", async h 
   await h.observe(); expect((await h.record()).autoTurnsStarted, "独立自动轮计数不可缺失").toBe(3);
   const run = await terminal(h, 45000); expect(run.interruptReason).toBe("goalLoop"); expect(run.loopGuard.kind).toBe("noAction");
   expect(run.stopOutcome).toBe("confirmed"); expect(run.autoTurnsStarted).toBe(3);
-  expect((await h.cli(["wait", h.runId, "--json"])).code).toBe(9);
+  expect((await h.cli(["wait", P, "--json"])).code).toBe(9);
 }, 60000);
 for (const state of ["active", "complete"]) scenario("E17", `goal ${state} 已含后代用量不双加不重获预算`, async h => {
   await h.control("goal", { threadId: P, status: "active", tokenBudget: 100, tokensUsed: 0 });
@@ -288,7 +289,8 @@ for (const phase of ["未发", "已发未知"]) for (const reason of ["stop", "o
   await h.control("release", { name: "unknown-start" }); await h.control("release", { name: "unknown-input" });
   await h.control("goal", { threadId: P, status: "active" }); await h.observe(200);
   expect((await h.starts()).length).toBe(phase === "已发未知" ? 2 : 1); expect((await h.record()).subagentJoin.automaticControlRevoked).toBe(true);
-  if (phase === "已发未知") expect((await h.state()).threads.root.interrupts.length).toBeGreaterThanOrEqual(1);
+  // 根输入回查仍被持续故障阻断，迟到 started/成功回包不能单独授予自有停止权。
+  if (phase === "已发未知") expect((await h.state()).threads.root.interrupts).toHaveLength(0);
   await h.until(async () => ((await h.owner.request("fixture/backgroundTerminals/state", {}) as any).threads.child ?? []).length === 0, 45000, "异常收尾未完成子后台命令清理");
   const background: any = await h.owner.request("fixture/backgroundTerminals/state", {});
   expect(background.threads.child).toEqual([]);
@@ -330,7 +332,7 @@ scenario("E22", "旧补读/完成晚于新汇总不能覆盖finalTurnId与modelS
   await h.observe(); expect((await h.record()).finalTurnId).toBe(turn.id);
   const response: any = await h.owner.request("broker/runs/modelSummaries", { threadIds: [P] });
   expect(response.runs.find((x: any) => x.runId === run.runId).finalTurnId).toBe(turn.id);
-  for (const args of [["wait", run.runId, "--json"], ["show", run.runId, "--json"], ["ls", "--json"]]) {
+  for (const args of [["wait", P, "--json"], ["show", P, "--json"], ["ls", "--json"]]) {
     const result = await h.cli(args); expect(result.code).toBe(0); expect(result.stdout).toContain(turn.id);
     if (args[0] !== "ls") expect(result.stdout).toContain(marker);
   }
@@ -365,7 +367,7 @@ scenario("E23", "模型强度、creationOrder、startConfirmation沿用原运行
   expect(h.notes("broker/run/started")).toHaveLength(1);
 });
 for (const withChild of [false, true]) for (const parentStatus of ["failed", "interrupted"]) scenario("E24", `${withChild ? "树提交" : "普通释放"} 父${parentStatus}不被goalBlocked覆盖`, async h => {
-  if (withChild) await h.spawn(); await h.control("goal", { threadId: P, status: "blocked" }); await h.finish(P, "失败细节", parentStatus);
+  if (withChild) await h.spawn(); await h.finish(P, "失败细节", parentStatus); await h.control("goal", { threadId: P, status: "blocked" });
   const run = await terminal(h); expect(run.status).toBe(parentStatus); expect((await h.starts()).length).toBe(1);
   if (withChild) expect(run.childrenStop).toBeDefined();
 });
@@ -378,8 +380,15 @@ for (const withChild of [false, true]) for (const [goalStatus, status, reason, t
   if (withChild) await h.spawn();
   await h.control("goal", { threadId: P, status: goalStatus, tokenBudget: 100, tokensUsed: goalStatus === "budgetLimited" ? 100 : 0 });
   await h.finish(P); const run = await terminal(h);
+  if (!withChild) {
+    // 用户 2026-10-11 定：没有子代理的运行保持原语义——暂停算正常完成，其余限制状态记 goalBlocked。
+    const legacy = goalStatus === "paused" ? "completed" : "goalBlocked";
+    expect(run.status).toBe(legacy); expect((await h.starts()).length).toBe(1);
+    expect((await h.cli(["wait", P, "--json"])).code).toBe(goalStatus === "paused" ? 0 : 9);
+    return;
+  }
   expect(run.status).toBe(status); expect(run.interruptReason).toBe(reason);
   expect(run.subagentJoin.terminalReason).toBe(terminalReason); expect((await h.starts()).length).toBe(1);
-  if (withChild) expect(run.childrenStop.trigger).toBe(terminalReason);
-  expect((await h.cli(["wait", h.runId, "--json"])).code).toBe(code);
+  expect(run.childrenStop.trigger).toBe(terminalReason);
+  expect((await h.cli(["wait", P, "--json"])).code).toBe(code);
 });

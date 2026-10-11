@@ -169,6 +169,10 @@ impl Machine {
         if matches!(claim.state, State::FinishingTree { .. }) {
             return Some(ReleaseDecision::Hold);
         }
+        // 没有纳管子代理的运行不进入收敛／汇总，交回 SA1a 门禁与原释放流程（用户 2026-10-11 定）。
+        if !self.run_has_subagents(&run) && !matches!(claim.state, State::Converging { .. }) {
+            return None;
+        }
         if self.stop_busy(thread) || self.tree_for_run(&run).is_some() {
             return None;
         }
@@ -178,7 +182,7 @@ impl Machine {
         let reason = match turn_status {
             Some(TurnStatus::Failed) => Some(TerminalReason::ParentFailed),
             Some(TurnStatus::Interrupted) => Some(TerminalReason::ParentInterrupted),
-            _ => goal_reason(goal_status),
+            _ => self.goal_terminal(&run, goal_status),
         };
         if let Some(reason) = reason {
             self.convergence_fail(&run, reason, actions);
@@ -225,6 +229,10 @@ impl Machine {
         };
         let converging = matches!(claim.state, State::Converging { .. });
         let finishing = matches!(claim.state, State::FinishingTree { .. });
+        // 同上：没有子代理且尚未进入收敛的运行，SA1b 不接管轮次、goal 与交接事件。
+        if !converging && !self.run_has_subagents(&run) {
+            return false;
+        }
         if !self.convergences.runs.contains_key(&run) {
             if self.convergences.enabled
                 && !claim.joined()
@@ -232,7 +240,8 @@ impl Machine {
                 && !claim.precheck()
                 && matches!(event, ConvergeEvent::GoalChanged { .. })
             {
-                let reason = goal_reason(
+                let reason = self.goal_terminal(
+                    &run,
                     self.records
                         .get(thread)
                         .and_then(|r| r.goal_status.as_deref()),
@@ -360,7 +369,7 @@ impl Machine {
                 if goal.as_deref() == Some("paused") && self.goal_restoration_pending(thread) {
                     return false;
                 }
-                if let Some(reason) = goal_reason(goal.as_deref()) {
+                if let Some(reason) = self.goal_terminal(&run, goal.as_deref()) {
                     self.convergence_fail(&run, reason, actions);
                     return true;
                 }
@@ -464,12 +473,14 @@ impl Machine {
     fn convergence_drive_once(&mut self, run: &str, actions: &mut Vec<Action>) {
         let runtime = self.convergences.runs[run].clone();
         let thread = runtime.token.claim.thread_id.clone();
-        if let Some(reason) = goal_reason(
-            self.records
-                .get(&thread)
-                .and_then(|r| r.goal_status.as_deref()),
-        )
-        .filter(|_| !self.goal_restoration_pending(&thread))
+        if let Some(reason) = self
+            .goal_terminal(
+                run,
+                self.records
+                    .get(&thread)
+                    .and_then(|r| r.goal_status.as_deref()),
+            )
+            .filter(|_| !self.goal_restoration_pending(&thread))
         {
             self.convergence_fail(run, reason, actions);
             return;
@@ -1166,6 +1177,15 @@ impl Machine {
             return value;
         }
         self.begin_subagent_reconcile(token, batch, actions)
+    }
+}
+
+impl Machine {
+    /// goal 非活动对应的协调终态。没有纳管子代理的运行被暂停时不算异常，保持 SA1b 之前
+    /// 「暂停即正常结束」的语义（用户 2026-10-11 定）；blocked 等限制状态两种语义本就一致。
+    fn goal_terminal(&self, run: &str, status: Option<&str>) -> Option<TerminalReason> {
+        goal_reason(status)
+            .filter(|r| *r != TerminalReason::GoalPaused || self.run_has_subagents(run))
     }
 }
 

@@ -226,6 +226,24 @@ impl Machine {
                     .and_then(|r| r.can_accept_direct_input)
             })
     }
+    /// 本运行是否已纳管子代理（有子代理成员或在途派生）。没有时，共享空转刹车与 goal 非活动
+    /// 保持 SA1b 之前的语义（用户 2026-10-11 定：只在确有子代理要收尾时才按异常处理）。
+    /// 证据包括：在途派生、子代理成员、关系表中挂在本执行线程下的子代理边（含尚停在
+    /// pendingInit、未成为成员的子代理），以及收敛账本里待启动的项。
+    pub fn run_has_subagents(&self, run_id: &str) -> bool {
+        self.relations.contexts.get(run_id).is_some_and(|c| {
+            !c.in_flight_spawns.is_empty()
+                || c.members.values().any(|m| m.kind == RelationKind::Subagent)
+                || self.relations.edges.values().any(|e| {
+                    e.kind == RelationKind::Subagent
+                        && e.parent_thread_id == c.identity.execution_thread_id
+                })
+        }) || self
+            .convergences
+            .ledgers
+            .get(run_id)
+            .is_some_and(|l| !l.pending.is_empty())
+    }
     /// 给自然结束门禁用：活动成员、待答请求、在途派生、未决候选算 some；
     /// 成员上有未归属的活动轮次、或可能属于本运行的回查未决算 unknown。
     pub fn has_managed_activity(&self, run_id: &str) -> Activity {

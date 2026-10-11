@@ -81,6 +81,13 @@ fn setup() -> (Machine, SubagentMock) {
     mock.register(P, None, "v1", false, true);
     (m, mock)
 }
+/// 已纳管一个先完成的子代理：只有确有子代理的运行才进入收敛（用户 2026-10-11 定）。
+fn setup_with_child() -> (Machine, SubagentMock) {
+    let (mut m, mut mock) = setup();
+    spawn(&mut m, &mut mock, P, T, "C0", "spawn-c0", "c0-t1");
+    complete(&mut m, &mut mock, "C0", "c0-t1", "completed");
+    (m, mock)
+}
 fn spawn(
     m: &mut Machine,
     mock: &mut SubagentMock,
@@ -305,7 +312,7 @@ fn 状态归一完整且未知不等于缺输出() {
 }
 #[test]
 fn pending_init父结束或证据过期仍阻塞() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     let (a, _) = SubagentMock::v1_spawn(P, T, "无首轮", "子", false);
     apply(&mut m, a);
     complete(&mut m, &mut mock, P, T, "completed");
@@ -322,7 +329,7 @@ fn pending_init父结束或证据过期仍阻塞() {
 }
 #[test]
 fn 发现失败按五十五三十六十退避且总期限不刷新() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     let deadline = m.convergences.runs[R].deadline_mono_ms;
     for delay in [5_000, 15_000, 30_000, 60_000, 60_000] {
@@ -348,18 +355,21 @@ fn 发现期间新工作使旧覆盖无效() {
     );
 }
 #[test]
-fn 空工作也必须先完成发现_不为零批次开汇总() {
+fn 无子代理运行不进入收敛_按原流程直接完成() {
+    // 用户 2026-10-11 定：没有纳管子代理的运行不做收尾发现、不开汇总，保持原释放语义。
     let (mut m, mut mock) = setup();
     complete(&mut m, &mut mock, P, T, "completed");
-    assert!(m.claims.contains_key(P));
-    assert_eq!(join(&m).work_epoch, 0);
-    discover(&mut m, true);
     assert!(!m.claims.contains_key(P));
+    assert!(m
+        .convergences
+        .progress
+        .get(R)
+        .is_none_or(|p| p.discovery.is_none()));
     assert_eq!(m.runs.runs[R].status, Some(RunStatus::Completed));
 }
 #[test]
 fn goal清除覆盖第二条自然释放路径() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     notify(
         &mut m,
         "thread/goal/updated",
@@ -373,7 +383,9 @@ fn goal清除覆盖第二条自然释放路径() {
     notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
     assert!(matches!(m.claims[P].state, State::Converging { .. }));
     discover(&mut m, true);
-    assert_eq!(m.runs.runs[R].status, Some(RunStatus::Completed));
+    // 已有子代理结果：发现完成后仍须汇总，不能直接沿用父 completed 释放。
+    assert!(m.claims.contains_key(P));
+    assert_eq!(m.runs.runs[R].state, RunState::Running);
 }
 #[test]
 fn detach保留待答期限工作版本并拒绝旧token() {
@@ -412,7 +424,7 @@ fn detach保留待答期限工作版本并拒绝旧token() {
 }
 #[test]
 fn 单调期限不受墙钟前后跳影响() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     let token = m.convergences.runs[R].token.clone();
     let deadline = m.convergences.runs[R].deadline_mono_ms;
@@ -435,7 +447,7 @@ fn 单调期限不受墙钟前后跳影响() {
 }
 #[test]
 fn 迟到started不授予外部轮所有权() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     apply(&mut m, mock.turn_started(P, "外部轮"));
     assert!(!m.claims[P].owned_turns.contains("外部轮"));
@@ -449,7 +461,7 @@ fn 迟到started不授予外部轮所有权() {
 #[test]
 fn 停止与期限交错保留首个原因且不复活() {
     for first_stop in [true, false] {
-        let (mut m, mut mock) = setup();
+        let (mut m, mut mock) = setup_with_child();
         complete(&mut m, &mut mock, P, T, "completed");
         let token = m.convergences.runs[R].token.clone();
         if first_stop {
@@ -476,7 +488,7 @@ fn 停止与期限交错保留首个原因且不复活() {
 }
 #[test]
 fn owner断开锁定原因_detach后不响应旧owner() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     apply(&mut m, Event::Disconnected { conn: 1 });
     assert_eq!(join(&m).terminal_reason, Some(TerminalReason::OwnerGone));
@@ -484,7 +496,7 @@ fn owner断开锁定原因_detach后不响应旧owner() {
 }
 #[test]
 fn 未知已发操作在取消和abandon后仍未落定() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     let op = operation(&m, ReconcileSubmission::OutcomeUnknown);
     m.convergence_operation_changed(op.clone());
@@ -505,7 +517,7 @@ fn 未知已发操作在取消和abandon后仍未落定() {
 }
 #[test]
 fn phase通知与watch共享revision且只给扩展连接() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     m.records.get_mut(P).unwrap().watchers.extend([2, 3]);
     m.live_conns.extend([2, 3]);
@@ -880,7 +892,7 @@ fn 预算未核实不把零读号当成功() {
 fn goal暂停阻断运行中及收敛中自动启动() {
     for waiting in [true, false] {
         for status in ["paused", "blocked", "budgetLimited", "usageLimited"] {
-            let (mut m, mut mock) = setup();
+            let (mut m, mut mock) = setup_with_child();
             if waiting {
                 complete(&mut m, &mut mock, P, T, "completed");
             }
@@ -911,7 +923,7 @@ fn notloaded通知撤销旧观察但不制造新结果版本() {
 }
 #[test]
 fn 关闭失去自动权_重启仅保留历史摘要() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     let token = m.convergences.runs[R].token.clone();
     apply(&mut m, Event::Shutdown);
@@ -1030,7 +1042,7 @@ fn 独立配置保存但不发送上游也不启用门禁() {
 
 #[test]
 fn 所有身份字段与发现代号都拒绝旧回调() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     let token = m.convergences.runs[R].token.clone();
     for i in 0..6 {
@@ -1149,7 +1161,7 @@ fn 旧投递不得回退最终汇总轮定位() {
 }
 #[test]
 fn 重启沿用原中断原因但撤销历史自动权() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     let mut record = m.runs.runs[R].clone();
     record.interrupt_reason = Some(InterruptReason::Stop);
@@ -1178,7 +1190,7 @@ fn 重启沿用原中断原因但撤销历史自动权() {
 
 #[test]
 fn 旧父轮迟到started不把收敛状态恢复为running() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "completed");
     let deadline = m.convergences.runs[R].deadline_mono_ms;
     apply(&mut m, mock.turn_started(P, T));
@@ -1483,7 +1495,7 @@ fn 集成_托管交接保留动态工具待答及原截止() {
 
 #[test]
 fn 集成_停止期间非活动goal换版本会重新核实() {
-    let (mut m, mut mock) = setup();
+    let (mut m, mut mock) = setup_with_child();
     complete(&mut m, &mut mock, P, T, "interrupted");
     let id = m.stops.operations.keys().next().unwrap().clone();
     let op = m.stops.operations.get_mut(&id).unwrap();

@@ -545,12 +545,13 @@ impl Machine {
                 .as_ref()
                 .is_some_and(|s| s.revoked);
             if revoked {
-                if self
-                    .runs
-                    .runs
-                    .get(&run)
-                    .and_then(|r| r.subagent_join.as_ref())
-                    .is_some_and(|j| !j.automatic_control_revoked)
+                if self.run_has_subagents(&run)
+                    && self
+                        .runs
+                        .runs
+                        .get(&run)
+                        .and_then(|r| r.subagent_join.as_ref())
+                        .is_some_and(|j| !j.automatic_control_revoked)
                 {
                     let thread = self.loop_guards[&run].thread.clone();
                     self.convergence_cancel_for_thread(
@@ -617,13 +618,14 @@ impl Machine {
             .records
             .get(thread)
             .is_some_and(|r| r.goal_controlled && r.goal_status.as_deref() == Some("active"));
-        if !self.shared || (managed && controlled) {
+        // 共享模式只在确有子代理要收尾时停止本次运行；否则保持拍板 K：只暂停 goal、不中断在跑的轮。
+        if !self.shared || (managed && controlled && self.run_has_subagents(run)) {
             actions.push(Action::Warn(format!(
                 "线程 {thread} 自动续跑空转（{:?}，{} 轮），暂停 goal 并停止本次运行",
                 report.kind, report.count
             )));
             self.run_loop_guard(run, report, actions);
-            if managed && self.convergence_enabled() {
+            if managed && self.convergence_enabled() && self.run_has_subagents(run) {
                 self.convergence_fail(run, crate::sa1b::TerminalReason::NoAction, actions);
             } else {
                 self.begin_stop(thread, StopReason::GoalLoop, false, actions);

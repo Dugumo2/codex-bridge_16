@@ -2406,10 +2406,14 @@ impl Machine {
         } else if event.method == "turn/completed" {
             if self.claims.get(thread_id).is_some_and(|c| {
                 c.run_id.as_ref().is_some_and(|run| {
-                    self.runs
-                        .runs
-                        .get(run)
-                        .is_some_and(|r| r.subagent_join.is_some())
+                    // 只有纳管子代理的运行才按自有轮过滤完成通知；否则保持原语义（审查的外层轮
+                    // 在内层轮开始后完成，不能被丢弃）。
+                    self.run_has_subagents(run)
+                        && self
+                            .runs
+                            .runs
+                            .get(run)
+                            .is_some_and(|r| r.subagent_join.is_some())
                 }) && notification_turn_id(&event.params)
                     .is_some_and(|t| !c.owned_turns.contains(t))
             }) {
@@ -2647,6 +2651,11 @@ impl Machine {
 
     fn completed(&mut self, thread_id: &str, convergence_turn: &str, actions: &mut Vec<Action>) {
         if self.convergence_enabled()
+            && self
+                .claims
+                .get(thread_id)
+                .and_then(|c| c.run_id.as_deref())
+                .is_some_and(|run| self.run_has_subagents(run))
             && self
                 .claims
                 .get(thread_id)

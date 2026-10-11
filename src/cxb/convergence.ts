@@ -13,13 +13,22 @@ const reasons: Record<TerminalReason, string> = {
   goalUsageLimited: "目标用量受限", rootNoDirectInput: "根线程不能直接输入", abandoned: "已放弃清理责任", brokerShutdown: "broker 关闭或失联",
 };
 
+/** 本运行是否涉及子代理协调。没有时不显示协调信息，普通运行输出保持原样（用户 2026-10-11 定）。 */
+function involvesSubagents(run: ConvergenceSummary & { children?: unknown[] }): boolean {
+  const join = run.subagentJoin;
+  if (!join) return false;
+  return join.workEpoch > 0 || join.wakeupsStarted > 0 || join.terminalReason != null || join.automaticControlRevoked === true
+    || !["running", "released"].includes(join.phase) || (run.children?.length ?? 0) > 0;
+}
+
 /** 协调状态是运行的附加说明，不另造生命周期或停止成功结论。 */
-export function convergenceLines(run: ConvergenceSummary & Pick<Partial<RunResult>, "convergenceConfig">, pending = 0): string[] {
+export function convergenceLines(run: ConvergenceSummary & Pick<Partial<RunResult>, "convergenceConfig" | "children">, pending = 0): string[] {
   const lines: string[] = [];
+  if (!involvesSubagents(run)) return lines;
   const join = run.subagentJoin;
   if (join) {
     lines.push(`运行协调：${phases[join.phase]}${pending > 0 ? `；等待回答（${pending} 项）` : ""}；唤醒 ${join.wakeupsStarted}/${run.convergenceConfig?.maxWakeups ?? 5} 次，提交 ${join.wakeupAttempts} 次，重试 ${join.startRetriesUsed} 次`);
-    lines.push(`收敛期限：${new Date(join.deadlineAt).toISOString()}；工作批次 ${join.workEpoch}，已投递 ${join.deliveredEpoch}，已汇总 ${join.reconciledEpoch}`);
+    lines.push(`收敛期限：${join.deadlineAt === 0 ? "尚未开始收敛计时" : new Date(join.deadlineAt).toISOString()}；工作批次 ${join.workEpoch}，已投递 ${join.deliveredEpoch}，已汇总 ${join.reconciledEpoch}`);
     if (join.resultCoverage) {
       const c = join.resultCoverage;
       lines.push(`结果覆盖：批次 ${c.epoch}，共 ${c.total} 项，可用 ${c.available}，截断 ${c.truncated}，不可用 ${c.unavailable}，省略 ${c.omitted}`);

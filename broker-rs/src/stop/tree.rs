@@ -1465,12 +1465,11 @@ impl Machine {
                 let Some(context) = self.manage_context(run) else {
                     return 0;
                 };
-                if self
-                    .runs
-                    .runs
-                    .get(run)
-                    .is_some_and(|r| r.subagent_join.is_some())
-                {
+                // 收敛账本只在运行仍在进行时有效；已结束运行的重复停止只看关系层在途派生，
+                // 避免把结束时冻结的待启动项永久算作未落定。
+                if self.runs.runs.get(run).is_some_and(|r| {
+                    r.subagent_join.is_some() && r.state == crate::runs::RunState::Running
+                }) {
                     self.convergences
                         .ledgers
                         .get(run)

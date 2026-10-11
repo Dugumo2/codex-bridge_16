@@ -132,6 +132,10 @@ impl Machine {
     }
 
     pub fn notify_convergence_changed(&self, run: &str, actions: &mut Vec<Action>) {
+        // 没有纳管子代理的运行不推送协调进度，客户端输出保持原样（用户 2026-10-11 定）。
+        if !self.run_has_subagents(run) {
+            return;
+        }
         let (Some(context), Some(summary)) =
             (self.manage_context(run), self.convergence_summary(run))
         else {

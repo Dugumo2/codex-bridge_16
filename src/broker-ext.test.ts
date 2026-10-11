@@ -2582,6 +2582,11 @@ process.stdin.on("end", () => process.exit(0));
         case "thread/goal/get":
           reply({ goal: thread(p.threadId).goal ?? null });
           break;
+        case "thread/list":
+        case "thread/loaded/list":
+        case "thread/backgroundTerminals/list":
+          reply({ data: [], nextCursor: null });
+          break;
         case "thread/goal/set": {
           const t = thread(p.threadId);
           if (!t.goal || (p.objective !== undefined && p.objective !== t.goal.objective)) {
@@ -2687,7 +2692,7 @@ process.stdin.on("end", () => process.exit(0));
         await turnsWritten(home, "thread-sh", n);
       }
       await autoTurn(mock, "thread-sh", [idleItem]);
-      // 服务器紧接着又开了一轮：刹车只能暂停 goal，不能误伤正在跑的轮。
+      // 服务器紧接着又开了一轮：刹车只能暂停 goal，不能误伤正在跑的轮（拍板 K；没有子代理时 SA1b 不改变）。
       const next = mock.startAuto("thread-sh");
       expect(next).toBe("turn-5");
       await waitFor(() => brokerPaused(mock), 10_000);
@@ -2731,7 +2736,7 @@ process.stdin.on("end", () => process.exit(0));
       await client.request("thread/goal/get", { threadId: "thread-dk" });
       expect(brokerPaused(mock)).toBe(false);
       expect(mock.goal("thread-dk").status).toBe("active");
-      // 桌面端自己暂停：认领在等待续跑时释放，运行正常结束、没有刹车记录。
+      // 桌面端自己暂停：没有子代理时运行正常结束、没有刹车记录（用户 2026-10-11 定）。
       mock.desktop("thread/goal/set", { threadId: "thread-dk", status: "paused" });
       await waitFor(() => runOf(home, "thread-dk")?.state === "ended", 10_000);
       const run = runOf(home, "thread-dk") as RunFile & { loopGuard?: unknown };
@@ -2760,13 +2765,12 @@ process.stdin.on("end", () => process.exit(0));
       // 桌面端在同一线程上开一轮（带 userMessage）：broker 认领正等续跑，这一轮接进同一运行。
       mock.desktop("turn/start", { threadId: "thread-us", input: [{ type: "text", text: "我来插一句" }] });
       mock.finish("thread-us", [agent("d", "回答桌面端")]);
-      await turnsWritten(home, "thread-us", 3);
+      await waitFor(() => (runOf(home, "thread-us") as any)?.subagentJoin?.automaticControlRevoked === true);
       for (let n = 4; n <= 6; n++) {
         await autoTurn(mock, "thread-us", [idleItem]);
-        await turnsWritten(home, "thread-us", n);
       }
       await client.request("thread/goal/get", { threadId: "thread-us" });
-      expect(brokerPaused(mock)).toBe(false);
+      expect(brokerPaused(mock), JSON.stringify({run:runOf(home,"thread-us"),calls:mock.log})).toBe(false);
       expect(mock.goal("thread-us").status).toBe("active");
       mock.desktop("thread/goal/set", { threadId: "thread-us", status: "paused" });
       await waitFor(() => runOf(home, "thread-us")?.state === "ended", 10_000);

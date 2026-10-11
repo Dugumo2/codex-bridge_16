@@ -1285,7 +1285,12 @@ setInterval(() => {}, 1000);
         await client.request("turn/start", { threadId: "thread-001", input: [{ type: "text", text: "hi" }] });
         await waitFor(() => notifications.some((n) => n.method === "turn/completed" && (n.params as { turn?: { id?: string } }).turn?.id === "turn-001"), 3000);
         expect(notifications.some((n) => n.method === "item/agentMessage/delta")).toBe(true);
-        // The claim ended with OUR turn, not the predecessor's: the thread is free again.
+        // 上游完成后还须等待 broker 的最终发现释放认领。
+        const releaseDeadline = Date.now() + 3000;
+        while ((await client.request("broker/threads/list", {}) as any).threads.find((t: any) => t.threadId === "thread-001")?.state !== "idle") {
+          if (Date.now() >= releaseDeadline) throw new Error("最终发现未释放认领");
+          await Bun.sleep(20);
+        }
         const again = (await client.request("turn/start", { threadId: "thread-001", input: [{ type: "text", text: "again" }] })) as { turn: { id: string } };
         expect(again.turn.id).toBe("turn-001");
         await client.close();
@@ -1311,6 +1316,11 @@ setInterval(() => {}, 1000);
         await client.request("turn/start", { threadId: "thread-001", input: [{ type: "text", text: "hi" }] });
         await waitFor(() => notifications.some((n) => n.method === "turn/completed" && (n.params as { turn?: { id?: string } }).turn?.id === "turn-001"), 4000);
         expect(notifications.some((n) => n.method === "item/agentMessage/delta")).toBe(true);
+        const releaseDeadline = Date.now() + 3000;
+        while ((await client.request("broker/threads/list", {}) as any).threads.find((t: any) => t.threadId === "thread-001")?.state !== "idle") {
+          if (Date.now() >= releaseDeadline) throw new Error("最终发现未释放认领");
+          await Bun.sleep(20);
+        }
         const again = (await client.request("turn/start", { threadId: "thread-001", input: [{ type: "text", text: "again" }] })) as { turn: { id: string } };
         expect(again.turn.id).toBe("turn-001");
         await client.close();
