@@ -258,6 +258,8 @@ export interface LoopGuardReport {
 }
 
 export interface RunResult {
+  /** 最近一次已开始的轮次；结束后保留，旧记录缺省为 null。 */
+  currentTurnId?: string | null;
   creationOrder?: { epoch: number; sequence: number };
   startConfirmation?: { confirmed: boolean; owned: boolean | null; threadId: string | null; turnId: string | null };
   /** 运行中的轮尚无 TurnResult 时暂存的改道；轮结束并入该轮结果后清空。 */
@@ -287,6 +289,23 @@ export interface RunResult {
   turns: TurnResult[];
   turnsTotal: number;
 }
+
+/** broker/runs/modelSummaries 的轻量回包，不含输入、输出正文。 */
+export interface RunModelSummary {
+  runId: string;
+  threadId: string;
+  reviewThreadId: string | null;
+  state: RunResult["state"];
+  startedAt: number;
+  creationOrder: NonNullable<RunResult["creationOrder"]> | null;
+  startConfirmation: NonNullable<RunResult["startConfirmation"]>;
+  meta: Pick<RunMeta, "source" | "model" | "effort"> | null;
+  currentTurnId: string | null;
+  lastTurn: { turnId: string; reroute: Reroute | null } | null;
+  pendingReroute: NonNullable<RunResult["pendingReroute"]> | null;
+}
+
+export type ModelRun = RunResult | RunModelSummary;
 
 export type InboxKind = "approval" | "question" | "mcp" | "guardian";
 

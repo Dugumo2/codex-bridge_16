@@ -1,5 +1,5 @@
 import { sanitizeForTerminal } from "../questions";
-import { CxbError, type BrokerRpc, type LifecycleInfo, type RunResult, type ThreadSummary } from "./contracts";
+import { CxbError, type BrokerRpc, type LifecycleInfo, type RunResult, type RunModelSummary, type ThreadSummary } from "./contracts";
 import { readAllRuns, readLifecycle, readThreadIndex, type ThreadIndexEntry } from "./ledger";
 import { modelLabel, threadModelDisplay, type ModelDisplay } from "./show-model";
 import { backgroundLines, derivedOnly, stopReportLines } from "./subagents";
@@ -140,21 +140,17 @@ export const ls: CommandHandler = async (ctx) => {
     const ranked = sorted(items);
     const truncated = more || ranked.length > limit;
     items = ctx.parsed.options.all ? ranked : ranked.slice(0, limit);
-    for (const item of items) {
-      const indexModel = item.model;
-      Object.assign(item, threadModelDisplay(item.threadId, indexModel, diskRuns));
-      if (!onlineRpc) continue;
+    let online: RunModelSummary[] = [];
+    if (onlineRpc && items.length) {
       try {
-        const snapshot = await onlineRpc.request<{ thread?: ThreadSummary; run?: RunResult | null; runs?: RunResult[] }>(
-          "broker/threads/watch", { threadId: item.threadId, includeRuns: true });
-        const online = [...snapshot.runs ?? [], ...snapshot.run ? [snapshot.run] : []];
-        // 同一运行的在线状态覆盖磁盘旧快照；不合格的最近运行不能遮住更早的合格记录。
-        Object.assign(item, threadModelDisplay(item.threadId, snapshot.thread?.model ?? indexModel, diskRuns, online, snapshot.thread));
+        online = (await onlineRpc.request<{ runs: RunModelSummary[] }>("broker/runs/modelSummaries",
+          { threadIds: [...new Set(items.map((item) => item.threadId))] })).runs;
       } catch (error) {
         if (session.signal.aborted) throw error;
-        ctx.out.notice(`无法读取线程 ${item.shortId ?? item.threadId} 的在线运行，模型来源按本地账本显示`);
+        ctx.out.notice("无法读取在线运行摘要，模型来源按本地账本显示");
       }
     }
+    for (const item of items) Object.assign(item, threadModelDisplay(item.threadId, item.model, diskRuns, online));
     ctx.out.progress(`共发现 ${ranked.length} 条线程，显示 ${items.length} 条`);
     ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL REASONING PREVIEW\n");
     for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${modelLabel(item)} ${item.reasoning ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));

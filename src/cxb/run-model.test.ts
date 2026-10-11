@@ -67,6 +67,10 @@ for (const [label, models] of unknownCatalogs) {
     expect(result).toMatchObject({ reasoning: undefined, reasoningSource: "上游当前设置" });
     expect(result.notices.join("\n")).toContain("推理强度沿用上游当前设置（未核实）");
   }, 5000);
+  test(`决策表：${label}，上游回退模型无强度不能省略`, () => {
+    expect(() => select({ models, inherited: { model: "astra", effort: null, source: "沿用上游记录" } }))
+      .toThrow("无法确定 astra 支持的推理强度，请用 -r 指定");
+  }, 5000);
   test(`决策表：${label}，新开线程不发送强度`, () => {
     const result = select({ models, resume: false, inherited: undefined, model: "astra" });
     expect(result).toMatchObject({ reasoning: undefined, reasoningSource: "服务器默认" });

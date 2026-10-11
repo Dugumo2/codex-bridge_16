@@ -3,12 +3,12 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Model } from "../types";
 import { CxbError, type BrokerConnection, type RunResult } from "./contracts";
-import { compareRunCreation, latestModelRun, readAllRuns } from "./ledger";
+import { compareRunCreation, latestModelRun, readAllRuns, readRunRecord, listThreadRuns, readModelRuns } from "./ledger";
 import { createRunHandler } from "./run";
 import { createReviewHandler } from "./review";
 import { applyUserConfig } from "./user-config";
 import { renderHelp } from "./help";
-import { FakeRpc, runResult, wireError } from "./test-fixtures/run-fakes";
+import { FakeRpc, runResult, modelSummary, wireError } from "./test-fixtures/run-fakes";
 import { CLEANUP_BUDGET, TEST_BUDGET, RunHarness, fakeServerRequests } from "./test-fixtures/run-harness";
 
 let h: RunHarness;
@@ -46,7 +46,7 @@ const invalidCases: Array<[string, Partial<RunResult>]> = [
 
 /** 模拟 broker 的在线快照；thread/start/resume 回包故意与请求不同，暴露输出误取回包的回归。 */
 function fixture(options: { runs?: RunResult[]; latest?: RunResult | null; shared?: boolean; models?: Model[] | Error;
-  upstream?: { model?: string | null; reasoningEffort?: string | null } | Error; joined?: boolean; threadId?: string; watchError?: Error } = {}) {
+  upstream?: { model?: string | null; reasoningEffort?: string | null } | Error; joined?: boolean; threadId?: string; summaryError?: Error } = {}) {
   const fake = new FakeRpc();
   const threadId = options.threadId ?? "thread-test";
   const ended = runResult({ threadId, joined: options.joined ?? false });
@@ -70,9 +70,12 @@ function fixture(options: { runs?: RunResult[]; latest?: RunResult | null; share
     if (method === "broker/threads/annotate") return { shortId: "abcd1234" };
     if (method === "thread/goal/get") return { goal: null };
     if (method === "turn/start" || method === "review/start") return { runId: ended.runId, absorbedBy: options.joined ? "turn-external" : null };
+    if (method === "broker/runs/modelSummaries") {
+      expect(params).toEqual({ threadIds: [threadId] });
+      if (options.summaryError) throw options.summaryError;
+      return { runs: (options.runs ?? []).map(modelSummary) };
+    }
     if (method === "broker/threads/watch") {
-      if (params.includeRuns && options.watchError) throw options.watchError;
-      if (params.includeRuns) return { run: options.latest ?? options.runs?.at(-1) ?? null, runs: options.runs ?? [] };
       if (!fake.calls.some((call) => call.method === "turn/start" || call.method === "review/start")) return { run: options.latest ?? options.runs?.at(-1) ?? null };
       return { run: ended };
     }
@@ -95,6 +98,77 @@ function requestValues(f: ReturnType<typeof fixture>) {
   const meta = f.fake.calls.find((call) => call.method === "broker/threads/annotate")?.params.meta;
   return { turn, meta };
 }
+
+function corrupt(content: string) {
+  const dir = join(h.workspace.workspaceDir, "runs");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "run-bad.json"), content);
+}
+function expectNoStart(f: ReturnType<typeof fixture>) {
+  expect(f.fake.calls.filter((call) => ["thread/resume", "broker/threads/resumeOverrides", "broker/threads/annotate", "turn/start"].includes(call.method))).toEqual([]);
+}
+
+test("CLI 坏文件：可识别的无关线程损坏不阻断沿用，严格账本读取仍拒绝", async () => {
+  save(qualified());
+  corrupt(JSON.stringify({ payload: { runId: "run-bad", threadId: "unrelated", turns: "损坏" } }));
+  const f = fixture();
+  const result = await f.invoke();
+  expect(result.code).toBe(0);
+  expectRequest(f, result.stdout, "astra", "high", "沿用线程", "沿用线程");
+  expect(result.stderr).toContain("run-bad.json 无法解析，已跳过");
+  expect(() => readAllRuns(h.workspace.workspaceDir)).toThrow("无法解析");
+  expect(() => readRunRecord(h.workspace.workspaceDir, "run-bad")).toThrow("无法解析");
+  expect(() => listThreadRuns(h.workspace.workspaceDir, "thread-test")).toThrow("无法解析");
+  const scanned = readModelRuns(h.workspace.workspaceDir, () => {});
+  expect(scanned.runs[0]).not.toHaveProperty("input");
+  expect(scanned.runs[0]).not.toHaveProperty("turns");
+}, TEST_BUDGET);
+
+for (const [label, content] of [
+  ["JSON 截断", '{"payload":{"threadId":"thread-test"'],
+  ["目标线程结构损坏", JSON.stringify({ payload: { runId: "run-bad", threadId: "thread-test" } })],
+  ["无法识别归属", JSON.stringify({ payload: { runId: "run-bad" } })],
+] as const) {
+  for (const args of [[], ["-m", "sol"], ["-r", "medium"]]) test(`CLI 坏文件：${label}且参数不全 ${args.join(" ")} 要求显式参数且无副作用`, async () => {
+    save(qualified());
+    corrupt(content);
+    const f = fixture();
+    const result = await f.invoke(["--resume", "thread-test", ...args], { model: "sol", reasoning: "medium" });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("已跳过");
+    expect(result.stderr).toContain("请用 -m 和 -r 显式指定");
+    expectNoStart(f);
+  }, TEST_BUDGET);
+  test(`CLI 坏文件：${label}但显式 -m/-r 完整仍可运行`, async () => {
+    save(qualified());
+    corrupt(content);
+    const f = fixture();
+    const result = await f.invoke(["--resume", "thread-test", "-m", "sol", "-r", "medium"]);
+    expect(result.code, result.stderr).toBe(0);
+    expectRequest(f, result.stdout, "sol", "medium", "-m 指定", "-r 指定");
+    expect(result.stderr).toContain("已跳过");
+  }, TEST_BUDGET);
+}
+
+test("CLI 坏文件：在线同 runId 摘要补全损坏历史后允许沿用", async () => {
+  save(qualified());
+  corrupt("{损坏");
+  const f = fixture({ runs: [qualified({ runId: "run-bad", creationOrder: { epoch: 2, sequence: 1 }, meta: { source: "run", model: "sol", effort: "medium" } })] });
+  const result = await f.invoke();
+  expect(result.code).toBe(0);
+  expectRequest(f, result.stdout, "sol", "medium", "沿用线程", "沿用线程");
+  expect(result.stderr).toContain("已跳过");
+}, TEST_BUDGET);
+
+for (const models of [[], new Error("目录不可用"), [{ ...catalog[0]!, supportedReasoningEfforts: [] }]]) {
+  test(`CLI 上游只有模型不能充当上一合格运行：${models instanceof Error ? "目录失败" : models.length ? "强度为空" : "目录无模型"}`, async () => {
+    const f = fixture({ models, upstream: { model: "astra", reasoningEffort: null } });
+    const result = await f.invoke();
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("无法确定 astra 支持的推理强度，请用 -r 指定");
+    expectNoStart(f);
+  }, TEST_BUDGET);
+}
 function expectRequest(f: ReturnType<typeof fixture>, output: string, model: string | null, effort: string | null, modelSource: string, reasoningSource: string) {
   const { turn, meta } = requestValues(f);
   expect(turn).toBeDefined();
@@ -112,7 +186,7 @@ for (const continuing of [false, true]) test(`CLI 沿用：${continuing ? "--con
   const result = await f.invoke(["--resume", "thread-test", ...(continuing ? ["--continue"] : [])], { model: "sol", reasoning: "medium" });
   expect(result.code, result.stderr).toBe(0);
   expectRequest(f, result.stdout, "astra", "high", "沿用线程", "沿用线程");
-  expect(f.fake.calls.filter((call) => call.method === "broker/threads/watch" && call.params.includeRuns)).toHaveLength(1);
+  expect(f.fake.calls.filter((call) => call.method === "broker/runs/modelSummaries")).toHaveLength(1);
   if (continuing) expect(f.fake.calls.some((call) => call.method === "thread/resume")).toBe(false);
   else expect(f.fake.calls.find((call) => call.method === "thread/resume")?.params).toMatchObject({ model: "astra", config: { model_reasoning_effort: "high" } });
 }, TEST_BUDGET);
@@ -127,7 +201,7 @@ test("CLI 沿用：无 config 不跟随 pickBestModel 升级链", async () => {
 
 for (const [label, patch] of invalidCases) test(`CLI 历史回溯：最近${label}取更早合格运行`, async () => {
   save(qualified());
-  const recent = qualified({ runId: "run-b", creationOrder: { epoch: 9, sequence: 9 }, ...patch });
+  const recent = qualified({ runId: "run-b", creationOrder: { epoch: 9, sequence: 9 }, meta: { source: "run", model: "sol", effort: "medium" }, ...patch });
   save(recent);
   const f = fixture({ runs: [recent], latest: recent });
   const result = await f.invoke();
@@ -146,25 +220,22 @@ for (const state of ["中断", "失联"] as const) test(`CLI 历史回溯：确�
 
 test("CLI 历史回溯：淘汰内存、重启、索引缺失或重建均不影响磁盘 A", async () => {
   const a = qualified();
-  const b = qualified({ runId: "run-b", creationOrder: { epoch: 1, sequence: 2 }, startConfirmation: undefined });
+  const b = qualified({ runId: "run-b", creationOrder: { epoch: 1, sequence: 2 }, meta: { source: "run", model: "sol", effort: "medium" }, startConfirmation: undefined });
   save(a, 800, 99);
   save(b, 900, 999);
   for (const rebuilt of [false, true]) {
     if (rebuilt) writeFileSync(join(h.workspace.workspaceDir, "threads.json"), JSON.stringify({ payload: { threads: {
       abcd1234: { threadId: "thread-test", shortId: "abcd1234", updatedAt: 500, lastRunId: "run-b", model: "错误索引模型" },
     } } }));
-    const f = fixture({ runs: [], latest: null, ...(rebuilt ? {} : { watchError: unknownThread() }) });
+    const f = fixture({ runs: [], latest: null });
     const result = await f.invoke();
     expect(result.code).toBe(0);
     expectRequest(f, result.stdout, "astra", "high", "沿用线程", "沿用线程");
   }
 }, TEST_BUDGET);
 
-function unknownThread() {
-  return new CxbError("BROKER_UNAVAILABLE", "远端请求失败", { cause: { rpcCode: -32000, data: { reason: "unknownThread" } } });
-}
-test("CLI broker 不认识线程时仍可沿用上游记录", async () => {
-  const f = fixture({ watchError: unknownThread(), upstream: { model: "astra", reasoningEffort: "high" } });
+test("CLI broker 不认识线程时摘要为空，仍可沿用上游记录", async () => {
+  const f = fixture({ runs: [], upstream: { model: "astra", reasoningEffort: "high" } });
   const result = await f.invoke();
   expect(result.code).toBe(0);
   expectRequest(f, result.stdout, "astra", "high", "沿用上游记录", "沿用上游记录");
@@ -172,7 +243,7 @@ test("CLI broker 不认识线程时仍可沿用上游记录", async () => {
 }, TEST_BUDGET);
 test("CLI 历史快照的连接失败不能伪装成没有历史", async () => {
   save(qualified());
-  const f = fixture({ watchError: new CxbError("BROKER_UNAVAILABLE", "连接已断开") });
+  const f = fixture({ summaryError: new CxbError("BROKER_UNAVAILABLE", "连接已断开") });
   const result = await f.invoke();
   expect(result.code).toBe(6);
   expect(f.fake.calls.some((call) => call.method === "turn/start")).toBe(false);
@@ -333,7 +404,7 @@ test("CLI 新开线程不沿用已有历史，默认与空目录行为保持", a
     const result = await f.invoke([]);
     expect(result.code).toBe(0);
     expectRequest(f, result.stdout, empty ? null : "sol", empty ? null : "medium", "自动选择", empty ? "服务器默认" : "自动选择");
-    expect(f.fake.calls.some((call) => call.method === "thread/read" || call.params?.includeRuns)).toBe(false);
+    expect(f.fake.calls.some((call) => call.method === "thread/read" || call.method === "broker/runs/modelSummaries")).toBe(false);
     if (empty) {
       expect(result.stderr).toContain("推理强度由服务器默认决定");
       expect(requestValues(f).turn).not.toHaveProperty("model");
@@ -365,7 +436,7 @@ test("CLI review 不沿用模型、不登记请求模型或强度", async () => 
   expect(meta).not.toHaveProperty("model");
   expect(meta).not.toHaveProperty("effort");
   expect(JSON.parse(result.stdout)).not.toHaveProperty("modelSource");
-  expect(f.fake.calls.some((call) => call.params?.includeRuns)).toBe(false);
+  expect(f.fake.calls.some((call) => call.method === "broker/runs/modelSummaries")).toBe(false);
   expect(f.fake.calls.find((call) => call.method === "thread/resume")?.params.config.review_model).toBe("sol");
 }, TEST_BUDGET);
 
@@ -409,7 +480,7 @@ test("真 broker：新开请求登记与不同启动回包下的 JSON、续跑�
   const run = await observer.rpc.request<{ run: RunResult }>("broker/threads/watch", { threadId: payload.thread.id });
   expect(run.run.meta).toMatchObject({ source: "run", model: "astra", effort: "high" });
   const second = await h.invoke(createRunHandler(fakeServerRequests()), ["run", "继续", "--resume", payload.thread.id, "--json"]);
-  expect(second.code).toBe(0);
+  expect(second.code, second.stderr).toBe(0);
   expect(JSON.parse(second.stdout)).toMatchObject({ model: "astra", reasoning: "high", modelSource: "沿用线程", reasoningSource: "沿用线程" });
   const { calls } = await observer.rpc.request<any>("fixture/state");
   expect(calls.filter((call: any) => call.method === "turn/start").map((call: any) => [call.params.model, call.params.effort]))

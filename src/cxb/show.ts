@@ -1,6 +1,6 @@
 import { childEntry, showChildThread, showSubagents } from "./subagents";
 import { sanitizeForTerminal } from "../questions";
-import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type ThreadSummary, type TurnResult } from "./contracts";
+import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type RunModelSummary, type ThreadSummary, type TurnResult } from "./contracts";
 import { readAllRuns, readRunLog, readThreadIndex, listThreadRuns, type LogLine } from "./ledger";
 import { modelLabel, rerouteLabel, runModelDisplay, threadModelDisplay, type ModelDisplay } from "./show-model";
 import { lifecycleHint, lifecycleLabel } from "./lifecycle";
@@ -33,6 +33,20 @@ function modelNotice(ctx: CommandContext, model: ModelDisplay) {
   ctx.out.notice(clean(`模型：${modelLabel(model)}；请求强度：${model.reasoning ?? "-"}`));
 }
 
+/** 所有 show 模式共享续跑的候选集合；正文仍按各模式原有来源读取。 */
+async function readThreadModel(ctx: CommandContext, ref: ThreadRef, connect: () => Promise<BrokerRpc>,
+  indexModel: string | null, disk = readAllRuns(ctx.workspace.workspaceDir)): Promise<ModelDisplay> {
+  let online: RunModelSummary[] = [];
+  try {
+    const rpc = await connect();
+    online = (await rpc.request<{ runs: RunModelSummary[] }>("broker/runs/modelSummaries", { threadIds: [ref.threadId] })).runs;
+  } catch (error) {
+    if (error instanceof CxbError && error.code === "INTERRUPTED") throw error;
+    ctx.out.notice("无法连接 broker 或读取在线运行摘要，模型来源降级为本地账本");
+  }
+  return threadModelDisplay(ref.threadId, indexModel, disk, online);
+}
+
 function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
   showSubagents(ctx, run);
   if (run.childrenStop?.cleanupState === "abandoned") return;
@@ -44,11 +58,11 @@ function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
   }
 }
 
-function localResult(ctx: CommandContext, ref: ThreadRef) {
+async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => Promise<BrokerRpc>) {
   const index = readThreadIndex(ctx.workspace.workspaceDir).find((entry) => entry.threadId === ref.threadId)!;
   const disk = readAllRuns(ctx.workspace.workspaceDir);
   const run = disk.find((record) => record.runId === index.lastRunId);
-  const model = threadModelDisplay(ref.threadId, index.model, disk);
+  const model = await readThreadModel(ctx, ref, connect, index.model, disk);
   modelNotice(ctx, model);
   if (!run) throw new CxbError("NOT_FOUND", "线程没有运行记录", { id: ref.threadId });
   const last = run.turns.at(-1);
@@ -161,15 +175,7 @@ async function serverResult(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef,
     turn = { ...turn, items };
   }
   const result = serverOutput(turn?.items ?? []);
-  let snapshot: Snapshot | undefined;
-  try {
-    snapshot = await rpc.request<Snapshot>("broker/threads/watch", { threadId: ref.threadId, includeRuns: true });
-  } catch (error) {
-    if (error instanceof CxbError && error.code === "INTERRUPTED") throw error;
-    ctx.out.notice("无法读取在线运行，模型来源按本地账本显示");
-  }
-  const model = threadModelDisplay(ref.threadId, snapshot?.thread?.model ?? indexModel,
-    readAllRuns(ctx.workspace.workspaceDir), [...snapshot?.runs ?? [], ...snapshot?.run ? [snapshot.run] : []], snapshot?.thread);
+  const model = await readThreadModel(ctx, ref, async () => rpc, indexModel);
   modelNotice(ctx, model);
   ctx.out.result(result.output);
   ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: null, status: turn?.status ?? null,
@@ -190,11 +196,11 @@ function linesOfRun(all: LogLine[], runId: string): LogLine[] {
   return all.slice(first, last + 1).filter((line) => line.runId === runId || line.runId === null);
 }
 
-function showLog(ctx: CommandContext, ref: ThreadRef) {
+async function showLog(ctx: CommandContext, ref: ThreadRef, connect: () => Promise<BrokerRpc>) {
   const all = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : [];
   const records = listThreadRuns(ctx.workspace.workspaceDir, ref.threadId);
   const index = readThreadIndex(ctx.workspace.workspaceDir).find((entry) => entry.threadId === ref.threadId);
-  const model = threadModelDisplay(ref.threadId, index?.model ?? null, records);
+  const model = await readThreadModel(ctx, ref, connect, index?.model ?? null, records);
   modelNotice(ctx, model);
   const runs = records.map((run) => {
     const lines = linesOfRun(all, run.runId).filter((line) => ctx.parsed.options.full || SUMMARY_EVENTS.has(line.event)).map(eventLine);
@@ -219,7 +225,7 @@ function showLog(ctx: CommandContext, ref: ThreadRef) {
   return 0 as const;
 }
 
-interface Snapshot { thread: ThreadSummary; run: RunResult | null; runs?: RunResult[] }
+interface Snapshot { thread: ThreadSummary; run: RunResult | null }
 const PROGRESS_LABELS: Record<string, string> = { "turn/started": "轮次开始", "turn/completed": "轮次完成", "item/started": "条目开始", "item/completed": "条目完成" };
 /** 上游进展通知 → 显示行；只认 `source` 线程上的（null 表示还不知道该认哪个线程，一律丢弃）。 */
 function renderNotification(method: string, raw: unknown, source: string | null) {
@@ -323,7 +329,7 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
   });
   const close = rpc.onClose(() => reject(new CxbError("BROKER_UNAVAILABLE", "跟随期间 broker 连接断开")));
   try {
-    snapshot = await Promise.race([rpc.request<Snapshot>("broker/threads/watch", { threadId: ref.threadId, includeRuns: true }), failure]);
+    snapshot = await Promise.race([rpc.request<Snapshot>("broker/threads/watch", { threadId: ref.threadId }), failure]);
     runId = snapshot.run?.runId ?? snapshot.thread.lastRunId;
     for (const line of tail(ctx, ref)) emit(line);
     // 先把快照前后同批通知交给等待器，再清空缓冲；不能以 await 返回时刻划分通知新旧。
@@ -350,8 +356,7 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
     const run = await Promise.race([waiting, failure]);
     // 订阅子线程的请求有自身期限，取消与断线经 failure 收束。
     if (switching) await Promise.race([switching, failure]);
-    const model = threadModelDisplay(ref.threadId, snapshot.thread.model, readAllRuns(ctx.workspace.workspaceDir),
-      [...snapshot.runs ?? [], ...run ? [run] : []]);
+    const model = await Promise.race([readThreadModel(ctx, ref, async () => rpc, snapshot.thread.model), failure]);
     modelNotice(ctx, model);
     ctx.out.result(`运行结束：${run?.status ?? "无运行"}${runId ? `（${runId}）` : ""}\n`);
     ctx.out.resultJson({ terminal: true, status: run?.status ?? null, runId, ...model });
@@ -378,17 +383,17 @@ export const show: CommandHandler = async (ctx) => {
       ctx.out.notice(`${lifecycleLabel(ref.lifecycle)}：${lifecycleHint(ref.lifecycle.kind, ref.lifecycle.phase, ref.shortId ?? ref.threadId)}`);
       // purge 已删索引、只剩记录：没有本地结果可显示，--json 带出记录供调用方判断。
       if (!readThreadIndex(ctx.workspace.workspaceDir).some((entry) => entry.threadId === ref.threadId)) {
-        const model = threadModelDisplay(ref.threadId, null, readAllRuns(ctx.workspace.workspaceDir));
+        const model = await readThreadModel(ctx, ref, session.connect, null);
         modelNotice(ctx, model);
         ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: options.log ? "log" : options.tail ? "tail" : "result", runId: null });
         return 0;
       }
     }
-    if (options.log) return showLog(ctx, ref);
+    if (options.log) return await showLog(ctx, ref, session.connect);
     if (options.tail) {
       const items = tail(ctx, ref);
       const index = readThreadIndex(ctx.workspace.workspaceDir).find((entry) => entry.threadId === ref.threadId);
-      const model = threadModelDisplay(ref.threadId, index?.model ?? null, readAllRuns(ctx.workspace.workspaceDir));
+      const model = await readThreadModel(ctx, ref, session.connect, index?.model ?? null);
       modelNotice(ctx, model);
       for (const line of items) ctx.out.result(`${line.ts} ${line.text}\n`);
       ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "tail", items, next: null });
@@ -397,6 +402,6 @@ export const show: CommandHandler = async (ctx) => {
     // SA1 第 11 节：没有 RunRecord 的子代理线程，说明血缘后从服务器读它的结果。
     const child = childEntry(ctx.workspace.workspaceDir, ref.threadId);
     if (child && !child.lastRunId) return await showChildThread(ctx, child, async () => serverResult(ctx, await session.connect(), ref, child.model));
-    return localResult(ctx, ref);
+    return await localResult(ctx, ref, session.connect);
   } finally { session.dispose(); }
 };

@@ -16,11 +16,11 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-n4a-show-")); });
 afterEach(async () => { await removeTemp(dir); }, 10_000);
 
 describe("show 本地读取", () => {
-  test("就绪结果与完整 JSON 字段，完全不连接 broker", async () => {
+  test("就绪结果与完整 JSON 字段，模型查询连接 broker", async () => {
     ledger(dir);
     const t = context(dir, ["show", "abcd", "--json"]);
     expect(await show(t.ctx)).toBe(0);
-    expect(t.connects).toBe(0);
+    expect(t.connects).toBe(1);
     expect(t.json[0]).toEqual({ ok: true, command: "show", threadId: "thread-test", shortId: "abcd1234", mode: "result", runId: "run-test",
       model: "模型", reasoning: null, modelSource: "index", reroute: null,
       state: "ended", status: "completed", ready: "ready", result: "中文结果", outputSource: "finalAnswer", interruptReason: null,
@@ -75,7 +75,7 @@ describe("show 本地读取", () => {
     expect(t.json[0]).toMatchObject({ mode: "tail", next: null, command: "show" });
     expect(t.json[0].items.map((l: any) => l.text)).toEqual(["条目完成 危险", "轮次完成 turn-test"]);
     expect(t.json[0].items[0].kind).toBe("条目完成");
-    expect(t.connects).toBe(0);
+    expect(t.connects).toBe(1);
   });
   test("log 按运行分段、保留状态，full 加条目及脱敏元数据", async () => {
     ledger(dir, [runResult({ meta: { source: "run", token: "不可见" } }), runResult({ runId: "run-two", startedAt: 3000, input: "第二次要求" })]);
@@ -155,7 +155,7 @@ describe("show 服务器与跟随", () => {
     const t = context(dir, ["show", "server-only", "--server", "--json"]);
     t.fake.handle = (method, p) => {
       if (method === "broker/threads/list") return { threads: [] };
-      if (method === "broker/threads/watch") return { runs: [] };
+      if (method === "broker/runs/modelSummaries") return { runs: [] };
       if (method === "thread/turns/list") { expect(p).toEqual({ threadId: "server-only", cursor: null, limit: 1, sortDirection: "desc", itemsView: "notLoaded" }); return { data: [{ id: "last", status: "completed", items: [], itemsView: "notLoaded" }], nextCursor: "更早" }; }
       expect(p).toEqual({ threadId: "server-only", turnId: "last", cursor: p.cursor, limit: 64, sortDirection: "asc" });
       return { data: [{ turnId: "last", item: p.cursor ? { type: "exitedReviewMode", review: "审查结果" } : { type: "agentMessage", text: "最终回答", phase: "final_answer" } }], nextCursor: p.cursor ? null : "第二页" };
@@ -188,7 +188,7 @@ describe("show 服务器与跟随", () => {
       const t = context(dir, ["show", "abcd", "--server", "--json"]);
       t.fake.handle = (method, p) => {
         if (method === "broker/threads/list") return { threads: [summary()] };
-        if (method === "broker/threads/watch") return { runs: [] };
+        if (method === "broker/runs/modelSummaries") return { runs: [] };
         if (method === "thread/items/list") throw wireError(-32601, "Method not found: thread/items/list");
         if (p.itemsView === "notLoaded") return { data: [{ id: "last", status: "completed", items: [], itemsView: "notLoaded" }], nextCursor: null };
         expect(p).toEqual({ threadId: "thread-test", cursor: null, limit: 1, sortDirection: "desc", itemsView: "full" });
@@ -278,7 +278,9 @@ describe("show 服务器与跟随", () => {
     t.fake.handle = (m) => m === "broker/threads/list" ? { threads: [summary()] } : { thread: summary(), run: null };
     expect(await show(t.ctx)).toBe(0);
     expect(t.json.at(-1)).toMatchObject({ status: "completed", runId: "run-test" });
-    expect(t.fake.calls.at(-1)?.params).toEqual({ threadId: "thread-test", runId: "run-test" });
+    expect(t.fake.calls.filter((call) => call.method === "broker/threads/watch").at(-1)?.params)
+      .toEqual({ threadId: "thread-test", runId: "run-test" });
+    expect(t.fake.calls.at(-1)).toMatchObject({ method: "broker/runs/modelSummaries", params: { threadIds: ["thread-test"] } });
   });
   test("follow 缓冲同批早到通知，初始 tail 在前，pending 补全后最后一行才是终态", async () => {
     ledger(dir);
