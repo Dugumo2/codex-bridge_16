@@ -8,9 +8,11 @@
 //! 证据期限、回查期限和墓碑用单调毫秒（`Clock::mono_ms`）；请求的收到与截止时间沿用墙钟毫秒。
 pub mod types;
 
+pub mod convergence;
 mod discovery;
 mod facts;
 mod notify;
+pub mod results;
 mod routing;
 #[cfg(test)]
 mod tests;
@@ -299,7 +301,11 @@ impl Machine {
         result: DiscoveryResult,
         actions: &mut Vec<Action>,
     ) {
-        self.discovery_apply(op_id, caller, result, actions)
+        if let DiscoveryCaller::Converge { token, work_epoch } = caller {
+            self.convergence_discovery_done(token, work_epoch, result, actions);
+        } else {
+            self.discovery_apply(op_id, caller, result, actions);
+        }
     }
     pub fn on_claim_settled(
         &mut self,

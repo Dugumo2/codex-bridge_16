@@ -53,7 +53,20 @@ function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
   if (run.state === "lost" || run.stopOutcome === "unconfirmed") {
     ctx.out.notice(`停止中（未确认），先 cxb stop ${id} 核实`);
   } else if (run.status === "interrupted") {
-    const reasons = { clientDisconnected: "客户端断开", stop: "主动停止", brokerLost: "broker 失联", goalLoop: "空转刹车", subagentsUnfinished: "子代理未完成" };
+    const reasons: Record<NonNullable<RunResult["interruptReason"]>, string> = {
+      budgetExhausted: "原运行预算已耗尽",
+      budgetIncomplete: "预算证据不完整",
+      convergeDeadline: "子树收敛期限已到",
+      wakeLimit: "汇总轮次数已用尽",
+      autoTurnLimit: "自动父轮次数已用尽",
+      discoveryIncomplete: "子树发现不完整",
+      ownershipConflict: "轮次归属存在冲突",
+      wakeUnknown: "汇总启动结果不明",
+      wakeFailed: "汇总启动失败",
+      goalInactive: "目标禁止自动续轮",
+      rootNoDirectInput: "根线程不能直接输入",
+      abandoned: "已放弃子树清理责任",
+      clientDisconnected: "客户端断开", stop: "主动停止", brokerLost: "broker 失联", goalLoop: "空转刹车", subagentsUnfinished: "子代理未完成" };
     ctx.out.notice(`已中断（${run.interruptReason ? reasons[run.interruptReason] : "服务器中断"}），可继续：cxb run --resume ${id} --continue`);
   }
 }

@@ -9,10 +9,12 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+pub mod converge;
 mod ext;
 pub mod finish_gate;
 pub mod lifecycle;
 pub mod loop_guard;
+pub mod loop_guard_input;
 #[cfg(test)]
 #[path = "tests/m7.rs"]
 mod m7_tests;
@@ -20,6 +22,7 @@ pub mod resume;
 mod settling;
 pub mod shutdown;
 pub mod status_read;
+pub mod subagent_reconcile;
 #[cfg(test)]
 mod tests;
 
@@ -128,6 +131,15 @@ pub enum State {
         turn_id: String,
         joined: bool,
     },
+    /// SA1b 正常收敛，保留认领；骨架不构造此状态。
+    Converging {
+        owner: Owner,
+        turn_id: Option<String>,
+        parent_status: Option<crate::runs::TurnStatus>,
+        goal_status: Option<String>,
+        token: crate::sa1b::ConvergeToken,
+        phase: crate::sa1b::JoinPhase,
+    },
     /// SA-b 持有父轮结束快照；迟到事件不得把它恢复为 Running。
     FinishingTree {
         owner: Owner,
@@ -180,6 +192,7 @@ impl Claim {
         match &self.state {
             State::Starting { owner, .. }
             | State::Running { owner, .. }
+            | State::Converging { owner, .. }
             | State::FinishingTree { owner, .. }
             | State::AwaitingContinuation { owner } => Some(owner),
             State::Idle => None,
@@ -187,9 +200,9 @@ impl Claim {
     }
     pub fn turn_id(&self) -> Option<&str> {
         match &self.state {
-            State::Starting { turn_id, .. } | State::FinishingTree { turn_id, .. } => {
-                turn_id.as_deref()
-            }
+            State::Starting { turn_id, .. }
+            | State::Converging { turn_id, .. }
+            | State::FinishingTree { turn_id, .. } => turn_id.as_deref(),
             State::Running { turn_id, .. } => Some(turn_id),
             _ => None,
         }
@@ -255,6 +268,16 @@ pub struct ClaimToken {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operation {
+    StartReconciliation {
+        token: crate::sa1b::ConvergeToken,
+        op_id: crate::sa1b::ReconcileOpId,
+    },
+    ChildResultRead {
+        token: crate::sa1b::ConvergeToken,
+        read_id: crate::sa1b::BatchReadId,
+        key: crate::sa1b::ActivityKey,
+        page_generation: u64,
+    },
     /// H2-a 接读取分派；本批只保留未启用分支。
     StatusRead {
         read_id: u64,
@@ -352,6 +375,21 @@ pub struct RequestContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
+    ConvergeDeadline {
+        token: crate::sa1b::ConvergeToken,
+    },
+    ConvergeRetry {
+        token: crate::sa1b::ConvergeToken,
+        attempt: u32,
+    },
+    ChildResultsDeadline {
+        token: crate::sa1b::ConvergeToken,
+        read_id: crate::sa1b::BatchReadId,
+    },
+    ReconcileVerifyDeadline {
+        token: crate::sa1b::ConvergeToken,
+        op_id: crate::sa1b::ReconcileOpId,
+    },
     /// 状态读取的 20 秒总期限（可撤销，完成时撤销）。
     StatusReadDeadline {
         read_id: u64,
@@ -416,6 +454,10 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    ConvergeDeadline(String, u64),
+    ConvergeRetry(String, u64),
+    ChildResultsDeadline(crate::sa1b::BatchReadId),
+    ReconcileVerifyDeadline(crate::sa1b::ReconcileOpId),
     Stop(String, u64, crate::stop::StopTimer),
     StatusRead(u64),
     LookupDeadline(u64),
@@ -440,6 +482,20 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::ConvergeDeadline { token } => Some(TimerKey::ConvergeDeadline(
+                token.run_id.clone(),
+                token.generation,
+            )),
+            TimerKind::ConvergeRetry { token, .. } => Some(TimerKey::ConvergeRetry(
+                token.run_id.clone(),
+                token.generation,
+            )),
+            TimerKind::ChildResultsDeadline { read_id, .. } => {
+                Some(TimerKey::ChildResultsDeadline(*read_id))
+            }
+            TimerKind::ReconcileVerifyDeadline { op_id, .. } => {
+                Some(TimerKey::ReconcileVerifyDeadline(*op_id))
+            }
             TimerKind::Stop(tag, kind) => {
                 Some(TimerKey::Stop(tag.id.clone(), tag.generation, kind.clone()))
             }
@@ -665,6 +721,7 @@ pub struct Clock {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Machine {
+    pub convergences: converge::Convergences,
     /// H2 线程状态读取层：在途读取、页代号与活动版本号。
     pub status_reads: status_read::StatusReads,
     pub relations: crate::relations::Relations,
@@ -765,7 +822,13 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             state.breaker_probe_timer(generation, &mut actions)
         }
         Event::TransportFailed { context, error } => {
-            if let Operation::Lifecycle {
+            if matches!(context.operation, Operation::StartReconciliation { .. }) {
+                state.subagent_reconcile_transport(
+                    &context,
+                    crate::sa1b::ReconcileTransportEvent::TransportFailed,
+                    &mut actions,
+                );
+            } else if let Operation::Lifecycle {
                 thread,
                 operation,
                 attempt,
@@ -1454,6 +1517,17 @@ impl Machine {
             }
             _ => {}
         }
+        match &context.operation {
+            Operation::StartReconciliation { .. } => {
+                self.subagent_reconcile_reply(&context, result, actions);
+                return;
+            }
+            Operation::ChildResultRead { .. } => {
+                self.child_result_reply(&context, result, actions);
+                return;
+            }
+            _ => {}
+        }
         let current = context.token.as_ref().is_none_or(|t| self.current(t));
         // 空转刹车的暂停回包先核对版本，由处理函数自己决定是否学习（旧回包不得覆盖新事实）。
         if !matches!(
@@ -1472,6 +1546,9 @@ impl Machine {
             | Operation::Discovery { .. }
             | Operation::AttachThread { .. } => self.relation_reply(&context, result, actions),
             Operation::DerivedStop { .. } => self.tree_reply(&context, result, actions),
+            Operation::StartReconciliation { .. } | Operation::ChildResultRead { .. } => {
+                actions.push(Action::Warn("SA1b 回包重复分派，已忽略".into()));
+            }
             Operation::BreakerProbe { generation } => {
                 self.breaker_probe_reply(*generation, actions)
             }
@@ -1667,6 +1744,7 @@ impl Machine {
             // #9：完成已进入空窗或下一轮，迟到响应只清 pending。
             State::Running { .. }
             | State::AwaitingContinuation { .. }
+            | State::Converging { .. }
             | State::FinishingTree { .. } => {}
             State::Idle => actions.push(Action::Warn("启动回包与认领阶段不匹配".into())),
         }
@@ -2273,6 +2351,16 @@ impl Machine {
     }
 
     pub(crate) fn started(&mut self, thread_id: &str, id: &str, actions: &mut Vec<Action>) {
+        if self.convergence_event(
+            thread_id,
+            converge::ConvergeEvent::ParentTurn {
+                turn: id,
+                started: true,
+            },
+            actions,
+        ) {
+            return;
+        }
         // 必须在改变认领轮次及写开轮证据之前隔离旧轮；通知自报 threadId 不证明归属。
         if id.is_empty()
             || self.claims.get(thread_id).is_some_and(|claim| {
@@ -2320,7 +2408,7 @@ impl Machine {
                     joined: false,
                 }
             }
-            State::FinishingTree { .. } => return,
+            State::Converging { .. } | State::FinishingTree { .. } => return,
             State::Idle => {
                 actions.push(Action::Warn("启动通知与认领阶段不匹配".into()));
                 return;
@@ -2350,6 +2438,22 @@ impl Machine {
     }
 
     fn completed(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
+        let convergence_turn = self
+            .claims
+            .get(thread_id)
+            .and_then(Claim::turn_id)
+            .unwrap_or_default()
+            .to_owned();
+        if self.convergence_event(
+            thread_id,
+            converge::ConvergeEvent::ParentTurn {
+                turn: &convergence_turn,
+                started: false,
+            },
+            actions,
+        ) {
+            return;
+        }
         if let Some(claim) = self
             .claims
             .get(thread_id)
@@ -2434,6 +2538,13 @@ impl Machine {
     pub(crate) fn learn_goal(&mut self, thread_id: &str, active: bool, actions: &mut Vec<Action>) {
         self.record(thread_id).goal_active = active;
         self.observe_goal(thread_id, active);
+        if self.convergence_event(
+            thread_id,
+            converge::ConvergeEvent::GoalChanged { active },
+            actions,
+        ) {
+            return;
+        }
         if self
             .claims
             .get(thread_id)
@@ -2564,6 +2675,7 @@ impl Machine {
 
     /// #18 与停止操作：joined 不碰服务器，自有认领仅标记 owner_gone。
     fn disconnect(&mut self, conn: ConnId, actions: &mut Vec<Action>) {
+        self.on_convergence_owner_disconnect(conn, actions);
         self.lifecycle_disconnect(conn);
         self.live_conns.remove(&conn);
         self.cxb_conns.remove(&conn);
@@ -2694,6 +2806,10 @@ impl Machine {
             return;
         }
         match kind {
+            TimerKind::ConvergeDeadline { .. }
+            | TimerKind::ConvergeRetry { .. }
+            | TimerKind::ChildResultsDeadline { .. }
+            | TimerKind::ReconcileVerifyDeadline { .. } => self.convergence_timer(kind, actions),
             TimerKind::StatusReadDeadline { read_id } => {
                 self.status_read_deadline(read_id, actions)
             }
@@ -2758,6 +2874,7 @@ impl Machine {
         }
     }
     fn shutdown(&mut self, actions: &mut Vec<Action>) {
+        self.convergence_shutdown(actions);
         if self.closing {
             return;
         }

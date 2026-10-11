@@ -1,3 +1,6 @@
+import type { ConvergenceSummary, ConvergenceConfig, RunExecutionConfig, TurnOrigin, Sa1bInterruptReason, Sa1bTreeTrigger } from "./sa1b-contracts";
+export type * from "./sa1b-contracts";
+
 // src/cxb/contracts.ts — cxb CLI 各模块之间的接口约定（S4 N1）。
 //
 // 这里只放各路共用的常量、类型与错误类；实现分别在：
@@ -231,6 +234,7 @@ export interface RunMeta {
 }
 
 export interface TurnResult {
+  origin?: TurnOrigin;
   turnId: string;
   ready: "pending" | "ready" | "unavailable";
   status: "completed" | "interrupted" | "failed";
@@ -257,7 +261,9 @@ export interface LoopGuardReport {
   pause?: "pending" | "paused" | "superseded" | "failed";
 }
 
-export interface RunResult {
+export interface RunResult extends ConvergenceSummary {
+  convergenceConfig?: ConvergenceConfig;
+  executionConfig?: RunExecutionConfig;
   /** 最近一次已开始的轮次；结束后保留，旧记录缺省为 null。 */
   currentTurnId?: string | null;
   creationOrder?: { epoch: number; sequence: number };
@@ -280,7 +286,7 @@ export interface RunResult {
   reviewShortId?: string | null;
   input: string;
   continuedFrom: string | null;
-  interruptReason: "clientDisconnected" | "stop" | "brokerLost" | "goalLoop" | "subagentsUnfinished" | null;
+  interruptReason: "clientDisconnected" | "stop" | "brokerLost" | "goalLoop" | "subagentsUnfinished" | Sa1bInterruptReason | null;
   stopOutcome: "confirmed" | "unconfirmed" | null;
   stopCheck?: unknown;
   loopGuard?: LoopGuardReport;
@@ -292,6 +298,7 @@ export interface RunResult {
 
 /** broker/runs/modelSummaries 的轻量回包，不含输入、输出正文。 */
 export interface RunModelSummary {
+  finalTurnId?: string;
   runId: string;
   threadId: string;
   reviewThreadId: string | null;
@@ -532,7 +539,7 @@ export interface RootStopReport {
 export interface ChildrenStopReport {
   rootRelease?: { thread: string; released: boolean; reason: string };
   members?: Record<string, RootStopReport>; cleanupState?: string; abandonReason?: string | null; abandonedAt?: number | null;
-  trigger: "userStop" | "ownerGone" | "parentFinishedEarly" | "loopGuard" | "parentFailed" | "parentInterrupted";
+  trigger: "userStop" | "ownerGone" | "parentFinishedEarly" | "loopGuard" | "parentFailed" | "parentInterrupted" | Sa1bTreeTrigger;
   phase: TreePhase; version: number; root: RootStopReport;
   stopped: string[]; unconfirmed: string[]; failed: string[];
   conflicts: Array<{ thread: string; reason: string }>; capabilityLimited: string[];
@@ -541,7 +548,7 @@ export interface ChildrenStopReport {
 export interface CxbOrigin {
   rootThreadId: string; runId: string; parentThreadId: string; relationKind: RelationKind; sourceThreadId: string;
 }
-export interface ChildChanged {
+export interface ChildChanged extends ConvergenceSummary {
   runId: string; rootThreadId: string; threadId: string | null; parentThreadId?: string;
   relationKind?: RelationKind; activity?: ChildActivity; pendingCount?: number; revision: number; stopPhase?: TreePhase;
 }

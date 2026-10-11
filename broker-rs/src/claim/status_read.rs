@@ -31,6 +31,10 @@ const METHOD_NOT_FOUND: i64 = -32601;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusQuery {
+    ClientMessage {
+        client_user_message_id: String,
+        expected_previous_turn_id: Option<String>,
+    },
     Busy,
     Activity,
     Turn {
@@ -75,6 +79,10 @@ pub enum StatusResult {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusCaller {
+    SubagentReconcile {
+        token: crate::sa1b::ConvergeToken,
+        op_id: crate::sa1b::ReconcileOpId,
+    },
     ContinueCheck {
         round: u64,
     },
@@ -196,6 +204,7 @@ pub(crate) fn timer_token(thread: &str, token: &Option<ClaimToken>) -> ClaimToke
 impl Machine {
     /// 发起一次读取，返回唯一的非零编号。总是先发出第一个请求，从不同步回调。
     /// 关闭中发起的读取不发请求、不回调（与关闭时的静默取消一致）。
+    /// SA1b 的 ClientMessage 查询仍为骨架，返回零号禁用哨兵，不发请求、不回调。
     pub fn begin_status_read(
         &mut self,
         thread: &str,
@@ -204,6 +213,10 @@ impl Machine {
         caller: StatusCaller,
         actions: &mut Vec<Action>,
     ) -> u64 {
+        if matches!(query, StatusQuery::ClientMessage { .. }) {
+            actions.push(Action::Warn("SA1b clientId 核实读取尚未接线".into()));
+            return 0;
+        }
         let read_id = self.status_reads.allocate_read();
         if self.closing {
             actions.push(Action::Debug(format!(
@@ -256,6 +269,9 @@ impl Machine {
         #[cfg(test)]
         self.status_reads.observed.push(done.clone());
         match &done.caller {
+            StatusCaller::SubagentReconcile { .. } => {
+                self.subagent_reconcile_status_done(done, actions)
+            }
             StatusCaller::ContinueCheck { .. } => self.continue_check_done(done, actions),
             StatusCaller::StopVerify { .. } => self.stop_verify_done(done, actions),
             StatusCaller::Reconcile { .. } => self.reconcile_status_done(done, actions),
@@ -654,6 +670,9 @@ impl Machine {
             return Step::Done(StatusResult::Unknown(StatusUnknown::Malformed));
         };
         match (&read.query, active) {
+            (StatusQuery::ClientMessage { .. }, _) => {
+                Step::Done(StatusResult::Unknown(StatusUnknown::Unsupported))
+            }
             (StatusQuery::Busy, true) => Step::Done(StatusResult::Busy),
             (StatusQuery::Busy, false) => Step::Done(StatusResult::NotBusy),
             (StatusQuery::Activity, false) => Step::Done(StatusResult::Idle),

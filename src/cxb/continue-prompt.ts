@@ -105,6 +105,19 @@ const INTERRUPT_TEXT: Record<NonNullable<RunResult["interruptReason"]>, string> 
   brokerLost: "broker 重启，未能跟踪到结束",
   goalLoop: "自动续跑空转，被刹车暂停",
   subagentsUnfinished: "父线程结束时子代理尚未完成",
+  budgetExhausted: "原运行预算已耗尽",
+  budgetIncomplete: "预算证据不完整",
+  convergeDeadline: "子树收敛期限已到",
+  wakeLimit: "汇总轮次数已用尽",
+  autoTurnLimit: "自动父轮次数已用尽",
+  discoveryIncomplete: "子树发现不完整",
+  ownershipConflict: "轮次归属存在冲突",
+  wakeUnknown: "汇总启动结果不明",
+  wakeFailed: "汇总启动失败",
+  goalInactive: "目标禁止自动续轮",
+  rootNoDirectInput: "根线程不能直接输入",
+  abandoned: "已放弃子树清理责任",
+
 };
 
 function bullet(items: ProgressItem[]): string[] {

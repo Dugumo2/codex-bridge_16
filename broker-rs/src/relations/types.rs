@@ -213,6 +213,9 @@ pub enum HandoffKind {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberChange {
+    ResultReady,
+    ConvergencePhase,
+    Budget,
     Relation,
     Binding,
     Activity,
@@ -229,6 +232,10 @@ pub enum DiscoveryScope {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryCaller {
+    Converge {
+        token: crate::sa1b::ConvergeToken,
+        work_epoch: u64,
+    },
     TreeStop {
         tree_op: u64,
         round: u64,

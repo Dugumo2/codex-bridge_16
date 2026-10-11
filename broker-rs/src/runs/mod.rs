@@ -36,6 +36,7 @@ use crate::claim::{Action, ConnId, Machine, ReqKind, StopReason};
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub mod budget;
 #[cfg(test)]
 mod tests;
 pub mod types;
@@ -299,6 +300,12 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                final_turn_id: None,
+                auto_turns_started: None,
+                subagent_join: None,
+                run_budget: None,
+                convergence_config: None,
+                execution_config: None,
                 current_turn_id: None,
                 pending_reroute: None,
                 creation_order: Some(CreationOrder {
@@ -772,6 +779,7 @@ impl Machine {
             None
         };
         record.turns.push(TurnResult {
+            origin: None,
             reroute,
             turn_id: id.into(),
             ready: if pending {
@@ -824,6 +832,7 @@ impl Machine {
         }
         record.turns_total = record.turns_total.checked_add(1).expect("轮次总数已耗尽");
         record.turns.push(TurnResult {
+            origin: None,
             reroute: None,
             turn_id: String::new(),
             ready: Ready::Ready,
@@ -1110,6 +1119,15 @@ impl Machine {
         }
     }
     pub(crate) fn run_released(&mut self, run: &str, kind: ReleaseKind, actions: &mut Vec<Action>) {
+        self.on_run_finishing(run, kind, actions);
+        let convergence_terminal = self.convergence_run_terminal(
+            run,
+            self.runs
+                .runs
+                .get(run)
+                .and_then(|r| r.turns.last())
+                .map(|t| t.status),
+        );
         self.runs.trace("run_released");
         if self.runs.phase != Phase::Open {
             return;
@@ -1149,6 +1167,12 @@ impl Machine {
                 }
                 ReleaseKind::StopConfirmed | ReleaseKind::Shutdown => RunStatus::Interrupted,
             }
+        };
+        let status = if let Some(terminal) = convergence_terminal {
+            record.interrupt_reason = terminal.interrupt_reason;
+            terminal.status
+        } else {
+            status
         };
         record.state = RunState::Ended;
         record.status = Some(status);

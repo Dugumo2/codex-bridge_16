@@ -70,6 +70,12 @@ impl Drop for Temp {
 
 pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
+        final_turn_id: None,
+        auto_turns_started: None,
+        subagent_join: None,
+        run_budget: None,
+        convergence_config: None,
+        execution_config: None,
         current_turn_id: None,
         pending_reroute: None,
         creation_order: None,
@@ -309,6 +315,7 @@ async fn 从运行恢复索引_删除标记_review_任意_pending_与损坏文�
     let mut old = run("old", "parent", 10);
     old.turns = vec![
         TurnResult {
+            origin: None,
             reroute: None,
             turn_id: "turn1".into(),
             ready: Ready::Pending,
@@ -319,6 +326,7 @@ async fn 从运行恢复索引_删除标记_review_任意_pending_与损坏文�
             completed_at: 11,
         },
         TurnResult {
+            origin: None,
             reroute: None,
             turn_id: "turn2".into(),
             ready: Ready::Ready,

@@ -97,6 +97,7 @@ impl Machine {
 
     /// 第 1 步（共享专用）。私有服务器不调用，直接在第 4 步一并处理。
     pub(crate) fn quiesce(&mut self, actions: &mut Vec<Action>) {
+        self.convergence_shutdown(actions);
         if self.shared && !self.closing && !self.quiescing {
             self.quiescing = true;
             actions.push(Action::Debug("关闭开始，停止受理新运行与目标恢复".into()));

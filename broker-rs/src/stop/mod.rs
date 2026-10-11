@@ -410,6 +410,7 @@ impl Machine {
         clear: bool,
         actions: &mut Vec<Action>,
     ) -> Option<String> {
+        self.convergence_cancel_for_thread(thread, crate::sa1b::ReconcileCancel::Stop, actions);
         if self.tree_stop_gate(thread, reason, clear, actions) {
             return None;
         }
@@ -2025,6 +2026,14 @@ impl Machine {
         deadline: std::time::Instant,
         actions: &mut Vec<Action>,
     ) {
+        if matches!(context.operation, Operation::StartReconciliation { .. }) {
+            self.subagent_reconcile_transport(
+                &context,
+                crate::sa1b::ReconcileTransportEvent::TimedOut,
+                actions,
+            );
+            return;
+        }
         if let Operation::Lifecycle {
             thread,
             operation,
@@ -2433,6 +2442,14 @@ impl Machine {
         deadline: std::time::Instant,
         actions: &mut Vec<Action>,
     ) {
+        if matches!(context.operation, Operation::StartReconciliation { .. }) {
+            self.subagent_reconcile_transport(
+                context,
+                crate::sa1b::ReconcileTransportEvent::LateEvicted,
+                actions,
+            );
+            return;
+        }
         if self.closing {
             return;
         }
@@ -2469,6 +2486,14 @@ impl Machine {
         context: &RequestContext,
         actions: &mut Vec<Action>,
     ) {
+        if matches!(context.operation, Operation::StartReconciliation { .. }) {
+            self.subagent_reconcile_transport(
+                context,
+                crate::sa1b::ReconcileTransportEvent::LateDiscarded,
+                actions,
+            );
+            return;
+        }
         if self.closing {
             return;
         }

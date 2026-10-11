@@ -30,6 +30,21 @@ pub const MAX_TREE_REQUESTS: usize = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TreeTrigger {
+    BudgetExhausted,
+    BudgetIncomplete,
+    ConvergeDeadline,
+    WakeLimit,
+    AutoTurnLimit,
+    DiscoveryIncomplete,
+    OwnershipConflict,
+    WakeUnknown,
+    WakeFailed,
+    GoalPaused,
+    GoalBlocked,
+    GoalBudgetLimited,
+    GoalUsageLimited,
+    RootNoDirectInput,
+
     UserStop,
     OwnerGone,
     ParentFinishedEarly,
@@ -401,6 +416,11 @@ impl Machine {
 
     /// 发起整树停止（第 8.3 节）：立根屏障、冻结清理策略、停根、对已知成员发起派生停止、发现扩展集合。
     pub fn begin_tree_stop(&mut self, request: TreeStopRequest, actions: &mut Vec<Action>) -> u64 {
+        self.convergence_cancel_for_thread(
+            &request.snapshot.identity.execution_thread_id,
+            crate::sa1b::ReconcileCancel::Stop,
+            actions,
+        );
         if self.closing {
             return 0;
         }
@@ -1106,7 +1126,7 @@ impl Machine {
 
     // ─── 事实变化 ────────────────────────────────────────────────────
 
-    pub fn on_member_changed(
+    pub(crate) fn tree_member_changed(
         &mut self,
         run_id: &str,
         _revision: u64,
@@ -1945,7 +1965,10 @@ impl Machine {
             snapshot.parent_status = record.and_then(|r| r.turns.last()).map(|t| t.status);
         }
         let existing = record.and_then(|r| r.interrupt_reason);
-        let (status, interrupt_reason) = if op.report.children.cleanup_state == "abandoned" {
+        let terminal = self.convergence_run_terminal(&run, snapshot.parent_status);
+        let (status, interrupt_reason) = if let Some(terminal) = terminal {
+            (terminal.status, terminal.interrupt_reason)
+        } else if op.report.children.cleanup_state == "abandoned" {
             (RunStatus::Interrupted, Some(InterruptReason::Stop))
         } else {
             commit_status(&snapshot, trigger, existing)
@@ -2270,7 +2293,8 @@ impl Machine {
 
 /// 专用提交的终态优先级（第 8.4 节）：父 failed → failed；父 interrupted → interrupted（保留已有
 /// stop/clientDisconnected/goalLoop，否则 null）；其余有 loopGuard → interrupted/goalLoop；其余按树触发原因。
-/// 树触发总带异常或停止原因，因此不会落到 goalBlocked 或父 completed。
+/// SA1a 触发仍不会落到 goalBlocked 或父 completed；新增 SA1b 原因仅预留保守映射，尚无生产触发源。
+/// A 接线后普通释放与树提交共用 convergence_run_terminal，不能继续维护两份终态优先级。
 pub(crate) fn commit_status(
     snapshot: &ReleaseSnapshot,
     trigger: TreeTrigger,
@@ -2303,6 +2327,45 @@ pub(crate) fn commit_status(
         TreeTrigger::LoopGuard => (RunStatus::Interrupted, Some(InterruptReason::GoalLoop)),
         TreeTrigger::ParentFailed => (RunStatus::Failed, kept),
         TreeTrigger::ParentInterrupted => (RunStatus::Interrupted, kept),
+        TreeTrigger::BudgetExhausted => (
+            RunStatus::GoalBlocked,
+            Some(InterruptReason::BudgetExhausted),
+        ),
+        TreeTrigger::BudgetIncomplete => (
+            RunStatus::GoalBlocked,
+            Some(InterruptReason::BudgetIncomplete),
+        ),
+        TreeTrigger::ConvergeDeadline => (
+            RunStatus::Interrupted,
+            Some(InterruptReason::ConvergeDeadline),
+        ),
+        TreeTrigger::WakeLimit => (RunStatus::GoalBlocked, Some(InterruptReason::WakeLimit)),
+        TreeTrigger::AutoTurnLimit => {
+            (RunStatus::GoalBlocked, Some(InterruptReason::AutoTurnLimit))
+        }
+        TreeTrigger::DiscoveryIncomplete => (
+            RunStatus::Interrupted,
+            Some(InterruptReason::DiscoveryIncomplete),
+        ),
+        TreeTrigger::OwnershipConflict => (
+            RunStatus::Interrupted,
+            Some(InterruptReason::OwnershipConflict),
+        ),
+        TreeTrigger::WakeUnknown => (RunStatus::Interrupted, Some(InterruptReason::WakeUnknown)),
+        TreeTrigger::WakeFailed => (RunStatus::Failed, Some(InterruptReason::WakeFailed)),
+        TreeTrigger::GoalPaused => (RunStatus::Interrupted, Some(InterruptReason::GoalInactive)),
+        TreeTrigger::GoalBlocked => (RunStatus::GoalBlocked, Some(InterruptReason::GoalInactive)),
+        TreeTrigger::GoalBudgetLimited => (
+            RunStatus::GoalBlocked,
+            Some(InterruptReason::BudgetExhausted),
+        ),
+        TreeTrigger::GoalUsageLimited => {
+            (RunStatus::GoalBlocked, Some(InterruptReason::GoalInactive))
+        }
+        TreeTrigger::RootNoDirectInput => (
+            RunStatus::Interrupted,
+            Some(InterruptReason::RootNoDirectInput),
+        ),
     }
 }
 
@@ -2520,6 +2583,17 @@ impl Machine {
         if abandoned {
             reason = "alreadyAbandoned";
         } else if let Some(tree_op) = tree {
+            let thread = self.trees.operations[&tree_op]
+                .request
+                .snapshot
+                .identity
+                .execution_thread_id
+                .clone();
+            self.convergence_cancel_for_thread(
+                &thread,
+                crate::sa1b::ReconcileCancel::Abandon,
+                actions,
+            );
             let root_release = self.tree_abandon_root(tree_op);
             let release = root_release.released;
             let op = self.trees.operations.get_mut(&tree_op).expect("树停止存在");

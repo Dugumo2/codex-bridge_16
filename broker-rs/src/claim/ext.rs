@@ -69,6 +69,7 @@ fn owner_mut(claim: &mut Claim) -> Option<&mut Owner> {
     match &mut claim.state {
         State::Starting { owner, .. }
         | State::Running { owner, .. }
+        | State::Converging { owner, .. }
         | State::FinishingTree { owner, .. }
         | State::AwaitingContinuation { owner } => Some(owner),
         State::Idle => None,
@@ -573,6 +574,7 @@ impl Machine {
         if let Some(run) = &origin.run_id {
             self.on_handoff(run, crate::relations::HandoffKind::Detach, actions);
         }
+        self.convergence_event(thread, super::converge::ConvergeEvent::Detach, actions);
         let ids: Vec<_> = self
             .requests
             .pending
@@ -953,6 +955,7 @@ impl Machine {
             match claim.map(|c| &c.state) {
                 Some(State::Starting { .. }) => SummaryState::Starting,
                 Some(State::Running { .. }) => SummaryState::Running,
+                Some(State::Converging { .. }) => SummaryState::Running,
                 Some(State::FinishingTree { .. }) => SummaryState::Stopping,
                 Some(State::AwaitingContinuation { .. }) => SummaryState::Awaiting,
                 _ => SummaryState::Idle,

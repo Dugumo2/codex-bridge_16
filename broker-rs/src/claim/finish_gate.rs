@@ -52,6 +52,11 @@ impl Machine {
         turn_status: Option<TurnStatus>,
         actions: &mut Vec<Action>,
     ) -> ReleaseDecision {
+        if let Some(decision) =
+            self.convergence_release_gate(thread, goal_status, turn_status, actions)
+        {
+            return decision;
+        }
         if self.closing {
             return ReleaseDecision::Release;
         }

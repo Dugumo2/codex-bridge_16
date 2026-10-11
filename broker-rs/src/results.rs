@@ -126,15 +126,31 @@ pub struct Activity {
     pub unknown: bool,
 }
 
+pub fn classify_untrusted_input(item: &Value) -> crate::sa1b::InputSource {
+    if item.get("type").and_then(Value::as_str) == Some("userMessage") {
+        crate::sa1b::InputSource::ExternalUser
+    } else {
+        crate::sa1b::InputSource::NotUserMessage
+    }
+}
+
 impl Activity {
     pub fn observe(&mut self, item: &Value) {
+        self.observe_with_source(item, classify_untrusted_input(item));
+    }
+
+    pub fn observe_with_source(&mut self, item: &Value, source: crate::sa1b::InputSource) {
         match item.get("type").and_then(Value::as_str) {
             Some(
                 "commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall" | "webSearch"
                 | "imageView" | "imageGeneration",
             ) => self.action = true,
             Some(t) if t.ends_with("ToolCall") => self.action = true,
-            Some("userMessage") => self.user_input = true,
+            Some("userMessage") => {
+                if source != crate::sa1b::InputSource::TrustedReconcile {
+                    self.user_input = true;
+                }
+            }
             Some("agentMessage" | "reasoning" | "plan") => {}
             Some("enteredReviewMode" | "exitedReviewMode" | "contextCompaction") => {
                 self.special = true
