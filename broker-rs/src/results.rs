@@ -54,9 +54,18 @@ pub(crate) struct ItemOutput {
 
 impl ItemOutput {
     pub fn extend(&mut self, items: &[Value]) {
+        self.extend_with_classifier(items, classify_untrusted_input);
+    }
+
+    /// 分页调用方在接受当前页前核实运行身份，来源不能事后从布尔摘要中抹除。
+    pub fn extend_with_classifier(
+        &mut self,
+        items: &[Value],
+        mut classify: impl FnMut(&Value) -> crate::sa1b::InputSource,
+    ) {
         for item in items {
             self.seen = true;
-            self.activity.observe(item);
+            self.activity.observe_with_source(item, classify(item));
             if self.observe(item).is_none() {
                 self.invalid = true;
             }
@@ -160,9 +169,17 @@ impl Activity {
     }
 
     pub fn of(items: &[Value]) -> Self {
+        Self::of_with_classifier(items, classify_untrusted_input)
+    }
+
+    /// full items 与通知使用相同分类器；逐条合并，真实输入具有单调否决权。
+    pub fn of_with_classifier(
+        items: &[Value],
+        mut classify: impl FnMut(&Value) -> crate::sa1b::InputSource,
+    ) -> Self {
         let mut activity = Self::default();
         for item in items {
-            activity.observe(item);
+            activity.observe_with_source(item, classify(item));
         }
         activity
     }
