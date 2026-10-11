@@ -86,12 +86,22 @@ fn mi_旧记录缺新增字段读回不补造顺序与确认() {
     open(&mut m, "run-old", "线程");
     complete(&mut m, "run-old", "线程", "轮", json!([message("完成")]));
     let mut value = serde_json::to_value(&m.runs.runs["run-old"]).unwrap();
-    for field in ["creationOrder", "startConfirmation", "pendingReroute"] {
+    for field in [
+        "creationOrder",
+        "startConfirmation",
+        "pendingReroute",
+        "currentTurnId",
+    ] {
         value.as_object_mut().unwrap().remove(field);
     }
     value["meta"] = json!({"source":"run","template":"旧模板"});
     let record: RunRecord = serde_json::from_value(value).unwrap();
     assert!(record.creation_order.is_none());
+    assert!(record.current_turn_id.is_none());
+    assert!(serde_json::to_value(&record)
+        .unwrap()
+        .get("currentTurnId")
+        .is_none());
     assert_eq!(record.start_confirmation, StartConfirmation::default());
     assert!(record.turns[0].reroute.is_none());
     let meta: RunMeta = serde_json::from_value(record.meta.clone().unwrap()).unwrap();

@@ -66,6 +66,7 @@ pub(super) struct ActiveRun {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TurnLink {
+    pub started: bool,
     pub turn: String,
     pub run: RunId,
     pub completed: bool,
@@ -73,6 +74,19 @@ pub(super) struct TurnLink {
 
 #[allow(dead_code)]
 impl Runs {
+    pub(crate) fn superseded_turn(&self, run: &str, thread: &str, turn: &str) -> bool {
+        self.runs.get(run).is_some_and(|record| {
+            record
+                .current_turn_id
+                .as_deref()
+                .is_some_and(|current| current != turn)
+                && (record.turns.iter().any(|old| old.turn_id == turn)
+                    || self.turn_runs.get(thread).is_some_and(|links| {
+                        links.iter().any(|link| link.turn == turn && link.started)
+                    }))
+        })
+    }
+
     pub(super) fn generation(&mut self) -> u64 {
         self.next_generation = self
             .next_generation
@@ -81,7 +95,7 @@ impl Runs {
         self.next_generation
     }
 
-    pub(super) fn find_run(
+    pub(crate) fn find_run(
         &self,
         thread: &str,
         turn: &str,
@@ -119,6 +133,7 @@ impl Runs {
             return;
         }
         links.push_back(TurnLink {
+            started: false,
             turn: turn.into(),
             run: run.into(),
             completed,
@@ -349,6 +364,8 @@ impl Runs {
                         | RunNotice::RunEnded { run_id, .. } => run_id == &r.run_id,
                     }) || self.tree_retention_required(&r.run_id)
                         || self.verifying_history.contains(&r.run_id)
+                        || self.inflight_starts.contains(&r.run_id)
+                        || self.late_starts.contains(&r.run_id)
                         || matches!(r.state, RunState::Running | RunState::Stopping)
                         || self.reads.values().any(|read| {
                             read.read.run_id == r.run_id && read.phase != reads::ReadPhase::Done

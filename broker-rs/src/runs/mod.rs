@@ -152,6 +152,10 @@ pub struct Runs {
     pub(crate) epoch: u64,
     next_creation_sequence: u64,
     pub(crate) verifying_history: std::collections::HashSet<RunId>,
+    /// 从开轮发出保留至回包或线上迟到等待结束；不依赖认领生命周期。
+    pub(crate) inflight_starts: std::collections::HashSet<RunId>,
+    /// 每次状态迁移末尾从迟到核实登记刷新，核实过程也不得淘汰原运行。
+    pub(crate) late_starts: std::collections::HashSet<RunId>,
     pub(crate) lifecycle_gates: std::collections::BTreeMap<String, String>,
     purge: Option<purge::PendingPurge>,
     pub runs: HashMap<RunId, RunRecord>,
@@ -295,6 +299,7 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                current_turn_id: None,
                 pending_reroute: None,
                 creation_order: Some(CreationOrder {
                     epoch: self.runs.epoch,
@@ -388,22 +393,80 @@ impl Machine {
         turn: &str,
         actions: &mut Vec<Action>,
     ) {
-        if self.runs.phase != Phase::Open || turn.is_empty() {
+        if self.runs.phase != Phase::Open
+            || turn.is_empty()
+            || self.runs.find_run(thread, turn, Some(run)).as_deref() != Some(run)
+        {
             return;
         }
-        let Some(record) = self.runs.runs.get_mut(run) else {
-            return;
-        };
-        if record.state == RunState::Lost
-            || record.thread_id != thread
-            || record.start_confirmation.confirmed
+        if self.runs.runs[run].state == RunState::Lost
+            || self.runs.runs[run].thread_id != thread
+            || self.runs.runs[run].joined
+            || self.runs.runs[run].start_confirmation.owned == Some(false)
         {
+            return;
+        }
+        // 启动回包只描述本次请求的首轮；通知可能已推进多轮，迟到回包绝不回退当前轮。
+        if self.runs.runs[run].current_turn_id.is_none() {
+            self.run_current_turn_started(run, thread, turn, actions);
+        }
+        let record = self.runs.runs.get_mut(run).expect("运行存在");
+        if record.start_confirmation.confirmed {
             return;
         }
         let evidence = &mut record.start_confirmation;
         evidence.thread_id = Some(thread.into());
         evidence.turn_id = Some(turn.into());
         evidence.confirmed = evidence.owned == Some(true);
+        self.runs.put(run, actions);
+    }
+
+    /// 迟到归属核实可补已结束的原运行；失联和吸收不能获得新的自有资格。
+    pub(crate) fn run_late_owned(&mut self, run: &str, actions: &mut Vec<Action>) {
+        if self.runs.phase != Phase::Open {
+            return;
+        }
+        let Some(record) = self.runs.runs.get_mut(run) else {
+            return;
+        };
+        if record.state == RunState::Lost
+            || record.joined
+            || record.start_confirmation.owned == Some(false)
+        {
+            return;
+        }
+        record.start_confirmation.owned = Some(true);
+        record.start_confirmation.confirmed = record.start_confirmation.thread_id.as_deref()
+            == Some(&record.thread_id)
+            && record.start_confirmation.turn_id.is_some();
+        self.runs.put(run, actions);
+    }
+
+    fn run_current_turn_started(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        let record = &self.runs.runs[run];
+        if record.current_turn_id.as_deref() == Some(turn)
+            || self.runs.superseded_turn(run, thread, turn)
+        {
+            return;
+        }
+        self.runs.link_turn(run, thread, turn, false);
+        if let Some(link) = self
+            .runs
+            .turn_runs
+            .get_mut(thread)
+            .and_then(|links| links.iter_mut().find(|link| link.turn == turn))
+        {
+            link.started = true;
+        }
+        let record = self.runs.runs.get_mut(run).expect("运行存在");
+        record.current_turn_id = Some(turn.into());
+        record.pending_reroute = None;
         self.runs.put(run, actions);
     }
 
@@ -423,6 +486,10 @@ impl Machine {
             return;
         }
         if self.runs.runs[run].turns.iter().any(|t| t.turn_id == turn) {
+            return;
+        }
+        self.run_current_turn_started(run, thread, turn, actions);
+        if self.runs.runs[run].current_turn_id.as_deref() != Some(turn) {
             return;
         }
         self.runs.link_turn(run, thread, turn, false);

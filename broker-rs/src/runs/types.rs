@@ -184,6 +184,9 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    /// 最近一次已开始的轮次；结束不清空，旧记录不反推。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_reroute: Option<PendingReroute>,
     /// 创建时固定；文件外壳的 epoch/revision 随重写变化，不能用来判断运行先后。
@@ -225,6 +228,62 @@ pub struct RunRecord {
     pub turns: Vec<TurnResult>,
     /// 本运行一共完成过多少轮，含被截掉的。
     pub turns_total: u64,
+}
+
+/// 一次性模型查询的投影，不复制输入、输出或完整元数据。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunModelSummary<'a> {
+    pub run_id: &'a str,
+    pub thread_id: &'a str,
+    pub review_thread_id: Option<&'a str>,
+    pub state: RunState,
+    pub started_at: u64,
+    pub creation_order: Option<CreationOrder>,
+    pub start_confirmation: &'a StartConfirmation,
+    pub meta: Option<ModelMeta<'a>>,
+    pub current_turn_id: Option<&'a str>,
+    pub last_turn: Option<ModelTurn<'a>>,
+    pub pending_reroute: Option<&'a PendingReroute>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelMeta<'a> {
+    pub source: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTurn<'a> {
+    pub turn_id: &'a str,
+    pub reroute: Option<&'a Reroute>,
+}
+
+impl RunRecord {
+    pub fn model_summary(&self) -> RunModelSummary<'_> {
+        RunModelSummary {
+            run_id: &self.run_id,
+            thread_id: &self.thread_id,
+            review_thread_id: self.review_thread_id.as_deref(),
+            state: self.state,
+            started_at: self.started_at,
+            creation_order: self.creation_order,
+            start_confirmation: &self.start_confirmation,
+            meta: self.meta.as_ref().map(|meta| ModelMeta {
+                source: meta.get("source").and_then(Value::as_str),
+                model: meta.get("model").and_then(Value::as_str),
+                effort: meta.get("effort").and_then(Value::as_str),
+            }),
+            current_turn_id: self.current_turn_id.as_deref(),
+            last_turn: self.turns.last().map(|turn| ModelTurn {
+                turn_id: &turn.turn_id,
+                reroute: turn.reroute.as_ref(),
+            }),
+            pending_reroute: self.pending_reroute.as_ref(),
+        }
+    }
 }
 
 /// threads.json 的一项：线程索引中需要持久化的部分。2.3 节 ThreadSummary 的运行时字段

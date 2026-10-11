@@ -7,6 +7,79 @@ use super::*;
 use crate::appserver::rpc;
 use crate::claim::{Operation, State};
 
+#[tokio::test(start_paused = true)]
+async fn mi_共享rpc真实超时释放换代后迟到核实持久化原运行() {
+    tokio::time::resume();
+    let temp = crate::store::tests::Temp::new();
+    let (store, loaded) = crate::store::open(temp.config()).await.unwrap();
+    tokio::time::pause();
+    let mut h = Harness::new(true);
+    h.core = h.core.with_store(Some(store.clone()), loaded);
+    h.core.restore();
+    h.core.machine.record("线程").subscribed = true;
+    h.client(1, "turn/start", json!({"threadId":"线程"}));
+    let original = h.outgoing().await;
+    let run = h.core.machine.claims["线程"].run_id.clone().unwrap();
+    // 让真实 RPC 的 5 秒请求期限触发，不直接伪造 TimedOut 事件。
+    tokio::time::advance(Duration::from_secs(5)).await;
+    h.pump_until(|message| matches!(message, CoreMsg::App(AppEvent::TimedOut { .. })))
+        .await;
+    assert!(h.incoming_client().await.get("error").is_some());
+    let read = h.outgoing().await;
+    assert_eq!(read["method"], "thread/read");
+    h.answer(
+        &read,
+        Ok(json!({"thread":{"id":"线程","status":{"type":"idle"}}})),
+    )
+    .await;
+    assert!(h.core.machine.claims.is_empty());
+    assert_eq!(
+        h.core.machine.runs.runs[&run].state,
+        crate::runs::RunState::Ended
+    );
+    assert!(h.core.machine.runs.verifying_history.is_empty());
+    h.client(2, "turn/start", json!({"threadId":"线程"}));
+    let _new_start = h.outgoing().await;
+    let newer = h.core.machine.claims["线程"].clone();
+    assert!(h.core.machine.runs.runs.contains_key(&run));
+    h.app_input
+        .send(proto::response_ok(original["id"].clone(), json!({"turn":{"id":"旧轮"}})).to_string())
+        .unwrap();
+    h.pump_until(|message| matches!(message, CoreMsg::App(AppEvent::LateReply { .. })))
+        .await;
+    let check = h.outgoing().await;
+    assert_eq!(check["method"], "thread/turns/list");
+    assert!(!h.core.machine.runs.runs[&run].start_confirmation.confirmed);
+    h.answer(
+        &check,
+        Ok(json!({"data":[{"id":"旧轮","status":"inProgress"}],"nextCursor":null})),
+    )
+    .await;
+    let record = &h.core.machine.runs.runs[&run];
+    assert_eq!(record.start_confirmation.owned, Some(true));
+    assert!(record.start_confirmation.confirmed);
+    assert_eq!(h.core.machine.claims["线程"], newer);
+    assert!(
+        !h.core.machine.runs.runs[newer.run_id.as_ref().unwrap()]
+            .start_confirmation
+            .confirmed
+    );
+    // 存储线程使用真实时钟，恢复计时后在有界期限内核对实际文件。
+    tokio::time::resume();
+    assert!(store
+        .drain(Duration::from_secs(5))
+        .await
+        .abandoned
+        .is_empty());
+    let value: Value = serde_json::from_slice(
+        &std::fs::read(temp.dir().join(format!("runs/{run}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(value["payload"]["startConfirmation"]["owned"], true);
+    assert_eq!(value["payload"]["startConfirmation"]["confirmed"], true);
+    assert_eq!(value["payload"]["state"], "ended");
+}
+
 #[tokio::test]
 async fn mi_真实存储跨重启递增epoch且保留确认登记改道和创建键() {
     use crate::runs::{CreationOrder, RunRecord};
@@ -41,6 +114,7 @@ async fn mi_真实存储跨重启递增epoch且保留确认登记改道和创建
             if let Some(restored) = h.core.machine.runs.runs.get(&old.run_id) {
                 assert_eq!(restored.creation_order, old.creation_order);
                 assert_eq!(restored.start_confirmation, old.start_confirmation);
+                assert_eq!(restored.current_turn_id, old.current_turn_id);
             }
         }
         h.core.machine.record("线程").subscribed = true;
@@ -65,6 +139,7 @@ async fn mi_真实存储跨重启递增epoch且保留确认登记改道和创建
             .unwrap()
             .clone();
         assert!(record.start_confirmation.confirmed);
+        assert_eq!(record.current_turn_id.as_deref(), Some(turn.as_str()));
         assert_eq!(
             record.meta,
             Some(json!({"source":"run","model":"gpt-6-astra","effort":"high"}))

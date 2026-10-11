@@ -1217,6 +1217,7 @@ fn 单次请求无响应以无响应完成且迟到回包丢弃() {
 
 fn late_start(generation: u64, round: u64, late_settling: bool) -> crate::stop::LateStart {
     crate::stop::LateStart {
+        run_id: None,
         stream_id: None,
         review_id: None,
         token: ClaimToken {
