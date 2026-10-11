@@ -283,6 +283,9 @@ impl Machine {
                 .remove(&conn)
         });
         let run_id = open.run_id.clone();
+        if open.kind == ReqKind::ReviewStart {
+            self.convergences.review_runs.insert(run_id.clone());
+        }
         self.runs.next_creation_sequence = self
             .runs
             .next_creation_sequence
@@ -767,6 +770,7 @@ impl Machine {
                 activity
                     .observe_with_source(item, self.classify_result_input(&run, thread, id, item));
             }
+            self.guard_activity(&run, thread, id, activity);
             self.runs
                 .guard_evidence
                 .push((run.clone(), id.into(), Some(activity)));

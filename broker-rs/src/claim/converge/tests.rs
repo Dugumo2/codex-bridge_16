@@ -983,7 +983,7 @@ fn 发现实际_rpc路径补查活动与goal并不学习旧代回包() {
     }
     assert_eq!(
         checks,
-        3,
+        4,
         "facts={:?} progress={:?} discoveries={:?} work={:?}",
         m.convergence_facts(R),
         m.convergences.progress[R],
@@ -1266,4 +1266,317 @@ fn 根能力未知先补查_明确false异常且不启动汇总() {
             assert_eq!(join(&m).terminal_reason, None);
         }
     }
+}
+
+#[test]
+fn 集成_跟进复用只绑定明确操作后的新轮() {
+    for version in ["v1", "v2"] {
+        let (mut m, mut mock) = setup();
+        spawn(&mut m, &mut mock, P, T, "子", "派生", "旧轮");
+        complete(&mut m, &mut mock, "子", "旧轮", "completed");
+        let item = if version == "v1" {
+            json!({"type":"collabAgentToolCall","id":"跟进","tool":"sendInput","status":"completed","senderThreadId":P,"receiverThreadIds":["子"]})
+        } else {
+            json!({"type":"subAgentActivity","id":"跟进","kind":"interacted","agentThreadId":"子"})
+        };
+        notify(
+            &mut m,
+            "item/started",
+            json!({"threadId":P,"turnId":T,"item":item}),
+        );
+        notify(
+            &mut m,
+            "item/completed",
+            json!({"threadId":P,"turnId":T,"item":item}),
+        );
+        apply(&mut m, mock.turn_started("子", "新轮"));
+        complete(&mut m, &mut mock, "子", "新轮", "completed");
+        complete(&mut m, &mut mock, P, T, "completed");
+        discover(&mut m, true);
+        let facts = m.convergence_facts(R).unwrap();
+        assert_eq!(facts.activities.len(), 2);
+        assert!(facts
+            .activities
+            .iter()
+            .all(|a| a.verified && a.activity == MemberActivity::Settled));
+        assert_eq!(facts.pending_starts, 0);
+        assert!(m.convergences.progress[R].reading.is_some());
+    }
+}
+
+#[test]
+fn 集成_完成后关闭保留shutdown结果和关闭证明() {
+    let (mut m, mut mock) = setup();
+    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+    complete(&mut m, &mut mock, "子", "子轮", "interrupted");
+    notify(&mut m, "thread/closed", json!({"threadId":"子"}));
+    notify(
+        &mut m,
+        "item/completed",
+        json!({"threadId":P,"turnId":T,"item":{"id":"关闭","type":"collabAgentToolCall","tool":"closeAgent","status":"completed","agentsStates":{"子":{"status":"shutdown"}}}}),
+    );
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert_eq!(
+        m.convergence_facts(R).unwrap().activities[0].result_status,
+        Some(ActivityResultStatus::Shutdown)
+    );
+    assert!(m.convergences.closed_threads.contains("子"));
+}
+
+#[test]
+fn 集成_授权交接新token重核实原提交不重发不刷新截止() {
+    use crate::claim::status_read::{StatusCaller, StatusDone, StatusResult};
+    use crate::claim::Operation;
+    let (mut m, mut mock) = setup();
+    m.convergences.test_budget = None;
+    m.convergences.test_read = None;
+    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+    complete(&mut m, &mut mock, "子", "子轮", "completed");
+    complete(&mut m, &mut mock, P, T, "completed");
+    let actions = discover(&mut m, true);
+    let read = actions
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Request(c) if matches!(c.operation, Operation::ChildResultRead { .. }) => {
+                Some(c)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let actions = apply(
+        &mut m,
+        Event::Reply {
+            context: read,
+            result: Ok(crate::test_support::status_read::items_page(
+                "子轮",
+                &[json!({"type":"agentMessage","text":"随机子结果"})],
+                None,
+            )),
+        },
+    );
+    let request = actions
+        .iter()
+        .find_map(|a| match a {
+            Action::Request(c) if matches!(c.operation, Operation::StartReconciliation { .. }) => {
+                Some(c.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    let Operation::StartReconciliation { token: old, op_id } = &request.operation else {
+        unreachable!()
+    };
+    let original = m.reconcile_operation(*op_id).unwrap().clone();
+    let old_read = m.runs.reconciliation.operations[&op_id.0]
+        .status_read
+        .unwrap();
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":"汇总轮","status":"inProgress"}}),
+    );
+    m.clock.mono_ms += 5_000;
+    let actions = apply(
+        &mut m,
+        Event::ClientRequest {
+            request: ClientRequest {
+                conn: 1,
+                id: json!(999),
+                method: "broker/threads/detach".into(),
+                params: Some(json!({"threadId":P,"runId":R,"policy":"on-request"})),
+            },
+            run_id: None,
+        },
+    );
+    let current = m.convergences.runs[R].token.clone();
+    assert_ne!(current, *old);
+    let pending = &m.runs.reconciliation.operations[&op_id.0];
+    assert_eq!(pending.verify_token, current);
+    assert_ne!(pending.status_read, Some(old_read));
+    assert_eq!(pending.operation, original);
+    assert!(!actions.iter().any(|a| matches!(a,Action::Request(c) if matches!(c.operation,Operation::StartReconciliation { .. }))));
+    m.subagent_reconcile_status_done(
+        StatusDone {
+            read_id: old_read,
+            thread: P.into(),
+            token: Some(old.claim.clone()),
+            caller: StatusCaller::SubagentReconcile {
+                token: old.clone(),
+                op_id: *op_id,
+            },
+            result: StatusResult::Carrier("汇总轮".into()),
+        },
+        &mut vec![],
+    );
+    assert_eq!(join(&m).delivered_epoch, 0);
+    let read_id = m.runs.reconciliation.operations[&op_id.0]
+        .status_read
+        .unwrap();
+    let mut actions = vec![];
+    m.subagent_reconcile_status_done(
+        StatusDone {
+            read_id,
+            thread: P.into(),
+            token: Some(current.claim.clone()),
+            caller: StatusCaller::SubagentReconcile {
+                token: current.clone(),
+                op_id: *op_id,
+            },
+            result: StatusResult::Carrier("汇总轮".into()),
+        },
+        &mut actions,
+    );
+    assert_eq!(join(&m).delivered_epoch, original.work_epoch);
+    assert_eq!(join(&m).wakeup_attempts, 1);
+    assert_eq!(m.runs.runs[R].auto_turns_started, Some(1));
+    let final_op = m.reconcile_operation(*op_id).unwrap();
+    assert_eq!(final_op.token, *old);
+    assert_eq!(
+        final_op.client_user_message_id,
+        original.client_user_message_id
+    );
+    assert_eq!(
+        final_op.verify_deadline_mono_ms,
+        original.verify_deadline_mono_ms
+    );
+    assert!(!actions.iter().any(|a| matches!(a,Action::Request(c) if matches!(c.operation,Operation::StartReconciliation { .. }))));
+}
+
+#[test]
+fn 集成_托管交接保留动态工具待答及原截止() {
+    let (mut m, mut mock) = setup();
+    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+    apply(
+        &mut m,
+        Event::ServerRequest {
+            id: json!(91),
+            forward_id: "动态转发".into(),
+            method: "item/tool/call".into(),
+            params: Some(
+                json!({"threadId":"子","turnId":"子轮","callId":"调用","tool":"测试工具","arguments":{}}),
+            ),
+        },
+    );
+    let deadline = m.convergences.runs[R].deadline_mono_ms;
+    let actions = apply(
+        &mut m,
+        Event::ClientRequest {
+            request: ClientRequest {
+                conn: 1,
+                id: json!(92),
+                method: "broker/threads/detach".into(),
+                params: Some(json!({"threadId":P,"runId":R,"policy":"on-request"})),
+            },
+            run_id: None,
+        },
+    );
+    assert!(!actions.iter().any(
+        |a| matches!(a,Action::ServerResult {id,..}|Action::ServerError {id,..} if *id==json!(91))
+    ));
+    assert_eq!(m.convergences.runs[R].deadline_mono_ms, deadline);
+    assert_eq!(m.convergence_facts(R).unwrap().pending_requests, 1);
+    assert!(m
+        .inbox_pending_run_items(R)
+        .iter()
+        .any(|i| i.method == "item/tool/call"));
+}
+
+#[test]
+fn 集成_停止期间非活动goal换版本会重新核实() {
+    let (mut m, mut mock) = setup();
+    complete(&mut m, &mut mock, P, T, "interrupted");
+    let id = m.stops.operations.keys().next().unwrap().clone();
+    let op = m.stops.operations.get_mut(&id).unwrap();
+    op.goal_busy = false;
+    op.goal_attempted = true;
+    op.goal_done = true;
+    op.brake_version = Some(m.stops.versions[P]);
+    let actions = notify(
+        &mut m,
+        "thread/goal/updated",
+        json!({"threadId":P,"goal":{"status":"blocked"}}),
+    );
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a,Action::Request(c) if c.method=="thread/goal/get")));
+    assert_eq!(
+        join(&m).terminal_reason,
+        Some(TerminalReason::ParentInterrupted)
+    );
+}
+
+#[test]
+fn 集成_首采样完成通知早于承载核实时仍回放原运行结果() {
+    use crate::claim::status_read::{StatusCaller, StatusDone, StatusResult};
+    use crate::claim::Operation;
+    let (mut m, mut mock) = setup();
+    m.convergences.test_budget = None;
+    m.convergences.test_read = None;
+    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+    complete(&mut m, &mut mock, "子", "子轮", "completed");
+    complete(&mut m, &mut mock, P, T, "completed");
+    let actions = discover(&mut m, true);
+    let read = actions
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Request(c) if matches!(c.operation, Operation::ChildResultRead { .. }) => {
+                Some(c)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let actions = apply(
+        &mut m,
+        Event::Reply {
+            context: read,
+            result: Ok(crate::test_support::status_read::items_page(
+                "子轮",
+                &[json!({"type":"agentMessage","text":"结果"})],
+                None,
+            )),
+        },
+    );
+    let (token, op_id) = actions
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Request(c) => match c.operation {
+                Operation::StartReconciliation { token, op_id } => Some((token, op_id)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap();
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":"快汇总","status":"inProgress"}}),
+    );
+    notify(
+        &mut m,
+        "turn/completed",
+        json!({"threadId":P,"turn":{"id":"快汇总","status":"completed","itemsView":"summary","items":[]}}),
+    );
+    assert!(m.runs.reconciliation.operations[&op_id.0]
+        .completions
+        .contains_key("快汇总"));
+    assert!(!m.runs.runs[R].turns.iter().any(|t| t.turn_id == "快汇总"));
+    let read_id = m.runs.reconciliation.operations[&op_id.0]
+        .status_read
+        .unwrap();
+    m.subagent_reconcile_status_done(
+        StatusDone {
+            read_id,
+            thread: P.into(),
+            token: Some(token.claim.clone()),
+            caller: StatusCaller::SubagentReconcile { token, op_id },
+            result: StatusResult::Carrier("快汇总".into()),
+        },
+        &mut vec![],
+    );
+    assert!(m.runs.runs[R]
+        .turns
+        .iter()
+        .any(|t| t.turn_id == "快汇总" && t.status == TurnStatus::Completed));
+    assert_eq!(join(&m).reconciled_epoch, join(&m).work_epoch);
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
 }

@@ -74,7 +74,7 @@ impl Machine {
     }
 
     /// A 在新运行建立协调上下文后调用。None 必须代表已核实无预算，不能代表漏读预算。
-    /// 此入口没有生产调用点；旧记录或重启摘要不能重新构造能力。
+    /// 生产协调器建立运行身份后调用；旧记录或重启摘要不能重新构造能力。
     pub fn initialize_run_safeguards(
         &mut self,
         token: &ConvergeToken,

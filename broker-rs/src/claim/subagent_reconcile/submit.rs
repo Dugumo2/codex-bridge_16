@@ -135,7 +135,7 @@ impl Machine {
             BudgetAdmission::NeedsVerification => Err(ReconcileRefusal::BudgetIncomplete),
         }
     }
-    fn reconcile_goal_target(&self, token: &ConvergeToken) -> Option<String> {
+    pub(crate) fn reconcile_goal_target(&self, token: &ConvergeToken) -> Option<String> {
         let claim = self.claims.get(&token.claim.thread_id)?;
         let State::Running {
             turn_id,

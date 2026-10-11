@@ -2323,6 +2323,20 @@ impl Machine {
             self.inbox_guardian_review(thread_id, &event.params, actions);
         }
         if !event.committed {
+            if event.method == "thread/tokenUsage/updated" {
+                if let Some(params) = event.params.as_ref() {
+                    if let (Some(turn), Some(usage)) = (
+                        params.get("turnId").and_then(Value::as_str),
+                        params.get("tokenUsage"),
+                    ) {
+                        if self.convergences.usage_evidence.len() < 4096 {
+                            self.convergences
+                                .usage_evidence
+                                .insert((thread_id.into(), turn.into()), usage.clone());
+                        }
+                    }
+                }
+            }
             if event.method == "thread/goal/updated" {
                 let active = event
                     .params
@@ -2487,6 +2501,18 @@ impl Machine {
             }
             "turn/completed" => {
                 if let Some(turn) = event.params.as_ref().and_then(|p| p.get("turn")) {
+                    if run.is_none() {
+                        if let Some(current_run) =
+                            self.claims.get(thread).and_then(|c| c.run_id.clone())
+                        {
+                            self.reconcile_observe_parent_completed(
+                                &current_run,
+                                thread,
+                                turn,
+                                actions,
+                            );
+                        }
+                    }
                     self.run_turn_completed(thread, run.as_deref(), turn, actions);
                 }
             }
@@ -2495,6 +2521,26 @@ impl Machine {
     }
 
     pub(crate) fn started(&mut self, thread_id: &str, id: &str, actions: &mut Vec<Action>) {
+        if self.convergence_enabled()
+            && self
+                .claims
+                .get(thread_id)
+                .and_then(|c| c.run_id.as_ref())
+                .is_some_and(|run| {
+                    self.convergences.review_runs.contains(run)
+                        && self.runs.runs.get(run).is_some_and(|r| {
+                            r.start_confirmation.confirmed
+                                && r.start_confirmation
+                                    .turn_id
+                                    .as_deref()
+                                    .is_some_and(|outer| outer != id)
+                        })
+                        && !self.reconcile_unresolved(run)
+                })
+        {
+            // 审查内层轮不是父运行的新自动轮；外层完成仍须进入收敛门禁。
+            return;
+        }
         if self.convergence_event(
             thread_id,
             converge::ConvergeEvent::ParentTurn {

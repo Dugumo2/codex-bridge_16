@@ -438,6 +438,33 @@ impl Machine {
         }
     }
 
+    pub(crate) fn reconcile_verify_started(
+        &mut self,
+        token: &ConvergeToken,
+        actions: &mut Vec<Action>,
+    ) {
+        let pending: Vec<_> = self
+            .runs
+            .reconciliation
+            .operations
+            .values()
+            .filter(|p| p.verify_token == *token && p.operation.outcome_unknown && !p.expired)
+            .map(|p| (p.operation.op_id, p.status_read))
+            .collect();
+        for (id, read) in pending {
+            if let Some(read) = read {
+                self.cancel_status_read(read, actions);
+            }
+            self.runs
+                .reconciliation
+                .operations
+                .get_mut(&id.0)
+                .unwrap()
+                .status_read = None;
+            self.verify_reconciliation(id, actions);
+        }
+    }
+
     /// 快轮可能在 clientId 核实前完成；只暂存有界完成壳，核实后走正常分页补读。
     pub(crate) fn reconcile_observe_parent_completed(
         &mut self,
@@ -662,14 +689,7 @@ impl Machine {
         }
         self.reconcile_changed(&token.run_id, actions);
         if self.convergences.progress.contains_key(&token.run_id) {
-            self.convergence_event(
-                &token.claim.thread_id,
-                crate::claim::converge::ConvergeEvent::ParentTurn {
-                    turn,
-                    started: true,
-                },
-                actions,
-            );
+            self.convergence_parent_confirmed(token, turn, actions);
             self.convergence_delivered(token, op_id, turn, epoch, actions);
             if self.runs.runs[&token.run_id]
                 .turns

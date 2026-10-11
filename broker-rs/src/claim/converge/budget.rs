@@ -88,16 +88,79 @@ impl Machine {
             if !self.safeguards_token_current(&token) {
                 continue;
             }
-            self.convergence_sync_facts(&token.run_id);
-            if let Some(facts) = self.convergence_facts(&token.run_id) {
-                for fact in facts.activities {
-                    self.require_budget_activity(&token, fact.key, actions);
+            if self
+                .runs
+                .reconciliation
+                .parents
+                .get(&token.run_id)
+                .is_none_or(Vec::is_empty)
+            {
+                if let Some(turn) = self.runs.runs[&token.run_id]
+                    .start_confirmation
+                    .turn_id
+                    .clone()
+                {
+                    self.reconcile_parent_started(&token, &turn, TurnOrigin::User, actions);
                 }
             }
             if self.runs.runs[&token.run_id].run_budget.is_none() {
                 if let Some(budget) = self.initial_convergence_budget(&token.claim.thread_id) {
                     self.runs.runs.get_mut(&token.run_id).unwrap().run_budget = Some(budget);
                 }
+            }
+            let has_budget = self.runs.runs[&token.run_id].run_budget.is_some();
+            if !has_budget && self.convergences.runs[&token.run_id].deadline_mono_ms != u64::MAX {
+                continue;
+            }
+            self.convergence_sync_facts(&token.run_id);
+            if let Some(facts) = self.convergence_facts(&token.run_id) {
+                if facts.pending_requests > 0
+                    && self.convergences.runs[&token.run_id].deadline_mono_ms == u64::MAX
+                {
+                    self.convergence_begin(&token.claim.thread_id, actions);
+                }
+                for fact in facts.activities {
+                    if !has_budget {
+                        break;
+                    }
+                    self.require_budget_activity(&token, fact.key.clone(), actions);
+                    // 新派生线程的首活动累计数属于该活动；后续复用没有基线时只登记缺口。
+                    if fact.verified && fact.key.activity_seq == 1 {
+                        self.convergence_activity_usage(&token, fact.key, actions);
+                    }
+                }
+            }
+            let parents = self
+                .runs
+                .reconciliation
+                .parents
+                .get(&token.run_id)
+                .cloned()
+                .unwrap_or_default();
+            if has_budget && parents.is_empty() {
+                let key = ActivityKey {
+                    thread_id: token.claim.thread_id.clone(),
+                    activity_seq: 1,
+                    turn_id: self.runs.runs[&token.run_id]
+                        .start_confirmation
+                        .turn_id
+                        .clone(),
+                };
+                self.require_budget_activity(&token, key, actions);
+            }
+            for (index, parent) in parents.iter().enumerate() {
+                if !has_budget {
+                    break;
+                }
+                self.require_budget_activity(
+                    &token,
+                    ActivityKey {
+                        thread_id: token.claim.thread_id.clone(),
+                        activity_seq: index as u64 + 1,
+                        turn_id: Some(parent.turn.clone()),
+                    },
+                    actions,
+                );
             }
             if let Some(goal) = self
                 .convergences
@@ -162,6 +225,44 @@ impl Machine {
         if goal.get("status").and_then(Value::as_str) == Some("complete") {
             self.freeze_goal_budget(token, actions);
         }
+    }
+
+    fn convergence_activity_usage(
+        &mut self,
+        token: &ConvergeToken,
+        key: ActivityKey,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(turn) = &key.turn_id else {
+            return;
+        };
+        let Some(total) = self
+            .convergences
+            .usage_evidence
+            .get(&(key.thread_id.clone(), turn.clone()))
+            .and_then(|u| u.get("total"))
+        else {
+            return;
+        };
+        let (Some(input_tokens), Some(cached_input_tokens), Some(output_tokens)) = (
+            total.get("inputTokens").and_then(Value::as_u64),
+            total.get("cachedInputTokens").and_then(Value::as_u64),
+            total.get("outputTokens").and_then(Value::as_u64),
+        ) else {
+            return;
+        };
+        self.observe_run_budget(
+            token,
+            BudgetEvidence {
+                key,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                evidence_version: input_tokens.saturating_add(output_tokens),
+                goal_covered_tokens: None,
+            },
+            actions,
+        );
     }
 
     pub(crate) fn convergence_budget_reply(

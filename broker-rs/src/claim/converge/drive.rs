@@ -5,6 +5,36 @@ use crate::relations::convergence::settled;
 use crate::stop::tree::TreeScope;
 
 impl Machine {
+    pub(crate) fn convergence_parent_confirmed(
+        &mut self,
+        token: &ConvergeToken,
+        turn: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        if !self.convergence_token_current(token)
+            || self.convergences.runs[&token.run_id].automatic_control_revoked
+            || !self.claims[&token.claim.thread_id]
+                .owned_turns
+                .contains(turn)
+        {
+            return;
+        }
+        if matches!(
+            self.claims[&token.claim.thread_id].state,
+            State::Converging { .. }
+        ) {
+            let owner = self.claims[&token.claim.thread_id]
+                .owner()
+                .cloned()
+                .expect("已核实自有轮");
+            self.claims.get_mut(&token.claim.thread_id).unwrap().state = State::Running {
+                owner,
+                turn_id: turn.into(),
+                joined: false,
+            };
+            self.convergence_phase(&token.run_id, JoinPhase::Reconciling, actions);
+        }
+    }
     pub(crate) fn convergence_begin(
         &mut self,
         thread: &str,
@@ -245,6 +275,27 @@ impl Machine {
                     return true;
                 }
                 if !own {
+                    if revoked
+                        && self.stop_busy(thread)
+                        && !self.reconcile_unresolved(&run)
+                        && self
+                            .records
+                            .get(thread)
+                            .is_some_and(|r| r.goal_active && (!self.shared || r.goal_controlled))
+                        && matches!(
+                            self.claims[thread].state,
+                            State::Running { .. } | State::AwaitingContinuation { .. }
+                        )
+                        && self.claims[thread].turn_id().is_none_or(|previous| {
+                            self.claims[thread]
+                                .owned_ended
+                                .iter()
+                                .any(|t| t == previous)
+                        })
+                    {
+                        // 已确认自有 goal 的制动失败后续轮仍交原停止驱动，未知汇总不走此路。
+                        return false;
+                    }
                     if !revoked
                         && matches!(
                             self.claims[thread].state,
@@ -255,6 +306,7 @@ impl Machine {
                     }
                     let token = self.convergences.runs[&run].token.clone();
                     self.reconcile_observe_parent_started(&token, turn);
+                    self.reconcile_verify_started(&token, actions);
                     if revoked || self.convergence_root_unsettled(&run) {
                         return true;
                     }
@@ -305,6 +357,9 @@ impl Machine {
             }
             ConvergeEvent::GoalChanged { active } => {
                 let goal = self.records.get(thread).and_then(|r| r.goal_status.clone());
+                if goal.as_deref() == Some("paused") && self.goal_restoration_pending(thread) {
+                    return false;
+                }
                 if let Some(reason) = goal_reason(goal.as_deref()) {
                     self.convergence_fail(&run, reason, actions);
                     return true;
@@ -409,17 +464,34 @@ impl Machine {
     fn convergence_drive_once(&mut self, run: &str, actions: &mut Vec<Action>) {
         let runtime = self.convergences.runs[run].clone();
         let thread = runtime.token.claim.thread_id.clone();
+        if let Some(reason) = goal_reason(
+            self.records
+                .get(&thread)
+                .and_then(|r| r.goal_status.as_deref()),
+        )
+        .filter(|_| !self.goal_restoration_pending(&thread))
+        {
+            self.convergence_fail(run, reason, actions);
+            return;
+        }
         if self.clock.mono_ms >= runtime.deadline_mono_ms {
             self.convergence_deadline(run, actions);
             return;
         }
-        if !matches!(self.claims[&thread].state, State::Converging { .. }) {
+        let merging_goal = self.reconcile_goal_target(&runtime.token).is_some();
+        if !matches!(self.claims[&thread].state, State::Converging { .. }) && !merging_goal {
             return;
         }
         self.convergence_sync_facts(run);
         let Some(facts) = self.convergence_facts(run) else {
             return;
         };
+        if merging_goal && facts.work_epoch == 0 {
+            return;
+        }
+        if runtime.deadline_mono_ms == u64::MAX {
+            self.convergence_begin(&thread, actions);
+        }
         if let Some(join) = self
             .runs
             .runs
@@ -468,6 +540,9 @@ impl Machine {
             .expect("摘要存在")
             .clone();
         if facts.work_epoch == 0 || join.reconciled_epoch == facts.work_epoch {
+            if merging_goal {
+                return;
+            }
             self.convergence_phase(run, JoinPhase::Released, actions);
             self.release(&thread, actions);
             return;
@@ -490,11 +565,13 @@ impl Machine {
             .convergence_config
             .clone()
             .unwrap_or_default();
-        if join.wakeups_started >= config.max_wakeups {
+        if !merging_goal && join.wakeups_started >= config.max_wakeups {
             self.convergence_fail(run, TerminalReason::WakeLimit, actions);
             return;
         }
-        if self.runs.runs[run].auto_turns_started.unwrap_or(0) >= config.max_auto_turns {
+        if !merging_goal
+            && self.runs.runs[run].auto_turns_started.unwrap_or(0) >= config.max_auto_turns
+        {
             self.convergence_fail(run, TerminalReason::AutoTurnLimit, actions);
             return;
         }
@@ -627,6 +704,9 @@ impl Machine {
                 .covered_epoch = Some(work_epoch);
             self.convergence_changed(run, actions);
             self.convergence_drive(run, actions);
+        } else if !result.cancelled && result.state.complete && facts.work_epoch != work_epoch {
+            // 在途发现期间的新结果要求立即覆盖新批次，不沿用失败退避。
+            self.convergence_drive(run, actions);
         } else {
             self.convergence_retry(run, actions);
         }
@@ -709,6 +789,11 @@ impl Machine {
     }
 
     fn convergence_deadline(&mut self, run: &str, actions: &mut Vec<Action>) {
+        let token = self.convergences.runs[run].token.clone();
+        if self.budget_verification_expired(&token) {
+            self.convergence_fail(run, TerminalReason::BudgetIncomplete, actions);
+            return;
+        }
         if self
             .convergences
             .runs

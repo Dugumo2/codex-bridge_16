@@ -705,7 +705,15 @@ impl Machine {
         for thread in &threads {
             self.goal_fact_version(thread);
         }
+        self.goal_fact_version(&root);
         let work = self.relations.aux.work.get_mut(&op_id).unwrap();
+        let root_goal = (root.clone(), "thread/goal/get".to_owned());
+        if !work.checks_done.contains(&root_goal)
+            && !work.checks_in_flight.contains(&root_goal)
+            && !work.checks_queue.contains(&root_goal)
+        {
+            work.checks_queue.push_back(root_goal);
+        }
         if root_check {
             let key = (root.clone(), "thread/read".to_owned());
             if !work.checks_done.contains(&key)
@@ -801,6 +809,11 @@ impl Machine {
                         .and_then(Value::as_str)
                         .is_some()
                 {
+                    if let Some(goal) = value.get("goal").filter(|g| g.is_object()) {
+                        self.convergences
+                            .goal_evidence
+                            .insert(thread.into(), goal.clone());
+                    }
                     let active = value
                         .get("goal")
                         .and_then(|g| g.get("status"))
@@ -835,7 +848,13 @@ impl Machine {
                     .get("status")
                     .and_then(|s| s.get("type"))
                     .and_then(Value::as_str);
-                if status != Some("notLoaded") {
+                let verified_closed = self.convergences.closed_threads.contains(thread)
+                    && self.convergences.observations.iter().any(|((t, _), o)| {
+                        t == thread
+                            && o.result == Some(crate::sa1b::ActivityResultStatus::Shutdown)
+                            && o.conn_epoch == self.relations.conn_epoch
+                    });
+                if status != Some("notLoaded") || verified_closed {
                     if let Some(turns) = info.get("turns").and_then(Value::as_array) {
                         for turn in turns {
                             if let (Some(id), Some(status)) = (

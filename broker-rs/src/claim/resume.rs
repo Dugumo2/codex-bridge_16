@@ -179,6 +179,14 @@ pub(super) fn lookup_error(lookup: &RunLookup, thread: &str) -> Option<&'static 
 }
 
 impl Machine {
+    pub(crate) fn goal_restoration_pending(&self, thread: &str) -> bool {
+        self.claims.get(thread).is_some_and(|c| {
+            c.resume_goal
+                || c.run_id
+                    .as_ref()
+                    .is_some_and(|run| self.goal_restores.pending.contains_key(run))
+        })
+    }
     pub(crate) fn continue_request(
         &mut self,
         request: ClientRequest,

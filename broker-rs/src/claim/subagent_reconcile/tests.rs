@@ -1139,3 +1139,38 @@ fn 交接后用新token重查同一输入且原提交和总窗不变() {
         assert_eq!(submissions(&a), 0);
     }
 }
+
+#[test]
+fn 集成_真实开始后空条目页只等待输入落盘不判外部轮() {
+    let (mut m, token) = fixture(1);
+    let (id, request) = start(&mut m, &token);
+    m.subagent_reconcile_reply(&request, Ok(json!({"turn":{"id":"快轮"}})), &mut vec![]);
+    m.reconcile_observe_parent_started(&token, "快轮");
+    let read_id = m.runs.reconciliation.operations[&id.0].status_read.unwrap();
+    m.subagent_reconcile_status_done(
+        StatusDone {
+            read_id,
+            thread: T.into(),
+            token: Some(token.claim.clone()),
+            caller: StatusCaller::SubagentReconcile {
+                token: token.clone(),
+                op_id: id,
+            },
+            result: StatusResult::NoCarrier,
+        },
+        &mut vec![],
+    );
+    assert!(m.reconcile_operation(id).unwrap().outcome_unknown);
+    assert!(!m.runs.reconciliation.operations[&id.0]
+        .known_turns
+        .contains("快轮"));
+    m.clock.mono_ms += 500;
+    let mut actions = vec![];
+    m.drive_subagent_reconcile(&mut actions);
+    carrier(&mut m, &token, id, "快轮");
+    assert_eq!(
+        m.reconcile_operation(id).unwrap().submission,
+        ReconcileSubmission::ConfirmedOwnTurn
+    );
+    assert_eq!(submissions(&actions), 0);
+}

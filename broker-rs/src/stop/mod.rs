@@ -1344,6 +1344,8 @@ impl Machine {
         if let Some(id) = self.stop_key(thread) {
             let op = self.stops.operations.get_mut(&id).unwrap();
             op.invalidate_round();
+            // 非活动通知同样推进版本；旧制动证据失效后必须允许重新读取，不能永久卡住。
+            op.goal_attempted = false;
             if active {
                 op.brake_version = None;
                 op.goal_done = false;

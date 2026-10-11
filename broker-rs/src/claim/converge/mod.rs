@@ -1,4 +1,4 @@
-//! A 路协调器：生产开关默认关闭，集成确认 B/C 完整后才允许启用。
+//! 收敛协调器：生产 Core 显式启用已接通的组件，裸 Machine 保留可隔离测试的默认状态。
 use super::{Action, ConnId, Machine, Owner, State, TimerKey, TimerKind};
 use crate::relations::{Authority, DiscoveryCaller, DiscoveryResult, DiscoveryScope, MemberChange};
 use crate::runs::{InterruptReason, ReleaseKind, TurnStatus};
@@ -53,6 +53,11 @@ pub struct Convergences {
     pub goals: BTreeMap<String, (u64, bool)>,
     pub capabilities: BTreeMap<String, (u64, bool)>,
     pub goal_evidence: BTreeMap<String, serde_json::Value>,
+    pub reuse_candidates:
+        BTreeMap<(crate::relations::EvidenceKey, String), std::collections::BTreeSet<String>>,
+    pub closed_threads: std::collections::BTreeSet<String>,
+    pub usage_evidence: BTreeMap<(String, String), serde_json::Value>,
+    pub review_runs: std::collections::BTreeSet<String>,
     pub observations:
         BTreeMap<(String, String), crate::relations::convergence::ActivityObservation>,
     pub progress: HashMap<String, Progress>,
@@ -219,7 +224,10 @@ impl Machine {
             // 新活动、结果和回答允许立即重核实；已有发现仍由单一在途登记合并。
             if matches!(
                 reason,
-                MemberChange::Activity | MemberChange::ResultReady | MemberChange::Goal
+                MemberChange::Activity
+                    | MemberChange::ResultReady
+                    | MemberChange::Goal
+                    | MemberChange::Request
             ) {
                 if let Some(progress) = self.convergences.progress.get_mut(run) {
                     progress.retry_at = None;
@@ -457,6 +465,23 @@ impl Machine {
     }
 
     pub(crate) fn convergence_prune(&mut self) {
+        self.convergences
+            .review_runs
+            .retain(|run| self.runs.runs.contains_key(run));
+        self.convergences
+            .goal_evidence
+            .retain(|thread, _| self.records.contains_key(thread));
+        self.convergences
+            .reuse_candidates
+            .retain(|(key, _), _| self.relations.operations.contains_key(key));
+        self.convergences.closed_threads.retain(|thread| {
+            self.records.contains_key(thread)
+                || self
+                    .relations
+                    .contexts
+                    .values()
+                    .any(|c| c.members.contains_key(thread))
+        });
         self.convergences.ledgers.retain(|run, _| {
             self.relations.contexts.contains_key(run) || self.convergences.runs.contains_key(run)
         });

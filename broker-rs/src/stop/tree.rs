@@ -1404,7 +1404,15 @@ impl Machine {
         let commit_due = {
             let op = &self.trees.operations[&tree_op];
             let work = &self.trees.aux.work[&tree_op];
-            !op.committed && work.deadline_passed && work.root_done
+            !op.committed
+                && work.deadline_passed
+                && (work.root_done
+                    || self
+                        .runs
+                        .runs
+                        .get(&op.request.snapshot.identity.run_id)
+                        .and_then(|r| r.subagent_join.as_ref())
+                        .is_some_and(|j| j.terminal_reason.is_some()))
         };
         if commit_due {
             self.tree_commit(tree_op, actions);

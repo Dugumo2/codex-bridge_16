@@ -190,6 +190,7 @@ impl Machine {
                 true
             }
             "thread/closed" => {
+                self.convergences.closed_threads.insert(thread.clone());
                 self.convergence_observation_gap(&thread, actions);
                 self.detach_evidence(&thread);
                 false
@@ -671,6 +672,43 @@ impl Machine {
                     self.spawn_candidate(&key, &child, AgentVersion::V2, actions);
                 }
             }
+            _ if self.convergence_enabled()
+                && confirmed
+                && !failed
+                && matches!(
+                    kind,
+                    EvidenceKind::V1SendInput
+                        | EvidenceKind::V1ResumeAgent
+                        | EvidenceKind::V2Interacted
+                ) =>
+            {
+                // 自有父轮的明确跟进与之后唯一新开始配对；不把历史完成轮当作新工作。
+                for child in receivers {
+                    if !self
+                        .manage_context(&run)
+                        .is_some_and(|c| c.members.contains_key(&child))
+                    {
+                        continue;
+                    }
+                    let observed = self
+                        .relations
+                        .aux
+                        .observed
+                        .get(&child)
+                        .map(|v| v.iter().map(|o| o.turn.clone()).collect())
+                        .unwrap_or_default();
+                    self.convergences
+                        .reuse_candidates
+                        .entry((key.clone(), child.clone()))
+                        .or_insert(observed);
+                    self.relations
+                        .aux
+                        .spawn_waits
+                        .insert(child.clone(), key.clone());
+                    self.pair_first_turn(&key, &child, actions);
+                    self.materialize(&key, actions);
+                }
+            }
             _ => {
                 // sendInput、resumeAgent、v2 interacted/interrupted/completed：不证明新轮，只记事实。
                 let op = self.relations.operations.get_mut(&key).expect("证据操作");
@@ -771,7 +809,18 @@ impl Machine {
             .aux
             .observed
             .get(child)
-            .map(|o| o.iter().map(|t| t.turn.clone()).collect())
+            .map(|o| {
+                o.iter()
+                    .filter(|t| {
+                        !self
+                            .convergences
+                            .reuse_candidates
+                            .get(&(key.clone(), child.into()))
+                            .is_some_and(|old| old.contains(&t.turn))
+                    })
+                    .map(|t| t.turn.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         match observed.len() {
             0 => {
@@ -825,6 +874,10 @@ impl Machine {
         } else {
             match op.kind {
                 EvidenceKind::V2Started => BindingEvidence::V2Started,
+                EvidenceKind::V2Interacted => BindingEvidence::V2Interacted,
+                EvidenceKind::V1SendInput | EvidenceKind::V1ResumeAgent => {
+                    BindingEvidence::V1Message
+                }
                 _ => BindingEvidence::V1Spawn,
             }
         };

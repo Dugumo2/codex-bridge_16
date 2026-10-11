@@ -123,16 +123,34 @@ impl Machine {
             let Some(status) = state.get("status").and_then(serde_json::Value::as_str) else {
                 continue;
             };
-            let turn = self.unique_active_bound_turn(thread);
             let closed = status == "shutdown"
                 && item.get("tool").and_then(serde_json::Value::as_str) == Some("closeAgent")
                 && item.get("status").and_then(serde_json::Value::as_str) == Some("completed");
+            let turn = self.unique_active_bound_turn(thread).or_else(|| {
+                closed
+                    .then(|| {
+                        self.relations
+                            .aux
+                            .observed
+                            .get(thread)?
+                            .back()
+                            .map(|o| o.turn.clone())
+                    })
+                    .flatten()
+                    .filter(|turn| {
+                        self.relations
+                            .bindings
+                            .get(&(thread.clone(), turn.clone()))
+                            .is_some_and(|b| b.run_id == run && b.status == BindingStatus::Bound)
+                    })
+            });
             if let Some(turn) = turn {
                 self.convergence_observe_activity(thread, &turn, status, closed);
                 if matches!(status, "completed" | "failed" | "errored" | "interrupted") || closed {
                     self.observe_turn(thread, &turn, true, true, actions);
                 }
                 if closed {
+                    self.convergences.closed_threads.insert(thread.clone());
                     self.convergence_observe_goal(thread, false, actions);
                 }
             } else if status == "pendingInit" {
@@ -163,6 +181,18 @@ impl Machine {
             return;
         }
         let (activity, result) = normalize_activity(status, closed_verified);
+        if activity == MemberActivity::Running {
+            self.convergences.closed_threads.remove(thread);
+        }
+        if result.is_some()
+            && self
+                .convergences
+                .observations
+                .get(&key)
+                .is_some_and(|o| o.result == Some(ActivityResultStatus::Shutdown))
+        {
+            return;
+        }
         // 同一轮已结束后迟到 started 不允许回退；复用线程使用新的 turnId。
         if result.is_none()
             && activity == MemberActivity::Running
@@ -373,7 +403,12 @@ impl Machine {
         if ledger.overflow {
             conflicts.push("活动事实超出有界容量".into());
         }
-        let inbox = self.inbox_pending_run_items(run_id);
+        // Guardian 是已拒绝动作的可选事后复核，不是仍悬挂的上游审批/提问请求。
+        let inbox: Vec<_> = self
+            .inbox_pending_run_items(run_id)
+            .into_iter()
+            .filter(|i| i.kind != crate::inbox::InboxKind::Guardian)
+            .collect();
         let inbox_ids: BTreeSet<_> = inbox.iter().map(|item| item.id.as_str()).collect();
         // 同一子请求转入收件箱后仍有路由记录，按实际事项去重。
         let pending_requests = self
