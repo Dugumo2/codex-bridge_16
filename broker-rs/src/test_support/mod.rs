@@ -3,3 +3,7 @@ pub(crate) mod status_read;
 pub(crate) mod subagent;
 
 pub(crate) mod background;
+
+// A/B/C 可在各自单测中复用；E 的独立集成测试也按 path 引入同一实现。
+#[allow(dead_code)]
+pub(crate) mod sa1b;
