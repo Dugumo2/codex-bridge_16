@@ -1289,6 +1289,26 @@ impl Machine {
         }));
     }
 
+    /// 正常和 RPC 超时后的迟到回包共用；只取发请求时保存的运行身份。
+    pub(crate) fn record_start_reply(
+        &mut self,
+        context: &RequestContext,
+        result: &Result<Value, Value>,
+        actions: &mut Vec<Action>,
+    ) {
+        if context.method != "turn/start" {
+            return;
+        }
+        if let Operation::Stream { run_id: Some(run) } = &context.operation {
+            if let (Some(thread), Some(turn)) = (
+                thread_id(&context.params),
+                result.as_ref().ok().and_then(response_turn_id),
+            ) {
+                self.run_start_evidence(run, thread, turn, actions);
+            }
+        }
+    }
+
     /// #7–#11、#24、#27：回包交付独立于认领；事实学习独立于运行阶段。
     pub(crate) fn apply_reply(
         &mut self,
@@ -1453,14 +1473,7 @@ impl Machine {
                 }
             }
             Operation::Stream { run_id } => {
-                if context.method == "turn/start" {
-                    if let (Some(run), Some(thread), Some(turn)) = (
-                        run_id.as_deref(), thread_id(&context.params),
-                        result.as_ref().ok().and_then(response_turn_id),
-                    ) {
-                        self.run_start_evidence(run, thread, turn, actions);
-                    }
-                }
+                self.record_start_reply(&context, &result, actions);
                 let review_child = result
                     .as_ref()
                     .ok()
@@ -2188,6 +2201,7 @@ impl Machine {
             })
             .and_then(|claim| claim.run_id.clone());
         match event.method.as_str() {
+            "model/rerouted" => self.run_rerouted(&event.params, actions),
             "item/started" | "item/completed" => {
                 if let (Some(turn), Some(item)) =
                     (turn, event.params.as_ref().and_then(|p| p.get("item")))
@@ -2424,8 +2438,8 @@ impl Machine {
                 if context.method != "thread/fork" {
                     self.record(thread_id).subscribed = true;
                 }
-                // broker 自发的恢复（屏障、续跑预检、inbox）不带模型，回包里是服务器默认模型，
-                // 不代表本线程实际用的模型，只有客户端请求的回包才改写索引模型。
+                // broker 自发恢复（屏障、续跑预检、inbox）的回包反映上游会话配置，
+                // 不代表本次开轮的请求值；只有客户端线程请求的回包才改写索引模型。
                 let learn_model = context.operation == Operation::Forward;
                 self.run_learn_thread(thread_id, value, learn_model, actions);
             }

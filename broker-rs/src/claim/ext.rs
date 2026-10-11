@@ -317,6 +317,8 @@ impl Machine {
                 };
                 if serde_json::from_value::<RunMeta>(meta.clone()).is_err()
                     || serde_json::to_vec(meta).map_or(true, |v| v.len() > MAX_META_BYTES)
+                    || (meta.get("source").and_then(Value::as_str) == Some("review")
+                        && (meta.get("model").is_some() || meta.get("effort").is_some()))
                 {
                     invalid(&request, actions);
                     return;

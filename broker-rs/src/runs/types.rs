@@ -141,6 +141,8 @@ pub enum OutputSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reroute: Option<Reroute>,
     pub turn_id: String,
     pub ready: Ready,
     pub status: TurnStatus,
@@ -182,6 +184,8 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reroute: Option<PendingReroute>,
     /// 创建时固定；文件外壳的 epoch/revision 随重写变化，不能用来判断运行先后。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creation_order: Option<CreationOrder>,
@@ -363,6 +367,23 @@ pub enum RunSource {
 pub struct CreationOrder {
     pub epoch: u64,
     pub sequence: u64,
+}
+
+/// 服务器本轮实际改道，仅用于显示，不覆盖登记的请求模型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reroute {
+    pub from_model: String,
+    pub to_model: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingReroute {
+    pub turn_id: String,
+    #[serde(flatten)]
+    pub reroute: Reroute,
 }
 
 /// 开轮证据与归属定案分开保存，允许两者以任意顺序到达。

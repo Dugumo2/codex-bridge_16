@@ -4,6 +4,7 @@ use super::*;
 
 mod ext;
 mod loop_guard;
+mod model_inherit;
 mod resume;
 mod review;
 mod runs;

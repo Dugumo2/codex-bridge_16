@@ -5,6 +5,65 @@ use crate::test_support::status_read::{meta, turns_page};
 
 const OLD: &str = "run-原运行";
 const NEW: &str = "run-续跑";
+
+#[test]
+fn mi_续跑预检及未知键降级真实路径前后模型不同仍不改索引() {
+    for retry_unknown in [false, true] {
+        let mut m = fixture(false);
+        let entry = m.runs.index.threads.values_mut().next().unwrap();
+        entry.model = Some("原模型".into());
+        entry.resume_overrides =
+            Some(serde_json::from_value(json!({"config":{"bad.key":true,"keep.key":7}})).unwrap());
+        let mut resume = resume_barrier(&mut m);
+        if retry_unknown {
+            let actions = response(
+                &mut m,
+                &resume,
+                Err(
+                    json!({"code":-32600,"message":"failed to load configuration: unknown configuration field `bad.key` in -c/--config override"}),
+                ),
+            );
+            resume = requests(&actions)
+                .into_iter()
+                .find(|r| r.method == "thread/resume")
+                .unwrap();
+            assert!(resume.resume_retried);
+        }
+        let actions = response(
+            &mut m,
+            &resume,
+            Ok(json!({"thread":{"id":"线程"},"model":"恢复时模型"})),
+        );
+        assert_eq!(
+            m.runs
+                .index
+                .threads
+                .values()
+                .next()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("原模型")
+        );
+        let (actions, _, _, _) = pump(&mut m, actions);
+        let stream = requests(&actions)
+            .into_iter()
+            .find(|r| r.method == "turn/start")
+            .unwrap();
+        response(&mut m, &stream, Ok(json!({"turn":{"id":"新轮"}})));
+        assert_eq!(
+            m.runs
+                .index
+                .threads
+                .values()
+                .next()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("原模型")
+        );
+    }
+}
 fn step_raw(machine: &mut Machine, event: Event) -> Vec<Action> {
     let (next, actions) = step(std::mem::take(machine), event);
     *machine = next;
