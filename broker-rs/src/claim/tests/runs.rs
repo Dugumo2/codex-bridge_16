@@ -589,7 +589,7 @@ fn index_model(m: &Machine, thread: &str) -> Option<String> {
 }
 
 #[test]
-fn 内部恢复回包的默认模型不覆盖索引且开轮按指定模型记录() {
+fn mi_内部恢复屏障前后模型不同仍不改索引() {
     let mut m = Machine::new(false);
     let started = apply(
         &mut m,
@@ -609,7 +609,7 @@ fn 内部恢复回包的默认模型不覆盖索引且开轮按指定模型记�
             1,
             2,
             "turn/start",
-            json!({"threadId":"线程","model":"指定模型","input":[{"type":"text","text":"输入"}]}),
+            json!({"threadId":"线程","model":"开轮新模型","input":[{"type":"text","text":"输入"}]}),
         )),
     );
     let barrier = first_request(&actions);
@@ -627,7 +627,7 @@ fn 内部恢复回包的默认模型不覆盖索引且开轮按指定模型记�
 }
 
 #[test]
-fn 续跑预检恢复不改索引模型而开轮指定新模型才更新() {
+fn mi_仅客户端线程回包学习模型而开轮成功失败均不学习() {
     let mut m = Machine::new(false);
     let started = apply(&mut m, client(request(1, 1, "thread/start", json!({}))));
     reply(
@@ -685,7 +685,7 @@ fn 续跑预检恢复不改索引模型而开轮指定新模型才更新() {
         &Ok(json!({"turn":{"id":"轮"}})),
         &mut actions,
     );
-    assert_eq!(index_model(&m, "线程").as_deref(), Some("新模型"));
+    assert_eq!(index_model(&m, "线程").as_deref(), Some("原模型"));
     // 陌生线程开轮不新建索引；客户端自己的恢复回包仍按回包改写。
     m.learn_traffic(
         &context(

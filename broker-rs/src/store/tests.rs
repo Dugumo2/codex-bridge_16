@@ -11,7 +11,7 @@ use std::time::{Instant, SystemTime};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
-pub(super) struct Temp {
+pub(crate) struct Temp {
     pub root: PathBuf,
 }
 impl Temp {
@@ -47,7 +47,7 @@ impl Temp {
     pub fn dir(&self) -> PathBuf {
         workspace_dir(&self.root, &self.root)
     }
-    pub fn disk(&self) -> Disk {
+    pub(super) fn disk(&self) -> Disk {
         Disk::initialize(
             &mut self.config(),
             Gate {
@@ -70,6 +70,7 @@ impl Drop for Temp {
 
 pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
+        pending_reroute: None,
         creation_order: None,
         start_confirmation: Default::default(),
         children: Vec::new(),
@@ -307,6 +308,7 @@ async fn 从运行恢复索引_删除标记_review_任意_pending_与损坏文�
     let mut old = run("old", "parent", 10);
     old.turns = vec![
         TurnResult {
+            reroute: None,
             turn_id: "turn1".into(),
             ready: Ready::Pending,
             status: TurnStatus::Completed,
@@ -316,6 +318,7 @@ async fn 从运行恢复索引_删除标记_review_任意_pending_与损坏文�
             completed_at: 11,
         },
         TurnResult {
+            reroute: None,
             turn_id: "turn2".into(),
             ready: Ready::Ready,
             status: TurnStatus::Completed,

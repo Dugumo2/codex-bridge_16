@@ -1201,6 +1201,44 @@ fn 超时对账没有活动释放登记迟到按编号中断不碰新认领() {
     assert!(m.stops.late.is_empty());
     assert_eq!(m.claims["线程"], new);
 }
+
+#[test]
+fn mi_真实超时对账释放后迟到成功只确认原运行且lost不补确认() {
+    for lost in [false, true] {
+        let (mut m, context) = started(false, "turn/start");
+        let run = m.claims["线程"].run_id.clone().unwrap();
+        let actions = apply(
+            &mut m,
+            Event::TimedOut {
+                tag: 0,
+                deadline: Instant::now() + std::time::Duration::from_millis(LATE_MS),
+                context: context.clone(),
+                error: err(),
+            },
+        );
+        snapshot(&mut m, &req(&actions, "thread/read"), &[]);
+        assert!(m.claims.is_empty());
+        assert!(!m.runs.runs[&run].start_confirmation.confirmed);
+        // 保留一个仍待核实的历史记录，验证当前认领换代后补写的目标。
+        m.runs.verifying_history.insert(run.clone());
+        if lost {
+            m.runs.runs.get_mut(&run).unwrap().state = RunState::Lost;
+        }
+        client(&mut m, "turn/start", 9, json!({"threadId":"线程"}));
+        let newer = m.claims["线程"].run_id.clone().unwrap();
+        assert_ne!(newer, run);
+        apply(
+            &mut m,
+            Event::LateReply {
+                context,
+                result: Ok(json!({"turn":{"id":"旧轮"}})),
+            },
+        );
+        assert_eq!(m.runs.runs[&run].start_confirmation.confirmed, !lost);
+        assert!(!m.runs.runs[&newer].start_confirmation.confirmed);
+        assert!(m.runs.runs[&newer].start_confirmation.turn_id.is_none());
+    }
+}
 #[test]
 fn 迟到登记期间旧轮次启动只中断旧轮次且完成清除登记() {
     let (mut m, c) = started(false, "turn/start");

@@ -3,6 +3,104 @@ use super::*;
 use crate::claim::ext::*;
 use crate::runs::{Ready, RunLookup, SummaryOwner, SummaryState};
 
+#[test]
+fn mi_模型强度遵循既有元数据字符集类型与总长度预算() {
+    for field in ["model", "effort"] {
+        let mut m = Machine::new(false);
+        m.record("线程").subscribed = true;
+        for value in [json!(null), json!(""), json!("模型/强度-é_6.1\n\t")] {
+            let meta = json!({"source":"run",field:value});
+            let result = response(&call(
+                &mut m,
+                1,
+                "broker/threads/annotate",
+                json!({"threadId":"线程","meta":meta}),
+            ));
+            assert!(result.get("error").is_none(), "{result}");
+            assert_eq!(m.records["线程"].pending_meta[&1], meta);
+        }
+        for bad in [json!(17), json!(true), json!([]), json!({})] {
+            let result = response(&call(
+                &mut m,
+                2,
+                "broker/threads/annotate",
+                json!({"threadId":"线程","meta":{"source":"run",field:bad}}),
+            ));
+            assert_eq!(result["error"]["code"], -32602);
+        }
+        let base = serde_json::to_vec(&json!({"source":"run",field:""}))
+            .unwrap()
+            .len();
+        for extra in [0, 1] {
+            let meta = json!({"source":"run",field:"a".repeat(MAX_META_BYTES-base+extra)});
+            let result = response(&call(
+                &mut m,
+                3,
+                "broker/threads/annotate",
+                json!({"threadId":"线程","meta":meta}),
+            ));
+            assert_eq!(result.get("error").is_some(), extra == 1);
+        }
+        for value in [Value::Null, json!("gpt-6-astra")] {
+            let result = response(&call(
+                &mut m,
+                4,
+                "broker/threads/annotate",
+                json!({"threadId":"线程","meta":{"source":"review",field:value}}),
+            ));
+            assert_eq!(result["error"]["code"], -32602);
+            assert!(!m.records["线程"].pending_meta.contains_key(&4));
+        }
+    }
+}
+
+#[test]
+fn mi_watch按需返回线程全部内存运行且确认不可由客户端伪造() {
+    let mut m = Machine::new(false);
+    m.record("线程").subscribed = true;
+    let meta = json!({"source":"run","model":"astra","effort":"high","startConfirmation":{"confirmed":true},"creationOrder":{"epoch":999,"sequence":999}});
+    call(
+        &mut m,
+        1,
+        "broker/threads/annotate",
+        json!({"threadId":"线程","meta":meta}),
+    );
+    for (run, thread) in [
+        ("run-one", "线程"),
+        ("run-two", "线程"),
+        ("run-other", "其他线程"),
+    ] {
+        m.run_opened(
+            RunOpen {
+                run_id: run.into(),
+                thread_id: thread.into(),
+                conn: Some(1),
+                kind: ReqKind::TurnStart,
+                joined: false,
+                input: String::new(),
+                continued_from: None,
+            },
+            &mut vec![],
+        );
+    }
+    assert!(!m.runs.runs["run-one"].start_confirmation.confirmed);
+    assert_eq!(m.runs.runs["run-one"].creation_order.unwrap().epoch, 0);
+    let result = response(&call(
+        &mut m,
+        1,
+        "broker/threads/watch",
+        json!({"threadId":"线程","includeRuns":true}),
+    ));
+    let runs = result["result"]["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    assert!(runs.iter().all(|run| run["threadId"] == "线程"));
+    assert!(runs
+        .iter()
+        .any(|run| run["runId"] == "run-one" && run["meta"]["model"] == "astra"));
+    let result = response(&watch(&mut m, 1, "线程"));
+    assert!(result["result"]["runs"].is_null());
+}
+
 fn connected(machine: &mut Machine, conn: u64, cxb: bool) {
     apply(machine, Event::Connected { conn });
     apply(machine, Event::Initialized { conn, cxb });
@@ -936,7 +1034,8 @@ fn 暂存回包后新增扩展声明最终附加运行字段() {
 fn 恢复屏障严格区分未知登记键与其他错误() {
     for case in 0..7 {
         let mut m = Machine::new(false);
-        m.runs.ensure_thread("线程", 1, 1);
+        let short = m.runs.ensure_thread("线程", 1, 1);
+        m.runs.index.threads.get_mut(&short).unwrap().model = Some("原模型".into());
         call(
             &mut m,
             1,
@@ -997,7 +1096,15 @@ fn 恢复屏障严格区分未知登记键与其他错误() {
                 .iter()
                 .any(|a| matches!(a, Action::Store(crate::store::StoreOp::PutThreads(_)))));
             let retry = resumes[0].clone();
-            let next = reply(&mut m, &retry, Ok(json!({"thread":{"id":"线程"}})));
+            let next = reply(
+                &mut m,
+                &retry,
+                Ok(json!({"thread":{"id":"线程"},"model":"降级后的服务器模型"})),
+            );
+            assert_eq!(
+                m.runs.index.threads[&short].model.as_deref(),
+                Some("原模型")
+            );
             assert_eq!(first_request(&next).method, "turn/start");
         }
     }

@@ -2524,6 +2524,8 @@ impl Machine {
         if self.closing {
             return;
         }
+        // 旧认领已释放或迟到追踪已收尾时，仍可补原运行的开轮事实，不能借用当前认领。
+        self.record_start_reply(&context, &result, actions);
         self.release_stream_slot(context.stream_id);
         context.client = None;
         if self.unwrap_goal_reply(&mut context, &result, false, actions) {

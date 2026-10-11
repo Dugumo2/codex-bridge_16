@@ -1356,6 +1356,7 @@ fn 守护审批恢复带覆盖并保留历史选项() {
     own(&mut m, "t");
     let short = m.runs.ensure_thread("t", 1, 1);
     m.runs.index.threads.get_mut(&short).unwrap().resume_overrides = Some(serde_json::from_value(json!({"config":{"features.default_mode_request_user_input":true},"developerInstructions":"提问指令"})).unwrap());
+    m.runs.index.threads.get_mut(&short).unwrap().model = Some("原模型".into());
     let id = guardian(&mut m, "r", json!("denied"), &mut Vec::new());
     let actions = resolve(
         &mut m,
@@ -1376,6 +1377,20 @@ fn 守护审批恢复带覆盖并保留历史选项() {
             json!({"threadId":"t","excludeTurns":true,"persistExtendedHistory":false,"config":{"features.default_mode_request_user_input":true},"developerInstructions":"提问指令"})
         )
     );
+    let resume = resume.clone();
+    let mut actions = Vec::new();
+    m.apply_reply(
+        resume,
+        Ok(json!({"thread":{"id":"t"},"model":"服务器模型"})),
+        &mut actions,
+    );
+    assert_eq!(
+        m.runs.index.threads[&short].model.as_deref(),
+        Some("原模型")
+    );
+    assert!(actions.iter().any(
+        |a| matches!(a, Action::Request(r) if r.method == "thread/approveGuardianDeniedAction")
+    ));
 }
 
 #[test]
@@ -1394,6 +1409,7 @@ fn 守护恢复未知键降级一次并保留历史参数() {
         )
         .unwrap(),
     );
+    m.runs.index.threads.get_mut(&short).unwrap().model = Some("原模型".into());
     let id = guardian(&mut m, "r", json!("denied"), &mut Vec::new());
     let actions = resolve(
         &mut m,
@@ -1430,7 +1446,15 @@ fn 守护恢复未知键降级一次并保留历史参数() {
         )
     );
     actions.clear();
-    m.apply_reply(retry, Ok(json!({"thread":{"id":"t"}})), &mut actions);
+    m.apply_reply(
+        retry,
+        Ok(json!({"thread":{"id":"t"},"model":"降级后模型"})),
+        &mut actions,
+    );
+    assert_eq!(
+        m.runs.index.threads[&short].model.as_deref(),
+        Some("原模型")
+    );
     assert!(actions
         .iter()
         .any(|a| matches!(a,Action::Request(r) if r.method=="thread/approveGuardianDeniedAction")));

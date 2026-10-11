@@ -276,7 +276,10 @@ impl Machine {
                 .remove(&conn)
         });
         let run_id = open.run_id.clone();
-        self.runs.next_creation_sequence = self.runs.next_creation_sequence.checked_add(1)
+        self.runs.next_creation_sequence = self
+            .runs
+            .next_creation_sequence
+            .checked_add(1)
             .expect("运行创建序号已耗尽");
         let entry = self
             .runs
@@ -292,9 +295,19 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
-                creation_order: Some(CreationOrder { epoch: self.runs.epoch, sequence: self.runs.next_creation_sequence }),
+                pending_reroute: None,
+                creation_order: Some(CreationOrder {
+                    epoch: self.runs.epoch,
+                    sequence: self.runs.next_creation_sequence,
+                }),
                 start_confirmation: StartConfirmation {
-                    owned: if open.joined { Some(false) } else if !self.shared { Some(true) } else { None },
+                    owned: if open.joined {
+                        Some(false)
+                    } else if !self.shared {
+                        Some(true)
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
                 children: Vec::new(),
@@ -358,7 +371,9 @@ impl Machine {
             if matches!(record.state, RunState::Running | RunState::Stopping) {
                 record.joined = joined;
                 record.start_confirmation.owned = Some(!joined);
-                record.start_confirmation.confirmed = !joined && record.start_confirmation.turn_id.is_some();
+                record.start_confirmation.confirmed = !joined
+                    && record.start_confirmation.thread_id.as_deref() == Some(&record.thread_id)
+                    && record.start_confirmation.turn_id.is_some();
                 self.runs.updated.insert(run.into(), self.clock.now_ms);
                 self.runs.put(run, actions);
             }
@@ -366,10 +381,25 @@ impl Machine {
     }
 
     /// 只接收成功 turn/start 回包或 turn/started；请求回包必须使用原请求保存的 runId。
-    pub(crate) fn run_start_evidence(&mut self, run: &str, thread: &str, turn: &str, actions: &mut Vec<Action>) {
-        if self.runs.phase != Phase::Open || turn.is_empty() { return; }
-        let Some(record) = self.runs.runs.get_mut(run) else { return; };
-        if record.state == RunState::Lost || record.thread_id != thread || record.start_confirmation.confirmed { return; }
+    pub(crate) fn run_start_evidence(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        if self.runs.phase != Phase::Open || turn.is_empty() {
+            return;
+        }
+        let Some(record) = self.runs.runs.get_mut(run) else {
+            return;
+        };
+        if record.state == RunState::Lost
+            || record.thread_id != thread
+            || record.start_confirmation.confirmed
+        {
+            return;
+        }
         let evidence = &mut record.start_confirmation;
         evidence.thread_id = Some(thread.into());
         evidence.turn_id = Some(turn.into());
@@ -399,10 +429,65 @@ impl Machine {
         let active = self.runs.active.get_mut(run).expect("活动运行存在");
         let key = (thread.to_owned(), turn.to_owned());
         if active.current_turn.as_ref() != Some(&key) {
+            // 新轮开始时淘汰旧轮暂存，哪怕旧轮完成通知缺失也不串轮。
+            if self
+                .runs
+                .runs
+                .get_mut(run)
+                .expect("运行存在")
+                .pending_reroute
+                .take()
+                .is_some()
+            {
+                self.runs.put(run, actions);
+            }
+            let active = self.runs.active.get_mut(run).expect("活动运行存在");
             active.current_turn = Some(key);
             active.snapshot = Snapshot::default();
             self.runs
                 .log(run, self.clock.now_ms, "轮次开始", turn, actions);
+        }
+    }
+
+    pub(crate) fn run_rerouted(&mut self, params: &Option<Value>, actions: &mut Vec<Action>) {
+        if self.runs.phase != Phase::Open {
+            return;
+        }
+        let Some(params) = params.as_ref() else {
+            return;
+        };
+        let (Some(thread), Some(turn)) = (
+            params.get("threadId").and_then(Value::as_str),
+            params.get("turnId").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        // 必须已有当前轮关联；不能借当前认领或通知自报的轮次建立归属。
+        let Some(run) = self.runs.find_run(thread, turn, None) else {
+            return;
+        };
+        if !self.runs.active.get(&run).is_some_and(|active| {
+            active
+                .current_turn
+                .as_ref()
+                .is_some_and(|key| key.0 == thread && key.1 == turn)
+        }) || !matches!(
+            self.runs.runs[&run].state,
+            RunState::Running | RunState::Stopping
+        ) {
+            return;
+        }
+        let Ok(reroute) = serde_json::from_value::<Reroute>(params.clone()) else {
+            return;
+        };
+        let pending = PendingReroute {
+            turn_id: turn.into(),
+            reroute,
+        };
+        let record = self.runs.runs.get_mut(&run).expect("运行存在");
+        if record.pending_reroute.as_ref() != Some(&pending) {
+            record.pending_reroute = Some(pending);
+            self.runs.put(&run, actions);
         }
     }
 
@@ -609,7 +694,18 @@ impl Machine {
         let record = self.runs.runs.get_mut(&run).expect("运行存在");
         let turn_index = usize::try_from(record.turns_total).expect("轮次总数超出本机容量");
         record.turns_total = record.turns_total.checked_add(1).expect("轮次总数已耗尽");
+        // 迟到的旧轮完成不消费当前轮改道；对应轮完成则转入结果并清空暂存。
+        let reroute = if record
+            .pending_reroute
+            .as_ref()
+            .is_some_and(|p| p.turn_id == id)
+        {
+            record.pending_reroute.take().map(|p| p.reroute)
+        } else {
+            None
+        };
         record.turns.push(TurnResult {
+            reroute,
             turn_id: id.into(),
             ready: if pending {
                 Ready::Pending
@@ -661,6 +757,7 @@ impl Machine {
         }
         record.turns_total = record.turns_total.checked_add(1).expect("轮次总数已耗尽");
         record.turns.push(TurnResult {
+            reroute: None,
             turn_id: String::new(),
             ready: Ready::Ready,
             status: TurnStatus::Failed,

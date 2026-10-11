@@ -7,6 +7,92 @@ use super::*;
 use crate::appserver::rpc;
 use crate::claim::{Operation, State};
 
+#[tokio::test]
+async fn mi_真实存储跨重启递增epoch且保留确认登记改道和创建键() {
+    use crate::runs::{CreationOrder, RunRecord};
+    let temp = crate::store::tests::Temp::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut previous: Option<RunRecord> = None;
+    for epoch in 1..=3 {
+        let (store, loaded) = crate::store::open(temp.config()).await.unwrap();
+        assert_eq!(loaded.epoch, epoch);
+        if let Some(old) = &previous {
+            // 内存加载会筛选历史候选，必须另从文件核对未被选入内存的记录。
+            let file: Value = serde_json::from_slice(
+                &std::fs::read(temp.dir().join(format!("runs/{}.json", old.run_id))).unwrap(),
+            )
+            .unwrap();
+            let restored: RunRecord = serde_json::from_value(file["payload"].clone()).unwrap();
+            assert_eq!(&restored, old);
+        }
+        let mut h = Harness::new(false);
+        h.core = h.core.with_store(Some(store.clone()), loaded);
+        h.core.fixed_clock = Some(claim::Clock {
+            now_ms: now - epoch * 1000,
+            mono_ms: 0,
+            entropy: epoch,
+        });
+        h.core.restore();
+        if let Some(old) = &previous {
+            // 重启将活动旧运行写成 lost，外壳更新仍不得重写创建键或反推确认。
+            if let Some(restored) = h.core.machine.runs.runs.get(&old.run_id) {
+                assert_eq!(restored.creation_order, old.creation_order);
+                assert_eq!(restored.start_confirmation, old.start_confirmation);
+            }
+        }
+        h.core.machine.record("线程").subscribed = true;
+        h.client(2, "broker/threads/annotate", json!({"threadId":"线程","meta":{"source":"run","model":"gpt-6-astra","effort":"high"}}));
+        assert!(h.incoming_client().await.get("result").is_some());
+        let turn = format!("轮-{epoch}");
+        h.client(1, "turn/start", json!({"threadId":"线程"}));
+        let start = h.outgoing().await;
+        h.answer(&start, Ok(json!({"turn":{"id":turn}}))).await;
+        assert_eq!(h.incoming_client().await["id"], 1);
+        h.notification("model/rerouted", json!({"threadId":"线程","turnId":turn,"fromModel":"gpt-6-astra","toModel":"gpt-6.1-sol","reason":"highRiskCyberActivity"})).await;
+        if epoch == 2 {
+            h.notification("turn/completed", json!({"threadId":"线程","turn":{"id":turn,"status":"completed","items":[{"type":"agentMessage","phase":"final_answer","text":"完成"}]}})).await;
+        }
+        let record = h
+            .core
+            .machine
+            .runs
+            .runs
+            .values()
+            .find(|run| run.creation_order == Some(CreationOrder { epoch, sequence: 1 }))
+            .unwrap()
+            .clone();
+        assert!(record.start_confirmation.confirmed);
+        assert_eq!(
+            record.meta,
+            Some(json!({"source":"run","model":"gpt-6-astra","effort":"high"}))
+        );
+        if epoch == 2 {
+            assert!(record.pending_reroute.is_none());
+            assert_eq!(
+                record.turns[0].reroute.as_ref().unwrap().to_model,
+                "gpt-6.1-sol"
+            );
+        } else {
+            assert!(record.pending_reroute.is_some());
+        }
+        if let Some(old) = &previous {
+            assert!(record.started_at < old.started_at);
+            assert!(record.creation_order > old.creation_order);
+        }
+        assert!(store
+            .drain(Duration::from_secs(5))
+            .await
+            .abandoned
+            .is_empty());
+        previous = Some(record);
+        drop(h);
+        drop(store);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn m7普通客户端无status目标写入在途时关闭先暂停再中断() {
     let mut h = Harness::new(false);

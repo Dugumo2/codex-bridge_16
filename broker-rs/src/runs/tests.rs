@@ -58,6 +58,8 @@ use crate::results::{Snapshot, MAX_TEXT_BYTES};
 use crate::store::{StoreOp, RETENTION_MS};
 use serde_json::json;
 
+mod model_inherit;
+
 #[test]
 fn n7_每类日志带运行编号且内容清洗与空内容符合四段格式() {
     let mut m = machine();
