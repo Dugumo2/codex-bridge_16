@@ -189,8 +189,13 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
     const blocked = await cli("run", "--resume", PARENT, "--json", "屏障期间不能派单");
     expect(blocked.code, JSON.stringify(blocked)).toBe(8);
     if (rootLimited) {
-      expect((await rpc("broker/threads/watch", { threadId: PARENT })).run.state).not.toBe("ended");
-      expect((await rpc("broker/health")).claims).toBeGreaterThan(0);
+      // 接口第 8 节允许树停止交付期限到后提交真实异常 ended/unconfirmed；
+      // 根后台能力受限不构成“必须保持 running”的保证，屏障仍须先于弃管解除。
+      expect((await rpc("broker/threads/watch", { threadId: PARENT })).run).toMatchObject({
+        state: "ended", status: "interrupted", stopOutcome: "unconfirmed",
+        childrenStop: { cleanupState: "active", root: { backgroundCleanup: { state: "capabilityLimited" } } },
+      });
+      expect((await rpc("broker/health")).claims).toBe(0);
     }
     const abandoned = await cli("stop", PARENT, "--run", run.runId, "--abandon", "--json");
     expect(abandoned.code, JSON.stringify(abandoned)).toBe(3);
