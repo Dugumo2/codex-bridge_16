@@ -128,6 +128,10 @@ scenario("新运行跟进旧子线程：按本次跟进绑定，汇总后结束"
   expect(run.subagentJoin).toBeDefined();
 });
 
+/** 发现真实输入后必须当场锁定归属冲突并收尾，不能只撤权、拖到 20 秒核实窗到期才由别的路径结束。 */
+async function locked(h: H, where: string) {
+  await h.until(async () => (await h.record()).subagentJoin?.terminalReason === "ownershipConflict", 5000, `${where}发现真实输入后未立即锁定归属冲突`);
+}
 for (const where of ["核实分页", "快轮完成全文"] as const) scenario(`${where}才发现真实输入：明确按归属冲突收尾，wait 能结束`, async h => {
   await h.spawn(); await h.finish("child", mark());
   // 回包丢失、条目通知扣住：汇总已发出但结果未知，真实输入只能从核实读取或完成全文里看到。
@@ -143,16 +147,16 @@ for (const where of ["核实分页", "快轮完成全文"] as const) scenario(`$
   if (where === "核实分页") {
     await h.control("release", { name: "items" });
     // 撤权后不能借它中断未证明自有的承载轮；该轮自行结束后停止才能确认、运行收尾。
-    await h.until(async () => (await h.record()).subagentJoin?.automaticControlRevoked === true, 6000, "分页核实未撤权");
+    await locked(h, "分页核实");
     await h.finish(P, "承载轮结束", "completed", carrier);
   } else {
     await h.control("turn", { threadId: P, turnId: carrier, action: "complete", announce: false });
     const turn = (await h.state()).threads.root.turns.find((x: any) => x.id === carrier);
     await h.control("inject", { message: { method: "turn/completed", params: { threadId: P, turn: { ...turn, itemsView: "full" } } } });
-    await h.until(async () => (await h.record()).subagentJoin?.automaticControlRevoked === true, 6000, "完成全文未撤权");
+    await locked(h, "完成全文");
   }
-  // 通知只是延迟而非丢失：撤权定案后放行，停止据此确认承载轮已结束。
-  await h.control("release", { name: "started" }); await h.control("release", { name: "input" });
+  // 真实输入的条目通知始终收不到（审查指出的触发条件）；只放行轮次开始通知，停止据此确认承载轮已结束。
+  await h.control("release", { name: "started" });
   // 结果不明的已发提交保留只读核实直到 20 秒总窗，之后才能确认根线程收尾。
   const run = await terminal(h, 30000).catch(async error => {
     const watch = await h.watch();
