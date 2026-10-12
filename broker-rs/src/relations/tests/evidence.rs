@@ -207,14 +207,18 @@ fn 旧子线程在父新运行开始后才发事件不误绑_同一子代理被�
     // 新运行 R2 在 P 上开始。
     m.claims
         .insert(P.into(), claim(Owner::Client(1), "父轮2", "运行乙", 2));
+    m.ensure_context("运行乙");
+    assert!(!m.run_has_subagents("运行乙"), "旧血缘不算新运行的子代理");
     // 旧子线程迟到的新轮：不能归 R2，也不能再归已撤权的 R。
     let late = mock.turn_started(C, "子轮9");
     mock.inject(&mut m, late);
     assert_eq!(bound(&m, C, "子轮9"), None);
+    assert!(!m.run_has_subagents("运行乙"), "旧子迟到轮次不能触发新运行汇总");
     // R2 用 sendInput 复用同一子代理：仍然没有轮次证据。
     let (s, c) = SubagentMock::v1_message("sendInput", P, "父轮2", "消息1", C, false);
     let reuse = mock.turn_started(C, "子轮10");
     run(&mut m, &mut mock, vec![s, reuse, c]);
+    assert!(m.run_has_subagents("运行乙"), "当前运行显式复用仍须收敛核实");
     assert_eq!(bound(&m, C, "子轮10"), None);
     assert_eq!(bound(&m, C, "子轮1"), None, "已结算的绑定随运行退役");
 }

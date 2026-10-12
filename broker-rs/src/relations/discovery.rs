@@ -479,6 +479,12 @@ impl Machine {
         let mut members = BTreeMap::new();
         let mut counted = 0usize;
         for (thread, edge) in &all {
+            // 收敛按运行归属筛选；显式整树停止仍保留原来的历史血缘清理范围。
+            if let DiscoveryCaller::Converge { token, .. } = &caller {
+                if self.historical_subagent_for_run(&token.run_id, thread) {
+                    continue;
+                }
+            }
             // 根深度 0：直接子线程深度 1，最深 8；多走几层只为识别「通到根但超深」。
             let mut current = edge.parent_thread_id.clone();
             let mut depth = 1;
@@ -677,6 +683,9 @@ impl Machine {
         let work = &self.relations.aux.work[&op_id];
         // ancestor/list 已按根过滤；loaded/list 的未知线程必须沿血缘验证。
         for (thread, edge) in work.found.iter().chain(work.read_edges.iter()) {
+            if self.historical_subagent_for_run(&token.run_id, thread) {
+                continue;
+            }
             let mut parent = edge.parent_thread_id.clone();
             for _ in 0..MAX_DEPTH {
                 if parent == root {

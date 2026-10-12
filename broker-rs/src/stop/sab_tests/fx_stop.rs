@@ -255,6 +255,39 @@ fn lim_b_abandon根已停但后台受限应唯一提交并可同线程派单() {
 }
 
 #[test]
+fn sa1b_弃管后同线程新运行不继承旧子代理且可完成() {
+    for root_limited in [false, true] {
+        let mut s = Sim::new();
+        assert!(s.m.enable_convergence(crate::claim::converge::ConvergenceReadiness {
+            trusted_inputs: true,
+            budget_admission: true,
+            asynchronous_results: true,
+            terminal_mapping: true,
+            cancellation_verified: true,
+        }));
+        s.spawn_v1("旧子", "旧派生", "旧子轮");
+        s.never.insert("旧子".into());
+        s.background_supported = !root_limited;
+        stop(&mut s, true);
+        s.advance(40_000);
+        assert_eq!(abandon(&mut s)["childrenStop"]["rootRelease"]["released"], true);
+        assert!(s.m.thread_relation("旧子").is_some(), "保留血缘诊断");
+        let actions = s.client(OWNER, "turn/start", json!({"threadId":P,"input":[]}), Some("新运行"));
+        let start = actions.iter().find_map(|a| match a {
+            Action::Request(c) if c.method == "turn/start" => Some(c.clone()),
+            _ => None,
+        }).expect("新运行开轮");
+        s.apply(Event::Reply { context: start, result: Ok(json!({"turn":{"id":"新父轮"}})) });
+        s.turn_started(P, "新父轮");
+        assert!(!s.m.run_has_subagents("新运行"), "旧血缘不能授予新运行收敛责任");
+        s.turn_completed(P, "新父轮", "completed");
+        assert!(!s.m.claims.contains_key(P));
+        assert_eq!(s.m.runs.runs["新运行"].status, Some(crate::runs::RunStatus::Completed));
+        assert_eq!(s.m.runs.runs[R].children_stop.as_ref().unwrap().cleanup_state, "abandoned");
+    }
+}
+
+#[test]
 fn lim_b_abandon证据不足或认领变更不释放且说明原因() {
     for fault in [
         "ownership",

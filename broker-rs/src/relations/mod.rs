@@ -237,12 +237,32 @@ impl Machine {
                 || self.relations.edges.values().any(|e| {
                     e.kind == RelationKind::Subagent
                         && e.parent_thread_id == c.identity.execution_thread_id
+                        && !self.historical_subagent_for_run(run_id, &e.child_thread_id)
                 })
         }) || self
             .convergences
             .ledgers
             .get(run_id)
             .is_some_and(|l| !l.pending.is_empty())
+    }
+
+    /// 血缘属于线程历史，不自动属于同线程的下一运行。当前运行有派生／复用证据时仍须纳管；
+    /// 仅排除已证明属于其他运行的旧成员，未知来源和 pendingInit 继续保守核实。
+    pub(crate) fn historical_subagent_for_run(&self, run: &str, thread: &str) -> bool {
+        if self
+            .manage_context(run)
+            .is_some_and(|c| c.members.contains_key(thread))
+            || self.relations.operations.values().any(|op| {
+                op.run_id == run && op.receivers.contains(thread)
+            })
+        {
+            return false;
+        }
+        self.runs.runs.values().any(|r| {
+            r.run_id != run && r.children.iter().any(|c| c.thread_id == thread)
+        }) || self.relations.operations.values().any(|op| {
+            !op.run_id.is_empty() && op.run_id != run && op.receivers.contains(thread)
+        })
     }
     /// 给自然结束门禁用：活动成员、待答请求、在途派生、未决候选算 some；
     /// 成员上有未归属的活动轮次、或可能属于本运行的回查未决算 unknown。
