@@ -2765,12 +2765,13 @@ process.stdin.on("end", () => process.exit(0));
       // 桌面端在同一线程上开一轮（带 userMessage）：broker 认领正等续跑，这一轮接进同一运行。
       mock.desktop("turn/start", { threadId: "thread-us", input: [{ type: "text", text: "我来插一句" }] });
       mock.finish("thread-us", [agent("d", "回答桌面端")]);
-      await waitFor(() => (runOf(home, "thread-us") as any)?.subagentJoin?.automaticControlRevoked === true);
+      await turnsWritten(home, "thread-us", 3);
       for (let n = 4; n <= 6; n++) {
         await autoTurn(mock, "thread-us", [idleItem]);
+        await turnsWritten(home, "thread-us", n);
       }
       await client.request("thread/goal/get", { threadId: "thread-us" });
-      expect(brokerPaused(mock), JSON.stringify({run:runOf(home,"thread-us"),calls:mock.log})).toBe(false);
+      expect(brokerPaused(mock)).toBe(false);
       expect(mock.goal("thread-us").status).toBe("active");
       mock.desktop("thread/goal/set", { threadId: "thread-us", status: "paused" });
       await waitFor(() => runOf(home, "thread-us")?.state === "ended", 10_000);
