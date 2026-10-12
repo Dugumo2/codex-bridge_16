@@ -252,17 +252,21 @@ impl Machine {
         if self
             .manage_context(run)
             .is_some_and(|c| c.members.contains_key(thread))
-            || self.relations.operations.values().any(|op| {
-                op.run_id == run && op.receivers.contains(thread)
-            })
+            || self
+                .relations
+                .operations
+                .values()
+                .any(|op| op.run_id == run && op.receivers.contains(thread))
         {
             return false;
         }
-        self.runs.runs.values().any(|r| {
-            r.run_id != run && r.children.iter().any(|c| c.thread_id == thread)
-        }) || self.relations.operations.values().any(|op| {
-            !op.run_id.is_empty() && op.run_id != run && op.receivers.contains(thread)
-        })
+        self.runs
+            .runs
+            .values()
+            .any(|r| r.run_id != run && r.children.iter().any(|c| c.thread_id == thread))
+            || self.relations.operations.values().any(|op| {
+                !op.run_id.is_empty() && op.run_id != run && op.receivers.contains(thread)
+            })
     }
     /// 给自然结束门禁用：活动成员、待答请求、在途派生、未决候选算 some；
     /// 成员上有未归属的活动轮次、或可能属于本运行的回查未决算 unknown。
