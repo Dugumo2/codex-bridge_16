@@ -37,6 +37,8 @@ fn setup() -> (Machine, SubagentMock) {
     let mut m = Machine::default();
     m.clock.mono_ms = 1_000;
     m.clock.now_ms = 100_000;
+    // 与生产 Core 相同：broker 启动即打开门禁，运行按需启用（不再绕过启用前的初始化路径）。
+    assert!(m.enable_convergence(ready()));
     apply(&mut m, Event::Connected { conn: 1 });
     apply(&mut m, Event::Initialized { conn: 1, cxb: true });
     m.record(P).subscribed = true;
@@ -71,7 +73,6 @@ fn setup() -> (Machine, SubagentMock) {
         "turn/started",
         json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
     );
-    assert!(m.enable_convergence(ready()));
     m.convergences
         .capabilities
         .insert(P.into(), (m.relations.conn_epoch, true));
@@ -1591,4 +1592,41 @@ fn 集成_首采样完成通知早于承载核实时仍回放原运行结果() {
         .any(|t| t.turn_id == "快汇总" && t.status == TurnStatus::Completed));
     assert_eq!(join(&m).reconciled_epoch, join(&m).work_epoch);
     assert!(matches!(m.claims[P].state, State::Converging { .. }));
+}
+#[test]
+fn 无子代理时不建协调器_detach后再派生用当前授权代际启用() {
+    let (mut m, mut mock) = setup();
+    assert!(!m.sa1b_active(R), "没有子代理证据不启用");
+    assert!(m.runs.runs[R].subagent_join.is_none());
+    assert!(m.runs.runs[R].auto_turns_started.is_none());
+    let out = apply(
+        &mut m,
+        Event::ClientRequest {
+            request: ClientRequest {
+                conn: 1,
+                id: json!(98),
+                method: "broker/threads/detach".into(),
+                params: Some(json!({"threadId":P,"runId":R,"policy":"on-request"})),
+            },
+            run_id: None,
+        },
+    );
+    assert!(
+        matches!(m.claims[P].owner(), Some(Owner::Broker { .. })),
+        "{out:?}"
+    );
+    assert!(!m.sa1b_active(R), "detach 本身不启用");
+    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+    let token = m.convergences.runs[R].token.clone();
+    assert_eq!(token.manage_gen, m.manage_context(R).unwrap().gen);
+    assert!(m.convergence_token_current(&token), "启用时取当前代际");
+    complete(&mut m, &mut mock, "子", "子轮", "completed");
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    discover(&mut m, true);
+    assert_eq!(
+        m.convergences.progress[R].reading,
+        Some((BatchReadId(9), join(&m).work_epoch)),
+        "收敛继续推进到读取子结果"
+    );
 }

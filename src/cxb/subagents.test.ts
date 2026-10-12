@@ -14,7 +14,7 @@ import { stopReportLines, subagentRefusal, unfinishedNotice } from "./subagents"
 import { wait } from "./wait";
 import { removeTemp } from "./test-fixtures/main-test-support";
 import { context, ledger, reasonError, summary } from "./test-fixtures/n4a-unit";
-import { runResult } from "./test-fixtures/run-fakes";
+import { modelSummary, runResult } from "./test-fixtures/run-fakes";
 import { convergenceLines, observeConvergence } from "./convergence";
 import { convergenceFields, resultTurn } from "./run-result";
 import { exitCodeForRun, waitRun } from "./wait-run";
@@ -310,7 +310,7 @@ function serveRun(t: ReturnType<typeof context>, run: RunResult, pending: Return
     if (m === "turn/start" || m === "review/start") return { runId: "run-test" };
     if (m === "broker/threads/list") return { threads: [summary({ pendingCount: pending.length })] };
     if (m === "broker/threads/watch") return { thread: summary(), run, revision: 5, ...convergenceFields(run), pending };
-    if (m === "broker/runs/modelSummaries") return { runs: [] };
+    if (m === "broker/runs/modelSummaries") return { runs: [modelSummary(run)] };
     return {};
   };
 }
@@ -348,7 +348,8 @@ describe("SA1b D：最终交付与协调展示", () => {
       expect(await show(t.ctx)).toBe(5);
       if (missing) expect(t.json[0]).not.toHaveProperty("result");
       else {
-        expect(t.json[0]).toMatchObject({ stageResult: true, result: "迟到旧父轮" });
+        // 与 broker selected_parent_result 一致：阶段结果取已确认当前父轮，不取数组尾部的迟到旧轮。
+        expect(t.json[0]).toMatchObject({ stageResult: true, result: "新最终父轮" });
         expect(t.notices.join()).toContain("阶段结果");
         expect(t.notices.join()).toContain("等待子代理");
       }

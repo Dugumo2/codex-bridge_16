@@ -14,6 +14,20 @@ export class ProtocolBarrier {
 }
 export interface ScriptedOptions { version: "v1" | "v2"; grandchild?: boolean; contextOnly?: boolean }
 
+/** broker 汇总证据包的固定开头（broker-rs/src/claim/subagent_reconcile/evidence.rs 的 PROMPT）。 */
+export const EVIDENCE_HEAD = "请继续完成原任务，核实下列子代理结果并汇总最终答复。";
+
+/** 模型请求里的用户消息文本（字符串或 input_text 分段）。 */
+function userTexts(body: any): string[] {
+  return (body?.input ?? []).filter((item: any) => item?.role === "user").flatMap((item: any) =>
+    typeof item.content === "string" ? [item.content] : (item.content ?? []).map((part: any) => part?.text ?? ""));
+}
+
+/** 标记必须出现在本次汇总证据包内；子代理完成通知等其他位置的同一标记不算证据包送达。 */
+export function markerInEvidence(body: any, marker: string): boolean {
+  return userTexts(body).some((text) => text.includes(EVIDENCE_HEAD) && text.slice(text.indexOf(EVIDENCE_HEAD)).includes(marker));
+}
+
 export function createScriptedModel(options: ScriptedOptions) {
   const marker = `SA1B_${randomUUID().replaceAll("-", "")}`;
   const parentFinal = new ProtocolBarrier();
@@ -50,7 +64,7 @@ export function createScriptedModel(options: ScriptedOptions) {
         return sse(answer("父线程阶段完成"));
       }
       // 汇总第一次采样直接 final；只有实际模型输入含标记才返回标记。
-      if (!JSON.stringify(body).includes(marker)) throw new Error("汇总首采样没有随机子结果标记");
+      if (!markerInEvidence(body, marker)) throw new Error("汇总首采样没有随机子结果标记（须位于汇总证据包内）");
       return sse(answer(`已核实 ${marker}`));
     }
     if (role === "child" && options.grandchild) {

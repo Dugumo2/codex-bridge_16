@@ -682,14 +682,10 @@ impl Machine {
                         | EvidenceKind::V2Interacted
                 ) =>
             {
-                // 自有父轮的明确跟进与之后唯一新开始配对；不把历史完成轮当作新工作。
+                // 自有父轮的明确跟进与之后唯一新开始配对；不把历史完成轮当作新工作。接收线程不必
+                // 事先是本运行成员（新运行跟进旧子线程）：配对到的新轮按本次跟进绑定并纳入成员，
+                // 独立认领或已归属其他运行的轮在绑定时按冲突处理。
                 for child in receivers {
-                    if !self
-                        .manage_context(&run)
-                        .is_some_and(|c| c.members.contains_key(&child))
-                    {
-                        continue;
-                    }
                     let observed = self
                         .relations
                         .aux

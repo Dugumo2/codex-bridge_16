@@ -226,24 +226,29 @@ impl Machine {
                     .and_then(|r| r.can_accept_direct_input)
             })
     }
-    /// 本运行是否已纳管子代理（有子代理成员或在途派生）。没有时，共享空转刹车与 goal 非活动
-    /// 保持 SA1b 之前的语义（用户 2026-10-11 定：只在确有子代理要收尾时才按异常处理）。
-    /// 证据包括：在途派生、子代理成员、关系表中挂在本执行线程下的子代理边（含尚停在
-    /// pendingInit、未成为成员的子代理），以及收敛账本里待启动的项。
-    pub fn run_has_subagents(&self, run_id: &str) -> bool {
-        self.relations.contexts.get(run_id).is_some_and(|c| {
-            !c.in_flight_spawns.is_empty()
-                || c.members.values().any(|m| m.kind == RelationKind::Subagent)
-                || self.relations.edges.values().any(|e| {
-                    e.kind == RelationKind::Subagent
-                        && e.parent_thread_id == c.identity.execution_thread_id
-                        && !self.historical_subagent_for_run(run_id, &e.child_thread_id)
-                })
-        }) || self
-            .convergences
-            .ledgers
+    /// 本次运行自己派生或跟进过子代理（SA1b 按需启用的唯一依据，用户 2026-10-11 定：只有确有
+    /// 子代理的运行才走 SA1b）。只认本运行的证据：在途派生、本运行自有父轮上的派生／跟进操作；
+    /// 同一父线程历史运行留下的血缘边与成员不算，避免把旧子代理算到新运行头上。
+    pub fn run_subagent_evidence(&self, run_id: &str) -> bool {
+        self.relations
+            .contexts
             .get(run_id)
-            .is_some_and(|l| !l.pending.is_empty())
+            .is_some_and(|c| !c.in_flight_spawns.is_empty())
+            || self.relations.operations.values().any(|op| {
+                op.run_id == run_id
+                    && matches!(
+                        op.kind,
+                        EvidenceKind::V1Spawn
+                            | EvidenceKind::V2Started
+                            | EvidenceKind::V1SendInput
+                            | EvidenceKind::V1ResumeAgent
+                            | EvidenceKind::V2Interacted
+                    )
+                    && !matches!(
+                        op.outcome,
+                        EvidenceOutcome::Failed | EvidenceOutcome::Revoked
+                    )
+            })
     }
 
     /// 血缘属于线程历史，不自动属于同线程的下一运行。当前运行有派生／复用证据时仍须纳管；

@@ -244,9 +244,10 @@ scenario("E15", "50轮总数不因goal变更或裁剪历史恢复重置，无免
 scenario("E16", "连续无动作3轮保留刹车及真实停止报告", async h => {
   await h.control("goal", { threadId: P, status: "active" }); await h.finish(P);
   for (let i = 1; i <= 3; i++) { await h.control("turn", { threadId: P, action: "start", turnId: `idle-${i}` }); await h.finish(P, "没有动作"); }
-  await h.observe(); expect((await h.record()).autoTurnsStarted, "独立自动轮计数不可缺失").toBe(3);
+  // 无子代理运行不启用 SA1b（按需启用），保留 s4-cli 的旧刹车与记录形状，不写独立自动轮计数。
+  await h.observe(); expect((await h.record()).autoTurnsStarted, "未启用协调不写独立计数").toBeUndefined();
   const run = await terminal(h, 45000); expect(run.interruptReason).toBe("goalLoop"); expect(run.loopGuard.kind).toBe("noAction");
-  expect(run.stopOutcome).toBe("confirmed"); expect(run.autoTurnsStarted).toBe(3);
+  expect(run.stopOutcome).toBe("confirmed"); expect(run.autoTurnsStarted).toBeUndefined(); expect(run.subagentJoin).toBeUndefined();
   expect((await h.cli(["wait", P, "--json"])).code).toBe(9);
 }, 60000);
 for (const state of ["active", "complete"]) scenario("E17", `goal ${state} 已含后代用量不双加不重获预算`, async h => {

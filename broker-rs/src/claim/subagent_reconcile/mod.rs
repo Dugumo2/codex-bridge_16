@@ -301,6 +301,31 @@ impl Machine {
         }
         self.reconcile_changed(&token.run_id, actions);
     }
+    /// 承载分页或快轮完成全文里才发现真实输入：除撤销自动汇总外必须明确收尾（ownershipConflict），
+    /// 不能只撤权而让运行停在无人推进的收敛状态；已发提交仍保留只读核实。
+    pub(crate) fn reconcile_user_input(
+        &mut self,
+        token: &ConvergeToken,
+        actions: &mut Vec<Action>,
+    ) {
+        let current = self
+            .convergences
+            .runs
+            .get(&token.run_id)
+            .is_some_and(|r| r.token.claim == token.claim)
+            && self
+                .claims
+                .get(&token.claim.thread_id)
+                .is_some_and(|c| c.run_id.as_deref() == Some(token.run_id.as_str()));
+        if current {
+            self.convergence_cancel_for_thread(
+                &token.claim.thread_id,
+                ReconcileCancel::UserInput,
+                actions,
+            );
+        }
+        self.cancel_subagent_reconcile(token, ReconcileCancel::UserInput, actions);
+    }
     pub fn reconcile_unresolved(&self, run: &str) -> bool {
         self.runs
             .reconciliation
@@ -508,7 +533,7 @@ impl Machine {
                 self.classify_result_input(run, thread, id, item) == InputSource::ExternalUser
             })
         }) {
-            self.cancel_subagent_reconcile(&token, ReconcileCancel::UserInput, actions);
+            self.reconcile_user_input(&token, actions);
             return;
         }
         let mut shell =

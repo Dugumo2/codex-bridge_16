@@ -16,7 +16,8 @@ const mutations = [
   { name: "pendingInit伪造首轮", file: "sa1b-mock.ts", from: "if (child.pendingInit) {", to: "if (false) {", test: "pendingInit 与首轮缺失" },
   { name: "撤掉通知栅栏", file: "sa1b-mock.ts", from: "if (fence) { held.set", to: "if (false) { held.set", test: "栅栏先扣住后放行" },
   { name: "撤掉请求栅栏", file: "sa1b-mock.ts", from: "if (requestFence) { requestHeld.set", to: "if (false) { requestHeld.set", test: "请求栅栏在执行前" },
-  { name: "伪造缺标记汇总成功", file: "sa1b-scripted-model.ts", from: "if (!JSON.stringify(body).includes(marker)) throw", to: "if (false) throw", test: "汇总首采样缺随机标记" },
+  { name: "伪造缺标记汇总成功", file: "sa1b-scripted-model.ts", from: "if (!markerInEvidence(body, marker)) throw", to: "if (false) throw", test: "汇总首采样缺随机标记" },
+  { name: "通知补齐证据包缺失", file: "sa1b-scripted-model.ts", from: "if (!markerInEvidence(body, marker)) throw", to: "if (!JSON.stringify(body).includes(marker)) throw", test: "只在通知里出现标记" },
   { name: "撤掉父final栅栏", file: "sa1b-scripted-model.ts", from: "leafSampling.open();\n    await parentFinal.wait();", to: "leafSampling.open();", test: "必须父final栅栏后" },
   { name: "中间子代理抢先完成", file: "sa1b-scripted-model.ts", from: "await parentFinal.wait();\n      return sse(answer(\"子线程", to: "return sse(answer(\"子线程", test: "中间子代理也须等父final" },
 ];

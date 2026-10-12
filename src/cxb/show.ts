@@ -99,7 +99,8 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
   if (!last) {
     const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)
       ?.filter((line) => line.runId === run.runId && line.event === "启动失败").at(-1) : null;
-    ctx.out.notice(failure ? String(redactParams(failure.text)) : "运行启动失败，没有生成轮次");
+    if (run.subagentJoin) ctx.out.notice("最终结果不可用（unavailable）");
+    else ctx.out.notice(failure ? String(redactParams(failure.text)) : "运行启动失败，没有生成轮次");
   }
   ctx.out.progress(`结果来自本地；运行 ${run.runId}，状态 ${run.state}/${run.status ?? "未知"}`);
   return 0 as const;

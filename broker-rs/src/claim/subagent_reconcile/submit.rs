@@ -299,7 +299,11 @@ impl Machine {
                 .then(|| pending.operation.expected_previous_turn_id.clone())
                 .flatten(),
         };
-        if !self.reconcile_register_input(registration, actions) {
+        // detach 迁移的是同一笔已发提交：授权换代时已随运行能力迁移的登记不能再过「新提交准入」
+        // （原目标轮可能已结束、额度可能已到）；只有未迁移的才补登。原 clientId、批次、截止都不变。
+        if !self.reconcile_input_migrated(&registration)
+            && !self.reconcile_register_input(registration, actions)
+        {
             return Err(ReconcileRefusal::Disabled);
         }
         if let Some(read) = pending.status_read {

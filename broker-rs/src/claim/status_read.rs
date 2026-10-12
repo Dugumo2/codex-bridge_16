@@ -826,11 +826,7 @@ impl Machine {
                         })
                     })
                 {
-                    self.cancel_subagent_reconcile(
-                        &token,
-                        crate::sa1b::ReconcileCancel::UserInput,
-                        actions,
-                    );
+                    self.reconcile_user_input(&token, actions);
                 }
             }
         }

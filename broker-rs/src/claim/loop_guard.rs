@@ -60,6 +60,8 @@ pub struct Guard {
     next_seq: u64,
     /// 已触发过；同一运行只刹一次。
     pub tripped: bool,
+    /// 本运行的非首轮里出现过真实用户输入；SA1b 启用前出现则不再启用，交回 SA1a 收尾。
+    user_input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +105,24 @@ impl Guard {
             auto_turns: VecDeque::new(),
             next_seq: 0,
             tripped: false,
+            user_input: false,
         }
+    }
+
+    /// SA1b 按需启用时接上的事实：已开始的自动轮总数与仍可追溯的轮次。
+    pub(crate) fn started_auto_turns(&self) -> (u32, Vec<String>) {
+        (
+            u32::try_from(self.next_seq).unwrap_or(u32::MAX),
+            self.auto_turns
+                .iter()
+                .filter(|t| !t.vetoed)
+                .map(|t| t.turn.clone())
+                .collect(),
+        )
+    }
+
+    pub(crate) fn user_input_seen(&self) -> bool {
+        self.user_input
     }
 
     /// goal 真正变化：计数整体清零，自动候选的来源记录与序号保留。
@@ -111,8 +130,10 @@ impl Guard {
         let auto_turns = std::mem::take(&mut self.auto_turns);
         let next_seq = self.next_seq;
         let safeguards = self.safeguards.take();
+        let user_input = self.user_input;
         *self = Self::new(&self.thread);
         self.safeguards = safeguards;
+        self.user_input = user_input;
         self.auto_turns = auto_turns;
         self.next_seq = next_seq;
     }
@@ -256,6 +277,7 @@ impl Machine {
                     crate::sa1b::TurnOrigin::Goal,
                     actions,
                 );
+                self.auto_turn_limit_brake(run, thread, turn, actions);
                 return;
             }
         }
@@ -312,6 +334,38 @@ impl Machine {
         }
     }
 
+    /// 已启用 SA1b 的运行在续轮边界检查自动父轮绝对上限：第 50 轮允许完成，goal 仍要开第 51 轮即制动。
+    /// 旧的结算计数在启用后让位于此（启用前的轮数已接入 `autoTurnsStarted`）。
+    fn auto_turn_limit_brake(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(record) = self.runs.runs.get(run) else {
+            return;
+        };
+        let limit = record
+            .convergence_config
+            .as_ref()
+            .map_or(CONTINUATION_LIMIT, |c| c.max_auto_turns);
+        let Some(started) = record.auto_turns_started.filter(|n| *n > limit) else {
+            return;
+        };
+        let Some(guard) = self.loop_guards.get_mut(run).filter(|g| !g.tripped) else {
+            return;
+        };
+        guard.tripped = true;
+        let report = report(
+            LoopGuardKind::ContinuationLimit,
+            started,
+            limit,
+            vec![turn.into()],
+        );
+        self.trip_loop_guard(run, thread, report, actions);
+    }
+
     /// 线程上提交的条目通知：只记「有」动作或用户输入；自动候选里出现用户输入立即否决。
     pub(super) fn guard_item(&mut self, thread: &str, turn: &str, item: &Value) {
         let sources: Vec<_> = self
@@ -346,6 +400,7 @@ impl Machine {
             return;
         };
         if activity.user_input && !original_user_turn {
+            guard.user_input = true;
             if let Some(safeguards) = &mut guard.safeguards {
                 safeguards.revoked = true;
                 if let Some(runtime) = self.convergences.runs.get_mut(run) {
@@ -516,6 +571,7 @@ impl Machine {
             if activity.is_some_and(|a| a.user_input) && guard.is_auto(&turn) {
                 // 被挤出队列或已排到后面的轮也照样否决；通知已否决过的不重复。
                 let newly = guard.veto(&turn);
+                guard.user_input = true;
                 if let Some(safeguards) = &mut guard.safeguards {
                     safeguards.revoked = true;
                 }
@@ -545,13 +601,12 @@ impl Machine {
                 .as_ref()
                 .is_some_and(|s| s.revoked);
             if revoked {
-                if self.run_has_subagents(&run)
-                    && self
-                        .runs
-                        .runs
-                        .get(&run)
-                        .and_then(|r| r.subagent_join.as_ref())
-                        .is_some_and(|j| !j.automatic_control_revoked)
+                if self
+                    .runs
+                    .runs
+                    .get(&run)
+                    .and_then(|r| r.subagent_join.as_ref())
+                    .is_some_and(|j| !j.automatic_control_revoked)
                 {
                     let thread = self.loop_guards[&run].thread.clone();
                     self.convergence_cancel_for_thread(
@@ -618,15 +673,19 @@ impl Machine {
             .records
             .get(thread)
             .is_some_and(|r| r.goal_controlled && r.goal_status.as_deref() == Some("active"));
-        // 共享模式只在确有子代理要收尾时停止本次运行；否则保持拍板 K：只暂停 goal、不中断在跑的轮。
-        if !self.shared || (managed && controlled && self.run_has_subagents(run)) {
+        // 共享模式只在已启用 SA1b（确有子代理要收尾）时停止本次运行；否则保持拍板 K：只暂停 goal、不中断在跑的轮。
+        if !self.shared || (managed && controlled) {
             actions.push(Action::Warn(format!(
                 "线程 {thread} 自动续跑空转（{:?}，{} 轮），暂停 goal 并停止本次运行",
                 report.kind, report.count
             )));
+            let reason = match report.kind {
+                LoopGuardKind::NoAction => crate::sa1b::TerminalReason::NoAction,
+                LoopGuardKind::ContinuationLimit => crate::sa1b::TerminalReason::AutoTurnLimit,
+            };
             self.run_loop_guard(run, report, actions);
-            if managed && self.convergence_enabled() && self.run_has_subagents(run) {
-                self.convergence_fail(run, crate::sa1b::TerminalReason::NoAction, actions);
+            if managed && self.convergence_enabled() {
+                self.convergence_fail(run, reason, actions);
             } else {
                 self.begin_stop(thread, StopReason::GoalLoop, false, actions);
             }

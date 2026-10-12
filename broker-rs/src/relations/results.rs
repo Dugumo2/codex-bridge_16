@@ -302,10 +302,15 @@ impl Machine {
         match page {
             Some(true) => {
                 let (text, source) = std::mem::take(&mut child.output).finish();
-                child.item.output = text.value;
-                child.item.truncated = text.truncated;
-                child.item.output_source = source;
-                child.done = true;
+                if source == OutputSource::None {
+                    // 读完了但没有任何输出条目（含合法空末页）：如实披露缺失，活动终态保持不变。
+                    unavailable(child, "活动没有输出");
+                } else {
+                    child.item.output = text.value;
+                    child.item.truncated = text.truncated;
+                    child.item.output_source = source;
+                    child.done = true;
+                }
             }
             Some(false) => {}
             None => unavailable(child, "分页失败或数据不完整"),

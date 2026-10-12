@@ -169,8 +169,8 @@ impl Machine {
         if matches!(claim.state, State::FinishingTree { .. }) {
             return Some(ReleaseDecision::Hold);
         }
-        // 没有纳管子代理的运行不进入收敛／汇总，交回 SA1a 门禁与原释放流程（用户 2026-10-11 定）。
-        if !self.run_has_subagents(&run) && !matches!(claim.state, State::Converging { .. }) {
+        // 未启用 SA1b 的运行（本运行没有子代理证据）交回 SA1a 门禁与原释放流程（用户 2026-10-11 定）。
+        if !self.convergence_activate(thread, actions) {
             return None;
         }
         if self.stop_busy(thread) || self.tree_for_run(&run).is_some() {
@@ -229,30 +229,8 @@ impl Machine {
         };
         let converging = matches!(claim.state, State::Converging { .. });
         let finishing = matches!(claim.state, State::FinishingTree { .. });
-        // 同上：没有子代理且尚未进入收敛的运行，SA1b 不接管轮次、goal 与交接事件。
-        if !converging && !self.run_has_subagents(&run) {
-            return false;
-        }
-        if !self.convergences.runs.contains_key(&run) {
-            if self.convergences.enabled
-                && !claim.joined()
-                && !claim.settling()
-                && !claim.precheck()
-                && matches!(event, ConvergeEvent::GoalChanged { .. })
-            {
-                let reason = self.goal_terminal(
-                    &run,
-                    self.records
-                        .get(thread)
-                        .and_then(|r| r.goal_status.as_deref()),
-                );
-                if let Some(reason) = reason {
-                    if self.convergence_begin(thread, actions).is_some() {
-                        self.convergence_fail(&run, reason, actions);
-                        return true;
-                    }
-                }
-            }
+        // 未启用 SA1b 的运行，SA1b 不接管轮次、goal 与交接事件（启用后 detach 等授权迁移照常处理）。
+        if !self.convergence_activate(thread, actions) {
             return false;
         }
         if event == ConvergeEvent::Detach {
@@ -753,8 +731,13 @@ impl Machine {
     pub fn convergence_timer(&mut self, kind: TimerKind, actions: &mut Vec<Action>) {
         match kind {
             TimerKind::BudgetVerifyDeadline { token } => {
+                // 预算不完整只阻止新开自动汇总：父轮仍在工作时到期不终止，留给收敛准入判定。
                 if self.convergence_token_current(&token)
                     && self.budget_verification_expired(&token)
+                    && matches!(
+                        self.claims.get(&token.claim.thread_id).map(|c| &c.state),
+                        Some(State::Converging { .. })
+                    )
                 {
                     self.convergence_fail(&token.run_id, TerminalReason::BudgetIncomplete, actions);
                 }
@@ -835,23 +818,14 @@ impl Machine {
         reason: TerminalReason,
         actions: &mut Vec<Action>,
     ) {
-        if !self.convergences.runs.contains_key(run)
-            && self.convergences.enabled
-            && !self.closing
-            && !self.quiescing
-        {
+        if !self.sa1b_active(run) {
             let thread = self
                 .claims
                 .iter()
-                .find(|(_, c)| {
-                    c.run_id.as_deref() == Some(run)
-                        && !c.joined()
-                        && !c.settling()
-                        && !c.precheck()
-                })
+                .find(|(_, c)| c.run_id.as_deref() == Some(run))
                 .map(|(t, _)| t.clone());
             if let Some(thread) = thread {
-                self.convergence_begin(&thread, actions);
+                self.convergence_activate(&thread, actions);
             }
         }
         let Some(runtime) = self.convergences.runs.get(run).cloned() else {
@@ -1181,11 +1155,10 @@ impl Machine {
 }
 
 impl Machine {
-    /// goal 非活动对应的协调终态。没有纳管子代理的运行被暂停时不算异常，保持 SA1b 之前
-    /// 「暂停即正常结束」的语义（用户 2026-10-11 定）；blocked 等限制状态两种语义本就一致。
-    fn goal_terminal(&self, run: &str, status: Option<&str>) -> Option<TerminalReason> {
+    /// goal 非活动对应的协调终态。只在已启用 SA1b 的运行上调用；未启用的运行被暂停时不经过这里，
+    /// 保持 SA1b 之前「暂停即正常结束」的语义（用户 2026-10-11 定）。
+    fn goal_terminal(&self, _run: &str, status: Option<&str>) -> Option<TerminalReason> {
         goal_reason(status)
-            .filter(|r| *r != TerminalReason::GoalPaused || self.run_has_subagents(run))
     }
 }
 

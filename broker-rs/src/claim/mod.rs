@@ -2406,14 +2406,9 @@ impl Machine {
         } else if event.method == "turn/completed" {
             if self.claims.get(thread_id).is_some_and(|c| {
                 c.run_id.as_ref().is_some_and(|run| {
-                    // 只有纳管子代理的运行才按自有轮过滤完成通知；否则保持原语义（审查的外层轮
+                    // 只有已启用 SA1b 的运行才按自有轮过滤完成通知；否则保持原语义（审查的外层轮
                     // 在内层轮开始后完成，不能被丢弃）。
-                    self.run_has_subagents(run)
-                        && self
-                            .runs
-                            .runs
-                            .get(run)
-                            .is_some_and(|r| r.subagent_join.is_some())
+                    self.sa1b_active(run)
                 }) && notification_turn_id(&event.params)
                     .is_some_and(|t| !c.owned_turns.contains(t))
             }) {
@@ -2525,26 +2520,6 @@ impl Machine {
     }
 
     pub(crate) fn started(&mut self, thread_id: &str, id: &str, actions: &mut Vec<Action>) {
-        if self.convergence_enabled()
-            && self
-                .claims
-                .get(thread_id)
-                .and_then(|c| c.run_id.as_ref())
-                .is_some_and(|run| {
-                    self.convergences.review_runs.contains(run)
-                        && self.runs.runs.get(run).is_some_and(|r| {
-                            r.start_confirmation.confirmed
-                                && r.start_confirmation
-                                    .turn_id
-                                    .as_deref()
-                                    .is_some_and(|outer| outer != id)
-                        })
-                        && !self.reconcile_unresolved(run)
-                })
-        {
-            // 审查内层轮不是父运行的新自动轮；外层完成仍须进入收敛门禁。
-            return;
-        }
         if self.convergence_event(
             thread_id,
             converge::ConvergeEvent::ParentTurn {
@@ -2655,7 +2630,7 @@ impl Machine {
                 .claims
                 .get(thread_id)
                 .and_then(|c| c.run_id.as_deref())
-                .is_some_and(|run| self.run_has_subagents(run))
+                .is_some_and(|run| self.sa1b_active(run))
             && self
                 .claims
                 .get(thread_id)

@@ -21,6 +21,97 @@ impl Machine {
         })
     }
 
+    /// 本运行已按需启用 SA1b（协调器单向建立，运行释放时才移除）。未启用的运行完全走 `s4-cli` 原路径。
+    pub(crate) fn sa1b_active(&self, run: &str) -> bool {
+        self.convergences.runs.contains_key(run)
+    }
+
+    /// 按需启用：本运行第一次出现自有子代理派生／跟进证据时，用**当前**认领与管理代际建立协调器，
+    /// 接上启用前的自动轮数。启用前已有真实用户插话（自动控制已失）或已在停止的运行不启用，
+    /// 自然结束时交 SA1a 停树（`subagentsUnfinished`），不进入无人推进的收敛状态。
+    pub(crate) fn convergence_activate(&mut self, thread: &str, actions: &mut Vec<Action>) -> bool {
+        if !self.convergence_enabled() || self.closing || self.quiescing {
+            return false;
+        }
+        let Some(claim) = self.claims.get(thread) else {
+            return false;
+        };
+        let Some(run) = claim.run_id.clone() else {
+            return false;
+        };
+        if self.sa1b_active(&run) {
+            return true;
+        }
+        if claim.joined()
+            || claim.settling()
+            || claim.precheck()
+            || claim.owner_gone
+            || !matches!(
+                claim.state,
+                State::Running { .. } | State::AwaitingContinuation { .. }
+            )
+            || self.convergences.review_runs.contains(&run)
+            || self.stop_busy(thread)
+            || self.tree_for_run(&run).is_some()
+            || self
+                .loop_guards
+                .get(&run)
+                .is_some_and(|g| g.user_input_seen())
+            || !self.run_subagent_evidence(&run)
+        {
+            return false;
+        }
+        let before = actions.len();
+        if self.convergence_begin(thread, actions).is_none() {
+            return false;
+        }
+        // 先建立可信身份和计数；总期限从首次收敛门禁开始。
+        self.convergences
+            .runs
+            .get_mut(&run)
+            .expect("刚建立的协调器")
+            .deadline_mono_ms = u64::MAX;
+        let kept: Vec<_> = actions
+            .drain(before..)
+            .filter(|a| {
+                !matches!(
+                    a,
+                    Action::Schedule {
+                        kind: TimerKind::ConvergeDeadline { .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        actions.extend(kept);
+        let join = self
+            .runs
+            .runs
+            .get_mut(&run)
+            .and_then(|r| r.subagent_join.as_mut())
+            .expect("启用时建立摘要");
+        join.phase = JoinPhase::Running;
+        join.deadline_at = 0;
+        // 启用前开始的自有父轮按开始顺序登记：原始用户轮在前，正在跑的 goal 自动轮在后。
+        let token = self.convergences.runs[&run].token.clone();
+        let record = &self.runs.runs[&run];
+        if let Some(first) = record
+            .start_confirmation
+            .turn_id
+            .clone()
+            .filter(|_| record.start_confirmation.confirmed)
+        {
+            self.reconcile_parent_started(&token, &first, TurnOrigin::User, actions);
+        }
+        if let Some(current) = self.claims[thread].turn_id().map(str::to_owned) {
+            if self.auto_parent_turn_origin(&run, &current) == Some(TurnOrigin::Goal) {
+                self.reconcile_parent_started(&token, &current, TurnOrigin::Goal, actions);
+            }
+        }
+        self.convergence_changed(&run, actions);
+        true
+    }
+
     pub(crate) fn drive_convergence_safeguards(&mut self, actions: &mut Vec<Action>) {
         if !self.convergence_enabled() || self.closing || self.quiescing {
             return;
@@ -29,54 +120,14 @@ impl Machine {
             .claims
             .iter()
             .filter(|(_, c)| {
-                !c.joined()
-                    && !c.settling()
-                    && !c.precheck()
-                    && !c.owner_gone
-                    && matches!(
-                        c.state,
-                        State::Running { .. } | State::AwaitingContinuation { .. }
-                    )
-                    && c.run_id
-                        .as_ref()
-                        .is_some_and(|r| !self.convergences.runs.contains_key(r))
+                c.run_id
+                    .as_ref()
+                    .is_some_and(|r| !self.convergences.runs.contains_key(r))
             })
             .map(|(t, _)| t.clone())
             .collect();
         for thread in threads {
-            let before = actions.len();
-            if let Some(run) = self.convergence_begin(&thread, actions) {
-                // 先建立可信身份和计数；总期限从首次收敛门禁开始。
-                self.convergences
-                    .runs
-                    .get_mut(&run)
-                    .unwrap()
-                    .deadline_mono_ms = u64::MAX;
-                let kept: Vec<_> = actions
-                    .drain(before..)
-                    .filter(|a| {
-                        !matches!(
-                            a,
-                            Action::Schedule {
-                                kind: TimerKind::ConvergeDeadline { .. },
-                                ..
-                            }
-                        )
-                    })
-                    .collect();
-                actions.extend(kept);
-                let join = self
-                    .runs
-                    .runs
-                    .get_mut(&run)
-                    .unwrap()
-                    .subagent_join
-                    .as_mut()
-                    .unwrap();
-                join.phase = JoinPhase::Running;
-                join.deadline_at = 0;
-                self.convergence_changed(&run, actions);
-            }
+            self.convergence_activate(&thread, actions);
         }
         let tokens: Vec<_> = self
             .convergences

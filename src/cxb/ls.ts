@@ -6,7 +6,7 @@ import { backgroundLines, derivedOnly, stopReportLines } from "./subagents";
 import { lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
 import { commandSession } from "./command-session";
-import { convergenceFields, resultTurn, selectedResultFields } from "./run-result";
+import { convergenceFields, resultReady, resultTurn, selectedResultFields } from "./run-result";
 import { convergenceLines } from "./convergence";
 import type { ConvergenceSummary } from "./sa1b-contracts";
 
@@ -46,7 +46,7 @@ function localItems(threads: LocalThread[], runs: RunResult[]): ListItem[] {
     const selected = run ? resultTurn(run) : undefined;
     return { ...thread, ...threadModelDisplay(thread.threadId, thread.model, []),
       ...(run ? { ...convergenceFields(run), ...selectedResultFields(run) } : {}),
-      ...(run?.finalTurnId !== undefined || run?.subagentJoin ? { result: selected?.ready === "ready" ? selected.output : "", ready: selected?.ready ?? "pending",
+      ...(run?.finalTurnId !== undefined || run?.subagentJoin ? { result: selected?.ready === "ready" ? selected.output : "", ready: resultReady(run),
         ...(run.state === "running" || run.state === "stopping" ? { stageResult: true } : {}) } : {}),
       ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
   });

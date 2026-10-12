@@ -305,3 +305,31 @@ fn 子失败中断关闭缺失均保留状态且不依赖完成消息() {
         assert!(batch.input.contains(name));
     }
 }
+#[test]
+fn 读完但没有任何输出条目时标unavailable并保留真实终态() {
+    for items in [
+        vec![],
+        vec![json!({"type":"commandExecution","id":"命令","status":"completed"})],
+    ] {
+        let (mut m, token) = fixture(1);
+        let mut actions = vec![];
+        let id = m.read_child_results(token.clone(), 1, ResultLimits::default(), &mut actions);
+        assert_ne!(id, BatchReadId::DISABLED);
+        let request = child_requests(&actions).remove(0);
+        let turn = request.params.as_ref().unwrap()["turnId"].as_str().unwrap();
+        let status = m.runs.reconciliation.harness.as_ref().unwrap().facts[R].activities[0]
+            .result_status
+            .unwrap();
+        let mut next = vec![];
+        m.child_result_reply(&request, Ok(items_page(turn, &items, None)), &mut next);
+        m.drive_child_results(&mut next);
+        let batch = m.take_child_results(&token).unwrap();
+        assert_eq!(batch.coverage.available, 0, "空输出不能计为可用");
+        assert_eq!(batch.coverage.unavailable, 1);
+        assert_eq!(
+            batch.items[0].unavailable_reason.as_deref(),
+            Some("活动没有输出")
+        );
+        assert_eq!(batch.items[0].status, status, "活动终态保持不变");
+    }
+}

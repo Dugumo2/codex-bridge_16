@@ -100,9 +100,21 @@ impl Machine {
             .loop_guards
             .entry(token.run_id.clone())
             .or_insert_with(|| Guard::new(&token.claim.thread_id));
+        // 按需启用：接上启用前已开始的 goal 自动轮（总数不重置，仍可追溯的轮次按 goal 来源登记）。
+        let (started, turns) = guard.started_auto_turns();
+        for turn in &turns {
+            safeguards.counted.insert(turn.clone(), TurnOrigin::Goal);
+        }
         guard.safeguards = Some(safeguards);
         let record = self.runs.runs.get_mut(&token.run_id).expect("已核实运行");
-        record.auto_turns_started = Some(0);
+        record.auto_turns_started = Some(started);
+        for result in record
+            .turns
+            .iter_mut()
+            .filter(|r| turns.contains(&r.turn_id))
+        {
+            result.origin = Some(TurnOrigin::Goal);
+        }
         record.run_budget = budget;
         self.persist_safeguards(&token.run_id, actions);
         true
@@ -232,6 +244,18 @@ impl Machine {
         }
         guard.trusted.push(registration);
         true
+    }
+
+    /// 授权换代（`rebind_run_safeguards`）已把同一笔提交的登记迁到新身份。
+    pub(crate) fn reconcile_input_migrated(&self, registration: &TrustedInputRegistration) -> bool {
+        self.safeguards(&registration.token).is_some_and(|s| {
+            s.trusted.iter().any(|r| {
+                r.token == registration.token
+                    && r.op_id == registration.op_id
+                    && r.client_user_message_id == registration.client_user_message_id
+                    && r.work_epoch == registration.work_epoch
+            })
+        })
     }
 
     /// B 确认承载及自有归属后、回放条目前绑定实际轮；clientId 本身不授予自有权。

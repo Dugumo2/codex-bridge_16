@@ -1914,3 +1914,139 @@ mod sa1b_c {
         );
     }
 }
+
+/// 按需启用（三路审查 P1）：夹具与生产 Core 相同，broker 启动即打开 SA1b 门禁；只有本运行确有
+/// 子代理派生时才建立协调与独立计数，无子代理的运行保留 s4-cli 的旧刹车。
+mod on_demand {
+    use super::*;
+    use crate::claim::converge::ConvergenceReadiness;
+    use crate::sa1b::TerminalReason;
+    use crate::test_support::subagent::SubagentMock;
+
+    fn awaiting_enabled() -> Machine {
+        let mut machine = Machine::new(false);
+        assert!(machine.enable_convergence(ConvergenceReadiness {
+            trusted_inputs: true,
+            budget_admission: true,
+            asynchronous_results: true,
+            terminal_mapping: true,
+            cancellation_verified: true,
+        }));
+        machine.record("线程").subscribed = true;
+        let actions = apply(
+            &mut machine,
+            client(request(
+                1,
+                42,
+                "turn/start",
+                json!({"threadId": "线程", "input": [{"type": "text", "text": "  本次输入  "}]}),
+            )),
+        );
+        let context = first_request(&actions);
+        apply(&mut machine, goal_event("目标", "active", 0));
+        reply(&mut machine, &context, Ok(json!({"turn": {"id": "首轮"}})));
+        apply(&mut machine, turn("turn/started", "首轮"));
+        apply(
+            &mut machine,
+            done("首轮", json!([agent("首轮回答")]), "full"),
+        );
+        assert!(matches!(
+            machine.claims["线程"].state,
+            State::AwaitingContinuation { .. }
+        ));
+        machine
+    }
+
+    fn spawn_child(m: &mut Machine, parent_turn: &str) {
+        let mut mock = SubagentMock::default();
+        mock.register("线程", None, "v1", false, true);
+        mock.register("子", Some("线程"), "v1", false, true);
+        let (a, b) = SubagentMock::v1_spawn("线程", parent_turn, "派生", "子", false);
+        apply(m, a);
+        apply(m, b);
+        apply(m, mock.turn_started("子", "子轮"));
+    }
+
+    #[test]
+    fn 生产启用且无子代理_第五十个自动轮结束仍按旧刹车触发() {
+        let mut m = awaiting_enabled();
+        let limit = CONTINUATION_LIMIT as usize;
+        for i in 1..limit {
+            busy(&mut m, &format!("续{i}"));
+        }
+        assert!(!braked(&m), "{} 轮不应触发", limit - 1);
+        assert!(!m.sa1b_active(RUN), "无子代理不启用 SA1b");
+        assert_eq!(record(&m).auto_turns_started, None, "未启用不写独立计数");
+        let last = format!("续{limit}");
+        busy(&mut m, &last);
+        assert!(braked(&m), "第五十轮结束即按旧刹车停止");
+        let report = record(&m).loop_guard.clone().unwrap();
+        assert_eq!(report.kind, LoopGuardKind::ContinuationLimit);
+        assert_eq!(report.count, CONTINUATION_LIMIT);
+        assert_eq!(report.turn_ids, vec![last]);
+        assert!(record(&m).subagent_join.is_none());
+    }
+
+    #[test]
+    fn 生产启用且无子代理_连续三轮无动作仍按旧刹车停止() {
+        let mut m = awaiting_enabled();
+        for i in 1..=3 {
+            idle(&mut m, &format!("续{i}"));
+        }
+        assert_report(&m, LoopGuardKind::NoAction, &["续1", "续2", "续3"]);
+        assert!(record(&m).subagent_join.is_none());
+    }
+
+    #[test]
+    fn 启用前的自动轮数接上_第五十轮允许完成_第五十一轮开始即制动() {
+        let mut m = awaiting_enabled();
+        busy(&mut m, "续1");
+        busy(&mut m, "续2");
+        // 第三个自动轮里才第一次派生子代理：此刻按需启用，接上已开始的 3 个自动轮。
+        apply(&mut m, turn("turn/started", "续3"));
+        spawn_child(&mut m, "续3");
+        assert!(m.sa1b_active(RUN), "本运行首次派生即启用");
+        assert_eq!(record(&m).auto_turns_started, Some(3));
+        assert_eq!(
+            m.auto_parent_turn_origin(RUN, "续3"),
+            Some(crate::sa1b::TurnOrigin::Goal),
+            "正在跑的 goal 轮按来源登记"
+        );
+        apply(
+            &mut m,
+            done("续3", json!([command("续3-命令"), agent("做完了")]), "full"),
+        );
+        for i in 4..=CONTINUATION_LIMIT {
+            busy(&mut m, &format!("续{i}"));
+        }
+        assert_eq!(record(&m).auto_turns_started, Some(CONTINUATION_LIMIT));
+        assert!(record(&m).loop_guard.is_none(), "第五十轮允许完成");
+        apply(&mut m, turn("turn/started", "续51"));
+        let report = record(&m).loop_guard.clone().expect("第五十一轮开始即制动");
+        assert_eq!(report.kind, LoopGuardKind::ContinuationLimit);
+        assert_eq!(report.count, CONTINUATION_LIMIT + 1);
+        assert_eq!(report.turn_ids, vec!["续51".to_owned()]);
+        assert_eq!(
+            record(&m).subagent_join.as_ref().unwrap().terminal_reason,
+            Some(TerminalReason::AutoTurnLimit)
+        );
+    }
+
+    #[test]
+    fn 启用前已有用户插话_派生后不启用协调() {
+        let mut m = awaiting_enabled();
+        apply(&mut m, turn("turn/started", "续1"));
+        apply(
+            &mut m,
+            notify(
+                "item/completed",
+                json!({"threadId": "线程", "turnId": "续1",
+                    "item": {"type": "userMessage", "id": "插话", "content": [{"type": "text", "text": "用户插话"}]}}),
+            ),
+        );
+        spawn_child(&mut m, "续1");
+        assert!(m.run_subagent_evidence(RUN), "派生证据存在");
+        assert!(!m.sa1b_active(RUN), "自动控制已失，交 SA1a 收尾");
+        assert!(record(&m).subagent_join.is_none());
+    }
+}

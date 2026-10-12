@@ -1,6 +1,7 @@
 import { CxbError, type BrokerRpc, type RunResult, type RunModelSummary } from "../contracts";
 import { NO_RESPONSE } from "../../rpc";
 import { watchdog } from "./test-watchdog";
+import { resultTurn } from "../run-result";
 
 /** 单元测试用可控传输：显式扣住与放行消息，不用固定延迟制造竞态。 */
 export class FakeRpc {
@@ -76,10 +77,13 @@ export function wireError(code: number, message: string) {
   return new CxbError("BROKER_UNAVAILABLE", "远端请求失败", { cause: { rpcCode: code, detail: message } });
 }
 
-/** 严格按公共摘要接口构造回包，避免测试意外依赖完整记录的正文或 turns。 */
+/**
+ * 严格按公共摘要接口构造回包，避免测试意外依赖完整记录的正文或 turns。与 broker `model_summary` 一致：
+ * 带最终指针，结果轮按 `selected_parent_result`（即 CLI 的 resultTurn）选择，不取数组尾项。
+ */
 export function modelSummary(run: RunResult): RunModelSummary {
-  const last = run.turns.at(-1);
-  return { runId: run.runId, threadId: run.threadId, reviewThreadId: run.reviewThreadId, state: run.state,
+  const last = resultTurn(run);
+  return { ...(run.finalTurnId !== undefined ? { finalTurnId: run.finalTurnId } : {}), runId: run.runId, threadId: run.threadId, reviewThreadId: run.reviewThreadId, state: run.state,
     startedAt: run.startedAt, creationOrder: run.creationOrder ?? null,
     startConfirmation: run.startConfirmation ?? { confirmed: false, owned: null, threadId: null, turnId: null },
     meta: run.meta ? { source: run.meta.source, model: run.meta.model ?? null, effort: run.meta.effort ?? null } : null,

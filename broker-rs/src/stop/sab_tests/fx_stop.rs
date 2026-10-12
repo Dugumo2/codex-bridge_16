@@ -296,7 +296,7 @@ fn sa1b_弃管后同线程新运行不继承旧子代理且可完成() {
         });
         s.turn_started(P, "新父轮");
         assert!(
-            !s.m.run_has_subagents("新运行"),
+            !s.m.run_subagent_evidence("新运行"),
             "旧血缘不能授予新运行收敛责任"
         );
         if new_child {
@@ -307,7 +307,7 @@ fn sa1b_弃管后同线程新运行不继承旧子代理且可完成() {
             s.apply(started);
             s.apply(completed);
             s.turn_started("新子", "新子轮");
-            assert!(s.m.run_has_subagents("新运行"));
+            assert!(s.m.run_subagent_evidence("新运行"));
             s.turn_completed(P, "新父轮", "completed");
             let members = &s.m.manage_context("新运行").unwrap().members;
             assert!(members.contains_key("新子"));

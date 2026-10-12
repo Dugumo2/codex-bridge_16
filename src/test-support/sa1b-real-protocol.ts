@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TestClient, endpointFor, testSocketPath, writeMockCodexScript, spawnBroker, waitForSocket, removeDirWithRetry } from "./broker-harness";
-import { createScriptedModel, type ScriptedOptions } from "./sa1b-scripted-model";
+import { createScriptedModel, markerInEvidence, type ScriptedOptions } from "./sa1b-scripted-model";
 import { ASK_INSTRUCTIONS, ASK_RULES, SUBAGENT_RULES } from "../cxb/ask-instructions";
 import type { Subprocess } from "bun";
 
@@ -143,7 +143,7 @@ const code = await child.exited; await drain; process.exit(code);`);
       orderingProved = true;
       if (children.some(x => x.params.turn.status !== "completed")) throw new Error("父final后已有随机子结果，但broker停树中断子活动，未进入汇总");
       const rootBodies = script.requests.filter(x => x.role === "root");
-      if (rootBodies.length !== 3 || !JSON.stringify(rootBodies[2]!.body).includes(script.marker)) throw new Error("汇总第一次采样或随机标记验证失败");
+      if (rootBodies.length !== 3 || !markerInEvidence(rootBodies[2]!.body, script.marker)) throw new Error("汇总第一次采样的证据包内没有随机标记");
       if (initialBody.includes(script.marker)) throw new Error("初始提示泄露随机标记");
       const final = ended.turns.find((x: any) => x.turnId === ended.finalTurnId);
       if (!final?.output?.includes(script.marker) || ended.status !== "completed") throw new Error("最终父轮未交付随机标记");

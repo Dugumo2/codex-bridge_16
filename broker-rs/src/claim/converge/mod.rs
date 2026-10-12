@@ -132,8 +132,13 @@ impl Machine {
     }
 
     pub fn notify_convergence_changed(&self, run: &str, actions: &mut Vec<Action>) {
-        // 没有纳管子代理的运行不推送协调进度，客户端输出保持原样（用户 2026-10-11 定）。
-        if !self.run_has_subagents(run) {
+        // 未启用 SA1b 的运行不推送协调进度，客户端输出保持原样（用户 2026-10-11 定）。
+        if self
+            .runs
+            .runs
+            .get(run)
+            .is_none_or(|r| r.subagent_join.is_none())
+        {
             return;
         }
         let (Some(context), Some(summary)) =
@@ -340,10 +345,11 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
-            // 没有子代理的运行不参与协调：停止、插话都按原流程记原因（如 goalLoop），不改写为协调终态。
-            if !self.run_has_subagents(&run) {
+            // 未启用 SA1b 的运行不参与协调：停止、插话都按原流程记原因（如 goalLoop），不改写为协调终态。
+            if !self.sa1b_active(&run) {
                 return;
             }
+
             self.convergence_revoke(&run, reason, actions);
             if matches!(
                 reason,
