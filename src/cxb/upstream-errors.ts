@@ -57,9 +57,13 @@ export function upstreamGroupKey(error: UpstreamError): string {
   const normalized = /^Reconnecting\.\.\. [0-9]+\/[0-9]+$/.test(body) ? "" : body;
   return JSON.stringify([error.threadId, error.turnId, codexErrorVariant(error.codexErrorInfo), error.category, error.httpStatusCode, normalized]);
 }
+export function turnCodexErrorInfo(error: unknown): unknown {
+  const value = object(error);
+  return value.codexErrorInfo ?? object(value.data).codexErrorInfo ?? null;
+}
 export function turnErrorLine(error: unknown): string {
   const value = object(error);
-  const info = value.codexErrorInfo ?? object(value.data).codexErrorInfo ?? null;
+  const info = turnCodexErrorInfo(error);
   return `${diagnosticLine(value.message ?? error)}${statusNote({ httpStatusCode: httpStatus(info), codexErrorInfo: info })}`;
 }
 /** 新字段缺省不输出，选定最终轮的错误不能被旧轮或子线程替代。 */
@@ -124,7 +128,7 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
     accept(run);
     const result = merge(run);
     // 运行终态不受 diagnosticRevision 去重影响；历史 willRetry 不能冒充当前重试。
-    if (run.state === "ended" || run.state === "lost") display(result, true);
+    if (active && run.runId === runId() && (run.state === "ended" || run.state === "lost")) display(result, true);
     return result;
   };
   const failure = (run: RunResult) => {

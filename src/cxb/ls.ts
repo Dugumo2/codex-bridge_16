@@ -8,9 +8,11 @@ import type { CommandContext, CommandHandler } from "./main";
 import { commandSession } from "./command-session";
 import { convergenceFields, resultReady, resultTurn, selectedResultFields } from "./run-result";
 import { convergenceLines } from "./convergence";
+import { upstreamFields } from "./upstream-errors";
 import type { ConvergenceSummary } from "./sa1b-contracts";
 
 interface ListItem extends ModelDisplay, ConvergenceSummary {
+  upstreamError?: import("./contracts").UpstreamError;
   threadId: string; shortId: string | null; status: string; lastRunId: string | null;
   updatedAt: number; model: string | null; preview: string | null; goal: string | null;
   /** 待核实的归档或删除（`--json` 原样带出）。 */
@@ -45,7 +47,7 @@ function localItems(threads: LocalThread[], runs: RunResult[]): ListItem[] {
       : run?.state === "running" || run?.state === "stopping" || run?.state === "lost" ? run.state : run?.status ?? "idle";
     const selected = run ? resultTurn(run) : undefined;
     return { ...thread, ...threadModelDisplay(thread.threadId, thread.model, []),
-      ...(run ? { ...convergenceFields(run), ...selectedResultFields(run) } : {}),
+      ...(run ? { ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run) } : {}),
       ...(run?.finalTurnId !== undefined || run?.subagentJoin ? { result: selected?.ready === "ready" ? selected.output : "", ready: resultReady(run),
         ...(run.state === "running" || run.state === "stopping" ? { stageResult: true } : {}) } : {}),
       ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
@@ -163,14 +165,25 @@ export const ls: CommandHandler = async (ctx) => {
         ctx.out.notice("无法读取在线运行摘要，模型来源按本地账本显示");
       }
     }
-    for (const item of items) Object.assign(item, threadModelDisplay(item.threadId, item.model, diskRuns, online));
+    for (const item of items) {
+      Object.assign(item, threadModelDisplay(item.threadId, item.model, diskRuns, online));
+      // 诊断严格按列表项 lastRunId 关联；review／无模型／未确认启动仍是有效诊断来源。
+      const run = online?.find((candidate) => candidate.runId === item.lastRunId)
+        ?? diskRuns.find((candidate) => candidate.runId === item.lastRunId);
+      if (run?.upstreamError) Object.assign(item, upstreamFields(run));
+      else delete item.upstreamError;
+    }
     const pending = readPendingInbox(ctx.workspace.workspaceDir);
     for (const item of items) if (item.subagentJoin && pending && item.pendingCount === undefined) {
       item.pendingCount = pending.filter((entry) => entry.runId === item.lastRunId && entry.kind !== "guardian").length;
     }
     ctx.out.progress(`共发现 ${ranked.length} 条线程，显示 ${items.length} 条`);
     ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL REASONING PREVIEW\n");
-    for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${modelLabel(item)} ${item.reasoning ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
+    for (const item of items) {
+      const error = item.upstreamError;
+      const status = `${item.status}${error ? `（上游 ${error.httpStatusCode ?? error.category}×${error.count}）` : ""}`;
+      ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${modelLabel(item)} ${item.reasoning ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
+    }
     for (const item of items) if (item.childrenStop) for (const line of stopReportLines(item.childrenStop)) ctx.out.notice(`${item.shortId ?? item.threadId} ${line}`);
     for (const item of items) if (item.backgroundCleanup && !item.childrenStop) for (const line of backgroundLines(item.threadId, item.backgroundCleanup)) ctx.out.notice(line);
     for (const item of items) {

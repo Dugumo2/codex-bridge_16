@@ -1,6 +1,7 @@
 import { showSubagents } from "./subagents";
 import { convergenceFields, resultTurn, selectedResultFields } from "./run-result";
 import { convergenceLines, observeConvergence } from "./convergence";
+import { observeUpstreamErrors, upstreamResultFields } from "./upstream-errors";
 import { CxbError, EXIT, rpcFailure, type BrokerRpc, type InboxItem, type InboxWaitReply, type RunResult, type ThreadSummary } from "./contracts";
 import { presentItem, safeLine } from "./inbox";
 import { commandSession } from "./command-session";
@@ -58,6 +59,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   let snapshot: { thread: ThreadSummary; run: RunResult | null; pending: InboxItem[]; revision?: number } & import("./sa1b-contracts").ConvergenceSummary | undefined;
   let runId: string | null = null;
   const convergence = observeConvergence(rpc, () => runId, (line) => ctx.out.notice(line));
+  const upstream = observeUpstreamErrors(convergence.rpc, () => runId, (line) => ctx.out.notice(line));
   const buffered: InboxItem[] = [];
   let found!: (items: InboxItem[]) => void;
   const pending = new Promise<InboxItem[]>((resolve) => { found = resolve; });
@@ -100,13 +102,15 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     const rendered = renderPending(items, { threadId: ref.threadId, shortId: label });
     ctx.out.result(rendered.text);
     for (const line of convergenceLines(convergence.fields(), items.length)) ctx.out.notice(line);
-    ctx.out.resultJson({ ...rendered.json as object, ...convergence.fields() });
+    ctx.out.resultJson({ ...rendered.json as object, ...convergence.fields(), ...upstream.fields() });
     return EXIT.WAITING_RESPONSE;
   };
   try {
     snapshot = await rpc.request("broker/threads/watch", { threadId: ref.threadId });
     runId = snapshot!.run?.runId ?? snapshot!.thread.lastRunId;
     convergence.accept({ ...snapshot!.run, ...snapshot, runId: runId ?? undefined });
+    if (snapshot!.run) snapshot!.run = upstream.apply(snapshot!.run);
+    else upstream.refresh();
     if (!runId) throw new CxbError("NOT_FOUND", "线程没有运行记录", { id });
     // 快照、缓冲、实时三处事项统一只认目标运行（终审讨论：别的运行的事项不能让 wait 误退 5）。
     const initial = snapshot!.pending.filter((i) => i.kind !== "guardian" && i.runId === runId);
@@ -118,17 +122,21 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     moves.length = 0;
     const atSnapshot = snapshot!.run ?? readRunRecord(ctx.workspace.workspaceDir, runId);
     const alreadyDone = atSnapshot?.state === "ended" || atSnapshot?.state === "lost";
-    running = waitRun(convergence.rpc, { threadId: ref.threadId, runId, workspaceDir: ctx.workspace.workspaceDir,
+    running = waitRun(upstream.rpc, { threadId: ref.threadId, runId, workspaceDir: ctx.workspace.workspaceDir,
       timeoutMs: Math.max(0, deadline - performance.now()), signal: controller.signal,
       log: (text) => ctx.out.progress(text) });
     const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure]);
     if ("items" in winner) return outputPending(winner.items);
-    const run = winner.run;
+    const run = upstream.apply(winner.run);
     showSubagents(ctx, run);
     const code = exitCodeForRun(run);
+    if (code === EXIT.CODEX_FAILED) {
+      if (run.upstreamError || resultTurn(run)?.error != null) ctx.out.notice("Codex 执行失败，请用 cxb show 查看运行结果");
+      upstream.failure(run);
+    }
     ctx.out.result(resultTurn(run)?.output ?? "");
     ctx.out.resultJson({ ok: code === EXIT.OK, command: "wait", waitFor: "thread", threadId: ref.threadId,
-      shortId: ref.shortId, runId, status: run.status, result: resultTurn(run)?.output ?? "", alreadyDone, ...convergenceFields(run), ...selectedResultFields(run),
+      shortId: ref.shortId, runId, status: run.status, result: resultTurn(run)?.output ?? "", alreadyDone, ...convergenceFields(run), ...selectedResultFields(run), ...upstreamResultFields(run),
       ...(run.subagentJoin && run.interruptReason ? { interruptReason: run.interruptReason } : {}),
       ...(run.loopGuard ? { loopGuard: run.loopGuard } : {}),
       // 子代理停止报告与中断原因（subagentsUnfinished 等）原样带出；没有子代理时字段缺省，旧输出不变。
@@ -136,7 +144,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
       ...(run.childrenStop ? { interruptReason: run.interruptReason, childrenStop: run.childrenStop } : {}) });
     return code;
   } finally {
-    off(); offMoved(); convergence.dispose(); signal.removeEventListener("abort", abort); controller.abort();
+    off(); offMoved(); convergence.dispose(); upstream.dispose(); signal.removeEventListener("abort", abort); controller.abort();
     // 交接胜出时仍等取消收束，避免遗留 waitRun 的订阅和计时器。
     await running?.catch(() => undefined);
   }

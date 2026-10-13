@@ -134,7 +134,21 @@ test("最终 JSON 只增实际存在字段，SA1b 最终轮错误不能取数组
   const stage = { ...base.turns[0]!, turnId: "stage", error: { message: "阶段失败" } };
   const final = { ...stage, turnId: "final", error: { message: "Bearer final-secret", codexErrorInfo: "unauthorized" } };
   expect(upstreamResultFields(base)).toEqual({});
+  expect(upstreamResultFields({ ...base, diagnosticRevision: 10, lastProgressAt: 1234 })).toEqual({});
   expect(upstreamResultFields({ ...base, finalTurnId: "final", turns: [final, stage] })).toEqual({ error: { message: "Bearer ***", codexErrorInfo: "unauthorized" } });
   expect(upstreamResultFields({ ...base, finalTurnId: "missing", turns: [stage] })).toEqual({});
   expect(upstreamResultFields({ ...base, finalTurnId: "final", turns: [stage, { ...final, error: null }] })).toEqual({});
+});
+
+test("runId 未确认的终态快照也必须缓冲，销毁后保持静默", async () => {
+  const o = observer(null);
+  o.fake.handle = () => ({ run: runResult({ upstreamError: upstreamError(), diagnosticRevision: 1 }) });
+  await o.observed.rpc.request("broker/threads/watch");
+  expect(o.lines).toEqual([]);
+  o.setId("run-test");
+  expect(o.lines[0]).toBe("[cxb] 最近上游报错：上游认证失败（HTTP 401），共观察到 3 次（运行已结束）。");
+  o.dispose();
+  const before = [...o.lines];
+  o.emit(2); o.observed.apply(runResult({ upstreamError: upstreamError(), diagnosticRevision: 3 }));
+  expect(o.lines).toEqual(before);
 });

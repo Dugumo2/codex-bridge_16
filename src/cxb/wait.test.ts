@@ -8,6 +8,7 @@ import { bounded } from "./wait-run";
 import { cleanupContexts, context, errorCode, failure, gate, item, thread } from "./test-fixtures/n4b-support";
 import { runResult } from "./test-fixtures/run-fakes";
 import { removeTemp } from "./test-fixtures/main-test-support";
+import { upstreamError } from "./test-fixtures/upstream-errors";
 
 const dirs: string[] = [];
 beforeEach(() => { dirs.push(mkdtempSync(join(tmpdir(), "cxb-n4b-disk-"))); });
@@ -268,4 +269,52 @@ describe("乙组 wait 线程", () => {
       c.checkClean();
     }
   });
+});
+
+for (const json of [false, true]) test(`上游诊断 wait${json ? ' --json' : ''}：晚接入快照提示一次，最终错误退出七`, async () => {
+  const c = context(['wait', 'abcd1234', ...(json ? ['--json'] : [])]);
+  const run = runResult({ status: 'failed', upstreamError: upstreamError(), diagnosticRevision: 4,
+    turns: [{ ...runResult().turns[0]!, status: 'failed', error: { message: 'Bearer privateWaitKey', codexErrorInfo: 'unauthorized' } }] });
+  c.fake.handle = (method) => method === 'broker/threads/list' ? { threads: [thread()] }
+    : { thread: thread(), run, pending: [] };
+  expect(await wait(c.ctx)).toBe(7);
+  expect(c.notices.filter(line => line.startsWith('[cxb] 最近上游报错：'))).toEqual([
+    '[cxb] 最近上游报错：上游认证失败（HTTP 401），共观察到 3 次（运行已结束）。',
+  ]);
+  expect(c.notices.filter(line => line.startsWith('[cxb] 失败原因：'))).toEqual(['[cxb] 失败原因：Bearer ***（unauthorized）']);
+  expect(c.text.join('') + JSON.stringify(c.json)).not.toContain('[cxb]');
+  expect(c.notices.join('') + JSON.stringify(c.json)).not.toContain('privateWaitKey');
+  if (json) {
+    expect(c.json).toHaveLength(1);
+    expect(c.json[0]).toMatchObject({ status: 'failed', upstreamError: run.upstreamError, error: { message: 'Bearer ***', codexErrorInfo: 'unauthorized' } });
+  }
+  c.checkClean();
+});
+
+test('上游诊断 wait：通知先于快照，旧版本快照不倒退诊断，最终摘要独立于版本', async () => {
+  const c = context(['wait', 'abcd1234', '--json']);
+  let watches = 0;
+  c.fake.handle = (method) => {
+    if (method === 'broker/threads/list') return { threads: [thread()] };
+    if (++watches === 1) c.fake.emit('broker/run/updated', { runId: 'run-test', threadId: 'thread-test', diagnosticRevision: 8,
+      upstreamError: upstreamError({ count: 8 }), lastProgressAt: null, state: 'running', status: null });
+    return { thread: thread(), run: runResult({ status: 'failed', diagnosticRevision: 1, upstreamError: upstreamError({ count: 1 }),
+      turns: [{ ...runResult().turns[0]!, error: { message: '终态原因' }, status: 'failed' }] }), pending: [] };
+  };
+  expect(await wait(c.ctx)).toBe(7);
+  expect(c.json[0].upstreamError.count).toBe(8);
+  expect(c.notices.filter(line => line.includes('失败原因：'))).toEqual(['[cxb] 失败原因：终态原因']);
+  c.checkClean();
+});
+
+test('上游诊断 wait SA1b：finalTurnId 缺结果时不回退阶段错误', async () => {
+  const c = context(['wait', 'abcd1234', '--json']);
+  const run = runResult({ status: 'failed', finalTurnId: 'final-missing', upstreamError: upstreamError(), diagnosticRevision: 1,
+    turns: [{ ...runResult().turns[0]!, error: { message: '阶段原因不能冒充' }, status: 'failed' }] });
+  c.fake.handle = (method) => method === 'broker/threads/list' ? { threads: [thread()] } : { thread: thread(), run, pending: [] };
+  expect(await wait(c.ctx)).toBe(7);
+  expect(c.json[0]).not.toHaveProperty('error');
+  expect(c.notices.join()).not.toContain('失败原因');
+  expect(c.notices.join()).not.toContain('阶段原因不能冒充');
+  c.checkClean();
 });

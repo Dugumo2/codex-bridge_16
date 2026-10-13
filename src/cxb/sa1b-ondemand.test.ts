@@ -3,7 +3,7 @@
  * 启用前的 detach、插话、预算、历史子线程都不能让运行卡住或误停；未启用运行的 CLI 输出与 s4-cli 逐字一致。
  * 每个场景独立真 broker + 模拟上游。
  */
-import { expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -11,12 +11,16 @@ import { envWithPathPrefix, writeMockCodexScript } from "../test-support/broker-
 import { Sa1bHarness, SA1B_ROOT as P } from "../test-support/sa1b-harness";
 import { readRunLog } from "./ledger";
 import { resolveWorkspace } from "./workspace";
+import { upstreamBaselineCli } from "./test-fixtures/upstream-baseline";
 
 type H = Sa1bHarness;
 const mark = () => `SA1B_${randomUUID().replaceAll("-", "")}`;
 const text = (request: any) => (request?.params?.input ?? []).filter((x: any) => x.type === "text").map((x: any) => x.text).join("\n");
-/** s4-cli 基准 CLI（未合入 SA1b 的正式分支工作树）。 */
-const BASELINE_CLI = process.env.SA1B_BASELINE_CLI ?? "D:/codex-bridge/src/cxb/main.ts";
+/** 冻结的 s4-cli = 54434d2（已含 SA1b）；显式环境变量仍可指定其他对照。 */
+let BASELINE_CLI = process.env.SA1B_BASELINE_CLI ?? "";
+let baseline: ReturnType<typeof upstreamBaselineCli> | undefined;
+beforeAll(() => { if (!BASELINE_CLI) { baseline = upstreamBaselineCli(); BASELINE_CLI = baseline.main; } });
+afterAll(() => baseline?.dispose());
 
 const terminal = async (h: H, timeout = 8000) => {
   await h.until(async () => !!h.ended().length, timeout, "运行未在期限内结束"); return h.ended().at(-1);
@@ -226,7 +230,7 @@ function normalizeCli(value: string, h: H, run: any) {
     if (from) value = value.replaceAll(from, to);
   }
   return value.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<时间>")
-    .replace(/("(?:updatedAt|startedAt|endedAt|lastVerifiedAt)":\s*)\d+/g, '$1"<时间>"')
+    .replace(/("(?:updatedAt|startedAt|endedAt|completedAt|lastVerifiedAt)":\s*)\d+/g, '$1"<时间>"')
     .replace(/(耗时 |等待耗时 )\d+ 毫秒/g, "$1<耗时> 毫秒")
     .replace(/"alreadyDone":(true|false)/g, '"alreadyDone":"<连上时机>"');
 }
@@ -287,7 +291,8 @@ async function baselineSession(main: string, status: "completed" | "interrupted"
     expect(waitedJson).toMatchObject({ runId: h.runId, status });
     expect(typeof waitedJson.alreadyDone).toBe("boolean");
     for (const args of [["show", P], ["show", P, "--follow"], ["wait", P], ["ls"], ["show", P, "--json"],
-      ["wait", P, "--json"], ["ls", "--json"], ["show", P, "--follow", "--json"]]) {
+      ["wait", P, "--json"], ["ls", "--json"], ["show", P, "--follow", "--json"],
+      ["show", P, "--server"], ["show", P, "--server", "--json"], ["show", P, "--log"], ["show", P, "--log", "--json"]]) {
       outputs.push({ args, ...await cli(h, main, args) });
     }
     return outputs.map(row => ({ ...row, stdout: normalizeCli(row.stdout, h, run), stderr: normalizeCli(row.stderr, h, run) }));
