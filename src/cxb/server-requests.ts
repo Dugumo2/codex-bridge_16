@@ -184,8 +184,14 @@ export function redactParams(params: unknown): unknown {
       for (const secret of values) result = result.split(secret).join("***");
       // URL 查询、命令参数及头部文本也可能携带凭据。
       result = result.replace(/\bBearer\s+[^\s,;]+/gi, "Bearer ***")
+        .replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]+/g, "***")
+        .replace(/\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "***")
+        .replace(/([?&][^\s?&=#]*(?:key|token|secret|password|auth|signature)[^\s?&=#]*=)[^\s&#]*/gi, "$1***")
+        .replace(/^(\s*(?:Authorization|Cookie|Set-Cookie)\s*:)\s*[^\r\n]*/gim, "$1 ***")
+        .replace(/\b[A-Za-z0-9+/=]{32,}\b/g, "***")
         .replace(/((?:[\w-]*(?:token|cookie|authorization|password|passwd|secret|api[_-]?key|credential)[\w-]*)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&;]+)/gi, "$1***")
         .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1***@");
+      result = result.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-_])|\u009b[0-?]*[ -/]*[@-~]/g, "");
       return sanitizeForTerminal(result).replace(/[\r\u0080-\u009f\u202a-\u202e\u2066-\u2069]/g, "");
     }
     if (Array.isArray(value)) return value.map(clean);
