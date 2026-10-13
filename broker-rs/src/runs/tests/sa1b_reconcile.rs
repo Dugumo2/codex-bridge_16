@@ -220,6 +220,72 @@ fn 普通释放与树提交都使用相同终态决定且保留真实报告() {
 }
 
 #[test]
+fn 父轮未结束停树到期提交不建立缺失最终目标() {
+    use crate::stop::tree::{
+        ChildrenStopReport, ReleaseSnapshot, TreeFinishCommit, TreeStopReport,
+    };
+    let (mut m, token) = fixture(1);
+    own_start(&mut m, &token, "未完成父轮", TurnOrigin::Goal);
+    m.runs
+        .runs
+        .get_mut(R)
+        .unwrap()
+        .subagent_join
+        .as_mut()
+        .unwrap()
+        .terminal_reason = Some(TerminalReason::ConvergeDeadline);
+    let snapshot = ReleaseSnapshot {
+        identity: m.manage_context(R).unwrap().identity.clone(),
+        token: None,
+        owner: None,
+        gen: 1,
+        parent_turn_id: Some("未完成父轮".into()),
+        parent_status: None,
+        goal_status: None,
+        loop_guard: false,
+    };
+    let children: ChildrenStopReport = serde_json::from_value(json!({
+        "trigger":"convergeDeadline","phase":"unconfirmed","version":1,
+        "root":{"thread":T,"phase":"unconfirmed","check":{"ownership":true,"turnEnded":false,"goalBraked":true,"settled":false,"verifyDone":false},"clearRequested":false,"clearConfirmed":false,"error":null},
+        "stopped":[],"unconfirmed":[T],"failed":[],"conflicts":[],"capabilityLimited":[],
+        "discovery":{"missing":{},"complete":true,"version":1,"incompleteReasons":[]},"unsettledSpawns":0
+    })).unwrap();
+    m.commit_tree_finish(
+        TreeFinishCommit {
+            snapshot,
+            report: TreeStopReport {
+                tree_op: 1,
+                run_id: R.into(),
+                generation: 1,
+                round: 1,
+                children,
+                first_delivery_deadline_ms: 20_000,
+                committed: false,
+                cancelled: false,
+                barrier: true,
+            },
+            status: RunStatus::Interrupted,
+            interrupt_reason: Some(InterruptReason::ConvergeDeadline),
+        },
+        &mut vec![],
+    );
+    let run = &m.runs.runs[R];
+    assert_eq!(run.state, RunState::Ended);
+    assert_eq!(run.status, Some(RunStatus::Interrupted));
+    assert_eq!(run.stop_outcome, Some(StopOutcome::Unconfirmed));
+    assert_eq!(run.current_turn_id.as_deref(), Some("未完成父轮"));
+    assert!(run.turns.is_empty(), "不能伪造完成轮、状态或轮次计数");
+    assert_eq!(run.turns_total, 0);
+    assert!(
+        run.final_turn_id.is_none(),
+        "没有完成证据时不能承诺未来会出现最终目标"
+    );
+    assert!(run.selected_parent_result().is_none());
+    m.finalize_runs(&mut vec![]);
+    assert!(m.runs.runs[R].final_turn_id.is_none());
+}
+
+#[test]
 fn 未知外部轮完成不能通过fallback进入父运行() {
     let (mut m, token) = fixture(1);
     let (id, _) = start(&mut m, &token);

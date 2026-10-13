@@ -129,7 +129,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     ctx.out.result(resultTurn(run)?.output ?? "");
     ctx.out.resultJson({ ok: code === EXIT.OK, command: "wait", waitFor: "thread", threadId: ref.threadId,
       shortId: ref.shortId, runId, status: run.status, result: resultTurn(run)?.output ?? "", alreadyDone, ...convergenceFields(run), ...selectedResultFields(run),
-      ...(run.interruptReason ? { interruptReason: run.interruptReason } : {}),
+      ...(run.subagentJoin && run.interruptReason ? { interruptReason: run.interruptReason } : {}),
       ...(run.loopGuard ? { loopGuard: run.loopGuard } : {}),
       // 子代理停止报告与中断原因（subagentsUnfinished 等）原样带出；没有子代理时字段缺省，旧输出不变。
       ...(run.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}),

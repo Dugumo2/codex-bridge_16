@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { RunResult } from "./contracts";
-import { resultPending, resultReady, resultTurn, selectedResultFields } from "./run-result";
+import { modelTurn, resultPending, resultReady, resultTurn, selectedResultFields } from "./run-result";
 import { modelSummary, runResult } from "./test-fixtures/run-fakes";
 import type { SubagentJoin } from "./sa1b-contracts";
 
@@ -26,11 +26,17 @@ test("最终轮在中段：按最终指针交付，模拟摘要与 broker 一致
   expect(modelSummary(run)).toMatchObject({ finalTurnId: "汇总轮", lastTurn: { turnId: "汇总轮" } });
 });
 
-test("最终指针的目标缺失：不借旧轮冒充，结果仍待补读", () => {
+test("最终指针的目标缺失且运行已结束：明确不可用，不永久等待", () => {
   const run = record({ subagentJoin: join, finalTurnId: "未读到" });
   expect(resultTurn(run)).toBeUndefined();
-  expect(resultPending(run)).toBe(true);
+  expect(resultPending(run)).toBe(false);
+  expect(resultReady(run)).toBe("unavailable");
   expect(modelSummary(run).lastTurn).toBeNull();
+});
+test("最终指针的目标缺失但运行仍在进行：有界补读期间保持 pending", () => {
+  const run = record({ subagentJoin: join, finalTurnId: "未读到", state: "running", currentTurnId: "迟到轮" });
+  expect(resultPending(run)).toBe(true);
+  expect(resultReady(run)).toBe("pending");
 });
 
 test("协调运行进行中：取已确认当前父轮作阶段结果，不取尾部旧轮", () => {
@@ -47,4 +53,9 @@ for (const state of ["ended", "lost"] as const) test(`协调运行${state === "l
   expect(resultReady(run)).toBe("unavailable");
   expect(selectedResultFields(run)).toEqual({ ready: "unavailable" });
   expect(modelSummary(run).lastTurn).toBeNull();
+});
+
+test("未启用运行的模型展示保留 s4-cli 尾项规则", () => {
+  const run = record({ currentTurnId: "首轮" });
+  expect(modelTurn(run)?.turnId).toBe("迟到轮");
 });

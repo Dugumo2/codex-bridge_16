@@ -38,7 +38,8 @@ export function convergenceLines(run: ConvergenceSummary & Pick<Partial<RunResul
 
 /** 先订阅再取快照；同运行 revision 只前进，防止快照与迟到通知倒退阶段。 */
 export function observeConvergence(rpc: BrokerRpc, runId: () => string | null | undefined, notice: (line: string) => void) {
-  const views = new Map<string, { revision: number; fields: ConvergenceSummary }>();
+  type Fields = ConvergenceSummary & Pick<Partial<RunResult>, "convergenceConfig" | "executionConfig">;
+  const views = new Map<string, { revision: number; fields: Fields }>();
   let printed = "";
   let active = true;
   const display = () => {
@@ -47,13 +48,19 @@ export function observeConvergence(rpc: BrokerRpc, runId: () => string | null | 
     const text = convergenceLines(view.fields).join("\n");
     if (text && text !== printed) { printed = text; for (const line of text.split("\n")) notice(line); }
   };
-  const accept = (view: { runId?: string; revision?: number } & ConvergenceSummary) => {
+  const accept = (view: { runId?: string; revision?: number } & Fields) => {
     if (!active || !view.runId || !Number.isSafeInteger(view.revision)) return;
     const previous = views.get(view.runId);
     if (!previous || view.revision! > previous.revision) {
       // childChanged 可不带协调摘要；缺省字段不能抹掉已知的同运行事实。
-      views.set(view.runId, { revision: view.revision!, fields: { ...previous?.fields, ...convergenceFields(view) } });
+      views.set(view.runId, { revision: view.revision!, fields: { ...previous?.fields, ...convergenceFields(view),
+        convergenceConfig: previous?.fields.convergenceConfig ?? view.convergenceConfig,
+        executionConfig: previous?.fields.executionConfig ?? view.executionConfig } });
       if (views.size > 16) views.delete(views.keys().next().value!);
+    } else {
+      // 配置在同一运行内不可变；迟到／同 revision 快照可补齐配置，但不能倒退动态摘要。
+      previous.fields.convergenceConfig ??= view.convergenceConfig;
+      previous.fields.executionConfig ??= view.executionConfig;
     }
     display();
   };
@@ -68,5 +75,5 @@ export function observeConvergence(rpc: BrokerRpc, runId: () => string | null | 
     }
     return result;
   } };
-  return { accept, rpc: watchedRpc, fields: () => views.get(runId() ?? "")?.fields ?? {}, dispose: () => { active = false; for (const off of offs) off(); views.clear(); } };
+  return { accept, rpc: watchedRpc, fields: () => convergenceFields(views.get(runId() ?? "")?.fields ?? {}), dispose: () => { active = false; for (const off of offs) off(); views.clear(); } };
 }

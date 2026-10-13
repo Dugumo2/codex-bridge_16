@@ -345,8 +345,8 @@ describe("SA1b D：最终交付与协调展示", () => {
       ledger(dir, [run]);
       const t = context(dir, ["show", "abcd1234", "--json"]);
       serveRun(t, run);
-      expect(await show(t.ctx)).toBe(5);
-      if (missing) expect(t.json[0]).not.toHaveProperty("result");
+      expect(await show(t.ctx)).toBe(missing ? 0 : 5);
+      if (missing) expect(t.json[0]).toMatchObject({ result: "", ready: "unavailable" });
       else {
         // 与 broker selected_parent_result 一致：阶段结果取已确认当前父轮，不取数组尾部的迟到旧轮。
         expect(t.json[0]).toMatchObject({ stageResult: true, result: "新最终父轮" });
@@ -398,12 +398,12 @@ describe("SA1b D：最终交付与协调展示", () => {
     } finally { observer.dispose(); }
     expect(t.fake.subscriptions).toBe(0);
   });
-  test("wait 最终目标在数组中段或缺失时只接受对应 turnId 的补读", async () => {
-    for (const missing of [false, true]) {
+  test("wait 最终目标在数组中段时只接受对应 turnId 的补读", async () => {
+    for (const readyState of ["ready", "unavailable"] as const) {
       const t = context(dir, ["wait", "abcd1234"]);
       const run = converged();
-      const ready = run.turns[0]!;
-      run.turns = missing ? [run.turns[1]!] : [{ ...ready, ready: "pending", output: "" }, run.turns[1]!];
+      const ready = { ...run.turns[0]!, ready: readyState };
+      run.turns = [{ ...ready, ready: "pending", output: "" }, run.turns[1]!];
       serveRun(t, run);
       let done = false;
       const work = waitRun(t.fake.rpc, { threadId: run.threadId, runId: run.runId, timeoutMs: 1000 }).then(r => { done = true; return r; });
@@ -416,6 +416,17 @@ describe("SA1b D：最终交付与协调展示", () => {
       expect(resultTurn(await watchdog(work))?.output).toBe("新最终父轮");
       expect(t.fake.subscriptions).toBe(0);
     }
+  });
+  test("wait 缺失最终目标时优先合并已收到的同轮结果通知", async () => {
+    const t = context(dir, ["wait", "abcd1234"]);
+    const run = converged();
+    const final = run.turns[0]!;
+    serveRun(t, { ...run, state: "running", status: null, turns: [] });
+    const work = waitRun(t.fake.rpc, { threadId: run.threadId, runId: run.runId, timeoutMs: 1000 });
+    t.fake.emit("broker/thread/result", { runId: run.runId, turn: 0, result: final });
+    t.fake.emit("broker/run/ended", { run: { ...run, turns: [] } });
+    expect(resultTurn(await watchdog(work))).toEqual(final);
+    expect(t.fake.subscriptions).toBe(0);
   });
   test("模型沿用不随汇总轮改变原运行创建顺序、模型与强度；账本摘要认最终指针", () => {
     const run = converged();
@@ -545,7 +556,7 @@ test("SA1b run 待答交接输出等待回答与同一协调摘要", async () =>
 test("SA1b ls 明确区分最终结果待补读、不可用及待回答阶段", async () => {
   for (const mode of ["pending", "unavailable", "waiting"] as const) {
     const run = converged(mode === "waiting" ? { state: "running", status: null, finalTurnId: undefined, subagentJoin: joinState({ phase: "waitingSubtree" }) } : {});
-    if (mode === "pending") run.finalTurnId = "尚未读到";
+    if (mode === "pending") run.turns[0] = { ...run.turns[0]!, ready: "pending", output: "" };
     if (mode === "unavailable") run.turns[0] = { ...run.turns[0]!, ready: "unavailable", output: "" };
     ledger(dir, [run]);
     writeFileSync(join(dir, "inbox.json"), JSON.stringify({ payload: { items: [item({ threadId: "子代理" })] } }));
@@ -574,6 +585,40 @@ for (const command of ["run", "wait", "show"] as const) test(`SA1b ${command} �
   expect(t.json.at(-1)).toMatchObject({ result: "", ready: "unavailable", origin: "subagentReconcile", finalTurnId: "new-final" });
   expect(t.notices.join()).toContain("最终结果不可用（unavailable）");
 });
+
+for (const pointer of [undefined, "未完成父轮"]) for (const command of ["wait", "show-follow"] as const) test(`SA1b ${command} 停树到期父轮未结束：最终目标缺失明确不可用（${pointer ?? "无指针"}）`, async () => {
+  const run = converged({ state: "ended", status: "interrupted", finalTurnId: pointer, currentTurnId: "未完成父轮",
+    subagentJoin: joinState({ phase: "abnormal", terminalReason: "convergeDeadline" }), interruptReason: "convergeDeadline",
+    childrenStop: report({ phase: "unconfirmed" }), stopOutcome: "unconfirmed", turns: [] });
+  ledger(dir, [run]);
+  const t = context(dir, [command === "wait" ? "wait" : "show", "abcd1234", "--json", ...(command === "show-follow" ? ["--follow"] : [])]);
+  serveRun(t, run);
+  expect(await watchdog(command === "wait" ? wait(t.ctx) : show(t.ctx))).toBe(command === "wait" ? 4 : 0);
+  expect(t.json.at(-1)).toMatchObject({ runId: run.runId, status: "interrupted", ready: "unavailable", result: "" });
+  expect(t.fake.subscriptions).toBe(0);
+});
+for (const order of ["启用前快照", "通知先于同 revision 快照", "通知先于旧 revision 快照"] as const) test(`SA1b 观察器保留配置：${order}`, async () => {
+  const t = context(dir, ["wait", "abcd1234"]);
+  const config = { maxWakeups: 8 } as NonNullable<RunResult["convergenceConfig"]>;
+  const execution = { model: "原模型", effort: "high" };
+  const observer = observeConvergence(t.fake.rpc, () => "run-test", () => {});
+  try {
+    t.fake.handle = () => ({ run: runResult({ convergenceConfig: config, executionConfig: execution }), revision: order.includes("同 revision") ? 5 : 4 });
+    if (order === "启用前快照") {
+      await observer.rpc.request("broker/threads/watch", {});
+      expect(observer.fields()).not.toHaveProperty("convergenceConfig");
+      expect(observer.fields()).not.toHaveProperty("executionConfig");
+    }
+    t.fake.emit("broker/run/convergenceChanged", { runId: "run-test", revision: 5, subagentJoin: joinState({ phase: "reconciling" }) });
+    if (order !== "启用前快照") await observer.rpc.request("broker/threads/watch", {});
+    expect(observer.fields()).toMatchObject({ convergenceConfig: config, executionConfig: execution, subagentJoin: { phase: "reconciling" } });
+    observer.accept({ runId: "别的运行", revision: 99, executionConfig: { model: "错模型" } });
+    observer.accept({ runId: "run-test", revision: 3, subagentJoin: joinState({ phase: "running" }) });
+    expect(observer.fields().executionConfig).toEqual(execution);
+    expect(observer.fields().subagentJoin?.phase).toBe("reconciling");
+  } finally { observer.dispose(); }
+});
+
 test("SA1b 等待结束后的迟到快照不再输出或复活协调摘要", async () => {
   const t = context(dir, ["wait", "abcd1234"]);
   const lines: string[] = [];

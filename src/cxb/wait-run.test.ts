@@ -160,4 +160,7 @@ test("退出码优先级：私有与共享刹车均为九，其余遵守运行�
   }
   expect(exitCodeForRun(runResult({ status: "interrupted", interruptReason: "goalLoop" }))).toBe(9);
   expect(exitCodeForRun(runResult({ loopGuard: { kind: "noAction", count: 3, threshold: 3, turnIds: [], action: "pauseGoal" } }))).toBe(9);
+  // 未启用协调的记录逐字沿用 s4-cli：刹车优先于 failed，失联不额外改变原状态映射。
+  expect(exitCodeForRun(runResult({ status: "failed", interruptReason: "goalLoop" }))).toBe(9);
+  expect(exitCodeForRun(runResult({ state: "lost", status: "completed" }))).toBe(0);
 });

@@ -525,6 +525,37 @@ mod tests {
     }
 
     #[test]
+    fn 最终目标已有完成项时补读失败有界收束为不可用() {
+        let (mut m, mut current) = begin();
+        m.runs.runs.get_mut("运行").unwrap().final_turn_id = Some("轮".into());
+        m.run_released("运行", ReleaseKind::Natural, &mut vec![]);
+        assert_eq!(m.runs.runs["运行"].state, RunState::Ended);
+        for attempt in 0..=RESULT_RETRY_MS.len() {
+            let actions = answer(
+                &mut m,
+                &current,
+                Err(json!({"code":-32000,"message":"暂时不可读"})),
+            );
+            if let Some(delay) = RESULT_RETRY_MS.get(attempt) {
+                assert_eq!(
+                    m.runs.runs["运行"].selected_parent_result().unwrap().ready,
+                    Ready::Pending
+                );
+                current = retry(&mut m, &actions, *delay);
+            } else {
+                assert_eq!(
+                    m.runs.runs["运行"].selected_parent_result().unwrap().ready,
+                    Ready::Unavailable
+                );
+                assert!(m.runs.reads.is_empty());
+                assert!(!actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Request(_) | Action::Schedule { .. })));
+            }
+        }
+    }
+
+    #[test]
     fn 分页直到末页才发布完整输出与一次活动证据() {
         let (mut m, first) = begin();
         assert_eq!(first.method, "thread/items/list");

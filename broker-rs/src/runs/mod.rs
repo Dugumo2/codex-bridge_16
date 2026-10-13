@@ -1905,13 +1905,23 @@ impl Machine {
             .get(run)
             .and_then(|p| p.last());
         if let Some(parent) = last {
-            if join.terminal_reason.is_some()
-                || (parent.completed == Some(TurnStatus::Completed)
-                    && join.reconciled_epoch >= join.work_epoch)
+            // 异常停树的交付期限可能先于根轮结束。没有完成证据就没有最终答复；
+            // 以 ended + subagentJoin + 无 finalTurnId 明确 unavailable，保留 currentTurnId
+            // 作定位，不伪造已完成的 TurnResult。已有结果项仍走原有有界补读。
+            if record.turns.iter().any(|turn| turn.turn_id == parent.turn)
+                && (join.terminal_reason.is_some()
+                    || (parent.completed == Some(TurnStatus::Completed)
+                        && join.reconciled_epoch >= join.work_epoch))
             {
                 record.final_turn_id = Some(parent.turn.clone());
             }
-        } else if join.work_epoch == 0 && record.start_confirmation.confirmed {
+        } else if join.work_epoch == 0
+            && record.start_confirmation.confirmed
+            && record
+                .current_turn_id
+                .as_ref()
+                .is_some_and(|id| record.turns.iter().any(|turn| &turn.turn_id == id))
+        {
             record.final_turn_id = record.current_turn_id.clone();
         }
     }

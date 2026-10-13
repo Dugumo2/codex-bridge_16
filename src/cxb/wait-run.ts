@@ -20,10 +20,13 @@ export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, sig
 }
 
 export const exitCodeForRun: ExitCodeForRun = (run) => {
-  if (run.state === "lost") return EXIT.INTERRUPTED;
-  if (run.status === "failed") return EXIT.CODEX_FAILED;
+  if (run.subagentJoin) {
+    if (run.state === "lost") return EXIT.INTERRUPTED;
+    if (run.status === "failed") return EXIT.CODEX_FAILED;
+  }
   if (run.loopGuard || run.interruptReason === "goalLoop" || run.status === "goalBlocked") return EXIT.GOAL_BLOCKED_OR_LIMITED;
   if (run.status === "completed") return EXIT.OK;
+  if (run.status === "failed") return EXIT.CODEX_FAILED;
   return EXIT.INTERRUPTED;
 };
 
@@ -47,7 +50,7 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     const replacement = current.finalTurnId !== undefined
       ? [...results.values()].find((turn) => turn.turnId === current!.finalTurnId)
       : results.get(current.turnsTotal - 1);
-    if (resultPending(current) && replacement && replacement.turnId === (current.finalTurnId ?? last?.turnId)) {
+    if ((resultPending(current) || !last) && replacement && replacement.turnId === (current.finalTurnId ?? last?.turnId)) {
       current = { ...current, turns: last ? current.turns.map((turn) => turn.turnId === replacement.turnId ? replacement : turn)
         : [...current.turns, replacement] };
     }
