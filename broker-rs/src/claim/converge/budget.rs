@@ -42,14 +42,21 @@ impl Machine {
         if self.sa1b_active(&run) {
             return true;
         }
+        // 私有首轮的 started 可早于启动回包；必须已有自有轮证明，不能仅凭暂存轮号启用。
+        let confirmed_starting = matches!(
+            &claim.state,
+            State::Starting { turn_id: Some(turn), settling: false, .. }
+                if claim.owned_turns.contains(turn)
+        );
         if claim.joined()
             || claim.settling()
             || claim.precheck()
             || claim.owner_gone
-            || !matches!(
-                claim.state,
-                State::Running { .. } | State::AwaitingContinuation { .. }
-            )
+            || !(confirmed_starting
+                || matches!(
+                    claim.state,
+                    State::Running { .. } | State::AwaitingContinuation { .. }
+                ))
             || self.convergences.review_runs.contains(&run)
             || self.stop_busy(thread)
             || self.tree_for_run(&run).is_some()

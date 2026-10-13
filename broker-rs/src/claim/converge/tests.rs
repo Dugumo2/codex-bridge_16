@@ -33,7 +33,7 @@ fn notify(m: &mut Machine, method: &str, params: serde_json::Value) -> Vec<Actio
         },
     )
 }
-fn setup() -> (Machine, SubagentMock) {
+fn setup_pending() -> (Machine, SubagentMock, crate::claim::RequestContext) {
     let mut m = Machine::default();
     m.clock.mono_ms = 1_000;
     m.clock.now_ms = 100_000;
@@ -61,6 +61,17 @@ fn setup() -> (Machine, SubagentMock) {
             _ => None,
         })
         .unwrap();
+    m.convergences
+        .capabilities
+        .insert(P.into(), (m.relations.conn_epoch, true));
+    m.convergences.test_budget = Some(BudgetAdmission::Allowed);
+    m.convergences.test_read = Some(BatchReadId(9));
+    let mut mock = SubagentMock::default();
+    mock.register(P, None, "v1", false, true);
+    (m, mock, context)
+}
+fn setup() -> (Machine, SubagentMock) {
+    let (mut m, mock, context) = setup_pending();
     apply(
         &mut m,
         Event::Reply {
@@ -73,13 +84,6 @@ fn setup() -> (Machine, SubagentMock) {
         "turn/started",
         json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
     );
-    m.convergences
-        .capabilities
-        .insert(P.into(), (m.relations.conn_epoch, true));
-    m.convergences.test_budget = Some(BudgetAdmission::Allowed);
-    m.convergences.test_read = Some(BatchReadId(9));
-    let mut mock = SubagentMock::default();
-    mock.register(P, None, "v1", false, true);
     (m, mock)
 }
 /// 已纳管一个先完成的子代理：只有确有子代理的运行才进入收敛（用户 2026-10-11 定）。
@@ -1661,4 +1665,48 @@ fn 按需启用时只发布运行中且未计时_不排期也不公布收敛期�
     assert!(matches!(m.claims[P].state, State::Converging { .. }));
     assert!(join(&m).deadline_at > 0, "首次收敛门禁才开始计时");
     assert!(m.convergences.runs[R].deadline_mono_ms < u64::MAX);
+}
+
+#[test]
+fn 启动回包最后到仍启用收敛且不复活父轮() {
+    let (mut m, mut mock, context) = setup_pending();
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
+    );
+    assert!(matches!(
+        m.claims[P].state,
+        State::Starting {
+            settling: false,
+            ..
+        }
+    ));
+    assert!(m.claims[P].owned_turns.contains(T));
+    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+    assert!(m.sa1b_active(R));
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    assert!(m.tree_for_run(R).is_none());
+    let deadline = m.convergences.runs[R].deadline_mono_ms;
+    // 迟到的旧完成不能覆盖当前完成目标，启动回包只能清 pending。
+    complete(&mut m, &mut mock, P, "旧父轮", "failed");
+    apply(
+        &mut m,
+        Event::Reply {
+            context,
+            result: Ok(json!({"turn":{"id":T}})),
+        },
+    );
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    assert!(!m.claims[P].request_pending);
+    assert_eq!(m.claims[P].turn_id(), Some(T));
+    assert_eq!(m.convergences.runs[R].deadline_mono_ms, deadline);
+    assert!(m.tree_for_run(R).is_none());
+    complete(&mut m, &mut mock, "子", "子轮", "completed");
+    discover(&mut m, true);
+    assert_eq!(
+        m.convergences.progress[R].reading,
+        Some((BatchReadId(9), join(&m).work_epoch))
+    );
 }
