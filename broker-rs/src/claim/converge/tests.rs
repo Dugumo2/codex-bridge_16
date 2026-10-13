@@ -34,7 +34,13 @@ fn notify(m: &mut Machine, method: &str, params: serde_json::Value) -> Vec<Actio
     )
 }
 fn setup_pending() -> (Machine, SubagentMock, crate::claim::RequestContext) {
-    let mut m = Machine::default();
+    setup_pending_mode(false)
+}
+fn setup_pending_mode(shared: bool) -> (Machine, SubagentMock, crate::claim::RequestContext) {
+    let mut m = Machine {
+        shared,
+        ..Machine::default()
+    };
     m.clock.mono_ms = 1_000;
     m.clock.now_ms = 100_000;
     // 与生产 Core 相同：broker 启动即打开门禁，运行按需启用（不再绕过启用前的初始化路径）。
@@ -1709,4 +1715,73 @@ fn 启动回包最后到仍启用收敛且不复活父轮() {
         m.convergences.progress[R].reading,
         Some((BatchReadId(9), join(&m).work_epoch))
     );
+}
+
+#[test]
+fn settling外部派生不启用而自有派生定案后启用() {
+    for own_spawn in [false, true] {
+        for spawn_completed in [false, true] {
+            let (mut m, mut mock, context) = setup_pending_mode(true);
+            let parent = if own_spawn { T } else { "外部X" };
+            notify(
+                &mut m,
+                "turn/started",
+                json!({"threadId":P,"turn":{"id":parent,"status":"inProgress","items":[]}}),
+            );
+            let (started, completed) = SubagentMock::v1_spawn(P, parent, "派生", "子", false);
+            apply(&mut m, started);
+            if spawn_completed {
+                apply(&mut m, completed);
+            }
+            assert!(m.claims[P].settling());
+            let key = m.relations.operations.keys().next().unwrap().clone();
+            assert_eq!(m.relations.operations[&key].run_id, R);
+            assert!(!m.op_confirmed(&key));
+            assert!(!m.sa1b_active(R));
+            if !own_spawn {
+                notify(
+                    &mut m,
+                    "turn/started",
+                    json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
+                );
+            }
+            // started 已有证明，启动回包经 begin_settlement 同步定案，触发 confirm_waiting。
+            apply(
+                &mut m,
+                Event::Reply {
+                    context,
+                    result: Ok(json!({"turn":{"id":T}})),
+                },
+            );
+            assert!(!m.claims[P].settling());
+            assert!(m.claims[P].owned_turns.contains(T));
+            assert_eq!(m.run_subagent_evidence(R), own_spawn);
+            assert_eq!(m.sa1b_active(R), own_spawn);
+            if own_spawn {
+                assert!(m.op_confirmed(&key));
+                if !spawn_completed {
+                    assert!(m.relations.contexts[R].in_flight_spawns.contains(&key));
+                }
+            } else {
+                assert_eq!(
+                    m.relations.operations[&key].outcome,
+                    EvidenceOutcome::Unproven
+                );
+                assert_eq!(m.relations.operations[&key].run_id, R);
+                complete(&mut m, &mut mock, P, T, "completed");
+                assert!(!m.sa1b_active(R));
+            }
+        }
+    }
+}
+
+#[test]
+fn 自有v1在途派生立即启用() {
+    let (mut m, _) = setup();
+    let (started, _) = SubagentMock::v1_spawn(P, T, "派生", "子", false);
+    apply(&mut m, started);
+    let key = m.relations.operations.keys().next().unwrap();
+    assert!(m.op_confirmed(key));
+    assert!(m.relations.contexts[R].in_flight_spawns.contains(key));
+    assert!(m.sa1b_active(R));
 }
