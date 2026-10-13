@@ -2,6 +2,7 @@
 import { createServer, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import type { Socket } from "node:net";
+import { execFileSync } from "node:child_process";
 
 export type UpstreamScenario = "ok" | "401" | "402" | "403" | "429" | "429-usage" | "429-long"
   | "500" | "500-long" | "slow" | "drop" | "401-then-ok" | "sse429-long" | "connection";
@@ -25,6 +26,15 @@ export async function startUpstreamModel(scenario: UpstreamScenario, options: { 
   const startedAt = Date.now();
   const requests: ModelRequest[] = [];
   const violations: string[] = [];
+  if (scenario === "connection") {
+    // 独立 Node 进程先绑定再关闭临时端口，退出本身证明句柄已释放；避开 Bun 关监听的延迟。
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ["PATH", "SYSTEMROOT", "WINDIR"].includes(key.toUpperCase())));
+    Object.assign(env, { HOME: (process.env.TEMP! + "\\ue-port-only"), USERPROFILE: (process.env.TEMP! + "\\ue-port-only"), TEMP: process.env.TEMP!, TMP: process.env.TEMP! });
+    const port = Number(execFileSync("node.exe", ["-e", 'const net=require("node:net"); const s=net.createServer(); s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close();});'],
+      { cwd: import.meta.dir, env, windowsHide: true, timeout: 30_000, encoding: "utf8" }).trim());
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("无法取得本机连接拒绝端口");
+    return { scenario, baseUrl: `http://127.0.0.1:${port}/v1`, requests, violations, async close() {} };
+  }
   const sockets = new Set<Socket>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const responses = new Set<ServerResponse>();
@@ -48,10 +58,6 @@ export async function startUpstreamModel(scenario: UpstreamScenario, options: { 
       entry.status = 400; response.writeHead(400); response.end("隔离核对失败"); return;
     }
     const selected = scenario === "401-then-ok" ? (entry.sequence <= (options.failures ?? 2) ? "401" : "ok") : scenario;
-    if (selected === "connection") {
-      // 首次连接被断开后关闭监听，后续请求层重试得到真实 ConnectionRefused。
-      response.destroy(); server.close(); return;
-    }
     if (selected === "ok" || selected === "slow" || selected === "drop" || selected === "sse429-long") {
       entry.status = 200;
       const respond = () => {
@@ -82,14 +88,15 @@ export async function startUpstreamModel(scenario: UpstreamScenario, options: { 
   if (!address || typeof address === "string" || address.address !== "127.0.0.1") throw new Error("脚本模型未绑定本机地址");
   return {
     scenario, baseUrl: `http://127.0.0.1:${address.port}/v1`, requests, violations,
-    async stopListening() {
-      if (server.listening) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-    },
     async close() {
       for (const timer of timers) clearTimeout(timer);
       for (const response of responses) response.destroy();
       for (const socket of sockets) socket.destroy();
-      if (server.listening) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      server.unref();
+      if (server.listening) await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("脚本服务关闭超过 1000 毫秒期限")), 1000);
+        server.close((error) => { clearTimeout(timer); if (error) reject(error); else resolve(); });
+      });
     },
   };
 }

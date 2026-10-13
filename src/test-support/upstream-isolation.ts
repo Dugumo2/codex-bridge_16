@@ -18,7 +18,7 @@ export function isolatedEnvironment(root: string, inherited: NodeJS.ProcessEnv =
   Object.assign(env, { CODEX_HOME: join(root, "codex-home"), CXB_HOME: join(root, "cxb-home"),
     USERPROFILE: join(root, "profile"), HOME: join(root, "profile"), APPDATA: join(root, "profile", "AppData", "Roaming"),
     LOCALAPPDATA: join(root, "profile", "AppData", "Local"), TEMP: TEMP_ROOT, TMP: TEMP_ROOT,
-    CXB_UE_FAKE_KEY: FAKE_KEY, CXB_SERVER: "private" });
+    CXB_UE_FAKE_KEY: FAKE_KEY, CXB_SERVER: "private", NO_PROXY: "*" });
   return env;
 }
 
@@ -27,12 +27,16 @@ export function createUpstreamIsolation(baseUrl: string) {
   mkdirSync(TEMP_ROOT, { recursive: true });
   const root = mkdtempSync(join(TEMP_ROOT, "cxb-ue-"));
   const env = isolatedEnvironment(root);
+  // 关闭系统代理功能，并把环境代理占位钉在脚本端点；不继承开发者的代理配置。
+  // NO_PROXY=* 请求直接连接；即使底层忽略绕过规则，代理也仍是同一个脚本服务。
+  Object.assign(env, { HTTP_PROXY: new URL(baseUrl).origin, HTTPS_PROXY: new URL(baseUrl).origin, ALL_PROXY: new URL(baseUrl).origin });
   const cwd = join(root, "workspace");
   for (const path of [cwd, env.CODEX_HOME!, env.CXB_HOME!, env.USERPROFILE!, env.APPDATA!, env.LOCALAPPDATA!]) mkdirSync(path, { recursive: true });
   writeFileSync(join(env.CODEX_HOME!, "config.toml"), [
     'model = "gpt-5.4"', 'model_provider = "ue_script"', 'approval_policy = "never"', 'sandbox_mode = "danger-full-access"',
     'cli_auth_credentials_store = "file"', 'web_search = "disabled"', 'check_for_update_on_startup = false',
-    '[analytics]', 'enabled = false', '[feedback]', 'enabled = false', '[model_providers.ue_script]',
+    '[analytics]', 'enabled = false', '[feedback]', 'enabled = false', '[features]',
+    'respect_system_proxy = false', 'system_proxy_fallback = false', '[model_providers.ue_script]',
     'name = "UE 本地脚本模型"', `base_url = ${JSON.stringify(baseUrl)}`, 'wire_api = "responses"',
     'requires_openai_auth = false', 'supports_websockets = false', 'env_key = "CXB_UE_FAKE_KEY"', "",
   ].join("\n"));
@@ -116,7 +120,7 @@ export async function stopManaged(proc: ManagedProcess): Promise<void> {
 export async function removeIsolation(root: string): Promise<void> {
   const rel = relative(resolve(TEMP_ROOT), resolve(root));
   if (!rel || isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) throw new Error("拒绝清理测试临时目录之外的路径");
-  const end = Date.now() + 2000;
+  const end = Date.now() + 5000;
   while (true) {
     try { rmSync(root, { recursive: true, force: true }); return; }
     catch (error) { if (Date.now() >= end) throw error; await Bun.sleep(50); }
@@ -129,7 +133,8 @@ export function verifyEffectiveConfig(result: unknown, expected: string): void {
   const provider = config?.model_providers?.ue_script;
   if (config?.model_provider !== "ue_script" || provider?.base_url !== expected || provider?.wire_api !== "responses"
       || provider?.requires_openai_auth !== false || provider?.supports_websockets !== false || provider?.env_key !== "CXB_UE_FAKE_KEY"
-      || provider?.request_max_retries != null || provider?.stream_max_retries != null || config?.cli_auth_credentials_store !== "file") {
+      || provider?.request_max_retries != null || provider?.stream_max_retries != null || config?.cli_auth_credentials_store !== "file"
+      || config?.features?.respect_system_proxy !== false || config?.features?.system_proxy_fallback !== false) {
     throw new Error("最终有效 provider、端点、认证方式、传输或默认重试核对失败");
   }
 }

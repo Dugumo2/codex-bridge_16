@@ -8,7 +8,8 @@ import { CLEANUP_MS, TRACE_ROOT, codexCommand, createUpstreamIsolation, removeIs
 export interface ProtocolEvent { at: number; elapsedMs: number; direction: "sent" | "received"; message: Record<string, any> }
 export interface RealTrace {
   scenario: UpstreamScenario; version: string; startedAt: number; deadlineMs: number; cleanupMs: number;
-  isolation: { provider: string; baseUrl: string; supportsWebsockets: false; defaultRetries: true; configVerified: boolean };
+  isolation: { provider: string; baseUrl: string; supportsWebsockets: false; defaultRetries: true; configVerified: boolean;
+    noProxy: "*"; controlledProxy: string; respectSystemProxy: false; systemProxyFallback: false };
   events: ProtocolEvent[]; requests: ModelRequest[]; violations: string[]; stderr: string;
   threadId?: string; turnId?: string; interrupt?: { sentAt: number; acknowledgedAt?: number; completedAt?: number };
   completed?: Record<string, any>; failure?: string; cleaned?: boolean;
@@ -73,26 +74,31 @@ export async function runUpstreamReal(scenario: UpstreamScenario, options: RealO
   const server = await startUpstreamModel(scenario, { failures: options.failures });
   const isolation = createUpstreamIsolation(server.baseUrl);
   const trace: RealTrace = { scenario, startedAt, version: "", deadlineMs, cleanupMs: CLEANUP_MS,
-    isolation: { provider: "ue_script", baseUrl: server.baseUrl, supportsWebsockets: false, defaultRetries: true, configVerified: false },
+    isolation: { provider: "ue_script", baseUrl: server.baseUrl, supportsWebsockets: false, defaultRetries: true, configVerified: false,
+      noProxy: "*", controlledProxy: new URL(server.baseUrl).origin, respectSystemProxy: false, systemProxyFallback: false },
     events: [], requests: server.requests, violations: server.violations, stderr: "" };
   let proc: ManagedProcess | undefined;
+  const remaining = (limit = 10_000) => {
+    const time = deadline - Date.now();
+    if (time <= 0) throw new Error("真实场景超过总期限");
+    return Math.min(limit, time);
+  };
   try {
     const version = startManaged(codexCommand(["--version"]), isolation);
-    try { await within(version.closed, 5000, "Codex 版本查询"); trace.version = version.output().stdout.trim(); }
+    try { await within(version.closed, remaining(5000), "Codex 版本查询"); trace.version = version.output().stdout.trim(); }
     finally { await stopManaged(version); }
     if (trace.version !== "codex-cli 0.160.0") throw new Error(`Codex 版本不符：${trace.version}`);
     proc = startManaged(codexCommand(["app-server"]), isolation);
     const rpc = new UpstreamStdio(proc, trace.events, startedAt);
-    await rpc.request("initialize", { clientInfo: { name: "ue-local-real", title: "上游本地复现", version: "1" }, capabilities: { experimentalApi: true } });
+    await rpc.request("initialize", { clientInfo: { name: "ue-local-real", title: "上游本地复现", version: "1" }, capabilities: { experimentalApi: true } }, remaining());
     rpc.send({ method: "initialized" });
-    const config = await rpc.request("config/read", { cwd: isolation.cwd, includeLayers: false });
+    const config = await rpc.request("config/read", { cwd: isolation.cwd, includeLayers: false }, remaining());
     verifyEffectiveConfig(config, server.baseUrl); trace.isolation.configVerified = true;
     const thread = await rpc.request("thread/start", { cwd: isolation.cwd, approvalPolicy: "never", sandbox: "danger-full-access",
-      experimentalRawEvents: false, persistExtendedHistory: true });
+      experimentalRawEvents: false, persistExtendedHistory: true }, remaining());
     if (thread.modelProvider !== "ue_script") throw new Error("实际线程 provider 未保持隔离");
     trace.threadId = thread.thread.id;
-    if (scenario === "connection") await server.stopListening();
-    const started = await rpc.request("turn/start", { threadId: trace.threadId, input: [{ type: "text", text: "只输出本地脚本结果。" }] });
+    const started = await rpc.request("turn/start", { threadId: trace.threadId, input: [{ type: "text", text: "只输出本地脚本结果。" }] }, remaining());
     trace.turnId = started.turn.id;
     const final = () => trace.events.find((e) => e.direction === "received" && e.message.method === "turn/completed"
       && e.message.params.threadId === trace.threadId && e.message.params.turn.id === trace.turnId);
@@ -112,7 +118,8 @@ export async function runUpstreamReal(scenario: UpstreamScenario, options: RealO
     const cleanupAt = Date.now();
     const errors: string[] = [];
     for (const cleanup of [async () => { if (proc) await stopManaged(proc); }, () => server.close(), () => removeIsolation(isolation.root)]) {
-      try { await cleanup(); } catch (error) { errors.push(String(error)); }
+      try { await within(Promise.resolve().then(cleanup), Math.max(1, CLEANUP_MS - (Date.now() - cleanupAt)), "场景资源清理"); }
+      catch (error) { errors.push(String(error)); }
     }
     if (proc) trace.stderr = proc.output().stderr;
     trace.cleaned = errors.length === 0;

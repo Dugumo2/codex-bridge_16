@@ -143,9 +143,13 @@ export async function runUpstreamE2e(scenario: Scenario, mode: "smoke" | "contra
   finally {
     const cleanupStart = Date.now(); connection?.close();
     const errors: string[] = [];
+    const cleanup = async (work: () => Promise<unknown>) => {
+      try { await within(Promise.resolve().then(work), Math.max(1, CLEANUP_MS - (Date.now() - cleanupStart)), "E2E 资源清理"); }
+      catch (error) { errors.push(String(error)); }
+    };
     // broker 放在 CLI 前结束时，Windows Job 将真实私有上游整树一并收回。
-    for (const proc of [...processes].reverse()) { try { await stopManaged(proc); } catch (error) { errors.push(String(error)); } }
-    for (const cleanup of [() => model.close(), () => removeIsolation(isolation.root)]) { try { await cleanup(); } catch (error) { errors.push(String(error)); } }
+    for (const proc of [...processes].reverse()) await cleanup(() => stopManaged(proc));
+    await cleanup(() => model.close()); await cleanup(() => removeIsolation(isolation.root));
     if (Date.now() - cleanupStart > CLEANUP_MS) errors.push("E2E 清理超过 12 秒期限");
     result.cleaned = errors.length === 0; result.durationMs = Date.now() - started;
     if (errors.length) { result.passed = false; result.failure = [result.failure, ...errors].filter(Boolean).join("；"); }
