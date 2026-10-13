@@ -7,7 +7,7 @@
 //!   kind=started 已带 agentThreadId，不代表操作刚开始。
 //!
 //! 绑定分两步：证据有效期内把派生操作与 C 的唯一首轮「配对」；父轮确认是运行 R 的自有轮之后才「落实」为绑定。
-//! sendInput、resumeAgent、v2 interacted 不能证明具体轮次，只登记操作，不预约下一轮。
+//! sendInput、resumeAgent、v2 interacted 在收敛启用时配对唯一承载活动；历史完成轮不作为新工作。
 use super::*;
 use crate::claim::{Owner, State};
 use crate::policy::Policy;
@@ -683,10 +683,9 @@ impl Machine {
                         | EvidenceKind::V2Interacted
                 ) =>
             {
-                // 自有父轮的明确跟进与之后唯一新开始配对；不把历史完成轮当作新工作。接收线程不必
-                // 事先是本运行成员（新运行跟进旧子线程）：配对到的新轮按本次跟进绑定并纳入成员，
-                // 独立认领或已归属其他运行的轮在绑定时按冲突处理。
-                for child in receivers {
+                // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
+                // 只排除首次通知时已完成的旧轮；每个接收方只建一次基线，双通知不重新挂起。
+                for child in new_receivers {
                     if self.reject_followup_receiver(&key, &child) {
                         continue;
                     }
@@ -695,7 +694,12 @@ impl Machine {
                         .aux
                         .observed
                         .get(&child)
-                        .map(|v| v.iter().map(|o| o.turn.clone()).collect())
+                        .map(|v| {
+                            v.iter()
+                                .filter(|o| o.completed)
+                                .map(|o| o.turn.clone())
+                                .collect()
+                        })
                         .unwrap_or_default();
                     self.convergences
                         .reuse_candidates
