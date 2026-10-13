@@ -10,6 +10,7 @@ import { runResult, wireError } from "./test-fixtures/run-fakes";
 import { N4Broker } from "./test-fixtures/n4a-broker";
 import { readRunLog } from "./ledger";
 import { until } from "./test-fixtures/main-test-support";
+import { upstreamError } from "./test-fixtures/upstream-errors";
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-n4a-show-")); });
@@ -602,4 +603,67 @@ describe("show 服务器与跟随", () => {
     await expect(bounded(work, 1000, "取消未生效")).rejects.toBeInstanceOf(CxbError);
     expect(t.cleanup.size).toBe(0);
   });
+});
+
+for (const state of ['running', 'ended', 'lost'] as const) test(`上游诊断 show ${state}：默认两行，已结束措辞与 JSON`, async () => {
+  const run = runResult({ state, upstreamError: upstreamError(), diagnosticRevision: 1 });
+  ledger(dir, [run]);
+  const text = context(dir, ['show', 'abcd']);
+  expect(await show(text.ctx)).toBe(state === 'running' ? 5 : 0);
+  expect(text.texts.join('')).toContain(`最近上游报错：上游认证失败（HTTP 401）；3 次；首次 1970-01-01T00:00:01.000Z，最近 1970-01-01T00:00:02.000Z；${state === 'running' ? '仍在重试' : '运行已结束'}\n原因：认证已过期\n`);
+  const json = context(dir, ['show', 'abcd', '--json']);
+  expect(await show(json.ctx)).toBe(state === 'running' ? 5 : 0);
+  expect(json.json[0].upstreamError).toEqual(run.upstreamError);
+  expect(json.json[0]).not.toHaveProperty('diagnosticRevision');
+  expect(json.texts).toEqual([]);
+});
+
+test('上游诊断 show --server 与 --log 显示脱敏轮错误及变体', async () => {
+  const error = { message: '失败 sk-privateOriginalKey\n细节', codexErrorInfo: 'usageLimitExceeded' };
+  const run = runResult({ status: 'failed', turns: [{ ...runResult().turns[0]!, status: 'failed', error }] });
+  ledger(dir, [run]);
+  for (const mode of ['--server', '--log']) {
+    const t = context(dir, ['show', 'abcd', mode]);
+    t.fake.handle = (method) => method === 'broker/threads/list' ? { threads: [summary()] }
+      : method === 'broker/runs/modelSummaries' ? { runs: [] }
+        : method === 'thread/turns/list' ? { data: [{ id: 'turn-test', status: 'failed', error }], nextCursor: null }
+          : { data: [], nextCursor: null };
+    expect(await show(t.ctx)).toBe(0);
+    expect(t.texts.join('')).toContain('错误：失败 *** 细节（usageLimitExceeded）');
+    if (mode === "--server") expect(t.texts.join("")).toContain("codexErrorInfo：usageLimitExceeded");
+    expect(t.texts.join('') + t.notices.join('')).not.toContain('privateOriginalKey');
+  }
+});
+
+for (const json of [false, true]) test(`上游诊断 show --follow${json ? ' --json' : ''}：通知走 stderr，逐条 JSON stdout 不变`, async () => {
+  ledger(dir);
+  const t = context(dir, ['show', 'abcd', '--follow', ...(json ? ['--json'] : [])]);
+  let watches = 0;
+  t.fake.handle = (method) => {
+    if (method === 'broker/threads/list') return { threads: [summary()] };
+    if (method === 'broker/runs/modelSummaries') return { runs: [] };
+    if (method === 'broker/threads/watch') {
+      if (++watches === 2) {
+        t.emit('broker/run/updated', { runId: 'run-test', threadId: 'thread-test', diagnosticRevision: 1,
+          upstreamError: upstreamError(), lastProgressAt: null, state: 'running', status: null });
+        t.emit('error', { threadId: 'thread-test', error: { message: '原始通知不能显示' } });
+        t.emit('item/started', { threadId: 'thread-test', item: { type: 'commandExecution', id: 'item-new' } });
+        t.emit('broker/run/ended', { run: runResult({ diagnosticRevision: 1, upstreamError: upstreamError() }) });
+      }
+      return { thread: summary(), run: runResult({ state: 'running', status: null }), pending: [] };
+    }
+    throw new Error(`未预期的方法 ${method}`);
+  };
+  expect(await bounded(show(t.ctx), 3000, 'follow 未结束')).toBe(0);
+  expect(t.notices).toContain('[cxb] 上游认证失败（HTTP 401），Codex 正在重试；已观察到 3 次。');
+  expect(t.notices.join()).toContain('运行已结束');
+  expect(t.texts.join('') + JSON.stringify(t.json)).not.toContain('[cxb]');
+  expect(t.texts.join('') + JSON.stringify(t.json) + t.notices.join()).not.toContain('原始通知不能显示');
+  if (json) {
+    expect(t.json[0]).toMatchObject({ kind: 'item/started', text: '条目开始 commandExecution item-new' });
+    expect(t.json.at(-1)).toEqual({ terminal: true, status: 'completed', runId: 'run-test', model: '模型', reasoning: null, modelSource: 'index', reroute: null });
+    expect(t.json.at(-1)).not.toHaveProperty('upstreamError');
+  }
+  expect(t.fake.subscriptions + t.any.size + t.cleanup.size).toBe(0);
+  expect(t.fake.notificationErrors).toEqual([]);
 });

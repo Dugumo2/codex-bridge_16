@@ -10,6 +10,7 @@ import { resolveThreadLocal, resolveThreadViaBroker, type ThreadRef } from "./th
 import { waitRun } from "./wait-run";
 import { convergenceFields, resultPending, resultTurn, selectedResultFields } from "./run-result";
 import { observeConvergence } from "./convergence";
+import { diagnosticLine, observeUpstreamErrors, turnCodexErrorInfo, turnErrorLine, upstreamFields, upstreamShowLines } from "./upstream-errors";
 import type { ConvergenceSummary } from "./sa1b-contracts";
 import { commandSession, wireMessage } from "./command-session";
 
@@ -74,6 +75,11 @@ function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
   }
 }
 
+function showUpstream(ctx: CommandContext, run: RunResult, output = "") {
+  const lines = upstreamShowLines(run);
+  if (lines.length) ctx.out.result(`${output && !output.endsWith("\n") ? "\n" : ""}${lines.join("\n")}\n`);
+}
+
 async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => Promise<BrokerRpc>) {
   const index = readThreadIndex(ctx.workspace.workspaceDir).find((entry) => entry.threadId === ref.threadId)!;
   const disk = readAllRuns(ctx.workspace.workspaceDir);
@@ -87,14 +93,16 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
     const stage = run.subagentJoin && run.finalTurnId === undefined && last?.ready === "ready" ? last : undefined;
     if (stage) { ctx.out.notice("阶段结果（运行尚未完成）"); ctx.out.result(stage.output); }
     ctx.out.notice(`结果尚未就绪，请用 cxb wait ${ref.shortId ?? ref.threadId}`);
+    showUpstream(ctx, run, stage?.output);
     ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: run.runId, state: run.state,
-      ...convergenceFields(run), ...selectedResultFields(run), ...(stage ? { result: stage.output, stageResult: true } : {}),
+      ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run), ...(stage ? { result: stage.output, stageResult: true } : {}),
       stopOutcome: run.stopOutcome, childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup });
     return 5 as const;
   }
   ctx.out.result(last?.output ?? "");
+  showUpstream(ctx, run, last?.output);
   ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: run.runId, state: run.state,
-    status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none", ...convergenceFields(run), ...selectedResultFields(run),
+    status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none", ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run),
     childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup, interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
   if (!last) {
     const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)
@@ -107,7 +115,7 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
 }
 
 interface ServerItem { type: string; text?: string; phase?: string; review?: string }
-interface ServerTurn { id: string; status: string; items: ServerItem[] }
+interface ServerTurn { id: string; status: string; items: ServerItem[]; error?: unknown }
 /** 与 broker 的输出优先级一致；保持条目顺序。 */
 export function serverOutput(items: ServerItem[]): { output: string; outputSource: TurnResult["outputSource"] } {
   const review = items.filter((item) => item.type === "exitedReviewMode" && typeof item.review === "string").at(-1)?.review;
@@ -198,8 +206,14 @@ async function serverResult(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef,
   const model = await readThreadModel(ctx, ref, async () => rpc, indexModel);
   modelNotice(ctx, model);
   ctx.out.result(result.output);
+  if (turn?.status === "failed" && turn.error != null) {
+    ctx.out.result(`${result.output && !result.output.endsWith("\n") ? "\n" : ""}错误：${turnErrorLine(turn.error)}\n`);
+    const info = turnCodexErrorInfo(turn.error);
+    if (info != null) ctx.out.result(`codexErrorInfo：${diagnosticLine(info)}\n`);
+  }
   ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: null, status: turn?.status ?? null,
-    result: result.output, outputSource: result.outputSource, updatedAt: null });
+    result: result.output, outputSource: result.outputSource, updatedAt: null,
+    ...(turn?.status === "failed" && turn.error != null ? { error: redactParams(turn.error) } : {}) });
   ctx.out.progress("结果来自服务器");
   return 0 as const;
 }
@@ -225,16 +239,18 @@ async function showLog(ctx: CommandContext, ref: ThreadRef, connect: () => Promi
   const runs = records.map((run) => {
     const lines = linesOfRun(all, run.runId).filter((line) => ctx.parsed.options.full || SUMMARY_EVENTS.has(line.event)).map(eventLine);
     const entry = { runId: run.runId, state: run.state, status: run.status, startedAt: run.startedAt,
-      ...runModelDisplay(run), ...convergenceFields(run), pendingReroute: run.pendingReroute ?? null,
+      ...runModelDisplay(run), ...convergenceFields(run), ...upstreamFields(run), pendingReroute: run.pendingReroute ?? null,
       input: clean(run.input), items: lines, turns: run.turns.map((turn) => ({ ...turn, output: clean(turn.output), error: redactParams(turn.error) })),
       ...(ctx.parsed.options.full ? { meta: redactParams(run.meta), interruptReason: run.interruptReason, stopOutcome: run.stopOutcome,
         progress: redactParams(run.progress) } : {}) };
     ctx.out.result(`运行 ${run.runId} ${run.state}/${run.status ?? "未知"} ${new Date(run.startedAt).toISOString()}\n用户：${entry.input}\n`);
+    showUpstream(ctx, run);
     ctx.out.result(clean(`请求模型：${entry.model ?? "-"}；请求强度：${entry.reasoning ?? "-"}\n`));
     for (const line of lines) ctx.out.result(`${line.ts} ${line.text}\n`);
     for (const turn of entry.turns) {
       if (turn.reroute) ctx.out.result(clean(`轮次 ${turn.turnId}${rerouteLabel(turn.reroute)}：${turn.reroute.fromModel} → ${turn.reroute.toModel}；原因：${turn.reroute.reason}\n`));
       ctx.out.result(`Codex：${turn.output}\n`);
+      if (turn.error != null) ctx.out.result(`错误：${turnErrorLine(turn.error)}\n`);
     }
     if (entry.pendingReroute) ctx.out.result(clean(`运行中轮次 ${entry.pendingReroute.turnId}${rerouteLabel(entry.pendingReroute)}：${entry.pendingReroute.fromModel} → ${entry.pendingReroute.toModel}；原因：${entry.pendingReroute.reason}\n`));
     if (ctx.parsed.options.full) ctx.out.result(`元数据：${safeSummary({ meta: run.meta, interruptReason: run.interruptReason,
@@ -284,6 +300,7 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
   let snapshot: Snapshot | undefined;
   let runId: string | null = null;
   const convergence = observeConvergence(rpc, () => runId, (line) => ctx.out.notice(line));
+  const upstream = observeUpstreamErrors(convergence.rpc, () => runId, (line) => ctx.out.notice(line));
   /** 已显示行的出现次数（同一毫秒可以有内容相同的多行）。 */
   const printed = new Map<string, number>();
   let lastTs = "";
@@ -353,10 +370,12 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
     snapshot = await Promise.race([rpc.request<Snapshot>("broker/threads/watch", { threadId: ref.threadId }), failure]);
     runId = snapshot.run?.runId ?? snapshot.thread.lastRunId;
     convergence.accept({ ...snapshot.run, ...snapshot, runId: runId ?? undefined });
+    if (snapshot.run) snapshot.run = upstream.apply(snapshot.run);
+    else upstream.refresh();
     for (const line of tail(ctx, ref)) emit(line);
     // 先把快照前后同批通知交给等待器，再清空缓冲；不能以 await 返回时刻划分通知新旧。
-    const replayRpc: BrokerRpc = { ...rpc, on(method, handler) {
-      const dispose = rpc.on(method, handler);
+    const replayRpc: BrokerRpc = { ...upstream.rpc, on(method, handler) {
+      const dispose = upstream.rpc.on(method, handler);
       for (const event of buffered) if (event.method === method) handler(event.params);
       return dispose;
     } };
@@ -375,7 +394,8 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
     live = true;
     for (const event of buffered) handle(event.method, event.params);
     buffered.length = 0;
-    const run = await Promise.race([waiting, failure]);
+    const final = await Promise.race([waiting, failure]);
+    const run = final ? upstream.apply(final) : final;
     // 订阅子线程的请求有自身期限，取消与断线经 failure 收束。
     if (switching) await Promise.race([switching, failure]);
     const model = await Promise.race([readThreadModel(ctx, ref, async () => rpc, snapshot.thread.model), failure]);
@@ -386,7 +406,7 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
     ctx.out.resultJson({ terminal: true, status: run?.status ?? null, runId, ...model,
       ...(hasConvergence ? { result: resultTurn(run)?.output ?? "", ...convergenceFields(run), ...selectedResultFields(run) } : {}) });
     return 0 as const;
-  } finally { finished = true; off(); close(); convergence.dispose(); buffered.length = 0; }
+  } finally { finished = true; off(); close(); convergence.dispose(); upstream.dispose(); buffered.length = 0; }
 }
 
 export const show: CommandHandler = async (ctx) => {

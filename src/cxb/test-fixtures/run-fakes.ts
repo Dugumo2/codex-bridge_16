@@ -88,5 +88,5 @@ export function modelSummary(run: RunResult): RunModelSummary {
     startConfirmation: run.startConfirmation ?? { confirmed: false, owned: null, threadId: null, turnId: null },
     meta: run.meta ? { source: run.meta.source, model: run.meta.model ?? null, effort: run.meta.effort ?? null } : null,
     currentTurnId: run.currentTurnId ?? null, lastTurn: last ? { turnId: last.turnId, reroute: last.reroute ?? null } : null,
-    pendingReroute: run.pendingReroute ?? null };
+    pendingReroute: run.pendingReroute ?? null, ...(run.upstreamError ? { upstreamError: run.upstreamError } : {}) };
 }
