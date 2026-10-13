@@ -70,6 +70,9 @@ impl Drop for Temp {
 
 pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
+        upstream_error: None,
+        diagnostic_revision: 0,
+        last_progress_at: None,
         final_turn_id: None,
         auto_turns_started: None,
         subagent_join: None,

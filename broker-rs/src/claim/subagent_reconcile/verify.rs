@@ -21,6 +21,18 @@ impl Machine {
         {
             return;
         }
+        // 只给仍属原请求身份的运行补诊断，不替换汇总状态机的提交判定。
+        if let Err(error) = &result {
+            if context.token.as_ref() == Some(&token.claim) && self.reconcile_token_current(token) {
+                self.run_rpc_error(&token.run_id, &token.claim.thread_id, error, actions);
+            }
+        }
+        let pending = self
+            .runs
+            .reconciliation
+            .operations
+            .get_mut(&op_id.0)
+            .unwrap();
         pending.reply_received = true;
         if pending
             .operation

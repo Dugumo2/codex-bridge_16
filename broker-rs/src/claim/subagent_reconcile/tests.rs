@@ -18,6 +18,78 @@ use crate::relations::{
 use crate::runs::{OutputSource, ReleaseKind, RunOpen};
 use serde_json::json;
 
+#[test]
+fn 上游报错汇总启动失败只写诊断且不新增轮次或改变协调字段() {
+    let (mut machine, token) = fixture(1);
+    let (_, request) = start(&mut machine, &token);
+    let before = machine.runs.runs[R].clone();
+    let mut actions = vec![];
+    machine.subagent_reconcile_reply(
+        &request,
+        Err(json!({"code":-32603,"message":"汇总认证失败",
+            "data":{"codexErrorInfo":"unauthorized"}})),
+        &mut actions,
+    );
+    let record = &machine.runs.runs[R];
+    let diagnostic = record.upstream_error.as_ref().unwrap();
+    assert_eq!(
+        diagnostic.source,
+        crate::runs::upstream_error::UpstreamErrorSource::RpcResponse
+    );
+    assert_eq!(diagnostic.will_retry, None);
+    assert_eq!(
+        diagnostic.category,
+        crate::runs::upstream_error::UpstreamErrorCategory::Authentication
+    );
+    assert_eq!(record.subagent_join, before.subagent_join);
+    assert_eq!(record.run_budget, before.run_budget);
+    assert_eq!(record.auto_turns_started, before.auto_turns_started);
+    assert_eq!(record.turns, before.turns);
+    assert_eq!(record.turns_total, before.turns_total);
+    assert_eq!(record.execution_config, before.execution_config);
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, Action::Store(crate::store::StoreOp::PutRun(_)))));
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, Action::Send {message,..}
+        if message["method"] == "broker/run/updated")));
+}
+
+#[test]
+fn 上游报错通知不改变汇总预算或自动轮计数() {
+    let (mut machine, token) = fixture(1);
+    own_start(
+        &mut machine,
+        &token,
+        "当前轮",
+        TurnOrigin::SubagentReconcile,
+    );
+    machine.claims.get_mut(T).unwrap().state = State::Running {
+        owner: Owner::Client(1),
+        turn_id: "当前轮".into(),
+        joined: false,
+    };
+    machine.run_turn_started(R, T, "当前轮", &mut vec![]);
+    let before = machine.runs.runs[R].clone();
+    let diagnostic = crate::runs::upstream_error::UpstreamError::from_error(
+        T,
+        Some("当前轮"),
+        crate::runs::upstream_error::UpstreamErrorSource::ErrorNotification,
+        &json!({"message":"认证失败","codexErrorInfo":"unauthorized"}),
+        Some(true),
+        1_000,
+    );
+    machine.run_diagnostic_event(T, "当前轮", false, Some(diagnostic), false, &mut vec![]);
+    let record = &machine.runs.runs[R];
+    assert!(record.upstream_error.is_some());
+    assert_eq!(record.subagent_join, before.subagent_join);
+    assert_eq!(record.run_budget, before.run_budget);
+    assert_eq!(record.auto_turns_started, before.auto_turns_started);
+    assert_eq!(record.execution_config, before.execution_config);
+    assert_eq!(record.turns, before.turns);
+}
+
 pub(crate) const R: &str = "运行B";
 pub(crate) const T: &str = "父线程B";
 pub(crate) fn fixture(count: usize) -> (Machine, ConvergeToken) {

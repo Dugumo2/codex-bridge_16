@@ -241,7 +241,13 @@ impl Machine {
                 .runs
                 .runs
                 .values()
-                .filter(|run| ids.contains(run.thread_id.as_str()))
+                .filter(|run| {
+                    ids.contains(run.thread_id.as_str())
+                        || run
+                            .review_thread_id
+                            .as_deref()
+                            .is_some_and(|thread| ids.contains(thread))
+                })
                 .map(|run| run.model_summary())
                 .collect();
             ok(&request, json!({"runs":runs}), actions);
@@ -1005,6 +1011,48 @@ impl Machine {
     pub(crate) fn send_ext(&self, conn: ConnId, message: Value, actions: &mut Vec<Action>) {
         if self.cxb_conns.contains(&conn) {
             actions.push(Action::Send { conn, message });
+        }
+    }
+
+    /// 在认领删除或迁移之前取收件人，诊断仅通过扩展连接发送。
+    pub(crate) fn notify_run_updated(&self, run: &str, actions: &mut Vec<Action>) {
+        let Some(record) = self.runs.runs.get(run) else {
+            return;
+        };
+        let mut recipients = self.run_recipients(run);
+        for thread in
+            std::iter::once(record.thread_id.as_str()).chain(record.review_thread_id.as_deref())
+        {
+            let owner = self
+                .claims
+                .get(thread)
+                .filter(|claim| claim.run_id.as_deref() == Some(run))
+                .and_then(|_| self.owner_conn(thread));
+            for conn in owner.into_iter().chain(
+                self.records
+                    .get(thread)
+                    .into_iter()
+                    .flat_map(|record| record.watchers.iter().copied()),
+            ) {
+                if !recipients.contains(&conn) {
+                    recipients.push(conn);
+                }
+            }
+        }
+        let message = proto::notification(
+            "broker/run/updated",
+            Some(json!({
+                "runId": run,
+                "threadId": record.thread_id,
+                "diagnosticRevision": record.diagnostic_revision,
+                "upstreamError": record.upstream_error,
+                "lastProgressAt": record.last_progress_at,
+                "state": record.state,
+                "status": record.status,
+            })),
+        );
+        for conn in recipients {
+            self.send_ext(conn, message.clone(), actions);
         }
     }
 

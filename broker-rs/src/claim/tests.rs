@@ -9,6 +9,7 @@ mod resume;
 mod review;
 mod runs;
 mod settlement;
+mod upstream_error;
 
 fn apply(machine: &mut Machine, event: Event) -> Vec<Action> {
     let (next, mut actions) = step(std::mem::take(machine), event);

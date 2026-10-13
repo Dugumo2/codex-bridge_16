@@ -4,9 +4,14 @@
 //! 字段名按线上约定用 camelCase。字段只增不改：相对 2.3 节新增 `progress.doneTotal` 与 `stopCheck`，
 //! 见 S1-评审.md 第 20 节。
 
+use super::upstream_error::UpstreamError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
 
 pub type RunId = String;
 pub type ShortId = String;
@@ -199,6 +204,13 @@ pub struct Progress {
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_error: Option<UpstreamError>,
+    /// 只随上游报错或最近进展变化递增，与存储和协调版本独立。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub diagnostic_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_turns_started: Option<u32>,
@@ -262,6 +274,8 @@ pub struct RunRecord {
 #[serde(rename_all = "camelCase")]
 pub struct RunModelSummary<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_error: Option<&'a UpstreamError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub final_turn_id: Option<&'a str>,
     pub run_id: &'a str,
     pub thread_id: &'a str,
@@ -293,6 +307,7 @@ pub struct ModelTurn<'a> {
 impl RunRecord {
     pub fn model_summary(&self) -> RunModelSummary<'_> {
         RunModelSummary {
+            upstream_error: self.upstream_error.as_ref(),
             final_turn_id: self.final_turn_id.as_deref(),
             run_id: &self.run_id,
             thread_id: &self.thread_id,
