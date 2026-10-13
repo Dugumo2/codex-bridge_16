@@ -1121,19 +1121,18 @@ fn 有界批次形状与活动范围二次核实() {
 }
 #[test]
 fn 预算补核实有总窗_不重复发请求且失败不准入() {
-    let (mut m, mut mock) = setup();
-    m.convergences.test_budget = Some(BudgetAdmission::NeedsVerification);
-    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
-    complete(&mut m, &mut mock, "子", "子轮", "completed");
+    let (mut m, mut mock, verification) = setup_missing_budget();
+    complete(&mut m, &mut mock, "预算子", "预算子轮", "completed");
+    notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
     complete(&mut m, &mut mock, P, T, "completed");
     discover(&mut m, true);
-    let at = m.convergences.progress[R].budget_verify_started.unwrap();
     retry(&mut m);
     discover(&mut m, true);
     assert!(!join(&m).automatic_control_revoked);
     retry(&mut m);
     discover(&mut m, true);
-    assert!(m.clock.mono_ms >= at + 20_000);
+    assert!(m.clock.mono_ms >= verification.deadline_mono_ms);
+    assert!(m.take_budget_verification(&verification.token).is_none());
     assert_eq!(
         join(&m).terminal_reason,
         Some(TerminalReason::BudgetIncomplete)
@@ -1929,4 +1928,95 @@ fn 首轮仅初始输入重复或全文回放仍可按需启用() {
         assert!(!join(&m).automatic_control_revoked);
         assert!(!m.loop_guards[R].user_input_seen());
     }
+}
+
+fn setup_missing_budget() -> (
+    Machine,
+    SubagentMock,
+    crate::runs::budget::BudgetVerification,
+) {
+    let (mut m, mut mock) = setup();
+    m.convergences.test_budget = None;
+    notify(
+        &mut m,
+        "thread/goal/updated",
+        json!({"threadId":P,"goal":{"id":"预算goal","status":"active","tokenBudget":100000,"tokensUsed":10}}),
+    );
+    mock.register("预算子", Some(P), "v1", false, true);
+    let (started, completed) = SubagentMock::v1_spawn(P, T, "预算派生", "预算子", false);
+    let out = apply(&mut m, started);
+    let verification = out
+        .iter()
+        .find_map(|a| match a {
+            Action::Request(c) => match &c.operation {
+                crate::claim::Operation::GoalRead { inner, .. } => match inner.as_ref() {
+                    crate::claim::Operation::BudgetVerify { verification } => {
+                        Some(verification.clone())
+                    }
+                    _ => None,
+                },
+                crate::claim::Operation::BudgetVerify { verification } => {
+                    Some(verification.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("真实预算缺口登记并领取一次核实请求");
+    assert!(out.iter().any(|a| matches!(
+        a,
+        Action::Schedule {
+            kind: TimerKind::BudgetVerifyDeadline { .. },
+            delay_ms: 20_000,
+            ..
+        }
+    )));
+    apply(&mut m, completed);
+    apply(&mut m, mock.turn_started("预算子", "预算子轮"));
+    notify(&mut m, "thread/goal/cleared", json!({"threadId":"预算子"}));
+    assert_eq!(
+        m.reconcile_budget_admission(&verification.token),
+        BudgetAdmission::NeedsVerification
+    );
+    assert!(m.take_budget_verification(&verification.token).is_none());
+    (m, mock, verification)
+}
+
+#[test]
+fn 预算到期不经合并goal准入中断工作父轮() {
+    let (mut m, mut mock, verification) = setup_missing_budget();
+    complete(&mut m, &mut mock, "预算子", "预算子轮", "completed");
+    complete(&mut m, &mut mock, P, T, "completed");
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":"工作goal轮","status":"inProgress","items":[]}}),
+    );
+    assert_eq!(
+        m.reconcile_goal_target(&verification.token).as_deref(),
+        Some("工作goal轮")
+    );
+    discover(&mut m, true);
+    assert!(crate::relations::convergence::settled(
+        &m.convergence_facts(R).unwrap()
+    ));
+    for _ in 0..2 {
+        retry(&mut m);
+        discover(&mut m, true);
+    }
+    assert!(m.clock.mono_ms >= verification.deadline_mono_ms);
+    assert!(m.budget_verification_expired(&verification.token));
+    assert!(matches!(m.claims[P].state, State::Running { .. }));
+    assert_eq!(join(&m).terminal_reason, None);
+    assert!(m.tree_for_run(R).is_none());
+    assert!(m.convergences.progress[R].reading.is_none());
+    assert!(m.convergences.progress[R].operations.is_empty());
+    m.convergence_timer(
+        TimerKind::BudgetVerifyDeadline {
+            token: verification.token,
+        },
+        &mut vec![],
+    );
+    assert!(matches!(m.claims[P].state, State::Running { .. }));
+    assert!(!join(&m).automatic_control_revoked);
 }

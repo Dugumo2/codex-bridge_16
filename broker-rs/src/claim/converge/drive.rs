@@ -567,23 +567,8 @@ impl Machine {
                 return;
             }
             BudgetAdmission::NeedsVerification => {
-                if self.convergences.progress[run]
-                    .budget_verify_started
-                    .is_some_and(|at| self.clock.mono_ms.saturating_sub(at) >= 20_000)
-                {
-                    self.convergence_fail(run, TerminalReason::BudgetIncomplete, actions);
-                } else {
-                    if self.convergences.progress[run]
-                        .budget_verify_started
-                        .is_none()
-                    {
-                        self.convergences
-                            .progress
-                            .get_mut(run)
-                            .unwrap()
-                            .budget_verify_started = Some(self.clock.mono_ms);
-                        self.verify_run_budget(&runtime.token, actions);
-                    }
+                self.verify_run_budget(&runtime.token, actions);
+                if !self.convergence_budget_timeout(&runtime.token, actions) {
                     self.convergence_retry(run, actions);
                 }
                 return;
@@ -728,16 +713,7 @@ impl Machine {
     pub fn convergence_timer(&mut self, kind: TimerKind, actions: &mut Vec<Action>) {
         match kind {
             TimerKind::BudgetVerifyDeadline { token } => {
-                // 预算不完整只阻止新开自动汇总：父轮仍在工作时到期不终止，留给收敛准入判定。
-                if self.convergence_token_current(&token)
-                    && self.budget_verification_expired(&token)
-                    && matches!(
-                        self.claims.get(&token.claim.thread_id).map(|c| &c.state),
-                        Some(State::Converging { .. })
-                    )
-                {
-                    self.convergence_fail(&token.run_id, TerminalReason::BudgetIncomplete, actions);
-                }
+                self.convergence_budget_timeout(&token, actions);
             }
             TimerKind::ConvergeDeadline { token } => {
                 if self.convergence_token_current(&token)
@@ -781,8 +757,7 @@ impl Machine {
 
     fn convergence_deadline(&mut self, run: &str, actions: &mut Vec<Action>) {
         let token = self.convergences.runs[run].token.clone();
-        if self.budget_verification_expired(&token) {
-            self.convergence_fail(run, TerminalReason::BudgetIncomplete, actions);
+        if self.convergence_budget_timeout(&token, actions) {
             return;
         }
         if self

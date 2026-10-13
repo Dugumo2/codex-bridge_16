@@ -4,6 +4,25 @@ use crate::claim::{Operation, RequestContext};
 use serde_json::{json, Value};
 
 impl Machine {
+    /// 预算缺口只在父轮之间的收敛等待中终止；所有入口共用核实任务的原截止。
+    pub(super) fn convergence_budget_timeout(
+        &mut self,
+        token: &ConvergeToken,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        if !self.convergence_token_current(token)
+            || !matches!(
+                self.claims.get(&token.claim.thread_id).map(|c| &c.state),
+                Some(State::Converging { .. })
+            )
+            || !self.budget_verification_expired(token)
+        {
+            return false;
+        }
+        self.convergence_fail(&token.run_id, TerminalReason::BudgetIncomplete, actions);
+        true
+    }
+
     pub(crate) fn initial_convergence_budget(&self, thread: &str) -> Option<RunBudget> {
         let goal = self.convergences.goal_evidence.get(thread)?;
         let limit = goal.get("tokenBudget")?.as_u64()?;
