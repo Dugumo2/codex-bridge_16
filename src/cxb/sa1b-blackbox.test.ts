@@ -148,7 +148,8 @@ for (const size of ["多字节8KiB", "总64KiB", "超大批次", "输出不可�
     } else await h.finish(`C${i}`, `${i}：` + "汉字😀".repeat(size === "超大批次" ? 100 : 3000));
   }
   if (size === "输出不可读") await h.control("fault", { method: "thread/items/list", threadId: "C0", mode: "error" });
-  await h.finish(P); const { request, turn } = await summary(h, [], 15000); expect(Buffer.byteLength(text(request))).toBeLessThanOrEqual(65536);
+  // 180 个子代理逐个读结果再打包，满载下可超过 15 秒；设计期限为 60 秒（timeoutMs），等待放宽到 45 秒仍在期限内。
+  await h.finish(P); const { request, turn } = await summary(h, [], 45000); expect(Buffer.byteLength(text(request))).toBeLessThanOrEqual(65536);
   expect(text(request)).not.toContain("\uFFFD");
   const before = await h.record(); const coverage = before.subagentJoin.resultCoverage;
   expect(coverage.available + coverage.unavailable + coverage.omitted).toBe(coverage.total);
