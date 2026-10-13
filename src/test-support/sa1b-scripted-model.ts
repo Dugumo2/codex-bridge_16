@@ -19,13 +19,24 @@ export const EVIDENCE_HEAD = "请继续完成原任务，核实下列子代理�
 
 /** 模型请求里的用户消息文本（字符串或 input_text 分段）。 */
 function userTexts(body: any): string[] {
-  return (body?.input ?? []).filter((item: any) => item?.role === "user").flatMap((item: any) =>
-    typeof item.content === "string" ? [item.content] : (item.content ?? []).map((part: any) => part?.text ?? ""));
+  return (body?.input ?? []).filter((item: any) => item?.role === "user").map((item: any) =>
+    typeof item.content === "string" ? item.content : (item.content ?? []).filter((part: any) => part?.type === "input_text").map((part: any) => part.text ?? "").join("\n"));
 }
 
 /** 标记必须出现在本次汇总证据包内；子代理完成通知等其他位置的同一标记不算证据包送达。 */
-export function markerInEvidence(body: any, marker: string): boolean {
-  return userTexts(body).some((text) => text.includes(EVIDENCE_HEAD) && text.slice(text.indexOf(EVIDENCE_HEAD)).includes(marker));
+export function markerInEvidence(body: any, marker: string, expected?: { threadId: string; turnId: string }): boolean {
+  const current = userTexts(body).findLast(text => text.includes(EVIDENCE_HEAD));
+  if (!current) return false;
+  // 证据包每行一个活动 JSON，提示和覆盖统计不是活动输出；历史证据包也不能补齐本次缺项。
+  return current.slice(current.indexOf(EVIDENCE_HEAD)).split(/\r?\n/).some(line => {
+    let item: any;
+    try { item = JSON.parse(line); } catch { return false; }
+    return typeof item?.key?.threadId === "string" && Number.isSafeInteger(item.key.activitySeq)
+      && typeof item.key.turnId === "string" && item.locator?.threadId === item.key.threadId
+      && item.locator?.turnId === item.key.turnId
+      && (!expected || (item.key.threadId === expected.threadId && item.key.turnId === expected.turnId))
+      && typeof item.output === "string" && item.output.includes(marker);
+  });
 }
 
 export function createScriptedModel(options: ScriptedOptions) {
