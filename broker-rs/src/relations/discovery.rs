@@ -479,9 +479,16 @@ impl Machine {
         let mut members = BTreeMap::new();
         let mut counted = 0usize;
         for (thread, edge) in &all {
+            if let DiscoveryScope::Run { run_id } = &scope {
+                if self.rejected_followup_for_run(run_id, thread) {
+                    continue;
+                }
+            }
             // 收敛按运行归属筛选；显式整树停止仍保留原来的历史血缘清理范围。
             if let DiscoveryCaller::Converge { token, .. } = &caller {
-                if self.historical_subagent_for_run(&token.run_id, thread) {
+                if self.historical_subagent_for_run(&token.run_id, thread)
+                    || self.rejected_followup_for_run(&token.run_id, thread)
+                {
                     continue;
                 }
             }
@@ -683,7 +690,9 @@ impl Machine {
         let work = &self.relations.aux.work[&op_id];
         // ancestor/list 已按根过滤；loaded/list 的未知线程必须沿血缘验证。
         for (thread, edge) in work.found.iter().chain(work.read_edges.iter()) {
-            if self.historical_subagent_for_run(&token.run_id, thread) {
+            if self.historical_subagent_for_run(&token.run_id, thread)
+                || self.rejected_followup_for_run(&token.run_id, thread)
+            {
                 continue;
             }
             let mut parent = edge.parent_thread_id.clone();

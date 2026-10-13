@@ -278,14 +278,23 @@ impl Machine {
             .operation
             .verify_deadline_mono_ms
             .ok_or(ReconcileRefusal::InvalidBatch)?;
-        if pending.expired || self.clock.mono_ms >= deadline {
-            return Err(ReconcileRefusal::Deadline);
-        }
         if !pending.operation.outcome_unknown {
             return Err(ReconcileRefusal::AlreadyDelivered);
         }
         if pending.operation.automatic_control_revoked {
             return Err(ReconcileRefusal::Abandoned);
+        }
+        if pending.expired || self.clock.mono_ms >= deadline {
+            // 截止可能先于计时事件到达。先迁移核实身份，再以当前代际收尾；
+            // 不补登输入、不重发，也不刷新原提交的任何事实或期限。
+            self.runs
+                .reconciliation
+                .operations
+                .get_mut(&id.0)
+                .expect("原操作仍在")
+                .verify_token = token.clone();
+            self.expire_reconciliation(id, actions);
+            return Err(ReconcileRefusal::Deadline);
         }
         if pending.verify_token == *token {
             return Ok(());
@@ -320,6 +329,19 @@ impl Machine {
         current.next_verify = self.clock.mono_ms;
         self.verify_reconciliation(id, actions);
         Ok(())
+    }
+
+    fn expire_reconciliation(&mut self, id: ReconcileOpId, actions: &mut Vec<Action>) {
+        let pending = self.runs.reconciliation.operations[&id.0].clone();
+        if let Some(read) = pending.status_read {
+            self.cancel_status_read(read, actions);
+        }
+        let current = self.runs.reconciliation.operations.get_mut(&id.0).unwrap();
+        current.expired = true;
+        current.status_read = None;
+        current.operation.automatic_control_revoked = true;
+        // 未知副作用继续阻塞 settled，不把期限到当成明确未提交。
+        self.reconcile_abnormal(&pending.verify_token, TerminalReason::WakeUnknown, actions);
     }
 
     /// A 在 step 末尾驱动；发送前再次检查撤权、版本和额度，登记先于 Request。
@@ -405,19 +427,7 @@ impl Machine {
                         .is_some_and(|d| self.clock.mono_ms >= d)
                     {
                         if !pending.expired {
-                            if let Some(read) = pending.status_read {
-                                self.cancel_status_read(read, actions);
-                            }
-                            let p = self.runs.reconciliation.operations.get_mut(&id).unwrap();
-                            p.expired = true;
-                            p.status_read = None;
-                            p.operation.automatic_control_revoked = true;
-                            // 未知副作用继续阻塞 settled，不把期限到当成明确未提交。
-                            self.reconcile_abnormal(
-                                &pending.verify_token,
-                                TerminalReason::WakeUnknown,
-                                actions,
-                            );
+                            self.expire_reconciliation(ReconcileOpId(id), actions);
                         }
                     } else if self.clock.mono_ms >= pending.next_verify {
                         self.verify_reconciliation(ReconcileOpId(id), actions);

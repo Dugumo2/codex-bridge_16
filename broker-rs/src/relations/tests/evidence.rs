@@ -232,6 +232,104 @@ fn 旧子线程在父新运行开始后才发事件不误绑_同一子代理被�
     assert_eq!(bound(&m, C, "子轮1"), None, "已结算的绑定随运行退役");
 }
 
+fn 二审跟进夹具() -> (Machine, SubagentMock) {
+    let (mut m, mock) = setup(false);
+    assert!(
+        m.enable_convergence(crate::claim::converge::ConvergenceReadiness {
+            trusted_inputs: true,
+            budget_admission: true,
+            asynchronous_results: true,
+            terminal_mapping: true,
+            cancellation_verified: true,
+        })
+    );
+    m.ensure_context(R);
+    (m, mock)
+}
+
+#[test]
+fn 二审_r1_独立认领与未知线程不纳管且清除pending() {
+    for mode in [
+        "独立认领",
+        "未知线程",
+        "其他父线程",
+        "非子代理",
+        "其他运行绑定",
+    ] {
+        let (mut m, mut mock) = 二审跟进夹具();
+        if mode != "未知线程" {
+            mock.register(
+                C,
+                Some(if mode == "其他父线程" {
+                    "其他父"
+                } else {
+                    P
+                }),
+                "v1",
+                false,
+                true,
+            );
+            let event = mock.thread_started(C);
+            mock.inject(&mut m, event);
+        }
+        if mode == "独立认领" {
+            m.claims
+                .insert(C.into(), claim(Owner::Client(2), "独立轮", "独立运行", 9));
+        }
+        if mode == "非子代理" {
+            m.relations.edges.get_mut(C).unwrap().kind = RelationKind::ReviewExecution;
+        }
+        if mode == "其他运行绑定" {
+            m.relations.bindings.insert(
+                (C.into(), "其他轮".into()),
+                ActivityBinding {
+                    thread_id: C.into(),
+                    turn_id: "其他轮".into(),
+                    run_id: "其他运行".into(),
+                    parent_thread_id: P.into(),
+                    evidence: BindingEvidence::V1Spawn,
+                    operation: EvidenceKey {
+                        parent_thread_id: P.into(),
+                        parent_turn_id: "旧父轮".into(),
+                        item_id: "旧操作".into(),
+                    },
+                    status: BindingStatus::Bound,
+                },
+            );
+        }
+        let (started, completed) = SubagentMock::v1_message("sendInput", P, T, "跟进", C, false);
+        run(&mut m, &mut mock, vec![started, completed]);
+        let event = mock.turn_started(C, "跟进轮");
+        mock.inject(&mut m, event);
+        m.convergence_sync_facts(R);
+        assert!(
+            !m.manage_context(R).unwrap().members.contains_key(C),
+            "{mode}"
+        );
+        assert_eq!(bound(&m, C, "跟进轮"), None, "{mode}");
+        assert!(m.convergences.ledgers[R].pending.is_empty(), "{mode}");
+        assert!(!m.relations.aux.spawn_waits.contains_key(C), "{mode}");
+    }
+}
+
+#[test]
+fn 二审_r1_索引恢复血缘后跟进可以纳管() {
+    let (mut m, mut mock) = 二审跟进夹具();
+    let (mut old, mut old_mock) = setup(false);
+    spawn_v1(&mut old, &mut old_mock, C, "旧派生", "旧子轮");
+    m.runs.index = old.runs.index.clone();
+    assert!(m.runs.index.threads.values().any(|e| e.thread_id == C));
+    assert!(m.relations.edges.is_empty());
+    assert_eq!(m.thread_relation(C).unwrap().parent_thread_id, P);
+    let (started, completed) = SubagentMock::v1_message("sendInput", P, T, "跟进", C, false);
+    run(&mut m, &mut mock, vec![started, completed]);
+    let event = mock.turn_started(C, "跟进轮");
+    mock.inject(&mut m, event);
+    m.convergence_sync_facts(R);
+    assert_eq!(bound(&m, C, "跟进轮").as_deref(), Some(R));
+    assert!(m.convergences.ledgers[R].pending.is_empty());
+}
+
 #[test]
 fn 已绑定子线程派生的孙线程继承运行并保留直接父边() {
     let (mut m, mut mock) = setup(false);
@@ -535,4 +633,84 @@ fn 修复6_运行退役清理绑定与成员证据_等待写入及清理屏障()
     let (_, late) = SubagentMock::v1_spawn(P, T, "派生1", C, false);
     mock.inject(&mut m, late);
     assert!(m.relations.bindings.is_empty());
+}
+
+#[test]
+fn 二审_r2_interacted晚于新轮开始仍绑定并清除pending() {
+    let (mut m, mut mock) = 二审跟进夹具();
+    mock.register(C, Some(P), "v2", false, true);
+    let event = mock.thread_started(C);
+    mock.inject(&mut m, event);
+    let event = mock.turn_completed(C, "历史轮", "completed");
+    mock.inject(&mut m, event);
+    let event = mock.turn_started(C, "跟进轮");
+    mock.inject(&mut m, event);
+    let (started, completed) = SubagentMock::v2_activity("interacted", P, T, "跟进", C);
+    run(&mut m, &mut mock, vec![started, completed]);
+    m.convergence_sync_facts(R);
+    assert_eq!(bound(&m, C, "跟进轮").as_deref(), Some(R));
+    assert_eq!(bound(&m, C, "历史轮"), None);
+    assert!(m.convergences.ledgers[R].pending.is_empty());
+    assert!(
+        !m.relations.aux.spawn_waits.contains_key(C),
+        "双通知不得重新挂起已配对操作"
+    );
+    let event = mock.turn_completed(C, "跟进轮", "completed");
+    mock.inject(&mut m, event);
+    m.convergence_observe_goal(C, false, &mut vec![]);
+    m.convergence_sync_facts(R);
+    assert!(m.convergences.ledgers[R]
+        .activities
+        .iter()
+        .all(|a| a.verified && a.activity == MemberActivity::Settled));
+}
+
+#[test]
+fn 二审_r2_sendinput并入已有自有活动轮清除pending且保留原绑定() {
+    let (mut m, mut mock) = 二审跟进夹具();
+    spawn_v1(&mut m, &mut mock, C, "派生", "既有活动轮");
+    let original = m.binding(C, "既有活动轮").unwrap();
+    for item in ["跟进一", "跟进二"] {
+        let (started, completed) = SubagentMock::v1_message("sendInput", P, T, item, C, false);
+        run(&mut m, &mut mock, vec![started, completed]);
+        m.convergence_sync_facts(R);
+        assert_eq!(m.binding(C, "既有活动轮").unwrap(), original);
+        assert!(m.convergences.ledgers[R].pending.is_empty(), "{item}");
+        assert!(!m.relations.aux.spawn_waits.contains_key(C));
+    }
+    let event = mock.turn_completed(C, "既有活动轮", "completed");
+    mock.inject(&mut m, event);
+    m.convergence_observe_goal(C, false, &mut vec![]);
+    m.convergence_sync_facts(R);
+    assert_eq!(m.convergences.ledgers[R].activities.len(), 1);
+    assert!(m.convergences.ledgers[R].activities[0].verified);
+    assert_eq!(
+        m.convergences.ledgers[R].activities[0].activity,
+        MemberActivity::Settled
+    );
+}
+
+#[test]
+fn 二审_r2_历史完成轮不当新工作且多个活动轮不猜测() {
+    for ambiguous in [false, true] {
+        let (mut m, mut mock) = 二审跟进夹具();
+        mock.register(C, Some(P), "v2", false, true);
+        let event = mock.thread_started(C);
+        mock.inject(&mut m, event);
+        let event = mock.turn_completed(C, "历史轮", "completed");
+        mock.inject(&mut m, event);
+        if ambiguous {
+            for turn in ["活动一", "活动二"] {
+                let event = mock.turn_started(C, turn);
+                mock.inject(&mut m, event);
+            }
+        }
+        let (started, completed) = SubagentMock::v2_activity("interacted", P, T, "跟进", C);
+        run(&mut m, &mut mock, vec![started, completed]);
+        m.convergence_sync_facts(R);
+        assert_eq!(bound(&m, C, "历史轮"), None);
+        assert_eq!(bound(&m, C, "活动一"), None);
+        assert_eq!(bound(&m, C, "活动二"), None);
+        assert_eq!(m.convergences.ledgers[R].pending.len(), 1);
+    }
 }

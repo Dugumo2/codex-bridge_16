@@ -152,8 +152,11 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
         const value = child.version === "v1"
           ? { type: "collabAgentToolCall", id: `reuse-${++serial}`, tool: "sendInput", status: "completed", senderThreadId: parent.id, receiverThreadIds: [child.id], agentsStates: {} }
           : { type: "subAgentActivity", id: `reuse-${++serial}`, kind: "interacted", agentThreadId: child.id, agentPath: `/root/${child.id}` };
+        // 上游先提交消息后通知 interacted；也支持 sendInput 并入既有轮、不再开轮。
+        let turn = p.open === false ? child.turns.at(-1) : p.order === "turnFirst" ? start(child) : undefined;
         notify("item/started", { threadId: parent.id, turnId: pt.id, item: value }); item(parent, pt, value);
-        const turn = p.open === false ? child.turns.at(-1) : start(child); reply(msg.id, { turnId: turn?.id }); break;
+        if (p.open !== false && !turn) turn = start(child);
+        reply(msg.id, { turnId: turn?.id }); break;
       }
       case "turn": {
         if (!t) throw new Error("turn 缺 threadId");

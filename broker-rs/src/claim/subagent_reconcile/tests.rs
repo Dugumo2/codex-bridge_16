@@ -1174,3 +1174,96 @@ fn 集成_真实开始后空条目页只等待输入落盘不判外部轮() {
     );
     assert_eq!(submissions(&actions), 0);
 }
+
+#[test]
+fn 二审_r3_核实截止已到但到期事件未处理时先detach立即wakeunknown() {
+    for late_by in [0, 1] {
+        let (mut m, old) = fixture(1);
+        let (id, request) = start(&mut m, &old);
+        let original = m.runs.reconciliation.operations[&id.0].clone();
+        let old_read = original.status_read.expect("原核实读取在途");
+        m.enable_convergence(crate::claim::converge::ConvergenceReadiness {
+            trusted_inputs: true,
+            budget_admission: true,
+            asynchronous_results: true,
+            terminal_mapping: true,
+            cancellation_verified: true,
+        });
+        m.clock.mono_ms = original.operation.verify_deadline_mono_ms.unwrap() + late_by;
+        // 只推进时钟，不投递到期事件。按实际 detach 顺序先交接管理权，再进入 G 路调用方。
+        m.claims.get_mut(T).unwrap().state = State::AwaitingContinuation {
+            owner: Owner::Broker {
+                policy: crate::policy::Policy::Never,
+                approvals_reviewer: None,
+                owned_at: m.clock.now_ms,
+                last_watcher_at: m.clock.now_ms,
+            },
+        };
+        let mut actions = vec![];
+        m.on_handoff(R, crate::relations::HandoffKind::Detach, &mut actions);
+        m.convergence_event(
+            T,
+            crate::claim::converge::ConvergeEvent::Detach,
+            &mut actions,
+        );
+        let current = m.convergences.runs[R].token.clone();
+        assert_ne!(current, old);
+        let pending = &m.runs.reconciliation.operations[&id.0];
+        assert_eq!(pending.verify_token, current);
+        assert!(pending.expired);
+        assert!(pending.status_read.is_none());
+        assert!(pending.operation.outcome_unknown, "截止不能伪造明确未提交");
+        assert_eq!(
+            pending.operation.submission,
+            ReconcileSubmission::OutcomeUnknown
+        );
+        assert!(pending.operation.automatic_control_revoked);
+        assert_eq!(pending.operation.token, original.operation.token);
+        assert_eq!(
+            pending.operation.client_user_message_id,
+            original.operation.client_user_message_id
+        );
+        assert_eq!(
+            pending.operation.verify_deadline_mono_ms,
+            original.operation.verify_deadline_mono_ms
+        );
+        assert_eq!(pending.batch, original.batch);
+        assert_eq!(
+            m.runs.runs[R]
+                .subagent_join
+                .as_ref()
+                .unwrap()
+                .terminal_reason,
+            Some(TerminalReason::WakeUnknown)
+        );
+        assert!(m.reconcile_unresolved(R));
+        assert!(m.tree_for_run(R).is_some(), "不等总期限，立即进入停树收尾");
+        assert_eq!(submissions(&actions), 0);
+        // 旧代读取、启动回包及后续驱动都不能复活自动权或重发。
+        m.subagent_reconcile_status_done(
+            StatusDone {
+                read_id: old_read,
+                thread: T.into(),
+                token: Some(old.claim.clone()),
+                caller: StatusCaller::SubagentReconcile {
+                    token: old.clone(),
+                    op_id: id,
+                },
+                result: StatusResult::Carrier("迟到轮".into()),
+            },
+            &mut actions,
+        );
+        m.subagent_reconcile_reply(&request, Ok(json!({"turn":{"id":"迟到轮"}})), &mut actions);
+        m.drive_subagent_reconcile(&mut actions);
+        assert!(!m.claims[T].owned_turns.contains("迟到轮"));
+        assert_eq!(submissions(&actions), 0);
+        assert_eq!(
+            m.runs.runs[R]
+                .subagent_join
+                .as_ref()
+                .unwrap()
+                .terminal_reason,
+            Some(TerminalReason::WakeUnknown)
+        );
+    }
+}

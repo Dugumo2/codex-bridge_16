@@ -241,12 +241,15 @@ impl Machine {
             }
             let bound = !op.receivers.is_empty()
                 && op.receivers.iter().all(|thread| {
-                    self.relations.bindings.values().any(|b| {
-                        b.run_id == run
-                            && b.thread_id == *thread
-                            && b.operation == op.key
-                            && b.status == BindingStatus::Bound
-                    })
+                    op.rejected_receivers.contains_key(thread)
+                        || self.relations.bindings.values().any(|b| {
+                            b.run_id == run
+                                && b.thread_id == *thread
+                                // 跟进可并入同一运行已绑定的活动轮；不改写原绑定的派生来源。
+                                && (b.operation == op.key
+                                    || op.proven_turns.get(thread).is_some_and(|turns| turns.contains(&b.turn_id)))
+                                && b.status == BindingStatus::Bound
+                        })
                 });
             if op.outcome == EvidenceOutcome::Failed || bound {
                 ledger.pending.remove(&op.key);
