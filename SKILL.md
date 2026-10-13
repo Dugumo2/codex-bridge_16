@@ -77,6 +77,7 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 - **`cxb run` 一断开，Codex 就被叫停**（后台任务被停、意外断开都一样），进度保存，之后用 `--continue` 接着干。要不受断开影响地长时间运行，用 `--detach` 交给 broker 托管，再 `cxb wait <线程ID>`。`run_in_background` 是 Claude Code 的后台，`--detach` 是 broker 托管，两回事。
 - 线程 ID 是 cxb 的线程短 ID（`cxb ls` 列出），**不是** Claude Code 的后台任务 ID。
 - 可以同时派多个线程并行；遇到 429、`Concurrency limit` 等限流，停下向用户报告，不自动重试。
+- 上游报错会即时出现在 stderr（不需要 `-v`）：`[cxb] 上游认证失败（HTTP 401），Codex 正在重试；已观察到 n 次。` 加一行原因。看到认证、付费、拒绝访问、用量上限类提示时，Codex 多半在空转重试：先向用户报告（凭证过期、额度用完、模型冷却等需要用户处理），不要干等到超时；需要时 `cxb stop <线程ID>`。`cxb ls` 的状态列（如 `running（上游 401×3）`）、`cxb show` 的「最近上游报错」与 JSON 的 `upstreamError` 可随时查。子代理线程上的报错目前不汇总到父运行。
 - 脚本化处理用 `--json`（stdout 只有一个 JSON 对象），按退出码和 `error.code` 分支，不解析自然语言；`-v` 把过程写到 stderr。
 
 ## 5. 待回应事项：怎么处理、谁拍板
@@ -105,7 +106,7 @@ Codex 需要人回应时，cxb 把线程交给 broker 托管、以退出码 5 �
 | 4 | 运行被中断 | 查看 `interruptReason`、`subagentJoin.terminalReason` 和停止报告；期限、归属冲突或启动不明均不算正常完成。旧记录仍可能有 `subagentsUnfinished`，是否停下须看实际停止报告；按需显式续跑 |
 | 5 | 等待回应（不是失败） | 第 5 节 |
 | 6 | broker 不可用 | `cxb doctor`；`cxb ls --local`、`cxb show <线程ID>` 读本地记录 |
-| 7 | Codex 失败 | 读 stderr；MCP 被拒就改 `--approval auto` |
+| 7 | Codex 失败 | 读 stderr 的「失败原因」行（JSON 的 `error`、`upstreamError`）；MCP 被拒就改 `--approval auto`；认证、额度类上游错误报告用户，不要原样重派 |
 | 8 | 线程被占、停止中或待核实 | 按 stderr 提示做（`cxb stop`、`cxb stop <线程> --run <runId>`、重试 `cxb rm`），不要硬重试 |
 | 9 | 目标受阻或空转刹车 | `cxb show <线程ID> --log` 看原因；继续用 `--continue [新指示]`，放弃用 `cxb stop <线程ID> --clear` |
 | 1、10、12、130、143 | 用法错误、空闲、协议不匹配、信号 | 按 stderr 处理 |
