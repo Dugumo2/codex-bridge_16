@@ -80,6 +80,11 @@ for await (const chunk of process.stdin) {
       case "thread/goal/get":
         send({ id: message.id, result: { goal: null } });
         break;
+      case "thread/list":
+      case "thread/loaded/list":
+        // 分页结果测试没有子代理；仍提供真实发现协议的明确空集合。
+        send({ id: message.id, result: { data: [], nextCursor: null } });
+        break;
       case "thread/unsubscribe":
         send({ id: message.id, result: {} });
         break;

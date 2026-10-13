@@ -5,6 +5,8 @@ import type { CommandHandler } from "./main";
 import { stopThread } from "./stop-thread";
 import { backgroundLines, stopReportLines } from "./subagents";
 import { resolveThreadViaBroker } from "./thread-ref";
+import { convergenceFields } from "./run-result";
+import { convergenceLines } from "./convergence";
 
 export const stop: CommandHandler = async (ctx) => {
   const scope = commandSession(ctx);
@@ -27,11 +29,13 @@ export const stop: CommandHandler = async (ctx) => {
     else if (result.cleanupState === "released") ctx.out.notice("本次历史停止未确认，核验已结束；不占用线程，不作周期重试。");
     else ctx.out.notice(`已发出停止，Codex 尚未确认停下；请先查看清理报告，临时故障可等待后台核实`);
     if (result.backgroundCleanup) for (const line of backgroundLines(label, result.backgroundCleanup)) ctx.out.notice(line);
+    if (result.run) for (const line of convergenceLines(result.run)) ctx.out.notice(line);
     if (ctx.parsed.options.abandon) ctx.out.notice(result.actionApplied ? "已放弃本次树清理责任；可能仍有子代理或命令在运行。请换新线程，必要时换隔离工作目录。"
       : result.reason === "alreadyAbandoned" ? "本次树清理此前已放弃，未重新启动清理。"
       : result.reason === "alreadyConfirmed" ? "该运行的树停止已经确认，无需放弃清理。" : "不存在该运行的活动树停止，未应用放弃操作。");
     ctx.out.resultJson({ ok, command: "stop", threadId: ref.threadId, shortId: ref.shortId, runId: result.runId,
       interruptSent: result.interruptSent, stopOutcome: result.stopOutcome, goal: result.goal, alreadyStopped: result.alreadyStopped,
+      ...(result.run ? convergenceFields(result.run) : {}),
       ...(result.cleanupState ? { cleanupState: result.cleanupState } : {}),
       ...(result.backgroundCleanup ? { backgroundCleanup: result.backgroundCleanup } : {}),
       ...(result.actionApplied !== undefined ? { actionApplied: result.actionApplied, reason: result.reason } : {}),

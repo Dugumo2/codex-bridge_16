@@ -1,5 +1,6 @@
 import { CxbError, EXIT, type ExitCodeForRun, type RunResult, type TurnResult, type WaitRun } from "./contracts";
 import { readRunRecord } from "./ledger";
+import { resultPending, resultTurn } from "./run-result";
 
 /** 即使被等待方不遵守期限，也必须拒绝等待；迟到拒绝由 race 接住。 */
 export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, signal?: AbortSignal): Promise<T> {
@@ -19,6 +20,10 @@ export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, sig
 }
 
 export const exitCodeForRun: ExitCodeForRun = (run) => {
+  if (run.subagentJoin) {
+    if (run.state === "lost") return EXIT.INTERRUPTED;
+    if (run.status === "failed") return EXIT.CODEX_FAILED;
+  }
   if (run.loopGuard || run.interruptReason === "goalLoop" || run.status === "goalBlocked") return EXIT.GOAL_BLOCKED_OR_LIMITED;
   if (run.status === "completed") return EXIT.OK;
   if (run.status === "failed") return EXIT.CODEX_FAILED;
@@ -40,12 +45,16 @@ export const waitRun: WaitRun = async (rpc, opts) => {
   });
   const check = () => {
     if (!current || (current.state !== "ended" && current.state !== "lost")) return;
-    const last = current.turns.at(-1);
-    const replacement = results.get(current.turnsTotal - 1);
-    if (last?.ready === "pending" && replacement?.turnId === last.turnId) {
-      current = { ...current, turns: [...current.turns.slice(0, -1), replacement] };
+    const last = resultTurn(current);
+    // 新记录按稳定 turnId 接补读；旧记录仍核对零基序号，兼容裁剪后的账本。
+    const replacement = current.finalTurnId !== undefined
+      ? [...results.values()].find((turn) => turn.turnId === current!.finalTurnId)
+      : results.get(current.turnsTotal - 1);
+    if ((resultPending(current) || !last) && replacement && replacement.turnId === (current.finalTurnId ?? last?.turnId)) {
+      current = { ...current, turns: last ? current.turns.map((turn) => turn.turnId === replacement.turnId ? replacement : turn)
+        : [...current.turns, replacement] };
     }
-    if (current.turns.at(-1)?.ready !== "pending") finish(current);
+    if (!resultPending(current)) finish(current);
   };
   const watched = new Set<string>();
   const watch = (threadId: string) => {
@@ -76,7 +85,8 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     // 旧快照不能把已经收到的终态降回 running，也不能覆盖已就绪的结果。
     if (!current || (current.state !== "ended" && current.state !== "lost")) current = run;
     else if ((run.state === "ended" || run.state === "lost") && run.turnsTotal >= current.turnsTotal
-      && run.turns.at(-1)?.ready !== "pending") current = run;
+      && (current.finalTurnId === undefined || run.finalTurnId === current.finalTurnId)
+      && !resultPending(run)) current = run;
     check();
   };
   try {

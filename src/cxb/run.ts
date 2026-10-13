@@ -20,6 +20,8 @@ import type { Output } from "./output";
 import { approvalPreflight, reportApprovalPreflight } from "./preflight";
 import { childEntry, showSubagents, subagentRefusal } from "./subagents";
 import { bounded, exitCodeForRun, waitRun } from "./wait-run";
+import { convergenceFields, resultPending, resultTurn, selectedResultFields } from "./run-result";
+import { convergenceLines, observeConvergence } from "./convergence";
 
 /** 不把上游消息直接输出，防止错误文本回显提示词或凭据。 */
 export function rpcDetail(error: unknown): { code?: number; message: string } {
@@ -350,6 +352,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       }, log() { out.progress("收到服务端请求"); } });
     };
     attach(threadId);
+    const convergence = observeConvergence(rpc, () => runId, (line) => out.notice(line));
+    disposers.push(convergence.dispose);
     let started!: (id: string) => void;
     let startFailed!: (error: unknown) => void;
     const startedPromise = new Promise<string>((resolve, reject) => { started = resolve; startFailed = reject; });
@@ -393,9 +397,10 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     disposers.push(rpc.onClose(() => disconnected(new CxbError("BROKER_UNAVAILABLE", "等待续跑定案时 broker 连接断开", { retryable: true }))));
     const startMethod = plan.command === "review" ? "review/start" : "turn/start";
     const startParams = plan.command === "review"
-      ? { threadId, target: plan.review!.target, delivery: "inline" }
+      ? { threadId, target: plan.review!.target, delivery: "inline", cxbConvergence: { timeoutMs: (options["converge-timeout"] ?? 3600) * 1000 } }
       : { threadId, input: [{ type: "text", text: continued ? continued.prompt : plan.prompt!, text_elements: [] }], clientUserMessageId: randomUUID(),
         sandboxPolicy: sandboxPolicyFor(plan.sandbox), ...(model ? { model } : {}), ...(reasoning ? { effort: reasoning } : {}), ...approval,
+        cxbConvergence: { timeoutMs: (options["converge-timeout"] ?? 3600) * 1000 },
         // 条件请求：broker 在开工那一刻核实原运行仍可续，不满足就不开工（详细设计 2.3 节「续跑的条件请求」）。
         ...(continued ? { cxbContinue: { fromRunId: continued.from.runId } } : {}) };
     type StartReply = { runId?: string; shortId?: string; reviewThreadId?: string; absorbedBy?: unknown };
@@ -429,6 +434,9 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       { signal: controller.signal, timeoutMs: Math.min(30_000, remaining() ?? 30_000) }), remaining(), controller.signal);
       if (result.outcome !== "runEnded") {
         handedOver = true;
+        // 交接不重置协调期限；订阅后取同运行快照，补齐待答／detach 的展示。
+        const view = await request<{ run?: RunResult; revision?: number } & import("./sa1b-contracts").ConvergenceSummary>("broker/threads/watch", { threadId, runId });
+        convergence.accept({ ...view.run, ...view, runId });
         const health = await request<{ survivesParentJob: boolean }>("broker/health", {});
         if (!health.survivesParentJob) out.notice("当前环境下 broker 可能随本命令所在的进程组一起退出，托管不保证可靠");
       }
@@ -439,16 +447,16 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       const transferred = await handover();
       if (transferred.outcome !== "runEnded") {
         out.result(`${threadId} ${shortId} ${runId} 运行中\n`);
-        out.resultJson({ threadId, shortId, runId, status: "running" });
+        out.resultJson({ threadId, shortId, runId, status: "running", ...convergence.fields() });
         return EXIT.OK;
       }
       // 交接恰逢运行结束：已就绪的结果直接用，否则按共用等待补全，再照常输出与退出。
       const known = transferred.result;
-      result = known && known.runId === runId && known.turns.at(-1)?.ready !== "pending" ? known
-        : await bounded(waitRun(rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir }),
+      result = known && known.runId === runId && !resultPending(known) ? known
+        : await bounded(waitRun(convergence.rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir }),
           remaining(), controller.signal);
     } else {
-      const waiting = waitRun(rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir });
+      const waiting = waitRun(convergence.rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir });
       void waiting.catch(() => {});
       const abortWait = () => waitController.abort();
       controller.signal.addEventListener("abort", abortWait, { once: true });
@@ -462,7 +470,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
           waitController.abort();
           const rendered = deps.renderPending(transferred.pending, { threadId, shortId });
           out.result(rendered.text);
-          if (rendered.json && typeof rendered.json === "object") out.resultJson(rendered.json);
+          for (const line of convergenceLines(convergence.fields(), transferred.pending.length)) out.notice(line);
+          if (rendered.json && typeof rendered.json === "object") out.resultJson({ ...rendered.json, ...convergence.fields() });
           return EXIT.WAITING_RESPONSE;
         }
         result = await bounded(waiting, remaining(), controller.signal);
@@ -471,7 +480,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     finished = true;
     const code = exitCodeForRun(result);
     showSubagents(ctx, result);
-    const last = result.turns.at(-1);
+    const last = resultTurn(result);
     if (result.loopGuard) out.notice(`自动续跑刹车：${result.loopGuard.kind === "noAction" ? "连续无动作" : "轮数上限"}，${result.loopGuard.count} 轮`);
     else if (result.interruptReason === "goalLoop") out.notice(`自动续跑刹车：goalLoop，${result.turnsTotal} 轮`);
     if (code === EXIT.CODEX_FAILED) {
@@ -492,7 +501,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     out.progress(`运行结束：${result.status ?? result.state}，耗时 ${Math.max(0, (result.endedAt ?? Date.now()) - result.startedAt)} 毫秒`);
     out.result(last?.output ?? "");
     const common = { ok: code === EXIT.OK, command: plan.command, thread: { id: result.threadId, shortId: result.shortId },
-      runId: result.runId, status: result.status ?? result.state, result: last?.output ?? "",
+      runId: result.runId, status: result.status ?? result.state, result: last?.output ?? "", ...convergenceFields(result), ...selectedResultFields(result),
       ...(result.interruptReason ? { interruptReason: result.interruptReason } : {}),
       ...(result.childrenStop ? { childrenStop: result.childrenStop, stopOutcome: result.stopOutcome } : {}),
       ...(result.loopGuard ? { loopGuard: result.loopGuard } : {}) };

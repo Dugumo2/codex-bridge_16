@@ -35,6 +35,18 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InterruptReason {
+    BudgetExhausted,
+    BudgetIncomplete,
+    ConvergeDeadline,
+    WakeLimit,
+    AutoTurnLimit,
+    DiscoveryIncomplete,
+    OwnershipConflict,
+    WakeUnknown,
+    WakeFailed,
+    GoalInactive,
+    RootNoDirectInput,
+    Abandoned,
     SubagentsUnfinished,
     ClientDisconnected,
     Stop,
@@ -142,6 +154,8 @@ pub enum OutputSource {
 #[serde(rename_all = "camelCase")]
 pub struct TurnResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::sa1b::TurnOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reroute: Option<Reroute>,
     pub turn_id: String,
     pub ready: Ready,
@@ -184,6 +198,19 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_turns_started: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_join: Option<crate::sa1b::SubagentJoin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_budget: Option<crate::sa1b::RunBudget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence_config: Option<crate::sa1b::ConvergenceConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_config: Option<crate::sa1b::RunExecutionConfig>,
+
     /// 最近一次已开始的轮次；结束不清空，旧记录不反推。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_turn_id: Option<String>,
@@ -234,6 +261,8 @@ pub struct RunRecord {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunModelSummary<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_turn_id: Option<&'a str>,
     pub run_id: &'a str,
     pub thread_id: &'a str,
     pub review_thread_id: Option<&'a str>,
@@ -264,6 +293,7 @@ pub struct ModelTurn<'a> {
 impl RunRecord {
     pub fn model_summary(&self) -> RunModelSummary<'_> {
         RunModelSummary {
+            final_turn_id: self.final_turn_id.as_deref(),
             run_id: &self.run_id,
             thread_id: &self.thread_id,
             review_thread_id: self.review_thread_id.as_deref(),
@@ -277,7 +307,7 @@ impl RunRecord {
                 effort: meta.get("effort").and_then(Value::as_str),
             }),
             current_turn_id: self.current_turn_id.as_deref(),
-            last_turn: self.turns.last().map(|turn| ModelTurn {
+            last_turn: self.selected_parent_result().map(|turn| ModelTurn {
                 turn_id: &turn.turn_id,
                 reroute: turn.reroute.as_ref(),
             }),

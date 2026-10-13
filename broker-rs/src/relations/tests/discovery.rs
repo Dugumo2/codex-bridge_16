@@ -432,3 +432,29 @@ fn 修复6_发现完成退役登记且迟到回包无效() {
     m.relations_shutdown(&mut Vec::new());
     assert!(m.relations.discoveries.is_empty());
 }
+
+#[test]
+fn 二审_r1_已拒绝跟进不会经运行发现重新纳管() {
+    let (mut m, mut mock) = setup(false);
+    m.enable_convergence(crate::claim::converge::ConvergenceReadiness {
+        trusted_inputs: true,
+        budget_admission: true,
+        asynchronous_results: true,
+        terminal_mapping: true,
+        cancellation_verified: true,
+    });
+    m.ensure_context(R);
+    mock.register(C, Some(P), "v1", false, true);
+    let event = mock.thread_started(C);
+    mock.inject(&mut m, event);
+    m.claims
+        .insert(C.into(), claim(Owner::Client(2), "独立轮", "独立运行", 9));
+    let (started, completed) = SubagentMock::v1_message("sendInput", P, T, "跟进", C, false);
+    run(&mut m, &mut mock, vec![started, completed]);
+    assert!(!m.manage_context(R).unwrap().members.contains_key(C));
+    let (id, actions) = begin(&mut m);
+    finish_simple(&mut m, &mut mock, &actions, vec![thread(C, P)], vec![]);
+    let result = m.relations.aux.results.get(&id).expect("发现完成");
+    assert!(!result.members.contains_key(C));
+    assert!(!m.manage_context(R).unwrap().members.contains_key(C));
+}

@@ -1,18 +1,18 @@
 //! 自动续跑空转刹车（S1-评审第 26 节）。
 //!
-//! 只看服务器在认领处于 AwaitingContinuation 时自开、接进同一运行的轮（自动续跑候选），按运行计数：
+//! 兼容旧的 AwaitingContinuation 自动候选路径；SA1b 启用后另纳入已确认自有汇总轮：
 //! - 刹车一：连续 [`NO_ACTION_LIMIT`] 个证据完整的自动轮都没有外部动作；
 //! - 刹车二：本次运行合格的自动轮（结算时不含用户输入；共享模式还要求证据完整）达到 [`CONTINUATION_LIMIT`]。
 //!
 //! 证据只认完整条目（completed 自带 full，或结果补读读回的 full 轮次，经 `Runs.guard_evidence` 交回）；
 //! 条目通知只能证明「有」动作或用户输入，不能证明「没有」。按开始顺序结算，前面的轮证据未到时后面的排队。
 //! 用户输入是立即生效的否决：一看到（条目通知或完整证据）就清空无动作计数、丢掉排在它之前的候选，
-//! 共享模式还当场撤销控制资格，不等按序结算。计数只在 goal 身份（目标原文＋createdAt）或状态真正变化时
-//! 整体清零；普通的用量记账更新不算。
+//! 共享模式还当场撤销控制资格，不等按序结算。goal 身份或状态真正变化只清除旧结算计数及连续无动作计数；
+//! SA1b 的 autoTurnsStarted、输入能力和预算独立保留，最后获准的第 50 轮可完成最终核实。
 //!
 //! 触发后：
-//! - 私有模式走现有停止流程（暂停 goal 并中断，`StopReason::GoalLoop`）；
-//! - 共享模式只对本次运行控制的 goal（`ThreadRecord.goal_controlled`）发 `thread/goal/set paused`，
+//! - 私有模式及已启用、授权仍有效的 SA1b 运行走现有停止流程（`StopReason::GoalLoop`）；
+//! - 旧共享模式只对本次运行控制的 goal（`ThreadRecord.goal_controlled`）发 `thread/goal/set paused`，
 //!   不中断任何轮、不重试：正在跑的轮可能是别的客户端的。控制资格只来自本 broker 的客户端把 goal
 //!   设成 active、#2e 恢复成功（回包身份与当前事实一致，且发出后资格代号未变），或已知 goal 在自有的
 //!   客户端轮内换成新的（模型自己建 goal）；goal 变为非 active、自动轮出现用户输入时撤销并推进代号，
@@ -47,6 +47,8 @@ struct PendingTurn {
 /// 一次运行的刹车状态；认领不再属于该运行时删除。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guard {
+    /// SA1b 的运行级能力与水位；goal 变化不能清除，历史恢复不能重建。
+    pub(crate) safeguards: Option<super::loop_guard_input::Safeguards>,
     pub thread: String,
     /// 本次运行合格的自动轮数（刹车二），结算时累计。
     pub continuations: u32,
@@ -58,6 +60,10 @@ pub struct Guard {
     next_seq: u64,
     /// 已触发过；同一运行只刹一次。
     pub tripped: bool,
+    /// 本运行出现过初始请求以外的真实用户输入；启用前出现则交回 SA1a 收尾。
+    user_input: bool,
+    /// 发初始请求前登记，上游回显后只豁免已确认自有首轮中的该条输入。
+    pub(crate) initial_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,8 +97,9 @@ pub struct PauseTarget {
 }
 
 impl Guard {
-    fn new(thread: &str) -> Self {
+    pub(crate) fn new(thread: &str) -> Self {
         Self {
+            safeguards: None,
             thread: thread.into(),
             continuations: 0,
             idle: Vec::new(),
@@ -100,14 +107,38 @@ impl Guard {
             auto_turns: VecDeque::new(),
             next_seq: 0,
             tripped: false,
+            user_input: false,
+            initial_client_id: None,
         }
+    }
+
+    /// SA1b 按需启用时接上的事实：已开始的自动轮总数与仍可追溯的轮次。
+    pub(crate) fn started_auto_turns(&self) -> (u32, Vec<String>) {
+        (
+            u32::try_from(self.next_seq).unwrap_or(u32::MAX),
+            self.auto_turns
+                .iter()
+                .filter(|t| !t.vetoed)
+                .map(|t| t.turn.clone())
+                .collect(),
+        )
+    }
+
+    pub(crate) fn user_input_seen(&self) -> bool {
+        self.user_input
     }
 
     /// goal 真正变化：计数整体清零，自动候选的来源记录与序号保留。
     fn reset(&mut self) {
         let auto_turns = std::mem::take(&mut self.auto_turns);
         let next_seq = self.next_seq;
+        let safeguards = self.safeguards.take();
+        let user_input = self.user_input;
+        let initial_client_id = self.initial_client_id.take();
         *self = Self::new(&self.thread);
+        self.safeguards = safeguards;
+        self.user_input = user_input;
+        self.initial_client_id = initial_client_id;
         self.auto_turns = auto_turns;
         self.next_seq = next_seq;
     }
@@ -177,7 +208,8 @@ impl Guard {
             // 共享模式拿不到完整证据就无法排除别的客户端的输入，不计入上限。
             if complete || !shared {
                 self.continuations = self.continuations.saturating_add(1);
-                if self.continuations >= CONTINUATION_LIMIT {
+                // 新路径由开始时的持久化总数准入；第 50 轮仍可完成最终核实。
+                if self.safeguards.is_none() && self.continuations >= CONTINUATION_LIMIT {
                     return Some(report(
                         LoopGuardKind::ContinuationLimit,
                         self.continuations,
@@ -238,6 +270,22 @@ impl Machine {
         if turn.is_empty() {
             return;
         }
+        // 新运行的 goal 自动轮与汇总轮共享开始计数；旧路径仍保留原结算语义。
+        if let Some(token) = self.convergences.runs.get(run).map(|r| r.token.clone()) {
+            if self
+                .safeguards(&token)
+                .is_some_and(|s| !s.counted.contains_key(turn))
+            {
+                self.register_auto_parent_turn(
+                    &token,
+                    turn,
+                    crate::sa1b::TurnOrigin::Goal,
+                    actions,
+                );
+                self.auto_turn_limit_brake(run, thread, turn, actions);
+                return;
+            }
+        }
         let guard = self
             .loop_guards
             .entry(run.into())
@@ -291,23 +339,87 @@ impl Machine {
         }
     }
 
+    /// 已启用 SA1b 的运行在续轮边界检查自动父轮绝对上限：第 50 轮允许完成，goal 仍要开第 51 轮即制动。
+    /// 旧的结算计数在启用后让位于此（启用前的轮数已接入 `autoTurnsStarted`）。
+    fn auto_turn_limit_brake(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(record) = self.runs.runs.get(run) else {
+            return;
+        };
+        let limit = record
+            .convergence_config
+            .as_ref()
+            .map_or(CONTINUATION_LIMIT, |c| c.max_auto_turns);
+        let Some(started) = record.auto_turns_started.filter(|n| *n > limit) else {
+            return;
+        };
+        let Some(guard) = self.loop_guards.get_mut(run).filter(|g| !g.tripped) else {
+            return;
+        };
+        guard.tripped = true;
+        let report = report(
+            LoopGuardKind::ContinuationLimit,
+            started,
+            limit,
+            vec![turn.into()],
+        );
+        self.trip_loop_guard(run, thread, report, actions);
+    }
+
     /// 线程上提交的条目通知：只记「有」动作或用户输入；自动候选里出现用户输入立即否决。
     pub(super) fn guard_item(&mut self, thread: &str, turn: &str, item: &Value) {
-        let mut vetoed = false;
-        for guard in self.loop_guards.values_mut() {
-            if guard.thread != thread || !guard.is_auto(turn) {
-                continue;
-            }
-            let mut seen = Activity::default();
-            seen.observe(item);
-            if let Some(pending) = guard.pending.iter_mut().find(|p| p.turn == turn) {
-                pending.seen.observe(item);
-            }
-            if seen.user_input && guard.veto(turn) {
-                vetoed = true;
+        let sources: Vec<_> = self
+            .loop_guards
+            .keys()
+            .map(|run| {
+                (
+                    run.clone(),
+                    self.classify_result_input(run, thread, turn, item),
+                )
+            })
+            .collect();
+        for (run, source) in sources {
+            let mut activity = Activity::default();
+            activity.observe_with_source(item, source);
+            self.guard_activity(&run, thread, turn, activity);
+        }
+    }
+
+    /// 已通过分页身份校验且逐条分类后的正面证据；前页可立即否决，但不代表完整轮次。
+    pub(crate) fn guard_activity(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        activity: Activity,
+    ) {
+        let Some(guard) = self.loop_guards.get_mut(run).filter(|g| g.thread == thread) else {
+            return;
+        };
+        if activity.user_input {
+            guard.user_input = true;
+            if let Some(safeguards) = &mut guard.safeguards {
+                safeguards.revoked = true;
+                if let Some(runtime) = self.convergences.runs.get_mut(run) {
+                    runtime.automatic_control_revoked = true;
+                }
             }
         }
-        if vetoed && self.shared {
+        if !guard.is_auto(turn) {
+            return;
+        }
+        if let Some(pending) = guard.pending.iter_mut().find(|p| p.turn == turn) {
+            pending.seen.action |= activity.action;
+            pending.seen.user_input |= activity.user_input;
+            pending.seen.special |= activity.special;
+            pending.seen.unknown |= activity.unknown;
+        }
+        if activity.user_input && guard.veto(turn) && self.shared {
             self.revoke_goal_control(thread);
         }
     }
@@ -345,6 +457,11 @@ impl Machine {
     ///   客户端轮里就授予（模型自己建 goal；迟到的旧写入回包不算），是本 broker 未回包的授予写入请求的目标就等它的回包，否则视为外部替换，
     ///   撤销并推进代号（外部改走再改回也不能让旧回包恢复资格）。客户端设置与 #2e 恢复的授予见 [`Self::grant_goal_control`]。
     pub(super) fn guard_goal(&mut self, thread: &str, goal: Option<&Value>, source: GoalSource) {
+        if let Some(goal) = goal.filter(|g| g.is_object()) {
+            self.convergences
+                .goal_evidence
+                .insert(thread.into(), goal.clone());
+        }
         let goal = goal.filter(|g| g.is_object());
         let (objective, created) = identity(goal);
         let status = goal
@@ -447,6 +564,13 @@ impl Machine {
             return;
         }
         for (run, turn, activity) in evidence {
+            // 分页只交回已校验的活动证据；首轮也记录插话，但旧刹车仍只处理自动候选。
+            if let (Some(activity), Some(thread)) = (
+                activity,
+                self.loop_guards.get(&run).map(|g| g.thread.clone()),
+            ) {
+                self.guard_activity(&run, &thread, &turn, activity);
+            }
             let Some(guard) = self.loop_guards.get_mut(&run) else {
                 continue;
             };
@@ -456,6 +580,13 @@ impl Machine {
             if activity.is_some_and(|a| a.user_input) && guard.is_auto(&turn) {
                 // 被挤出队列或已排到后面的轮也照样否决；通知已否决过的不重复。
                 let newly = guard.veto(&turn);
+                guard.user_input = true;
+                if let Some(safeguards) = &mut guard.safeguards {
+                    safeguards.revoked = true;
+                }
+                if let Some(runtime) = self.convergences.runs.get_mut(&run) {
+                    runtime.automatic_control_revoked = true;
+                }
                 let thread = guard.thread.clone();
                 if newly && self.shared {
                     self.revoke_goal_control(&thread);
@@ -474,6 +605,44 @@ impl Machine {
         runs.sort();
         let shared = self.shared;
         for run in runs {
+            let revoked = self.loop_guards[&run]
+                .safeguards
+                .as_ref()
+                .is_some_and(|s| s.revoked);
+            if revoked {
+                if self
+                    .runs
+                    .runs
+                    .get(&run)
+                    .and_then(|r| r.subagent_join.as_ref())
+                    .is_some_and(|j| !j.automatic_control_revoked)
+                {
+                    let thread = self.loop_guards[&run].thread.clone();
+                    self.convergence_cancel_for_thread(
+                        &thread,
+                        crate::sa1b::ReconcileCancel::UserInput,
+                        actions,
+                    );
+                }
+                let join = self
+                    .runs
+                    .runs
+                    .get_mut(&run)
+                    .and_then(|r| r.subagent_join.as_mut());
+                if let Some(join) = join.filter(|j| !j.automatic_control_revoked) {
+                    join.automatic_control_revoked = true;
+                    self.persist_safeguards(&run, actions);
+                }
+            }
+            // 迟到的开始事实可以记账，但撤权或授权换代后不能再替用户发起刹车。
+            if self.loop_guards[&run].safeguards.is_some()
+                && !self.convergences.runs.get(&run).is_some_and(|runtime| {
+                    !runtime.automatic_control_revoked
+                        && self.safeguards(&runtime.token).is_some_and(|s| !s.revoked)
+                })
+            {
+                continue;
+            }
             let guard = self.loop_guards.get_mut(&run).expect("刚取出的运行");
             if guard.tripped {
                 continue;
@@ -505,13 +674,30 @@ impl Machine {
             )));
             return;
         }
-        if !self.shared {
+        let managed = self
+            .loop_guards
+            .get(run)
+            .is_some_and(|g| g.safeguards.is_some());
+        let controlled = self
+            .records
+            .get(thread)
+            .is_some_and(|r| r.goal_controlled && r.goal_status.as_deref() == Some("active"));
+        // 共享模式只在已启用 SA1b（确有子代理要收尾）时停止本次运行；否则保持拍板 K：只暂停 goal、不中断在跑的轮。
+        if !self.shared || (managed && controlled) {
             actions.push(Action::Warn(format!(
                 "线程 {thread} 自动续跑空转（{:?}，{} 轮），暂停 goal 并停止本次运行",
                 report.kind, report.count
             )));
+            let reason = match report.kind {
+                LoopGuardKind::NoAction => crate::sa1b::TerminalReason::NoAction,
+                LoopGuardKind::ContinuationLimit => crate::sa1b::TerminalReason::AutoTurnLimit,
+            };
             self.run_loop_guard(run, report, actions);
-            self.begin_stop(thread, StopReason::GoalLoop, false, actions);
+            if managed && self.convergence_enabled() {
+                self.convergence_fail(run, reason, actions);
+            } else {
+                self.begin_stop(thread, StopReason::GoalLoop, false, actions);
+            }
             return;
         }
         let record = self.records.get(thread);

@@ -168,7 +168,7 @@ async function run(client: Client) {
   await until(async () => {
     const snapshot = await client.request("broker/threads/watch", { threadId: "分页线程" });
     result = snapshot.run;
-    return result?.runId === started.runId && ["ready", "unavailable"].includes(result.turns.at(-1)?.ready);
+    return result?.runId === started.runId && result.state === "ended" && ["ready", "unavailable"].includes(result.turns.at(-1)?.ready);
   }, 20_000, "补读结果落定");
   return result;
 }

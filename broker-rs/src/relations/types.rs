@@ -107,6 +107,8 @@ pub struct EvidenceOperation {
     pub completed_seen: bool,
     pub outcome: EvidenceOutcome,
     pub receivers: BTreeSet<String>,
+    /// 跟进接收方的拒绝纳管理由；保留上游接收事实，不把拒绝误记成发送失败。
+    pub rejected_receivers: BTreeMap<String, String>,
     pub proven_turns: BTreeMap<String, BTreeSet<String>>,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
@@ -213,6 +215,9 @@ pub enum HandoffKind {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberChange {
+    ResultReady,
+    ConvergencePhase,
+    Budget,
     Relation,
     Binding,
     Activity,
@@ -229,6 +234,10 @@ pub enum DiscoveryScope {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiscoveryCaller {
+    Converge {
+        token: crate::sa1b::ConvergeToken,
+        work_epoch: u64,
+    },
     TreeStop {
         tree_op: u64,
         round: u64,

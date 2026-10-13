@@ -36,6 +36,7 @@ use crate::claim::{Action, ConnId, Machine, ReqKind, StopReason};
 use serde_json::Value;
 use std::collections::HashMap;
 
+pub mod budget;
 #[cfg(test)]
 mod tests;
 pub mod types;
@@ -149,6 +150,8 @@ pub enum ReleaseKind {
 /// 内存账本。活动记录随认领，历史最多 200 个线程；内部登记的清理随结果、释放和淘汰。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Runs {
+    pub(crate) reconciliation: crate::claim::subagent_reconcile::Reconciliations,
+    pub(crate) child_results: crate::relations::results::ChildReads,
     pub(crate) epoch: u64,
     next_creation_sequence: u64,
     pub(crate) verifying_history: std::collections::HashSet<RunId>,
@@ -280,6 +283,9 @@ impl Machine {
                 .remove(&conn)
         });
         let run_id = open.run_id.clone();
+        if open.kind == ReqKind::ReviewStart {
+            self.convergences.review_runs.insert(run_id.clone());
+        }
         self.runs.next_creation_sequence = self
             .runs
             .next_creation_sequence
@@ -299,6 +305,12 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                final_turn_id: None,
+                auto_turns_started: None,
+                subagent_join: None,
+                run_budget: None,
+                convergence_config: None,
+                execution_config: None,
                 current_turn_id: None,
                 pending_reroute: None,
                 creation_order: Some(CreationOrder {
@@ -483,6 +495,9 @@ impl Machine {
             return;
         }
         if self.runs.find_run(thread, turn, Some(run)).as_deref() != Some(run) {
+            return;
+        }
+        if !self.run_parent_is_owned(run, thread, turn) {
             return;
         }
         if self.runs.runs[run].turns.iter().any(|t| t.turn_id == turn) {
@@ -708,6 +723,10 @@ impl Machine {
         let Some(run) = self.runs.find_run(thread, id, fallback_run) else {
             return;
         };
+        if !self.run_parent_is_owned(&run, thread, id) {
+            self.reconcile_observe_parent_completed(&run, thread, turn, actions);
+            return;
+        }
         if self.runs.runs[&run].turns.iter().any(|t| t.turn_id == id)
             || self.runs.turn_runs.get(thread).is_some_and(|links| {
                 links
@@ -746,9 +765,15 @@ impl Machine {
         };
         let full = full_items(turn);
         if let Some(items) = full {
+            let mut activity = Activity::default();
+            for item in items {
+                activity
+                    .observe_with_source(item, self.classify_result_input(&run, thread, id, item));
+            }
+            self.guard_activity(&run, thread, id, activity);
             self.runs
                 .guard_evidence
-                .push((run.clone(), id.into(), Some(Activity::of(items))));
+                .push((run.clone(), id.into(), Some(activity)));
         }
         let output = full.and_then(output_from_items);
         let pending = output.is_none();
@@ -771,7 +796,15 @@ impl Machine {
         } else {
             None
         };
+        let origin = self
+            .runs
+            .reconciliation
+            .parents
+            .get(&run)
+            .and_then(|parents| parents.iter().find(|p| p.turn == id))
+            .map(|p| p.origin);
         record.turns.push(TurnResult {
+            origin,
             reroute,
             turn_id: id.into(),
             ready: if pending {
@@ -806,6 +839,7 @@ impl Machine {
                 actions,
             );
         }
+        self.reconcile_parent_completed(&run, id, actions);
         self.runs.put(&run, actions);
         self.runs.touch(&run, self.clock.now_ms, actions);
         self.runs
@@ -824,6 +858,7 @@ impl Machine {
         }
         record.turns_total = record.turns_total.checked_add(1).expect("轮次总数已耗尽");
         record.turns.push(TurnResult {
+            origin: None,
             reroute: None,
             turn_id: String::new(),
             ready: Ready::Ready,
@@ -1110,6 +1145,16 @@ impl Machine {
         }
     }
     pub(crate) fn run_released(&mut self, run: &str, kind: ReleaseKind, actions: &mut Vec<Action>) {
+        self.on_run_finishing(run, kind, actions);
+        self.finalize_parent_pointer(run);
+        let convergence_terminal = self.run_convergence_terminal(
+            run,
+            self.runs
+                .runs
+                .get(run)
+                .and_then(RunRecord::selected_parent_result)
+                .map(|t| t.status),
+        );
         self.runs.trace("run_released");
         if self.runs.phase != Phase::Open {
             return;
@@ -1122,7 +1167,7 @@ impl Machine {
             return;
         }
         let active = self.runs.active.remove(run).unwrap_or_default();
-        let last = record.turns.last().map(|t| t.status);
+        let last = record.selected_parent_result().map(|t| t.status);
         let thread = record
             .review_thread_id
             .as_ref()
@@ -1149,6 +1194,12 @@ impl Machine {
                 }
                 ReleaseKind::StopConfirmed | ReleaseKind::Shutdown => RunStatus::Interrupted,
             }
+        };
+        let status = if let Some(terminal) = convergence_terminal {
+            record.interrupt_reason = terminal.interrupt_reason;
+            terminal.status
+        } else {
+            status
         };
         record.state = RunState::Ended;
         record.status = Some(status);
@@ -1253,8 +1304,25 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         self.runs.trace("run_result_reply");
+        let sources: Vec<_> = result
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("data"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(64)
+            .map(|entry| {
+                self.classify_result_input(
+                    &read.run_id,
+                    &read.thread_id,
+                    &read.turn_id,
+                    &entry["item"],
+                )
+            })
+            .collect();
         self.runs
-            .read_reply(read, result, self.clock.now_ms, actions);
+            .read_reply(read, result, &sources, self.clock.now_ms, actions);
     }
 
     pub(crate) fn run_timer(&mut self, timer: RunTimer, actions: &mut Vec<Action>) {
@@ -1535,6 +1603,15 @@ impl Machine {
             return;
         }
         let run = commit.snapshot.identity.run_id.clone();
+        self.finalize_parent_pointer(&run);
+        let convergence_terminal = self.run_convergence_terminal(
+            &run,
+            self.runs
+                .runs
+                .get(&run)
+                .and_then(RunRecord::selected_parent_result)
+                .map(|t| t.status),
+        );
         let check = self.tree_check(commit.report.tree_op);
         let owner = match &commit.snapshot.owner {
             Some(crate::claim::Owner::Client(conn)) => {
@@ -1560,8 +1637,13 @@ impl Machine {
         });
         record.stop_check = (!confirmed).then_some(check);
         record.state = RunState::Ended;
-        record.status = Some(commit.status);
-        record.interrupt_reason = commit.interrupt_reason;
+        record.status = Some(
+            convergence_terminal
+                .as_ref()
+                .map_or(commit.status, |t| t.status),
+        );
+        record.interrupt_reason =
+            convergence_terminal.map_or(commit.interrupt_reason, |t| t.interrupt_reason);
         record.ended_at = Some(self.clock.now_ms);
         let thread = record.thread_id.clone();
         if confirmed {
@@ -1647,5 +1729,200 @@ impl Machine {
             self.runs.verifying_history.remove(id);
         }
         self.runs.put(id, actions);
+    }
+}
+
+impl RunRecord {
+    /// 新记录从明确最终指针取结果；活动运行从当前自有父轮取，旧记录保留原行为。
+    pub fn selected_parent_result(&self) -> Option<&TurnResult> {
+        if let Some(id) = &self.final_turn_id {
+            return self.turns.iter().find(|t| &t.turn_id == id);
+        }
+        if self.subagent_join.is_some() {
+            if matches!(self.state, RunState::Ended | RunState::Lost) {
+                return None;
+            }
+            return self
+                .current_turn_id
+                .as_ref()
+                .and_then(|id| self.turns.iter().find(|t| &t.turn_id == id));
+        }
+        self.turns.last()
+    }
+}
+impl Machine {
+    fn run_parent_is_owned(&self, run: &str, thread: &str, turn: &str) -> bool {
+        let Some(record) = self.runs.runs.get(run) else {
+            return false;
+        };
+        record.subagent_join.is_none()
+            || (record.start_confirmation.confirmed
+                && record.start_confirmation.turn_id.as_deref() == Some(turn))
+            || self
+                .runs
+                .reconciliation
+                .parents
+                .get(run)
+                .is_some_and(|p| p.iter().any(|p| p.turn == turn))
+            || self
+                .claims
+                .get(thread)
+                .is_some_and(|c| c.run_id.as_deref() == Some(run) && c.owned_turns.contains(turn))
+    }
+    /// 两出口共用 A 的终态函数；测试只替换尚未实现的 A 返回值。
+    fn run_convergence_terminal(
+        &self,
+        run: &str,
+        parent: Option<TurnStatus>,
+    ) -> Option<crate::sa1b::TerminalDisposition> {
+        #[cfg(test)]
+        if let Some(terminal) = self
+            .runs
+            .reconciliation
+            .harness
+            .as_ref()
+            .and_then(|h| h.terminal.as_ref())
+        {
+            return Some(terminal.clone());
+        }
+        self.convergence_run_terminal(run, parent)
+    }
+    pub(crate) fn persist_reconciliation(&mut self, run: &str, actions: &mut Vec<Action>) {
+        if self.runs.phase == Phase::Open {
+            self.runs.updated.insert(run.into(), self.clock.now_ms);
+            self.runs.put(run, actions);
+        }
+    }
+    /// 原请求解析完毕后调用一次，保存白名单；重试或汇总不得覆盖原执行约束。
+    pub fn run_save_execution_config(
+        &mut self,
+        run: &str,
+        params: &Value,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        if self.runs.phase != Phase::Open || !params.is_object() {
+            return false;
+        }
+        let Some(record) = self.runs.runs.get_mut(run) else {
+            return false;
+        };
+        if record.execution_config.is_some() {
+            return true;
+        }
+        let mut saved = serde_json::Map::new();
+        for key in crate::claim::subagent_reconcile::execution_keys() {
+            if let Some(value) = params.get(*key) {
+                saved.insert((*key).into(), value.clone());
+            }
+        }
+        record.execution_config = Some(crate::sa1b::RunExecutionConfig {
+            model: params
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            effort: params
+                .get("effort")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            turn_params: Some(Value::Object(saved)),
+        });
+        self.runs.put(run, actions);
+        true
+    }
+    /// 新自有父轮入口，不经过首次启动证明或重新建运行。
+    pub fn run_confirmed_parent_started(
+        &mut self,
+        run: &str,
+        thread: &str,
+        turn: &str,
+        origin: crate::sa1b::TurnOrigin,
+        actions: &mut Vec<Action>,
+    ) {
+        if self.runs.phase != Phase::Open
+            || self
+                .runs
+                .runs
+                .get(run)
+                .is_none_or(|r| r.state != RunState::Running || r.joined)
+        {
+            return;
+        }
+        let Some(parents) = self.runs.reconciliation.parents.get(run) else {
+            return;
+        };
+        if !parents.iter().any(|p| p.turn == turn && p.origin == origin) {
+            return;
+        }
+        // 确认可能晚于完成：更新旧轮来源，但只有开始顺序的最后一轮可以前进指针。
+        if let Some(result) = self
+            .runs
+            .runs
+            .get_mut(run)
+            .unwrap()
+            .turns
+            .iter_mut()
+            .find(|t| t.turn_id == turn)
+        {
+            result.origin = Some(origin);
+        }
+        if parents.last().is_some_and(|p| p.turn == turn) {
+            // 此处已有独立的自有开始顺序，不能用“已有结果即旧轮”的普通启发式挡住前进。
+            self.runs.link_turn(run, thread, turn, false);
+            if let Some(link) = self
+                .runs
+                .turn_runs
+                .get_mut(thread)
+                .and_then(|ls| ls.iter_mut().find(|l| l.turn == turn && l.run == run))
+            {
+                link.started = true;
+            }
+            let record = self.runs.runs.get_mut(run).unwrap();
+            if record.current_turn_id.as_deref() != Some(turn) {
+                record.current_turn_id = Some(turn.into());
+                record.pending_reroute = None;
+            }
+            self.run_turn_started(run, thread, turn, actions);
+        }
+        self.runs.put(run, actions);
+    }
+    fn finalize_parent_pointer(&mut self, run: &str) {
+        let Some(record) = self.runs.runs.get_mut(run) else {
+            return;
+        };
+        if record.state == RunState::Ended
+            || record.state == RunState::Lost
+            || record.final_turn_id.is_some()
+        {
+            return;
+        }
+        let Some(join) = &record.subagent_join else {
+            return;
+        };
+        let last = self
+            .runs
+            .reconciliation
+            .parents
+            .get(run)
+            .and_then(|p| p.last());
+        if let Some(parent) = last {
+            // 异常停树的交付期限可能先于根轮结束。没有完成证据就没有最终答复；
+            // 以 ended + subagentJoin + 无 finalTurnId 明确 unavailable，保留 currentTurnId
+            // 作定位，不伪造已完成的 TurnResult。已有结果项仍走原有有界补读。
+            if record.turns.iter().any(|turn| turn.turn_id == parent.turn)
+                && (join.terminal_reason.is_some()
+                    || (parent.completed == Some(TurnStatus::Completed)
+                        && join.reconciled_epoch >= join.work_epoch))
+            {
+                record.final_turn_id = Some(parent.turn.clone());
+            }
+        } else if join.work_epoch == 0
+            && record.start_confirmation.confirmed
+            && record
+                .current_turn_id
+                .as_ref()
+                .is_some_and(|id| record.turns.iter().any(|turn| &turn.turn_id == id))
+        {
+            record.final_turn_id = record.current_turn_id.clone();
+        }
     }
 }

@@ -8,9 +8,11 @@
 //! 证据期限、回查期限和墓碑用单调毫秒（`Clock::mono_ms`）；请求的收到与截止时间沿用墙钟毫秒。
 pub mod types;
 
+pub mod convergence;
 mod discovery;
 mod facts;
 mod notify;
+pub mod results;
 mod routing;
 #[cfg(test)]
 mod tests;
@@ -214,13 +216,78 @@ impl Machine {
         })
     }
     pub fn thread_capability(&self, thread_id: &str) -> Option<bool> {
-        self.thread_relation(thread_id)?.can_accept_direct_input
+        self.convergences
+            .capabilities
+            .get(thread_id)
+            .filter(|(epoch, _)| *epoch == self.relations.conn_epoch)
+            .map(|(_, capability)| *capability)
+            .or_else(|| {
+                self.thread_relation(thread_id)
+                    .and_then(|r| r.can_accept_direct_input)
+            })
+    }
+    /// 本次运行自己派生或跟进过子代理（SA1b 按需启用的唯一依据，用户 2026-10-11 定：只有确有
+    /// 子代理的运行才走 SA1b）。只认本运行的证据：在途派生、本运行自有父轮上的派生／跟进操作；
+    /// 同一父线程历史运行留下的血缘边与成员不算，避免把旧子代理算到新运行头上。
+    pub fn run_subagent_evidence(&self, run_id: &str) -> bool {
+        self.relations
+            .contexts
+            .get(run_id)
+            .is_some_and(|c| c.in_flight_spawns.iter().any(|key| self.op_confirmed(key)))
+            || self.relations.operations.values().any(|op| {
+                op.run_id == run_id
+                    && matches!(
+                        op.kind,
+                        EvidenceKind::V1Spawn
+                            | EvidenceKind::V2Started
+                            | EvidenceKind::V1SendInput
+                            | EvidenceKind::V1ResumeAgent
+                            | EvidenceKind::V2Interacted
+                    )
+                    // settling 可能暂存外部派生的 run_id；只有归属已定案且结果
+                    // 不是 Unproven 的操作才是本运行的启用证据。
+                    && (self.op_confirmed(&op.key)
+                        // 未接通 SA1b 的旧跟进路径用 Unproven 表示“不证明子轮”；
+                        // 保留其只读查询语义，但仍重新核实父轮确属本运行。
+                        || (!self.convergence_enabled()
+                            && matches!(
+                                self.parent_run(&op.key.parent_thread_id, &op.key.parent_turn_id),
+                                facts::ParentRun::Own { run, .. } if run == run_id
+                            )))
+                    && !matches!(
+                        op.outcome,
+                        EvidenceOutcome::Failed | EvidenceOutcome::Revoked
+                    )
+            })
+    }
+
+    /// 血缘属于线程历史，不自动属于同线程的下一运行。当前运行有派生／复用证据时仍须纳管；
+    /// 仅排除已证明属于其他运行的旧成员，未知来源和 pendingInit 继续保守核实。
+    pub(crate) fn historical_subagent_for_run(&self, run: &str, thread: &str) -> bool {
+        if self
+            .manage_context(run)
+            .is_some_and(|c| c.members.contains_key(thread))
+            || self
+                .relations
+                .operations
+                .values()
+                .any(|op| op.run_id == run && op.receivers.contains(thread))
+        {
+            return false;
+        }
+        self.runs
+            .runs
+            .values()
+            .any(|r| r.run_id != run && r.children.iter().any(|c| c.thread_id == thread))
+            || self.relations.operations.values().any(|op| {
+                !op.run_id.is_empty() && op.run_id != run && op.receivers.contains(thread)
+            })
     }
     /// 给自然结束门禁用：活动成员、待答请求、在途派生、未决候选算 some；
     /// 成员上有未归属的活动轮次、或可能属于本运行的回查未决算 unknown。
     pub fn has_managed_activity(&self, run_id: &str) -> Activity {
         let Some(context) = self.relations.contexts.get(run_id) else {
-            return Activity::None;
+            return Activity::Unknown;
         };
         let now = self.clock.mono_ms;
         let mut unknown = false;
@@ -299,7 +366,20 @@ impl Machine {
         result: DiscoveryResult,
         actions: &mut Vec<Action>,
     ) {
-        self.discovery_apply(op_id, caller, result, actions)
+        if let DiscoveryCaller::Converge { token, work_epoch } = caller {
+            if self
+                .convergences
+                .progress
+                .get(&token.run_id)
+                .and_then(|p| p.discovery)
+                .map(|p| p.0)
+                == Some(op_id)
+            {
+                self.convergence_discovery_done(token, work_epoch, result, actions);
+            }
+        } else {
+            self.discovery_apply(op_id, caller, result, actions);
+        }
     }
     pub fn on_claim_settled(
         &mut self,
@@ -313,6 +393,9 @@ impl Machine {
         self.ensure_sweep(actions);
     }
     pub fn on_handoff(&mut self, run_id: &str, kind: HandoffKind, actions: &mut Vec<Action>) {
+        if matches!(kind, HandoffKind::Joined | HandoffKind::External) {
+            self.convergence_authority_lost(run_id, actions);
+        }
         self.routing_handoff(run_id, kind, actions)
     }
     pub fn on_unclaimed_turn(

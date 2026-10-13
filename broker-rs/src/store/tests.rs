@@ -70,6 +70,12 @@ impl Drop for Temp {
 
 pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
+        final_turn_id: None,
+        auto_turns_started: None,
+        subagent_join: None,
+        run_budget: None,
+        convergence_config: None,
+        execution_config: None,
         current_turn_id: None,
         pending_reroute: None,
         creation_order: None,
@@ -309,6 +315,7 @@ async fn 从运行恢复索引_删除标记_review_任意_pending_与损坏文�
     let mut old = run("old", "parent", 10);
     old.turns = vec![
         TurnResult {
+            origin: None,
             reroute: None,
             turn_id: "turn1".into(),
             ready: Ready::Pending,
@@ -319,6 +326,7 @@ async fn 从运行恢复索引_删除标记_review_任意_pending_与损坏文�
             completed_at: 11,
         },
         TurnResult {
+            origin: None,
             reroute: None,
             turn_id: "turn2".into(),
             ready: Ready::Ready,
@@ -1022,4 +1030,103 @@ fn 删除扫描保留磁盘失联运行的停止确认() {
         plan.runs["confirmed"].stop_outcome,
         Some(StopOutcome::Confirmed)
     );
+}
+
+#[test]
+fn sa1b_新计数执行配置来源与最终指针真实落盘往返() {
+    use crate::claim::subagent_reconcile::tests::{
+        carrier, completed, fixture, own_start, start, R,
+    };
+    use crate::sa1b::TurnOrigin;
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let (mut m, token) = fixture(1);
+    let (id, _) = start(&mut m, &token);
+    own_start(&mut m, &token, "最终父轮", TurnOrigin::SubagentReconcile);
+    carrier(&mut m, &token, id, "最终父轮");
+    completed(&mut m, "最终父轮", "completed", "已核实结果");
+    m.run_released(R, crate::runs::ReleaseKind::Natural, &mut vec![]);
+    let mut record = m.runs.runs[R].clone();
+    record.started_at = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    record.ended_at = Some(record.started_at);
+    disk.write_json(
+        &run_file(&record.run_id),
+        &serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    drop(disk);
+    let loaded = Disk::initialize(
+        &mut temp.config(),
+        Gate {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            initialization: None,
+        },
+    )
+    .unwrap()
+    .1;
+    let restored = loaded.runs.iter().find(|r| r.run_id == R).unwrap();
+    assert_eq!(restored, &record);
+    assert_eq!(restored.subagent_join.as_ref().unwrap().wakeup_attempts, 1);
+    assert_eq!(restored.auto_turns_started, Some(1));
+    assert_eq!(restored.final_turn_id.as_deref(), Some("最终父轮"));
+    let mut restarted = crate::claim::Machine::new(false);
+    restarted.clock.now_ms = record.started_at;
+    restarted.restore_runs(loaded.index, loaded.runs, &mut vec![]);
+    assert!(restarted.convergences.runs.is_empty());
+    assert!(!restarted.reconcile_unresolved(R));
+}
+#[test]
+fn sa1b_旧文件缺省不伪造启用或来源() {
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let mut record = run("legacy-sa1b", "旧线程", now);
+    record.turns.push(TurnResult {
+        origin: None,
+        reroute: None,
+        turn_id: "旧轮".into(),
+        ready: Ready::Ready,
+        status: TurnStatus::Completed,
+        output: "旧答复".into(),
+        output_source: OutputSource::FinalAnswer,
+        error: None,
+        completed_at: now,
+    });
+    let old = serde_json::to_value(record).unwrap();
+    for key in [
+        "subagentJoin",
+        "convergenceConfig",
+        "executionConfig",
+        "finalTurnId",
+        "autoTurnsStarted",
+        "runBudget",
+    ] {
+        assert!(old.get(key).is_none());
+    }
+    assert!(old["turns"][0].get("origin").is_none());
+    disk.write_json(
+        &run_file(&"legacy-sa1b".into()),
+        &serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    drop(disk);
+    let loaded = Disk::initialize(
+        &mut temp.config(),
+        Gate {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            initialization: None,
+        },
+    )
+    .unwrap()
+    .1;
+    let restored = &loaded.runs[0];
+    assert!(restored.subagent_join.is_none());
+    assert!(restored.turns[0].origin.is_none());
+    assert_eq!(restored.selected_parent_result().unwrap().output, "旧答复");
 }

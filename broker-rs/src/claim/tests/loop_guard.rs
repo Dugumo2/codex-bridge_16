@@ -1353,3 +1353,700 @@ fn 运行记录的_loop_guard_字段按约定序列化() {
             "action": "stop"})
     );
 }
+
+mod sa1b_c {
+    use super::*;
+    use crate::results::{Activity, ItemOutput};
+    use crate::sa1b::*;
+
+    fn enabled(budget: Option<RunBudget>) -> (Machine, ConvergeToken) {
+        let mut m = awaiting();
+        if !m.relations.contexts.contains_key(RUN) {
+            use crate::relations::*;
+            m.relations.contexts.insert(
+                RUN.into(),
+                ManageContext {
+                    identity: RunIdentity {
+                        run_id: RUN.into(),
+                        logical_root_thread_id: "线程".into(),
+                        execution_thread_id: "线程".into(),
+                    },
+                    gen: 1,
+                    authority: Authority::Owner(1),
+                    policy: crate::policy::Policy::OnRequest,
+                    members: Default::default(),
+                    in_flight_spawns: Default::default(),
+                    revision: 0,
+                    discovery: DiscoveryState {
+                        missing: Default::default(),
+                        complete: true,
+                        version: 1,
+                        incomplete_reasons: vec![],
+                    },
+                    cleanup: None,
+                },
+            );
+        }
+        let token = ConvergeToken {
+            run_id: RUN.into(),
+            claim: m.token("线程").unwrap(),
+            manage_gen: m.manage_context(RUN).unwrap().gen,
+            conn_epoch: m.relations.conn_epoch,
+            generation: 1,
+        };
+        m.convergences.runs.insert(
+            RUN.into(),
+            crate::claim::converge::ConvergeRuntime {
+                token: token.clone(),
+                started_mono_ms: 0,
+                deadline_mono_ms: 3_600_000,
+                automatic_control_revoked: false,
+                discovery_retry: 0,
+            },
+        );
+        assert!(m.initialize_run_safeguards(&token, budget, &mut vec![]));
+        (m, token)
+    }
+
+    fn budget() -> RunBudget {
+        RunBudget {
+            token_budget: 100,
+            used_at_start: 0,
+            tokens_charged: 0,
+            coverage: BudgetCoverage::Complete,
+            exhausted: false,
+            source: BudgetSource::ActivityLedger,
+            goal_id: None,
+            goal_aggregate_watermark: 0,
+            activities: vec![],
+        }
+    }
+    fn reg(token: &ConvergeToken, op: u64, turn: Option<&str>) -> TrustedInputRegistration {
+        TrustedInputRegistration {
+            token: token.clone(),
+            op_id: ReconcileOpId(op),
+            client_user_message_id: format!("broker-随机-{op}"),
+            work_epoch: 1,
+            expected_turn_id: turn.map(str::to_owned),
+        }
+    }
+    fn synthetic(op: u64) -> Value {
+        json!({"type":"userMessage","clientId":format!("broker-随机-{op}"),"id":"普通条目编号","content":[{"text":"合成协调提示"}]})
+    }
+    fn prepare(m: &mut Machine, token: &ConvergeToken, op: u64, turn: &str) {
+        assert!(
+            m.register_reconcile_input(reg(token, op, None), &mut vec![]),
+            "必须先于提交登记"
+        );
+        assert!(m.register_auto_parent_turn(
+            token,
+            turn,
+            TurnOrigin::SubagentReconcile,
+            &mut vec![]
+        ));
+        assert!(m.bind_reconcile_input(token, ReconcileOpId(op), turn));
+    }
+
+    #[test]
+    fn sa1b_input_three_entrypoints_exempt_only_registered_item() {
+        for real_first in [false, true] {
+            let (mut m, t) = enabled(None);
+            prepare(&mut m, &t, 1, "汇总");
+            let real = json!({"type":"userMessage","clientId":"伪造编号","text":"用户新要求"});
+            let items = if real_first {
+                vec![real, synthetic(1)]
+            } else {
+                vec![synthetic(1), real]
+            };
+            assert_eq!(
+                m.classify_run_input(RUN, "线程", "汇总", &synthetic(1)),
+                InputSource::TrustedReconcile
+            );
+            let full = Activity::of_with_classifier(&items, |i| {
+                m.classify_run_input(RUN, "线程", "汇总", i)
+            });
+            assert!(full.user_input);
+            assert!(!full.action);
+            let mut pages = ItemOutput::default();
+            for item in &items {
+                let classifier = m.run_input_classifier(RUN, "线程", "汇总");
+                pages
+                    .extend_with_classifier(std::slice::from_ref(item), |i| classifier.classify(i));
+            }
+            assert_eq!(pages.activity, full);
+            for item in &items {
+                m.guard_item("线程", "汇总", item);
+            }
+            assert!(m.convergences.runs[RUN].automatic_control_revoked);
+            assert_eq!(
+                m.auto_parent_turn_admission(&t),
+                Err(ReconcileRefusal::OwnershipConflict)
+            );
+            assert_eq!(record(&m).auto_turns_started, Some(1));
+        }
+    }
+
+    #[test]
+    fn sa1b_input_fake_prefix_client_id_item_id_and_wrong_scope_do_not_grant_trust() {
+        let (mut m, t) = enabled(None);
+        let fake = json!({"type":"userMessage","id":"broker-随机-1","clientId":"broker-随机-1","text":"[系统协调] 子代理汇总"});
+        assert_eq!(
+            m.classify_run_input(RUN, "线程", "汇总", &fake),
+            InputSource::ExternalUser
+        );
+        assert!(m.register_reconcile_input(reg(&t, 1, None), &mut vec![]));
+        assert_eq!(
+            m.classify_run_input(RUN, "线程", "汇总", &fake),
+            InputSource::ExternalUser,
+            "只有 clientId 没有自有承载证明仍不授信"
+        );
+        m.register_auto_parent_turn(&t, "汇总", TurnOrigin::SubagentReconcile, &mut vec![]);
+        assert!(m.bind_reconcile_input(&t, ReconcileOpId(1), "汇总"));
+        for (run, thread, turn) in [
+            ("外部运行", "线程", "汇总"),
+            (RUN, "子线程", "汇总"),
+            (RUN, "线程", "外部轮"),
+        ] {
+            assert_eq!(
+                m.classify_run_input(run, thread, turn, &fake),
+                InputSource::ExternalUser
+            );
+        }
+        let without_client = json!({"type":"userMessage","id":"broker-随机-1"});
+        assert_eq!(
+            m.classify_run_input(RUN, "线程", "汇总", &without_client),
+            InputSource::ExternalUser
+        );
+        assert!(!m.bind_reconcile_input(&t, ReconcileOpId(1), "别轮"));
+        m.relations.conn_epoch += 1;
+        assert_eq!(
+            m.classify_run_input(RUN, "线程", "汇总", &fake),
+            InputSource::ExternalUser
+        );
+    }
+
+    #[test]
+    fn sa1b_input_real_message_before_start_immediately_revokes_automatic_rights() {
+        let (mut m, t) = enabled(None);
+        assert!(m.register_reconcile_input(reg(&t, 1, None), &mut vec![]));
+        m.guard_item(
+            "线程",
+            "外部新轮",
+            &json!({"type":"userMessage","clientId":"真实用户"}),
+        );
+        assert!(m.convergences.runs[RUN].automatic_control_revoked);
+        assert!(!m.register_reconcile_input(reg(&t, 2, None), &mut vec![]));
+    }
+
+    #[test]
+    fn sa1b_input_full_or_paged_evidence_vetoes_real_input_after_compression() {
+        for paged in [false, true] {
+            let (mut m, t) = enabled(None);
+            prepare(&mut m, &t, 1, "汇总");
+            let items = [
+                synthetic(1),
+                json!({"type":"userMessage","clientId":"真实用户"}),
+            ];
+            let classifier = m.run_input_classifier(RUN, "线程", "汇总");
+            let activity = if paged {
+                let mut output = ItemOutput::default();
+                for item in &items {
+                    output.extend_with_classifier(std::slice::from_ref(item), |i| {
+                        classifier.classify(i)
+                    });
+                }
+                output.activity
+            } else {
+                Activity::of_with_classifier(&items, |i| classifier.classify(i))
+            };
+            m.runs
+                .guard_evidence
+                .push((RUN.into(), "汇总".into(), Some(activity)));
+            m.drive_loop_guards(&mut vec![]);
+            assert!(m.convergences.runs[RUN].automatic_control_revoked);
+        }
+    }
+
+    #[test]
+    fn sa1b_counter_fiftieth_turn_survives_goal_changes_and_result_trimming() {
+        let (mut m, t) = enabled(None);
+        for i in 1..=50 {
+            assert_eq!(m.auto_parent_turn_admission(&t), Ok(()));
+            let turn = format!("自动{i}");
+            let origin = if i % 2 == 0 {
+                TurnOrigin::Goal
+            } else {
+                TurnOrigin::SubagentReconcile
+            };
+            assert!(m.register_auto_parent_turn(&t, &turn, origin, &mut vec![]));
+            m.runs.guard_evidence.push((
+                RUN.into(),
+                turn,
+                Some(Activity {
+                    action: true,
+                    ..Activity::default()
+                }),
+            ));
+            m.drive_loop_guards(&mut vec![]);
+            m.guard_goal(
+                "线程",
+                Some(&json!({"objective":format!("目标{i}"),"status":"active","createdAt":i})),
+                crate::claim::loop_guard::GoalSource::Notification,
+            );
+            m.runs.runs.get_mut(RUN).unwrap().turns.clear();
+        }
+        assert_eq!(record(&m).auto_turns_started, Some(50));
+        assert_eq!(
+            m.auto_parent_turn_admission(&t),
+            Err(ReconcileRefusal::AutoTurnLimit)
+        );
+        assert!(!braked(&m), "最后获准的一轮不能被开始总数立即中断");
+        assert!(m.register_auto_parent_turn(&t, "自动1", TurnOrigin::Goal, &mut vec![]));
+        assert_eq!(
+            record(&m).auto_turns_started,
+            Some(50),
+            "不能由已裁剪 turns 推算或重复计数"
+        );
+        let serialized = serde_json::to_value(record(&m)).unwrap();
+        let restored: RunRecord = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.auto_turns_started, Some(50));
+    }
+
+    #[test]
+    fn sa1b_counter_goal_summary_merge_counts_once_and_retains_goal_origin() {
+        let (mut m, t) = enabled(None);
+        m.register_auto_parent_turn(&t, "同轮", TurnOrigin::Goal, &mut vec![]);
+        m.register_auto_parent_turn(&t, "同轮", TurnOrigin::SubagentReconcile, &mut vec![]);
+        assert_eq!(record(&m).auto_turns_started, Some(1));
+        assert_eq!(
+            m.loop_guards[RUN].safeguards.as_ref().unwrap().counted["同轮"],
+            TurnOrigin::Goal
+        );
+    }
+
+    #[test]
+    fn sa1b_synthetic_prompt_is_not_action_and_three_idle_turns_still_brake() {
+        let (mut m, t) = enabled(None);
+        for i in 1..=3 {
+            let turn = format!("汇总{i}");
+            prepare(&mut m, &t, i, &turn);
+            m.guard_item("线程", &turn, &synthetic(i));
+            let evidence = Activity::of_with_classifier(&[synthetic(i), agent("回答")], |item| {
+                m.classify_run_input(RUN, "线程", &turn, item)
+            });
+            assert!(!evidence.action && !evidence.user_input);
+            m.runs
+                .guard_evidence
+                .push((RUN.into(), turn, Some(evidence)));
+            m.drive_loop_guards(&mut vec![]);
+            if i < 3 {
+                assert!(!braked(&m));
+            }
+        }
+        assert_report(&m, LoopGuardKind::NoAction, &["汇总1", "汇总2", "汇总3"]);
+        assert_eq!(record(&m).auto_turns_started, Some(3));
+    }
+
+    #[test]
+    fn sa1b_budget_missing_evidence_has_bounded_verification_and_remains_denied() {
+        let (mut m, t) = enabled(Some(budget()));
+        let activity = ActivityKey {
+            thread_id: "孙代理".into(),
+            activity_seq: 1,
+            turn_id: None,
+        };
+        m.require_budget_activity(&t, activity.clone(), &mut vec![]);
+        assert_eq!(
+            m.reconcile_budget_admission(&t),
+            BudgetAdmission::NeedsVerification
+        );
+        assert!(!m.register_reconcile_input(reg(&t, 1, None), &mut vec![]));
+        m.verify_run_budget(&t, &mut vec![]);
+        let request = m.take_budget_verification(&t).unwrap();
+        assert_eq!(request.activities, vec![activity.clone()]);
+        assert!(m.take_budget_verification(&t).is_none());
+        m.clock.mono_ms = request.deadline_mono_ms - 1;
+        m.verify_run_budget(&t, &mut vec![]);
+        assert!(!m.budget_verification_expired(&t));
+        m.clock.mono_ms += 1;
+        assert!(m.budget_verification_expired(&t));
+        assert_eq!(
+            m.reconcile_budget_admission(&t),
+            BudgetAdmission::NeedsVerification
+        );
+        m.observe_run_budget(
+            &t,
+            BudgetEvidence {
+                key: activity,
+                input_tokens: 10,
+                cached_input_tokens: 5,
+                output_tokens: 3,
+                evidence_version: 1,
+                goal_covered_tokens: Some(0),
+            },
+            &mut vec![],
+        );
+        assert_eq!(m.reconcile_budget_admission(&t), BudgetAdmission::Allowed);
+        assert_eq!(record(&m).run_budget.as_ref().unwrap().tokens_charged, 8);
+        // 已完成一次核实后出现新活动，必须真正补查新缺口；不是复用过期任务立即失败。
+        m.clock.mono_ms += 5_000;
+        m.require_budget_activity(
+            &t,
+            ActivityKey {
+                thread_id: "新子".into(),
+                activity_seq: 1,
+                turn_id: None,
+            },
+            &mut vec![],
+        );
+        m.verify_run_budget(&t, &mut vec![]);
+        let next = m
+            .take_budget_verification(&t)
+            .expect("新缺口必须可以领取补查");
+        assert_eq!(next.deadline_mono_ms, m.clock.mono_ms + 20_000);
+        assert!(!m.budget_verification_expired(&t));
+    }
+
+    #[test]
+    fn sa1b_budget_exhaustion_is_persisted_and_complete_cannot_reset_it() {
+        let (mut m, t) = enabled(Some(budget()));
+        let mut actions = vec![];
+        m.observe_run_budget(
+            &t,
+            BudgetEvidence {
+                key: ActivityKey {
+                    thread_id: "线程".into(),
+                    activity_seq: 1,
+                    turn_id: Some("汇总".into()),
+                },
+                input_tokens: 90,
+                cached_input_tokens: 10,
+                output_tokens: 20,
+                evidence_version: 1,
+                goal_covered_tokens: Some(0),
+            },
+            &mut actions,
+        );
+        assert_eq!(m.reconcile_budget_admission(&t), BudgetAdmission::Exhausted);
+        assert!(actions.iter().any(|a|matches!(a,Action::Store(crate::store::StoreOp::PutRun(r)) if r.run_budget.as_ref().is_some_and(|b|b.exhausted))));
+        m.freeze_goal_budget(&t, &mut vec![]);
+        assert_eq!(m.reconcile_budget_admission(&t), BudgetAdmission::Exhausted);
+        assert!(!m.initialize_run_safeguards(&t, Some(budget()), &mut vec![]));
+    }
+
+    #[test]
+    fn sa1b_old_records_and_stale_tokens_never_recreate_authority() {
+        let (mut m, t) = enabled(None);
+        for field in 0..5 {
+            let mut stale = t.clone();
+            match field {
+                0 => stale.run_id.push('旧'),
+                1 => stale.claim.claim_id += 1,
+                2 => stale.manage_gen += 1,
+                3 => stale.conn_epoch += 1,
+                _ => stale.generation += 1,
+            }
+            assert_eq!(
+                m.reconcile_budget_admission(&stale),
+                BudgetAdmission::Disabled
+            );
+            assert!(!m.register_reconcile_input(reg(&stale, 1, None), &mut vec![]));
+            assert!(!m.register_auto_parent_turn(&stale, "轮", TurnOrigin::Goal, &mut vec![]));
+        }
+        m.loop_guards.clear();
+        assert_eq!(m.reconcile_budget_admission(&t), BudgetAdmission::Disabled);
+        assert!(
+            !m.initialize_run_safeguards(&t, None, &mut vec![]),
+            "持久化计数不能恢复能力"
+        );
+    }
+
+    #[test]
+    fn sa1b_goal_started_hook_counts_independently_and_fiftieth_can_merge() {
+        let (mut m, t) = enabled(None);
+        apply(&mut m, turn("turn/started", "goal自动轮"));
+        assert_eq!(record(&m).auto_turns_started, Some(1));
+        assert_eq!(
+            m.auto_parent_turn_origin(RUN, "goal自动轮"),
+            Some(TurnOrigin::Goal)
+        );
+        m.runs.runs.get_mut(RUN).unwrap().auto_turns_started = Some(50);
+        assert!(
+            m.register_reconcile_input(reg(&t, 1, Some("goal自动轮")), &mut vec![]),
+            "合并现有第50轮不另占一轮"
+        );
+        assert!(!m.register_reconcile_input(reg(&t, 2, None), &mut vec![]));
+        assert_eq!(record(&m).auto_turns_started, Some(50));
+    }
+
+    #[test]
+    fn sa1b_detach_rebind_keeps_usage_input_scope_deadline_and_revocation() {
+        let (mut m, t) = enabled(Some(budget()));
+        prepare(&mut m, &t, 1, "汇总");
+        m.require_budget_activity(
+            &t,
+            ActivityKey {
+                thread_id: "子".into(),
+                activity_seq: 1,
+                turn_id: None,
+            },
+            &mut vec![],
+        );
+        m.verify_run_budget(&t, &mut vec![]);
+        let deadline = m.take_budget_verification(&t).unwrap().deadline_mono_ms;
+        let mut new = t.clone();
+        new.manage_gen += 1;
+        m.relations.contexts.get_mut(RUN).unwrap().gen = new.manage_gen;
+        m.convergences.runs.get_mut(RUN).unwrap().token = new.clone();
+        assert_eq!(
+            m.reconcile_budget_admission(&new),
+            BudgetAdmission::Disabled,
+            "没有显式迁移不能借新身份使用旧能力"
+        );
+        assert!(m.rebind_run_safeguards(&t, &new));
+        assert_eq!(
+            m.take_budget_verification(&new).unwrap().deadline_mono_ms,
+            deadline
+        );
+        assert_eq!(
+            m.classify_run_input(RUN, "线程", "汇总", &synthetic(1)),
+            InputSource::TrustedReconcile
+        );
+        assert_eq!(record(&m).auto_turns_started, Some(1));
+        assert_eq!(m.reconcile_budget_admission(&t), BudgetAdmission::Disabled);
+        m.guard_item("线程", "汇总", &json!({"type":"userMessage"}));
+        let mut next = new.clone();
+        next.manage_gen += 1;
+        m.relations.contexts.get_mut(RUN).unwrap().gen = next.manage_gen;
+        m.convergences.runs.get_mut(RUN).unwrap().token = next.clone();
+        assert!(m.rebind_run_safeguards(&new, &next));
+        assert_eq!(
+            m.auto_parent_turn_admission(&next),
+            Err(ReconcileRefusal::OwnershipConflict)
+        );
+    }
+
+    #[test]
+    fn sa1b_registration_is_scoped_idempotent_and_rejects_reused_capability() {
+        let (mut m, t) = enabled(None);
+        let original = reg(&t, 1, None);
+        assert!(m.register_reconcile_input(original.clone(), &mut vec![]));
+        assert!(m.register_reconcile_input(original.clone(), &mut vec![]));
+        let mut changed = original.clone();
+        changed.work_epoch += 1;
+        assert!(!m.register_reconcile_input(changed, &mut vec![]));
+        let mut reused = original;
+        reused.op_id = ReconcileOpId(2);
+        assert!(!m.register_reconcile_input(reused, &mut vec![]));
+        assert!(!m.register_reconcile_input(reg(&t, 0, None), &mut vec![]));
+        assert!(!m.register_reconcile_input(reg(&t, 3, Some("未知轮")), &mut vec![]));
+        assert_eq!(record(&m).auto_turns_started, Some(0));
+    }
+
+    #[test]
+    fn sa1b_paging_prefix_veto_is_immediate_without_claiming_complete_evidence() {
+        let (mut m, t) = enabled(None);
+        prepare(&mut m, &t, 1, "汇总");
+        let classifier = m.run_input_classifier(RUN, "线程", "汇总");
+        let mut output = ItemOutput::default();
+        output.extend_with_classifier(&[synthetic(1)], |i| classifier.classify(i));
+        m.guard_activity(RUN, "线程", "汇总", output.activity);
+        m.drive_loop_guards(&mut vec![]);
+        assert!(!m.convergences.runs[RUN].automatic_control_revoked);
+        assert!(!braked(&m));
+        output.extend_with_classifier(
+            &[json!({"type":"userMessage","clientId":"真实用户"})],
+            |i| classifier.classify(i),
+        );
+        m.guard_activity(RUN, "线程", "汇总", output.activity);
+        assert!(m.convergences.runs[RUN].automatic_control_revoked);
+        assert!(
+            m.runs.guard_evidence.is_empty(),
+            "前页正面证据不能冒充完整轮次"
+        );
+    }
+
+    #[test]
+    fn sa1b_revoked_or_replaced_authority_never_brakes_from_late_evidence() {
+        for revoke_kind in 0..3 {
+            let (mut m, t) = enabled(None);
+            for i in 1..=3 {
+                m.register_auto_parent_turn(&t, &format!("迟到{i}"), TurnOrigin::Goal, &mut vec![]);
+            }
+            match revoke_kind {
+                0 => m.guard_item("线程", "外部轮", &json!({"type":"userMessage"})),
+                1 => {
+                    m.convergences
+                        .runs
+                        .get_mut(RUN)
+                        .unwrap()
+                        .automatic_control_revoked = true
+                }
+                _ => m.relations.contexts.get_mut(RUN).unwrap().gen += 1,
+            }
+            for i in 1..=3 {
+                m.runs.guard_evidence.push((
+                    RUN.into(),
+                    format!("迟到{i}"),
+                    Some(Activity::default()),
+                ));
+            }
+            m.drive_loop_guards(&mut vec![]);
+            assert!(!braked(&m), "撤权／管理换代后迟到证据不能再次停止运行");
+            assert_eq!(record(&m).auto_turns_started, Some(3));
+        }
+    }
+
+    #[test]
+    fn sa1b_budget_zero_limit_exhausts_on_initialization_and_short_deadline_is_respected() {
+        let mut b = budget();
+        b.token_budget = 0;
+        let (m, t) = enabled(Some(b));
+        assert_eq!(m.reconcile_budget_admission(&t), BudgetAdmission::Exhausted);
+        let mut b = budget();
+        b.coverage = BudgetCoverage::Unknown;
+        let (mut m, t) = enabled(Some(b));
+        m.convergences.runs.get_mut(RUN).unwrap().deadline_mono_ms = 700;
+        m.verify_run_budget(&t, &mut vec![]);
+        assert_eq!(
+            m.take_budget_verification(&t).unwrap().deadline_mono_ms,
+            700
+        );
+    }
+}
+
+/// 按需启用（三路审查 P1）：夹具与生产 Core 相同，broker 启动即打开 SA1b 门禁；只有本运行确有
+/// 子代理派生时才建立协调与独立计数，无子代理的运行保留 s4-cli 的旧刹车。
+mod on_demand {
+    use super::*;
+    use crate::claim::converge::ConvergenceReadiness;
+    use crate::sa1b::TerminalReason;
+    use crate::test_support::subagent::SubagentMock;
+
+    fn awaiting_enabled() -> Machine {
+        let mut machine = Machine::new(false);
+        assert!(machine.enable_convergence(ConvergenceReadiness {
+            trusted_inputs: true,
+            budget_admission: true,
+            asynchronous_results: true,
+            terminal_mapping: true,
+            cancellation_verified: true,
+        }));
+        machine.record("线程").subscribed = true;
+        let actions = apply(
+            &mut machine,
+            client(request(
+                1,
+                42,
+                "turn/start",
+                json!({"threadId": "线程", "input": [{"type": "text", "text": "  本次输入  "}]}),
+            )),
+        );
+        let context = first_request(&actions);
+        apply(&mut machine, goal_event("目标", "active", 0));
+        reply(&mut machine, &context, Ok(json!({"turn": {"id": "首轮"}})));
+        apply(&mut machine, turn("turn/started", "首轮"));
+        apply(
+            &mut machine,
+            done("首轮", json!([agent("首轮回答")]), "full"),
+        );
+        assert!(matches!(
+            machine.claims["线程"].state,
+            State::AwaitingContinuation { .. }
+        ));
+        machine
+    }
+
+    fn spawn_child(m: &mut Machine, parent_turn: &str) {
+        let mut mock = SubagentMock::default();
+        mock.register("线程", None, "v1", false, true);
+        mock.register("子", Some("线程"), "v1", false, true);
+        let (a, b) = SubagentMock::v1_spawn("线程", parent_turn, "派生", "子", false);
+        apply(m, a);
+        apply(m, b);
+        apply(m, mock.turn_started("子", "子轮"));
+    }
+
+    #[test]
+    fn 生产启用且无子代理_第五十个自动轮结束仍按旧刹车触发() {
+        let mut m = awaiting_enabled();
+        let limit = CONTINUATION_LIMIT as usize;
+        for i in 1..limit {
+            busy(&mut m, &format!("续{i}"));
+        }
+        assert!(!braked(&m), "{} 轮不应触发", limit - 1);
+        assert!(!m.sa1b_active(RUN), "无子代理不启用 SA1b");
+        assert_eq!(record(&m).auto_turns_started, None, "未启用不写独立计数");
+        let last = format!("续{limit}");
+        busy(&mut m, &last);
+        assert!(braked(&m), "第五十轮结束即按旧刹车停止");
+        let report = record(&m).loop_guard.clone().unwrap();
+        assert_eq!(report.kind, LoopGuardKind::ContinuationLimit);
+        assert_eq!(report.count, CONTINUATION_LIMIT);
+        assert_eq!(report.turn_ids, vec![last]);
+        assert!(record(&m).subagent_join.is_none());
+    }
+
+    #[test]
+    fn 生产启用且无子代理_连续三轮无动作仍按旧刹车停止() {
+        let mut m = awaiting_enabled();
+        for i in 1..=3 {
+            idle(&mut m, &format!("续{i}"));
+        }
+        assert_report(&m, LoopGuardKind::NoAction, &["续1", "续2", "续3"]);
+        assert!(record(&m).subagent_join.is_none());
+    }
+
+    #[test]
+    fn 启用前的自动轮数接上_第五十轮允许完成_第五十一轮开始即制动() {
+        let mut m = awaiting_enabled();
+        busy(&mut m, "续1");
+        busy(&mut m, "续2");
+        // 第三个自动轮里才第一次派生子代理：此刻按需启用，接上已开始的 3 个自动轮。
+        apply(&mut m, turn("turn/started", "续3"));
+        spawn_child(&mut m, "续3");
+        assert!(m.sa1b_active(RUN), "本运行首次派生即启用");
+        assert_eq!(record(&m).auto_turns_started, Some(3));
+        assert_eq!(
+            m.auto_parent_turn_origin(RUN, "续3"),
+            Some(crate::sa1b::TurnOrigin::Goal),
+            "正在跑的 goal 轮按来源登记"
+        );
+        apply(
+            &mut m,
+            done("续3", json!([command("续3-命令"), agent("做完了")]), "full"),
+        );
+        for i in 4..=CONTINUATION_LIMIT {
+            busy(&mut m, &format!("续{i}"));
+        }
+        assert_eq!(record(&m).auto_turns_started, Some(CONTINUATION_LIMIT));
+        assert!(record(&m).loop_guard.is_none(), "第五十轮允许完成");
+        apply(&mut m, turn("turn/started", "续51"));
+        let report = record(&m).loop_guard.clone().expect("第五十一轮开始即制动");
+        assert_eq!(report.kind, LoopGuardKind::ContinuationLimit);
+        assert_eq!(report.count, CONTINUATION_LIMIT + 1);
+        assert_eq!(report.turn_ids, vec!["续51".to_owned()]);
+        assert_eq!(
+            record(&m).subagent_join.as_ref().unwrap().terminal_reason,
+            Some(TerminalReason::AutoTurnLimit)
+        );
+    }
+
+    #[test]
+    fn 启用前已有用户插话_派生后不启用协调() {
+        let mut m = awaiting_enabled();
+        apply(&mut m, turn("turn/started", "续1"));
+        apply(
+            &mut m,
+            notify(
+                "item/completed",
+                json!({"threadId": "线程", "turnId": "续1",
+                    "item": {"type": "userMessage", "id": "插话", "content": [{"type": "text", "text": "用户插话"}]}}),
+            ),
+        );
+        spawn_child(&mut m, "续1");
+        assert!(m.run_subagent_evidence(RUN), "派生证据存在");
+        assert!(!m.sa1b_active(RUN), "自动控制已失，交 SA1a 收尾");
+        assert!(record(&m).subagent_join.is_none());
+    }
+}

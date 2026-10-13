@@ -1,13 +1,16 @@
 import { sanitizeForTerminal } from "../questions";
 import { CxbError, type BrokerRpc, type LifecycleInfo, type RunResult, type RunModelSummary, type ThreadSummary } from "./contracts";
-import { readAllRuns, readLifecycle, readThreadIndex, type ThreadIndexEntry } from "./ledger";
+import { readAllRuns, readLifecycle, readPendingInbox, readThreadIndex, type ThreadIndexEntry } from "./ledger";
 import { modelLabel, threadModelDisplay, type ModelDisplay } from "./show-model";
 import { backgroundLines, derivedOnly, stopReportLines } from "./subagents";
 import { lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
 import { commandSession } from "./command-session";
+import { convergenceFields, resultReady, resultTurn, selectedResultFields } from "./run-result";
+import { convergenceLines } from "./convergence";
+import type { ConvergenceSummary } from "./sa1b-contracts";
 
-interface ListItem extends ModelDisplay {
+interface ListItem extends ModelDisplay, ConvergenceSummary {
   threadId: string; shortId: string | null; status: string; lastRunId: string | null;
   updatedAt: number; model: string | null; preview: string | null; goal: string | null;
   /** 待核实的归档或删除（`--json` 原样带出）。 */
@@ -16,6 +19,11 @@ interface ListItem extends ModelDisplay {
   subagents?: string[];
   backgroundCleanup?: import("./contracts").BackgroundCleanup;
   childrenStop?: import("./contracts").ChildrenStopReport;
+  result?: string;
+  ready?: "pending" | "ready" | "unavailable";
+  origin?: RunResult["turns"][number]["origin"];
+  stageResult?: boolean;
+  pendingCount?: number;
 }
 interface ServerThread {
   id: string; updatedAt: number; model?: string | null; preview?: string;
@@ -35,7 +43,12 @@ function localItems(threads: LocalThread[], runs: RunResult[]): ListItem[] {
     const run = thread.lastRunId ? byId.get(thread.lastRunId) : null;
     const status = thread.lifecycle ? lifecycleLabel(thread.lifecycle) : thread.state && thread.state !== "idle" ? thread.state
       : run?.state === "running" || run?.state === "stopping" || run?.state === "lost" ? run.state : run?.status ?? "idle";
-    return { ...thread, ...threadModelDisplay(thread.threadId, thread.model, []), ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
+    const selected = run ? resultTurn(run) : undefined;
+    return { ...thread, ...threadModelDisplay(thread.threadId, thread.model, []),
+      ...(run ? { ...convergenceFields(run), ...selectedResultFields(run) } : {}),
+      ...(run?.finalTurnId !== undefined || run?.subagentJoin ? { result: selected?.ready === "ready" ? selected.output : "", ready: resultReady(run),
+        ...(run.state === "running" || run.state === "stopping" ? { stageResult: true } : {}) } : {}),
+      ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
   });
 }
 
@@ -151,11 +164,21 @@ export const ls: CommandHandler = async (ctx) => {
       }
     }
     for (const item of items) Object.assign(item, threadModelDisplay(item.threadId, item.model, diskRuns, online));
+    const pending = readPendingInbox(ctx.workspace.workspaceDir);
+    for (const item of items) if (item.subagentJoin && pending && item.pendingCount === undefined) {
+      item.pendingCount = pending.filter((entry) => entry.runId === item.lastRunId && entry.kind !== "guardian").length;
+    }
     ctx.out.progress(`共发现 ${ranked.length} 条线程，显示 ${items.length} 条`);
     ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL REASONING PREVIEW\n");
     for (const item of items) ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${item.status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${modelLabel(item)} ${item.reasoning ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
     for (const item of items) if (item.childrenStop) for (const line of stopReportLines(item.childrenStop)) ctx.out.notice(`${item.shortId ?? item.threadId} ${line}`);
     for (const item of items) if (item.backgroundCleanup && !item.childrenStop) for (const line of backgroundLines(item.threadId, item.backgroundCleanup)) ctx.out.notice(line);
+    for (const item of items) {
+      for (const line of convergenceLines(item, item.pendingCount ?? 0)) ctx.out.notice(`${item.shortId ?? item.threadId} ${line}`);
+      if (item.result) ctx.out.result(`${item.stageResult ? "阶段结果" : "最终结果"}：${preview(item.result)}\n`);
+      if (item.ready === "pending") ctx.out.notice(`${item.shortId ?? item.threadId} 结果尚未就绪，请用 cxb wait 核实`);
+      if (item.ready === "unavailable") ctx.out.notice(`${item.shortId ?? item.threadId} 最终结果不可用（unavailable）`);
+    }
     ctx.out.resultJson({ ok: true, command: "ls", workspace: ctx.workspace.root, source, items, truncated });
     return 0;
   } finally { session.dispose(); }

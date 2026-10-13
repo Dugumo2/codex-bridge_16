@@ -31,6 +31,10 @@ const METHOD_NOT_FOUND: i64 = -32601;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusQuery {
+    ClientMessage {
+        client_user_message_id: String,
+        expected_previous_turn_id: Option<String>,
+    },
     Busy,
     Activity,
     Turn {
@@ -75,6 +79,10 @@ pub enum StatusResult {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusCaller {
+    SubagentReconcile {
+        token: crate::sa1b::ConvergeToken,
+        op_id: crate::sa1b::ReconcileOpId,
+    },
     ContinueCheck {
         round: u64,
     },
@@ -143,6 +151,8 @@ pub(crate) struct ReadState {
     cursors: HashSet<String>,
     /// Activity 按倒序收集到的活动轮次。
     active: Vec<String>,
+    /// clientId 查询的有界候选，前轮本身也必须检查（start 可能被 steer）。
+    client_candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -221,7 +231,7 @@ impl Machine {
             .entry(thread.to_owned())
             .or_insert(0);
         let stage = match query {
-            StatusQuery::Turn { .. } => ReadStage::Turns,
+            StatusQuery::Turn { .. } | StatusQuery::ClientMessage { .. } => ReadStage::Turns,
             _ => ReadStage::Metadata,
         };
         actions.push(Action::Schedule {
@@ -233,6 +243,7 @@ impl Machine {
             read_id,
             ReadState {
                 connection_epoch: self.relations.conn_epoch,
+                client_candidates: Vec::new(),
                 thread: thread.to_owned(),
                 token,
                 query,
@@ -256,6 +267,9 @@ impl Machine {
         #[cfg(test)]
         self.status_reads.observed.push(done.clone());
         match &done.caller {
+            StatusCaller::SubagentReconcile { .. } => {
+                self.subagent_reconcile_status_done(done, actions)
+            }
             StatusCaller::ContinueCheck { .. } => self.continue_check_done(done, actions),
             StatusCaller::StopVerify { .. } => self.stop_verify_done(done, actions),
             StatusCaller::Reconcile { .. } => self.reconcile_status_done(done, actions),
@@ -279,8 +293,10 @@ impl Machine {
                     "limit": STATUS_TURNS_LIMIT, "sortDirection": "desc", "itemsView": "notLoaded"}),
             ),
             ReadStage::Items { index } => {
-                let StatusQuery::Settlement { candidates, .. } = &read.query else {
-                    return None;
+                let candidates = match &read.query {
+                    StatusQuery::Settlement { candidates, .. } => candidates,
+                    StatusQuery::ClientMessage { .. } => &read.client_candidates,
+                    _ => return None,
                 };
                 (
                     "thread/items/list",
@@ -601,7 +617,7 @@ impl Machine {
                 Some(true) => Step::Done(StatusResult::Unknown(StatusUnknown::NotVisible)),
             },
             ReadStage::Turns => self.status_turns(read_id, &value),
-            ReadStage::Items { index } => self.status_items(read_id, index, &value),
+            ReadStage::Items { index } => self.status_items(read_id, index, &value, actions),
         };
         match outcome {
             Step::Done(result) => self.finish_status_read(read_id, result, actions),
@@ -631,12 +647,13 @@ impl Machine {
         read.rereads += 1;
         read.version = current;
         read.stage = match read.query {
-            StatusQuery::Turn { .. } => ReadStage::Turns,
+            StatusQuery::Turn { .. } | StatusQuery::ClientMessage { .. } => ReadStage::Turns,
             _ => ReadStage::Metadata,
         };
         read.cursor = None;
         read.cursors.clear();
         read.active.clear();
+        read.client_candidates.clear();
         actions.push(Action::Debug(format!(
             "线程 {} 活动版本变化，状态读取 {read_id} 第 {} 次重读",
             read.thread, read.rereads
@@ -654,6 +671,9 @@ impl Machine {
             return Step::Done(StatusResult::Unknown(StatusUnknown::Malformed));
         };
         match (&read.query, active) {
+            (StatusQuery::ClientMessage { .. }, _) => {
+                Step::Done(StatusResult::Unknown(StatusUnknown::Unsupported))
+            }
             (StatusQuery::Busy, true) => Step::Done(StatusResult::Busy),
             (StatusQuery::Busy, false) => Step::Done(StatusResult::NotBusy),
             (StatusQuery::Activity, false) => Step::Done(StatusResult::Idle),
@@ -693,6 +713,39 @@ impl Machine {
             Ok(page) => page,
             Err(reason) => return Step::Done(StatusResult::Unknown(reason)),
         };
+        if let StatusQuery::ClientMessage {
+            expected_previous_turn_id,
+            ..
+        } = &read.query
+        {
+            let mut reached_previous = false;
+            for (id, _, _) in &page.turns {
+                if read.client_candidates.contains(id) {
+                    return Step::Done(StatusResult::Unknown(StatusUnknown::Changed));
+                }
+                if read.client_candidates.len() >= STATUS_MAX_CANDIDATES {
+                    return Step::Done(StatusResult::Unknown(StatusUnknown::PageBudget));
+                }
+                read.client_candidates.push(id.clone());
+                if expected_previous_turn_id.as_ref() == Some(id) {
+                    reached_previous = true;
+                    break;
+                }
+            }
+            if !reached_previous {
+                if let Some(cursor) = page.next {
+                    read.cursor = Some(cursor);
+                    return Step::Next;
+                }
+            }
+            if read.client_candidates.is_empty() {
+                return Step::Done(StatusResult::NoCarrier);
+            }
+            read.stage = ReadStage::Items { index: 0 };
+            read.cursor = None;
+            read.cursors.clear();
+            return Step::Next;
+        }
         if let StatusQuery::Turn { target } = &read.query {
             if let Some((_, status, turn)) = page.turns.iter().find(|(id, _, _)| id == target) {
                 return Step::Done(StatusResult::Found {
@@ -736,23 +789,79 @@ impl Machine {
         }
     }
 
-    fn status_items(&mut self, read_id: u64, index: usize, value: &Value) -> Step {
+    fn status_items(
+        &mut self,
+        read_id: u64,
+        index: usize,
+        value: &Value,
+        actions: &mut Vec<Action>,
+    ) -> Step {
+        let reconcile = self.status_reads.reads.get(&read_id).and_then(|read| {
+            let StatusCaller::SubagentReconcile { token, op_id } = &read.caller else {
+                return None;
+            };
+            let turn = read.client_candidates.get(index)?;
+            let pending = self.runs.reconciliation.operations.get(&op_id.0)?;
+            // 查询可能回看原用户轮；历史输入不构成本次提交期间的新 veto。
+            if !pending.observed_starts.contains(turn) && !pending.started.contains_key(turn) {
+                return None;
+            }
+            Some((token.clone(), turn.clone()))
+        });
+        let outcome = self.status_items_page(read_id, index, value);
+        if !matches!(outcome, Step::Done(StatusResult::Unknown(_))) {
+            if let Some((token, turn)) = reconcile {
+                // 承载核实的分页也可能同时含真实输入，必须在授予归属前走 C 分类器。
+                if value
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| {
+                        items.iter().any(|entry| {
+                            self.classify_result_input(
+                                &token.run_id,
+                                &token.claim.thread_id,
+                                &turn,
+                                &entry["item"],
+                            ) == crate::sa1b::InputSource::ExternalUser
+                        })
+                    })
+                {
+                    self.reconcile_user_input(&token, actions);
+                }
+            }
+        }
+        outcome
+    }
+
+    fn status_items_page(&mut self, read_id: u64, index: usize, value: &Value) -> Step {
         let read = self
             .status_reads
             .reads
             .get_mut(&read_id)
             .expect("读取登记存在");
-        let StatusQuery::Settlement { candidates, input } = &read.query else {
-            return Step::Done(StatusResult::Unknown(StatusUnknown::Malformed));
+        let (candidates, input, client_id) = match &read.query {
+            StatusQuery::Settlement { candidates, input } => (candidates, Some(input), None),
+            StatusQuery::ClientMessage {
+                client_user_message_id,
+                ..
+            } => (&read.client_candidates, None, Some(client_user_message_id)),
+            _ => return Step::Done(StatusResult::Unknown(StatusUnknown::Malformed)),
         };
         let Some(candidate) = candidates.get(index) else {
             return Step::Done(StatusResult::Unknown(StatusUnknown::Malformed));
         };
-        let page = match items_page(value, candidate, &mut read.cursors) {
+        let page = match items_page(
+            value,
+            candidate,
+            &mut read.cursors,
+            client_id.map(String::as_str),
+        ) {
             Ok(page) => page,
             Err(reason) => return Step::Done(StatusResult::Unknown(reason)),
         };
-        if page.texts.iter().any(|text| carries(text, input)) {
+        if page.client_match
+            || input.is_some_and(|input| page.texts.iter().any(|text| carries(text, input)))
+        {
             return Step::Done(StatusResult::Carrier(candidate.clone()));
         }
         if let Some(cursor) = page.next {
@@ -861,6 +970,7 @@ fn shell(turn: &Value) -> Value {
 }
 
 struct ItemsPage {
+    client_match: bool,
     /// 本页全部 userMessage 的文本部分。
     texts: Vec<String>,
     next: Option<String>,
@@ -873,6 +983,7 @@ fn items_page(
     value: &Value,
     candidate: &str,
     seen: &mut HashSet<String>,
+    client_id: Option<&str>,
 ) -> Result<ItemsPage, StatusUnknown> {
     let malformed = StatusUnknown::Malformed;
     let data = value
@@ -883,6 +994,7 @@ fn items_page(
         return Err(malformed);
     }
     let mut texts = Vec::new();
+    let mut client_match = false;
     for entry in data {
         if entry.get("turnId").and_then(Value::as_str) != Some(candidate) {
             return Err(malformed);
@@ -895,6 +1007,9 @@ fn items_page(
         if kind != "userMessage" {
             continue;
         }
+        client_match |= client_id.is_some_and(|id| {
+            !id.is_empty() && item.get("clientId").and_then(Value::as_str) == Some(id)
+        });
         let content = item
             .get("content")
             .and_then(Value::as_array)
@@ -903,12 +1018,18 @@ fn items_page(
             let part_kind = part.get("type").and_then(Value::as_str).ok_or(malformed)?;
             if part_kind == "text" {
                 let text = part.get("text").and_then(Value::as_str).ok_or(malformed)?;
-                texts.push(text.to_owned());
+                if client_id.is_none() {
+                    texts.push(text.to_owned());
+                }
             }
         }
     }
     let next = next_cursor(value, data.is_empty(), seen)?;
-    Ok(ItemsPage { texts, next })
+    Ok(ItemsPage {
+        texts,
+        client_match,
+        next,
+    })
 }
 
 /// 与 `claim/settling.rs` 的 `carries_input` 同一口径：去首尾空白后与某条非空输入完全相等。

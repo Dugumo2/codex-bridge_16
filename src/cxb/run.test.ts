@@ -600,12 +600,18 @@ test("续跑 --detach：交接完成后返回新运行句柄且不停止、不�
   const unit = continueUnit(["--detach", "--json"]);
   const original = unit.fake.handle;
   unit.fake.handle = (method, params) => method === "broker/threads/detach"
-    ? { outcome: "detached", turnId: "turn-test", pending: [] } : original(method, params);
+    ? { outcome: "detached", turnId: "turn-test", pending: [] }
+    : method === "broker/threads/watch" && params.runId === "run-test"
+      ? { run: runResult({ state: "running", status: null, finalTurnId: undefined }), revision: 0, pending: [] }
+      : original(method, params);
   expect(await watchdog(createRunHandler(realRequests)(unit.ctx))).toBe(0);
   await unit.out.flush();
   expect(JSON.parse(unit.output().stdout)).toEqual({ threadId: "thread-test", shortId: "abcd1234", runId: "run-test", status: "running" });
   expect(unit.fake.calls.find((c) => c.method === "broker/threads/detach")?.params).toMatchObject({ threadId: "thread-test", runId: "run-test" });
-  expect(unit.fake.calls.filter((c) => c.method === "broker/threads/watch")).toHaveLength(1);
+  // 原运行续跑预检与交接后的新运行协调快照各一次；运行仍 running，不能等到结果才返回。
+  const watches = unit.fake.calls.filter((c) => c.method === "broker/threads/watch");
+  expect(watches).toHaveLength(2);
+  expect(watches[1]!.params).toEqual({ threadId: "thread-test", runId: "run-test" });
   expect(methods(unit)).not.toContain("broker/threads/stop");
   expect(unit.fake.subscriptions).toBe(0);
   expect(unit.closed()).toBe(true);

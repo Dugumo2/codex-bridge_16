@@ -210,3 +210,66 @@ fn 派生停止不跳过首次核实_活动成员不会未核实就判已停() {
     assert_ne!(report.phase, TreePhase::Confirmed);
     assert!(s.record().stop_outcome != Some(crate::runs::StopOutcome::Confirmed));
 }
+
+#[test]
+fn 二审_r1_跟进独立旧子线程后停止父运行不改它的goal() {
+    let mut s = Sim::new();
+    s.m.enable_convergence(crate::claim::converge::ConvergenceReadiness {
+        trusted_inputs: true,
+        budget_admission: true,
+        asynchronous_results: true,
+        terminal_mapping: true,
+        cancellation_verified: true,
+    });
+    s.mock.register("旧子", Some(P), "v1", false, true);
+    s.learn_thread("旧子");
+    let mut independent = s.m.claims[P].clone();
+    independent.run_id = Some("独立运行".into());
+    independent.claim_id = 99;
+    s.m.claims.insert("旧子".into(), independent);
+    s.goals.insert("旧子".into(), goal("旧子", "active"));
+    let (started, completed) = SubagentMock::v1_message("sendInput", P, T, "跟进", "旧子", false);
+    s.apply(started);
+    s.apply(completed);
+    let start = s.log.len();
+    stop(&mut s, json!({"threadId": P, "runId": R}));
+    assert!(s
+        .requests(&s.log[start..], "thread/goal/set", "旧子")
+        .is_empty());
+    assert!(s
+        .requests(&s.log[start..], "thread/goal/clear", "旧子")
+        .is_empty());
+    assert_eq!(s.goals["旧子"]["status"], "active");
+}
+
+#[test]
+fn 二审_r1_goal读取在途变为独立认领或其他运行绑定则不写入() {
+    for other_binding in [false, true] {
+        let mut s = Sim::new();
+        s.spawn_v1("子甲", "派生1", "子轮甲");
+        s.goals.insert("子甲".into(), goal("子甲", "active"));
+        s.hold.push(("thread/goal/get".into(), "子甲".into()));
+        stop(&mut s, json!({"threadId": P, "runId": R}));
+        assert!(s.held.iter().any(|r| r.method == "thread/goal/get"));
+        if other_binding {
+            s.m.relations
+                .bindings
+                .get_mut(&("子甲".into(), "子轮甲".into()))
+                .unwrap()
+                .run_id = "另一运行".into();
+        } else {
+            let mut independent = s.m.claims[P].clone();
+            independent.run_id = Some("独立运行".into());
+            independent.claim_id = 99;
+            s.m.claims.insert("子甲".into(), independent);
+        }
+        let start = s.log.len();
+        s.release("thread/goal/get", "子甲");
+        assert!(
+            s.requests(&s.log[start..], "thread/goal/set", "子甲")
+                .is_empty(),
+            "其他绑定={other_binding}"
+        );
+        assert_eq!(s.goals["子甲"]["status"], "active");
+    }
+}

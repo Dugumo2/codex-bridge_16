@@ -41,7 +41,7 @@ impl Machine {
             return;
         };
         let member = context.members.get(thread);
-        let params = json!({
+        let mut params = json!({
             "runId": run,
             "rootThreadId": context.identity.logical_root_thread_id,
             "threadId": if thread.is_empty() { Value::Null } else { json!(thread) },
@@ -51,6 +51,13 @@ impl Machine {
             "pendingCount": member.map(|m| m.pending_requests),
             "revision": context.revision,
         });
+        if let Some(summary) = self.convergence_summary(run) {
+            if let (Some(target), Ok(Value::Object(fields))) =
+                (params.as_object_mut(), serde_json::to_value(summary))
+            {
+                target.extend(fields);
+            }
+        }
         let message = crate::proto::notification("broker/run/childChanged", Some(params));
         for conn in self.run_recipients(run) {
             self.send_ext(conn, message.clone(), actions);
@@ -119,6 +126,11 @@ impl Machine {
                     "pending".into(),
                     json!(self.inbox_pending_aggregate(thread)),
                 );
+            }
+            if let Some(summary) = run.as_deref().and_then(|run| self.convergence_summary(run)) {
+                if let Ok(Value::Object(fields)) = serde_json::to_value(summary) {
+                    object.extend(fields);
+                }
             }
             object.insert("children".into(), children);
             object.insert("revision".into(), json!(context.map_or(0, |c| c.revision)));

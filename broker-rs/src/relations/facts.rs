@@ -7,7 +7,7 @@
 //!   kind=started 已带 agentThreadId，不代表操作刚开始。
 //!
 //! 绑定分两步：证据有效期内把派生操作与 C 的唯一首轮「配对」；父轮确认是运行 R 的自有轮之后才「落实」为绑定。
-//! sendInput、resumeAgent、v2 interacted 不能证明具体轮次，只登记操作，不预约下一轮。
+//! sendInput、resumeAgent、v2 interacted 在收敛启用时配对唯一承载活动；历史完成轮不作为新工作。
 use super::*;
 use crate::claim::{Owner, State};
 use crate::policy::Policy;
@@ -149,11 +149,13 @@ impl Machine {
                         event.method == "item/completed",
                         actions,
                     );
+                    self.convergence_agent_states(&thread, turn, item, actions);
                 }
                 relevant
             }
             "turn/started" => {
                 if let (false, Some(turn)) = (claimed, &turn) {
+                    self.convergence_observe_activity(&thread, turn, "running", false);
                     self.observe_turn(&thread, turn, true, false, actions);
                 }
                 true
@@ -161,6 +163,12 @@ impl Machine {
             "turn/completed" => {
                 if let Some(turn) = &turn {
                     if !claimed {
+                        let status = params
+                            .and_then(|p| p.get("turn"))
+                            .and_then(|t| t.get("status"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown");
+                        self.convergence_observe_activity(&thread, turn, status, false);
                         self.observe_turn(&thread, turn, true, true, actions);
                     }
                     self.parent_turn_ended(&thread, turn, actions);
@@ -182,6 +190,8 @@ impl Machine {
                 true
             }
             "thread/closed" => {
+                self.convergences.closed_threads.insert(thread.clone());
+                self.convergence_observation_gap(&thread, actions);
                 self.detach_evidence(&thread);
                 false
             }
@@ -192,6 +202,7 @@ impl Machine {
                     .and_then(Value::as_str)
                     == Some("notLoaded")
                 {
+                    self.convergence_observation_gap(&thread, actions);
                     self.detach_evidence(&thread);
                 }
                 false
@@ -582,6 +593,7 @@ impl Machine {
                     completed_seen: false,
                     outcome,
                     receivers: BTreeSet::new(),
+                    rejected_receivers: BTreeMap::new(),
                     proven_turns: BTreeMap::new(),
                     first_seen_ms: now,
                     expires_at_ms: now.saturating_add(EVIDENCE_TTL_MS),
@@ -659,6 +671,46 @@ impl Machine {
             EvidenceKind::V2Started => {
                 for child in new_receivers {
                     self.spawn_candidate(&key, &child, AgentVersion::V2, actions);
+                }
+            }
+            _ if self.convergence_enabled()
+                && confirmed
+                && !failed
+                && matches!(
+                    kind,
+                    EvidenceKind::V1SendInput
+                        | EvidenceKind::V1ResumeAgent
+                        | EvidenceKind::V2Interacted
+                ) =>
+            {
+                // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
+                // 只排除首次通知时已完成的旧轮；每个接收方只建一次基线，双通知不重新挂起。
+                for child in new_receivers {
+                    if self.reject_followup_receiver(&key, &child) {
+                        continue;
+                    }
+                    let observed = self
+                        .relations
+                        .aux
+                        .observed
+                        .get(&child)
+                        .map(|v| {
+                            v.iter()
+                                .filter(|o| o.completed)
+                                .map(|o| o.turn.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.convergences
+                        .reuse_candidates
+                        .entry((key.clone(), child.clone()))
+                        .or_insert(observed);
+                    self.relations
+                        .aux
+                        .spawn_waits
+                        .insert(child.clone(), key.clone());
+                    self.pair_first_turn(&key, &child, actions);
+                    self.materialize(&key, actions);
                 }
             }
             _ => {
@@ -749,6 +801,9 @@ impl Machine {
 
     /// 首轮配对：C 恰好观察到一轮就配对；还没有就等；不止一轮说明首轮身份不明，保持 unbound。
     fn pair_first_turn(&mut self, key: &EvidenceKey, child: &str, actions: &mut Vec<Action>) {
+        if self.reject_followup_receiver(key, child) {
+            return;
+        }
         let now = self.clock.mono_ms;
         let Some(op) = self.relations.operations.get(key) else {
             return;
@@ -761,7 +816,18 @@ impl Machine {
             .aux
             .observed
             .get(child)
-            .map(|o| o.iter().map(|t| t.turn.clone()).collect())
+            .map(|o| {
+                o.iter()
+                    .filter(|t| {
+                        !self
+                            .convergences
+                            .reuse_candidates
+                            .get(&(key.clone(), child.into()))
+                            .is_some_and(|old| old.contains(&t.turn))
+                    })
+                    .map(|t| t.turn.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         match observed.len() {
             0 => {
@@ -815,10 +881,17 @@ impl Machine {
         } else {
             match op.kind {
                 EvidenceKind::V2Started => BindingEvidence::V2Started,
+                EvidenceKind::V2Interacted => BindingEvidence::V2Interacted,
+                EvidenceKind::V1SendInput | EvidenceKind::V1ResumeAgent => {
+                    BindingEvidence::V1Message
+                }
                 _ => BindingEvidence::V1Spawn,
             }
         };
         for child in &op.receivers {
+            if self.reject_followup_receiver(key, child) {
+                continue;
+            }
             self.relations
                 .aux
                 .member_evidence
@@ -828,16 +901,100 @@ impl Machine {
             self.refresh_member(&op.run_id, child, MemberChange::Relation, actions);
         }
         for (child, turns) in &op.proven_turns {
+            if self.reject_followup_receiver(key, child) {
+                continue;
+            }
             for turn in turns {
                 self.bind(child, turn, &op.run_id, evidence, key, actions);
             }
         }
-        if !op.receivers.is_empty() && op.receivers.iter().all(|c| op.proven_turns.contains_key(c))
+        if !op.receivers.is_empty()
+            && op.receivers.iter().all(|c| {
+                op.proven_turns.contains_key(c)
+                    && !self.relations.operations[key]
+                        .rejected_receivers
+                        .contains_key(c)
+            })
         {
             if let Some(op) = self.relations.operations.get_mut(key) {
                 op.outcome = EvidenceOutcome::Proven;
             }
         }
+    }
+
+    /// 跟进只提供候选身份，血缘、独立认领与其他运行绑定必须在授予管理权前核实。
+    fn reject_followup_receiver(&mut self, key: &EvidenceKey, child: &str) -> bool {
+        let Some(op) = self.relations.operations.get(key) else {
+            return false;
+        };
+        if !matches!(
+            op.kind,
+            EvidenceKind::V1SendInput | EvidenceKind::V1ResumeAgent | EvidenceKind::V2Interacted
+        ) {
+            return false;
+        }
+        if op.rejected_receivers.contains_key(child) {
+            return true;
+        }
+        let reason = if !self.thread_relation(child).is_some_and(|edge| {
+            edge.kind == RelationKind::Subagent && edge.parent_thread_id == key.parent_thread_id
+        }) {
+            "未核实为本父线程的子代理"
+        } else if self.claims.contains_key(child) {
+            "接收方已有独立认领"
+        } else if self.relations.bindings.values().any(|binding| {
+            binding.thread_id == child
+                && binding.run_id != op.run_id
+                && binding.status == BindingStatus::Bound
+        }) {
+            "接收方已绑定其他运行"
+        } else {
+            return false;
+        };
+        let op = self
+            .relations
+            .operations
+            .get_mut(key)
+            .expect("跟进操作存在");
+        op.rejected_receivers.insert(child.into(), reason.into());
+        op.proven_turns.remove(child);
+        if op
+            .receivers
+            .iter()
+            .all(|t| op.rejected_receivers.contains_key(t))
+        {
+            op.outcome = EvidenceOutcome::Unproven;
+        }
+        if self.relations.aux.spawn_waits.get(child) == Some(key) {
+            self.relations.aux.spawn_waits.remove(child);
+        }
+        self.convergences
+            .reuse_candidates
+            .remove(&(key.clone(), child.into()));
+        true
+    }
+
+    /// 已拒绝的跟进候选不能通过后续收敛发现重新入册；本运行已有合法管理证据时仍保留。
+    pub(super) fn rejected_followup_for_run(&self, run: &str, child: &str) -> bool {
+        if self
+            .manage_context(run)
+            .is_some_and(|c| c.members.contains_key(child))
+        {
+            return false;
+        }
+        let mut rejected = false;
+        for op in self
+            .relations
+            .operations
+            .values()
+            .filter(|op| op.run_id == run && op.receivers.contains(child))
+        {
+            if !op.rejected_receivers.contains_key(child) {
+                return false;
+            }
+            rejected = true;
+        }
+        rejected
     }
 
     /// 写入绑定；独立认领或已有其他运行绑定构成冲突，不覆盖。
@@ -1396,6 +1553,18 @@ impl Machine {
         };
         context.revision = context.revision.saturating_add(1);
         let revision = context.revision;
+        // 同一 revision 的首条通知就必须携带新摘要，客户端可能丢弃后续同号通知。
+        self.convergence_sync_facts(run);
+        if let Some(epoch) = self.convergences.ledgers.get(run).map(|l| l.work_epoch) {
+            if let Some(join) = self
+                .runs
+                .runs
+                .get_mut(run)
+                .and_then(|r| r.subagent_join.as_mut())
+            {
+                join.work_epoch = epoch;
+            }
+        }
         self.persist_children(run, actions);
         self.notify_child_changed(run, thread, actions);
         self.on_member_changed(run, revision, change, actions);

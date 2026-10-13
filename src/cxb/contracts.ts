@@ -1,3 +1,6 @@
+import type { ConvergenceSummary, ConvergenceConfig, RunExecutionConfig, TurnOrigin, Sa1bInterruptReason, Sa1bTreeTrigger } from "./sa1b-contracts";
+export type * from "./sa1b-contracts";
+
 // src/cxb/contracts.ts — cxb CLI 各模块之间的接口约定（S4 N1）。
 //
 // 这里只放各路共用的常量、类型与错误类；实现分别在：
@@ -231,6 +234,7 @@ export interface RunMeta {
 }
 
 export interface TurnResult {
+  origin?: TurnOrigin;
   turnId: string;
   ready: "pending" | "ready" | "unavailable";
   status: "completed" | "interrupted" | "failed";
@@ -257,7 +261,9 @@ export interface LoopGuardReport {
   pause?: "pending" | "paused" | "superseded" | "failed";
 }
 
-export interface RunResult {
+export interface RunResult extends ConvergenceSummary {
+  convergenceConfig?: ConvergenceConfig;
+  executionConfig?: RunExecutionConfig;
   /** 最近一次已开始的轮次；结束后保留，旧记录缺省为 null。 */
   currentTurnId?: string | null;
   creationOrder?: { epoch: number; sequence: number };
@@ -280,18 +286,19 @@ export interface RunResult {
   reviewShortId?: string | null;
   input: string;
   continuedFrom: string | null;
-  interruptReason: "clientDisconnected" | "stop" | "brokerLost" | "goalLoop" | "subagentsUnfinished" | null;
+  interruptReason: "clientDisconnected" | "stop" | "brokerLost" | "goalLoop" | "subagentsUnfinished" | Sa1bInterruptReason | null;
   stopOutcome: "confirmed" | "unconfirmed" | null;
   stopCheck?: unknown;
   loopGuard?: LoopGuardReport;
   progress: { done: ProgressItem[]; doneTotal: number; unconfirmed: ProgressItem[]; observedFiles: string[]; incomplete?: boolean };
-  /** 最近一轮在最后；最多保留 100 轮。 */
+  /** 最多保留 100 轮；迟到旧结果可追加，最终交付以 finalTurnId 为准。 */
   turns: TurnResult[];
   turnsTotal: number;
 }
 
 /** broker/runs/modelSummaries 的轻量回包，不含输入、输出正文。 */
 export interface RunModelSummary {
+  finalTurnId?: string;
   runId: string;
   threadId: string;
   reviewThreadId: string | null;
@@ -429,7 +436,7 @@ export interface WaitRunOptions {
   workspaceDir?: string;
 }
 
-/** 等整次运行结束（`broker/run/ended`，认领释放）且最后一轮结果不再是 pending（`broker/thread/result`，
+/** 等整次运行结束（`broker/run/ended`，认领释放）且最终指向轮结果不再是 pending（旧记录回退最后一轮；`broker/thread/result`，
  *  只发给 watcher，所以内部先 `broker/threads/watch{threadId, runId}`，快照给的就是这次运行，不受线程上更新的运行影响）。
  *  快照里已经结束且就绪的直接返回；快照 run 为 null 时按 workspaceDir 读磁盘记录，没有则 NOT_FOUND。
  *  连接断开抛 BROKER_UNAVAILABLE。不处理服务端请求（那是 AttachServerRequests 的事）。 */
@@ -532,7 +539,7 @@ export interface RootStopReport {
 export interface ChildrenStopReport {
   rootRelease?: { thread: string; released: boolean; reason: string };
   members?: Record<string, RootStopReport>; cleanupState?: string; abandonReason?: string | null; abandonedAt?: number | null;
-  trigger: "userStop" | "ownerGone" | "parentFinishedEarly" | "loopGuard" | "parentFailed" | "parentInterrupted";
+  trigger: "userStop" | "ownerGone" | "parentFinishedEarly" | "loopGuard" | "parentFailed" | "parentInterrupted" | Sa1bTreeTrigger;
   phase: TreePhase; version: number; root: RootStopReport;
   stopped: string[]; unconfirmed: string[]; failed: string[];
   conflicts: Array<{ thread: string; reason: string }>; capabilityLimited: string[];
@@ -541,7 +548,7 @@ export interface ChildrenStopReport {
 export interface CxbOrigin {
   rootThreadId: string; runId: string; parentThreadId: string; relationKind: RelationKind; sourceThreadId: string;
 }
-export interface ChildChanged {
+export interface ChildChanged extends ConvergenceSummary {
   runId: string; rootThreadId: string; threadId: string | null; parentThreadId?: string;
   relationKind?: RelationKind; activity?: ChildActivity; pendingCount?: number; revision: number; stopPhase?: TreePhase;
 }

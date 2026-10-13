@@ -19,7 +19,12 @@ struct Pages {
 
 impl Pages {
     /// 完整遍历的末页才产生证据；中途失败不能把已读前缀冒充完整输出。
-    fn accept(&mut self, value: &Value, turn: &str) -> Option<bool> {
+    fn accept(
+        &mut self,
+        value: &Value,
+        turn: &str,
+        sources: &[crate::sa1b::InputSource],
+    ) -> Option<bool> {
         let data = value.get("data")?.as_array()?;
         if data.len() > PAGE_SIZE || self.count >= MAX_PAGES {
             return None;
@@ -37,14 +42,23 @@ impl Pages {
             }
             _ => return None,
         };
-        for entry in data {
+        let mut activity = self.output.activity;
+        for (index, entry) in data.iter().enumerate() {
             if entry.get("turnId")?.as_str()? != turn {
                 return None;
             }
             let item = entry.get("item")?;
             item.as_object()?;
+            activity.observe_with_source(
+                item,
+                sources
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(|| crate::results::classify_untrusted_input(item)),
+            );
             self.output.extend(std::slice::from_ref(item));
         }
+        self.output.activity = activity;
         self.count += 1;
         self.cursor = next;
         Some(self.cursor.is_none())
@@ -226,6 +240,7 @@ impl Runs {
         &mut self,
         read: ResultRead,
         result: Result<Value, Value>,
+        sources: &[crate::sa1b::InputSource],
         now: u64,
         actions: &mut Vec<Action>,
     ) {
@@ -275,7 +290,14 @@ impl Runs {
         let complete = result
             .as_ref()
             .ok()
-            .and_then(|value| pending.pages.accept(value, &read.turn_id));
+            .and_then(|value| pending.pages.accept(value, &read.turn_id, sources));
+        if complete.is_some() && pending.pages.output.activity.user_input {
+            self.guard_evidence.push((
+                read.run_id.clone(),
+                read.turn_id.clone(),
+                Some(pending.pages.output.activity),
+            ));
+        }
         if complete == Some(false) && self.phase == Phase::Open {
             self.next_page(pending, actions);
             return;
@@ -500,6 +522,37 @@ mod tests {
         let mut actions = Vec::new();
         m.run_timer(timer, &mut actions);
         request(&actions)
+    }
+
+    #[test]
+    fn 最终目标已有完成项时补读失败有界收束为不可用() {
+        let (mut m, mut current) = begin();
+        m.runs.runs.get_mut("运行").unwrap().final_turn_id = Some("轮".into());
+        m.run_released("运行", ReleaseKind::Natural, &mut vec![]);
+        assert_eq!(m.runs.runs["运行"].state, RunState::Ended);
+        for attempt in 0..=RESULT_RETRY_MS.len() {
+            let actions = answer(
+                &mut m,
+                &current,
+                Err(json!({"code":-32000,"message":"暂时不可读"})),
+            );
+            if let Some(delay) = RESULT_RETRY_MS.get(attempt) {
+                assert_eq!(
+                    m.runs.runs["运行"].selected_parent_result().unwrap().ready,
+                    Ready::Pending
+                );
+                current = retry(&mut m, &actions, *delay);
+            } else {
+                assert_eq!(
+                    m.runs.runs["运行"].selected_parent_result().unwrap().ready,
+                    Ready::Unavailable
+                );
+                assert!(m.runs.reads.is_empty());
+                assert!(!actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Request(_) | Action::Schedule { .. })));
+            }
+        }
     }
 
     #[test]
@@ -751,14 +804,14 @@ mod tests {
             ..Pages::default()
         };
         assert_eq!(
-            pages.accept(&page(vec![msg("内容")], Some("还有")).unwrap(), "轮"),
+            pages.accept(&page(vec![msg("内容")], Some("还有")).unwrap(), "轮", &[]),
             None
         );
         assert_eq!(
-            pages.accept(&page(vec![msg("内容")], None).unwrap(), "轮"),
+            pages.accept(&page(vec![msg("内容")], None).unwrap(), "轮", &[]),
             Some(true)
         );
-        assert_eq!(pages.accept(&page(vec![], None).unwrap(), "轮"), None);
+        assert_eq!(pages.accept(&page(vec![], None).unwrap(), "轮", &[]), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 /**
  * SA-b 黑盒：用子代理模拟（subagent-mock.ts）与状态读取模拟（status-history.ts，二者同时启用）驱动真实 broker。
- * - 父线程不等子代理就结束：门禁暂缓释放、停树，运行以 interrupted/subagentsUnfinished 结束且报告先于 ended；
+ * - 父线程不等子代理就结束：门禁暂缓释放、等待后代，再在同运行汇总；
  * - 停止父线程：整树停止，回包带 childrenStop；
  * - 不接受直接输入的子线程拒绝开工（subagentNoDirectInput）；
  * - 有子树的父线程拒绝归档（threadBusy + hasSubtree）。
@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Subprocess } from "bun";
 import type { TestClient as Client } from "./test-support/broker-harness";
+import { Sa1bHarness } from "./test-support/sa1b-harness";
 
 const RUNNABLE = process.platform === "win32";
 const harness = RUNNABLE ? await import("./test-support/broker-harness") : null;
@@ -73,23 +74,26 @@ describe.skipIf(!RUNNABLE)("broker-ext 子代理停止与门禁（SA-b）", () =
     throw new Error("等待条件超时");
   };
 
-  test("父线程不等子代理就结束：暂缓释放并停树，运行标子代理未完成，报告与 ended 一起交付", async () => {
-    const { sockPath } = await startBroker();
-    const owner = await h.TestClient.connectAndInit(sockPath, { cxb: true });
+  test("父线程不等子代理就结束：保持占用，后代完成后同运行汇总且只交付一次", async () => {
+    const integrated = new Sa1bHarness();
     try {
-      const run = await startRun(owner);
-      await spawnChild(owner, "child-1");
-      await finishParent(owner);
-      await h.waitFor(() => notes(owner, "broker/run/ended").some((n) => n.params?.run?.runId === run.runId), 30_000);
-      const ended = notes(owner, "broker/run/ended").find((n) => n.params?.run?.runId === run.runId)!.params.run;
-      expect(ended.status).toBe("interrupted");
-      expect(ended.interruptReason).toBe("subagentsUnfinished");
-      expect(ended.childrenStop.trigger).toBe("parentFinishedEarly");
-      expect(ended.childrenStop.stopped).toContain("child-1");
-      expect((await mockState(owner))["child-1"]!.interrupts.length).toBeGreaterThanOrEqual(1);
-      expect(notes(owner, "broker/run/ended").filter((n) => n.params?.run?.runId === run.runId)).toHaveLength(1);
+      await integrated.open(); await integrated.start(); await integrated.spawn("child-1");
+      await integrated.finish("root"); await integrated.observe();
+      expect(integrated.ended()).toHaveLength(0);
+      expect((await integrated.record()).state).toBe("running");
+      expect((await integrated.state()).threads["child-1"].interrupts).toHaveLength(0);
+      await integrated.finish("child-1", "子代理最终结果");
+      const request = await integrated.reconciliation();
+      expect(request.params.input[0].text).toContain("子代理最终结果");
+      await integrated.finish("root", "已核实子代理最终结果");
+      await integrated.until(async () => integrated.ended().length === 1);
+      const ended = integrated.ended()[0];
+      expect(ended.status).toBe("completed");
+      expect(ended.runId).toBe(integrated.runId);
+      expect(ended.childrenStop).toBeUndefined();
+      expect(ended.subagentJoin.reconciledEpoch).toBe(ended.subagentJoin.workEpoch);
     } finally {
-      await owner.close();
+      await integrated.close();
     }
   }, 60_000);
 
@@ -145,8 +149,6 @@ describe.skipIf(!RUNNABLE)("broker-ext 子代理停止与门禁（SA-b）", () =
       const run = await startRun(owner);
       await spawnChild(owner, "child-1");
       await owner.request("fixture/turn", { threadId: "child-1", action: "complete" });
-      await finishParent(owner);
-      await h.waitFor(() => notes(owner, "broker/run/ended").some((n) => n.params?.run?.runId === run.runId), 30_000);
       const error = await owner.request("broker/threads/archive", { threadId: PARENT }).then(() => null, (e: any) => e);
       expect(error?.code).toBe(-32001);
       const data = errorData(owner);

@@ -372,6 +372,17 @@ impl Machine {
             return;
         };
         let params = record.params.clone().unwrap_or_else(|| json!({}));
+        if record.method == DYNAMIC_TOOL
+            && self.convergence_enabled()
+            && record
+                .run_id
+                .as_ref()
+                .is_some_and(|run| self.convergences.runs.contains_key(run))
+        {
+            // 托管交接保留待答动态工具及原期限；不能用“不支持”代答来消除收敛阻塞。
+            self.child_inbox(key, actions);
+            return;
+        }
         match policy::decide(policy, &record.method, &params) {
             policy::Decision::Answer(result) => {
                 self.forget_request(key, actions);

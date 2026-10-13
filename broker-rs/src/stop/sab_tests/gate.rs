@@ -427,3 +427,185 @@ fn 树提交ended时按run撤销子请求与收件箱事项_不答不dismiss() {
     assert_eq!(s.m.inbox_pending_run(R), 0);
     assert_eq!(s.mock.answer_count("子甲", &request), 0, "不答、不 Dismiss");
 }
+
+fn sa1b_enable(s: &mut Sim) {
+    use crate::claim::converge::ConvergenceReadiness;
+    assert!(s.m.enable_convergence(ConvergenceReadiness {
+        trusted_inputs: true,
+        budget_admission: true,
+        asynchronous_results: true,
+        terminal_mapping: true,
+        cancellation_verified: true
+    }));
+    s.m.convergences.test_budget = Some(crate::sa1b::BudgetAdmission::Allowed);
+    s.m.convergences.test_read = Some(crate::sa1b::BatchReadId(10));
+}
+
+#[test]
+fn sa1b_abandon未知已发根保留占用_落定后普通收尾不复活() {
+    use crate::sa1b::*;
+    for unknown in [true, false] {
+        let mut s = Sim::new();
+        sa1b_enable(&mut s);
+        s.spawn_v1("子", "派生", "子轮");
+        s.never.insert("子".into());
+        s.hold.push(("thread/list".into(), "".into()));
+        s.turn_completed(P, T, "completed");
+        let token = s.m.convergences.runs[R].token.clone();
+        let mut operation = ReconcileOperation {
+            token: token.clone(),
+            work_epoch: s.record().subagent_join.as_ref().unwrap().work_epoch,
+            op_id: ReconcileOpId(1),
+            client_user_message_id: "未知提交".into(),
+            expected_previous_turn_id: Some(T.into()),
+            target_turn_id: None,
+            submission: if unknown {
+                ReconcileSubmission::OutcomeUnknown
+            } else {
+                ReconcileSubmission::NotSent
+            },
+            outcome_unknown: unknown,
+            automatic_control_revoked: false,
+            verify_deadline_mono_ms: Some(s.m.clock.mono_ms + 20_000),
+        };
+        s.m.convergence_operation_changed(operation.clone());
+        let mut actions = vec![];
+        s.m.convergence_fail(R, TerminalReason::ConvergeDeadline, &mut actions);
+        s.absorb(actions);
+        assert!(s.finishing());
+        let (id, out) = s.call(
+            OWNER,
+            "broker/threads/stop",
+            json!({"threadId":P,"runId":R,"abandon":true}),
+        );
+        let result = s.response(&out, id).unwrap()["result"].clone();
+        assert_eq!(
+            result["childrenStop"]["rootRelease"]["released"], !unknown,
+            "{result}"
+        );
+        assert!(
+            s.record()
+                .subagent_join
+                .as_ref()
+                .unwrap()
+                .automatic_control_revoked
+        );
+        if unknown {
+            assert!(matches!(
+                s.m.claims[P].state,
+                State::AwaitingContinuation { .. }
+            ));
+            s.turn_started(P, "归属未知迟到轮");
+            assert!(!s.m.claims[P].owned_turns.contains("归属未知迟到轮"));
+            assert_eq!(s.record().state, RunState::Running);
+            operation.submission = ReconcileSubmission::DefinitelyNotSubmitted;
+            operation.outcome_unknown = false;
+            s.m.convergence_operation_changed(operation);
+            s.apply(Event::Timer {
+                token: token.claim.clone(),
+                kind: TimerKind::ConvergeDeadline { token },
+            });
+        }
+        assert_eq!(s.record().state, RunState::Ended);
+        assert_eq!(s.record().status, Some(RunStatus::Interrupted));
+        assert_eq!(
+            s.record().subagent_join.as_ref().unwrap().terminal_reason,
+            Some(TerminalReason::Abandoned)
+        );
+        assert_eq!(s.run_ended(&s.log), 1);
+        s.notify(json!({"method":"thread/goal/updated","params":{"threadId":P,"goal":{"status":"active"}}}));
+        s.advance(3_600_000);
+        assert_eq!(s.run_ended(&s.log), 1);
+        assert!(!s.m.convergences.runs.contains_key(R));
+    }
+}
+
+#[test]
+fn sa1b_待答交接保持来源和截止_不为收敛代答() {
+    let mut s = Sim::new();
+    sa1b_enable(&mut s);
+    s.spawn_v1("子", "派生", "子轮");
+    let (id, event) = s.mock.request(
+        "子",
+        Some("子轮"),
+        Some(json!("待答问题")),
+        "item/tool/requestUserInput",
+    );
+    s.apply(event);
+    s.hold.push(("thread/list".into(), "".into()));
+    s.turn_completed(P, T, "completed");
+    let before =
+        s.m.relations
+            .requests
+            .values()
+            .find(|r| r.upstream_request_id == id)
+            .unwrap()
+            .clone();
+    let deadline = s.m.convergences.runs[R].deadline_mono_ms;
+    s.call(
+        OWNER,
+        "broker/threads/detach",
+        json!({"threadId":P,"runId":R,"policy":"on-request"}),
+    );
+    let after =
+        s.m.relations
+            .requests
+            .values()
+            .find(|r| r.upstream_request_id == id)
+            .unwrap();
+    assert_eq!(after.source_thread_id, before.source_thread_id);
+    assert_eq!(after.source_turn_id, before.source_turn_id);
+    assert_eq!(after.deadline_ms, before.deadline_ms);
+    assert_eq!(s.m.convergences.runs[R].deadline_mono_ms, deadline);
+    assert_eq!(s.mock.answer_count("子", &id), 0);
+    assert_eq!(s.m.convergence_facts(R).unwrap().pending_requests, 1);
+    s.apply(Event::Disconnected { conn: OWNER });
+    assert!(
+        !s.record()
+            .subagent_join
+            .as_ref()
+            .unwrap()
+            .automatic_control_revoked
+    );
+}
+
+#[test]
+fn sa1b_运行中限制停树产生的中断不能覆盖原异常() {
+    use crate::sa1b::TerminalReason;
+    for (reason, expected, interrupt) in [
+        (
+            TerminalReason::BudgetExhausted,
+            RunStatus::GoalBlocked,
+            InterruptReason::BudgetExhausted,
+        ),
+        (
+            TerminalReason::AutoTurnLimit,
+            RunStatus::GoalBlocked,
+            InterruptReason::AutoTurnLimit,
+        ),
+        (
+            TerminalReason::WakeFailed,
+            RunStatus::Failed,
+            InterruptReason::WakeFailed,
+        ),
+        (
+            TerminalReason::NoAction,
+            RunStatus::Interrupted,
+            InterruptReason::GoalLoop,
+        ),
+    ] {
+        let mut s = Sim::new();
+        sa1b_enable(&mut s);
+        s.spawn_v1("子", "派生", "子轮");
+        let mut actions = vec![];
+        s.m.convergence_fail(R, reason, &mut actions);
+        s.absorb(actions);
+        assert_eq!(s.record().state, RunState::Ended);
+        assert_eq!(s.record().status, Some(expected), "{reason:?}");
+        assert_eq!(s.record().interrupt_reason, Some(interrupt));
+        assert_eq!(
+            s.record().subagent_join.as_ref().unwrap().terminal_reason,
+            Some(reason)
+        );
+    }
+}

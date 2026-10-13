@@ -144,7 +144,8 @@ describe("show 真 broker", () => {
       expect(t.json[0].terminal).toBeUndefined();
       await broker.request("n4a/release");
       expect(await bounded(work, 10_000, "真实跟随未结束")).toBe(0);
-      expect(t.json.at(-1)).toEqual({ terminal: true, status: "completed", runId: started.runId, model: "本地模型", reasoning: null, modelSource: "index", reroute: null });
+      // SA1b 起终态行另带协调与最终轮字段（只增不改）；这里核对原有字段不变。
+      expect(t.json.at(-1)).toMatchObject({ terminal: true, status: "completed", runId: started.runId, model: "本地模型", reasoning: null, modelSource: "index", reroute: null });
       expect(t.json.some((line) => line.kind === "item/completed")).toBe(true);
     } finally { for (const cleanup of t.cleanup) await cleanup(); await bounded(work.catch(() => undefined), 2000, "跟随取消后未结束"); }
   }, 30_000);
