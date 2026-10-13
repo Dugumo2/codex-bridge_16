@@ -241,12 +241,13 @@ impl Machine {
             }
             let bound = !op.receivers.is_empty()
                 && op.receivers.iter().all(|thread| {
-                    self.relations.bindings.values().any(|b| {
-                        b.run_id == run
-                            && b.thread_id == *thread
-                            && b.operation == op.key
-                            && b.status == BindingStatus::Bound
-                    })
+                    op.rejected_receivers.contains_key(thread)
+                        || self.relations.bindings.values().any(|b| {
+                            b.run_id == run
+                                && b.thread_id == *thread
+                                && b.operation == op.key
+                                && b.status == BindingStatus::Bound
+                        })
                 });
             if op.outcome == EvidenceOutcome::Failed || bound {
                 ledger.pending.remove(&op.key);

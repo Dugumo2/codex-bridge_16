@@ -791,7 +791,7 @@ impl Machine {
         }
     }
 
-    /// 发 goal 写入前核对管理权：根线程看认领仍是本运行，子线程看运行没有撤权。
+    /// 发 goal 写入前复核目标归属；父运行未撤权本身不足以授权修改另一个线程。
     fn derived_authority_ok(&self, key: &(u64, String)) -> bool {
         let Some(op) = self.trees.aux.derived.get(key) else {
             return false;
@@ -802,8 +802,17 @@ impl Machine {
                 .get(&key.1)
                 .is_some_and(|c| c.run_id.as_deref() == Some(op.target.run_id.as_str()));
         }
-        self.manage_context(&op.target.run_id)
-            .is_some_and(|c| c.authority != Authority::Revoked)
+        !self.claims.contains_key(&key.1)
+            && self.manage_context(&op.target.run_id).is_some_and(|c| {
+                c.authority != Authority::Revoked
+                    && c.gen == op.target.authority_gen
+                    && c.members.get(&key.1).is_some_and(|m| m.conflict.is_none())
+            })
+            && !self.relations.bindings.values().any(|b| {
+                b.thread_id == key.1
+                    && b.status == BindingStatus::Bound
+                    && b.run_id != op.target.run_id
+            })
     }
 
     /// 把派生停止的当前结论交给协调器。
