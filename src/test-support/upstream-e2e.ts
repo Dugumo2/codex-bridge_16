@@ -123,8 +123,13 @@ export async function runUpstreamE2e(scenario: Scenario, mode: "smoke" | "contra
         : "[cxb] 上游认证失败（HTTP 401），Codex 正在重试；已观察到 1 次。");
       exactLine(run, `[cxb] 原因：${reason(error)}`);
       const label = scenario === "429" ? "上游限流（HTTP 429）" : "上游认证失败（HTTP 401）";
-      exactLine(waited, `[cxb] 最近上游报错：${label}，共观察到 ${error.count} 次（运行已结束）。`);
-      exactLine(waited, `[cxb] 原因：${reason(error)}`);
+      if (scenario === "429") {
+        // 最终轮有错误时 wait 只输出一行「失败原因」，不再补「运行已结束」摘要。
+        assert.equal(waited.stderr.includes("最近上游报错"), false, "最终失败不应再补运行已结束摘要");
+      } else {
+        exactLine(waited, `[cxb] 最近上游报错：${label}，共观察到 ${error.count} 次（运行已结束）。`);
+        exactLine(waited, `[cxb] 原因：${reason(error)}`);
+      }
       const showText = await command(["show", id]); assert.equal(showText.code, 0);
       assert((showText.stdout + showText.stderr).includes(`最近上游报错：${label}；${error.count} 次；首次 ${new Date(error.firstSeenAt).toISOString()}，最近 ${new Date(error.lastSeenAt).toISOString()}；运行已结束`));
       assert((showText.stdout + showText.stderr).includes(`原因：${reason(error)}`));
@@ -134,7 +139,12 @@ export async function runUpstreamE2e(scenario: Scenario, mode: "smoke" | "contra
         assert(final.error && waitJson.error, "429 最终失败 JSON 必须带真实 error");
         assert.deepEqual(waitJson.error, final.error);
         const failureLine = `[cxb] 失败原因：${final.error.message.replace(/\s+/gu, " ").trim()}（HTTP 429）`;
-        exactLine(run, failureLine); exactLine(waited, failureLine);
+        exactLine(waited, failureLine);
+        // run 里原因已由即时提示说过时，失败原因只指回去；同一段原因文字在 stderr 里只出现一次。
+        const runFailures = run.stderr.split(/\r?\n/u).filter((line: string) => line.startsWith("[cxb] 失败原因："));
+        assert.equal(runFailures.length, 1, "run 只能有一行失败原因");
+        assert(runFailures[0] === failureLine || runFailures[0] === "[cxb] 失败原因：见上方上游报错（HTTP 429）。", `失败原因行不符：${runFailures[0]}`);
+        assert.equal(run.stderr.split(reason(error)).length - 1, 1, "run 的 stderr 里同一段原因只能出现一次");
       } else { assert.equal(final.error, undefined); assert.equal(waitJson.error, undefined); }
     }
     assert.deepEqual(model.violations, []);

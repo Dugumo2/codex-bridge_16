@@ -78,6 +78,11 @@ export function upstreamResultFields(run: RunResult) {
 }
 
 type View = Pick<Partial<RunResult>, "upstreamError" | "diagnosticRevision" | "lastProgressAt" | "state" | "status"> & { runId?: string };
+/** 通知视图不带轮次；只有完整运行记录才能判断选定最终轮是否有错误。 */
+function failedWithTurnError(view: View): boolean {
+  const run = view as Partial<RunResult>;
+  return view.status === "failed" && Array.isArray(run.turns) && resultTurn(run as RunResult)?.error != null;
+}
 type Diagnostic = { revision: number; fields: Pick<Partial<RunResult>, "upstreamError" | "diagnosticRevision" | "lastProgressAt"> };
 
 /** 先订阅、后快照；诊断版本与最终失败摘要分别去重，彼此不能吞掉。 */
@@ -87,17 +92,26 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
   const buffered: View[] = [];
   const views = new Map<string, Diagnostic>();
   const printed = new Map<string, { key: string; retry: boolean | null; at: number; ended: boolean }>();
+  /** 每个运行已在「原因」行输出过的文本，失败摘要据此避免把同一原因再说一遍。 */
+  const reasons = new Map<string, Set<string>>();
   const failures = new Set<string>();
   const display = (view: View, forceEnded = false) => {
     if (!view.runId || !view.upstreamError) return;
     const error = view.upstreamError;
     const key = upstreamGroupKey(error);
     const ended = forceEnded || view.state === "ended" || view.state === "lost";
+    // 失败且选定最终轮有错误时由 failure 只输出一行「失败原因」，不再补历史摘要。
+    if (ended && failedWithTurnError(view)) return;
     const previous = printed.get(view.runId);
-    if (previous && previous.key === key && previous.retry === error.willRetry && previous.ended === ended
-      && (ended || now() - previous.at < 30_000)) return;
+    // 运行中已提示过同一组错误，结束时不再重复；只有从未提示过（如 wait 晚接入）才补「运行已结束」摘要。
+    if (ended && previous?.key === key) return;
+    if (previous && previous.key === key && previous.retry === error.willRetry && !ended && now() - previous.at < 30_000) return;
     printed.set(view.runId, { key, retry: error.willRetry, at: now(), ended });
-    for (const line of upstreamNoticeLines(error, ended)) notice(line);
+    const lines = upstreamNoticeLines(error, ended);
+    let shown = reasons.get(view.runId);
+    if (!shown) reasons.set(view.runId, shown = new Set());
+    shown.add(reason(error));
+    for (const line of lines) notice(line);
   };
   const acceptKnown = (view: View) => {
     const id = runId();
@@ -135,8 +149,16 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
     if (!active || run.runId !== runId() || run.status !== "failed" || failures.has(run.runId)) return;
     failures.add(run.runId);
     const error = resultTurn(run)?.error;
-    if (error != null) notice(`[cxb] 失败原因：${turnErrorLine(error)}`);
-    else display(merge(run), true);
+    if (error != null) {
+      const value = object(error);
+      const info = turnCodexErrorInfo(error);
+      const said = reasons.get(run.runId);
+      // 原因正文已在上方「原因」行出现过时只指回去，避免同一段文字在 stderr 里连说两遍。
+      const repeated = said !== undefined && [value.message, value.additionalDetails]
+        .some((text) => typeof text === "string" && text.trim() !== "" && said.has(diagnosticLine(text)));
+      notice(repeated ? `[cxb] 失败原因：见上方上游报错${statusNote({ httpStatusCode: httpStatus(info), codexErrorInfo: info })}。`
+        : `[cxb] 失败原因：${turnErrorLine(error)}`);
+    } else display(merge(run), true);
   };
   const off = rpc.on("broker/run/updated", (raw) => { if (raw && typeof raw === "object") accept(raw as View); });
   const watchedRpc: BrokerRpc = { ...rpc, async request<T>(method: string, params?: unknown, options?: Parameters<BrokerRpc["request"]>[2]): Promise<T> {
@@ -149,5 +171,5 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
   } };
   return { accept, refresh, apply, failure, rpc: watchedRpc,
     fields: () => upstreamFields(views.get(runId() ?? "")?.fields ?? {}),
-    dispose: () => { active = false; off(); buffered.length = 0; views.clear(); printed.clear(); failures.clear(); } };
+    dispose: () => { active = false; off(); buffered.length = 0; views.clear(); printed.clear(); reasons.clear(); failures.clear(); } };
 }

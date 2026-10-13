@@ -278,9 +278,8 @@ for (const json of [false, true]) test(`上游诊断 wait${json ? ' --json' : ''
   c.fake.handle = (method) => method === 'broker/threads/list' ? { threads: [thread()] }
     : { thread: thread(), run, pending: [] };
   expect(await wait(c.ctx)).toBe(7);
-  expect(c.notices.filter(line => line.startsWith('[cxb] 最近上游报错：'))).toEqual([
-    '[cxb] 最近上游报错：上游认证失败（HTTP 401），共观察到 3 次（运行已结束）。',
-  ]);
+  // 最终轮有错误时只输出一行「失败原因」，不再补「最近上游报错（运行已结束）」摘要。
+  expect(c.notices.filter(line => line.startsWith('[cxb] 最近上游报错：'))).toEqual([]);
   expect(c.notices.filter(line => line.startsWith('[cxb] 失败原因：'))).toEqual(['[cxb] 失败原因：Bearer ***（unauthorized）']);
   expect(c.text.join('') + JSON.stringify(c.json)).not.toContain('[cxb]');
   expect(c.notices.join('') + JSON.stringify(c.json)).not.toContain('privateWaitKey');

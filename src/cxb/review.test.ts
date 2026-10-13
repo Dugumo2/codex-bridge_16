@@ -37,8 +37,10 @@ test("CLI 连接边界改成 detached 时审查退出七", async () => {
   expect(result.code).toBe(7);
   expect(result.stderr).toContain("Codex");
   expect(result.stderr).toContain("失败");
-  // 上游报错可见化（契约 3.4）：启动失败的脱敏原因按「失败原因」展示，不再只给笼统失败。
-  expect(result.stderr).toContain("[cxb] 失败原因：paginated threads do not support detached review");
+  // 上游报错可见化（契约 3.4）：启动失败的脱敏原因要展示，且同一段原因在 stderr 里只出现一次。
+  expect(result.stderr).toContain("[cxb] 原因：paginated threads do not support detached review");
+  expect(result.stderr).toContain("[cxb] 失败原因：见上方上游报错。");
+  expect(result.stderr.split("paginated threads").length - 1).toBe(1);
 }, TEST_BUDGET);
 
 for (const legacyReview of [false, true]) test(`${legacyReview ? "legacy detached 迁移才重新挂接" : "inline 同线程回包不重新挂接"}服务端请求`, async () => {

@@ -656,7 +656,9 @@ for (const json of [false, true]) test(`上游诊断 show --follow${json ? ' --j
   };
   expect(await bounded(show(t.ctx), 3000, 'follow 未结束')).toBe(0);
   expect(t.notices).toContain('[cxb] 上游认证失败（HTTP 401），Codex 正在重试；已观察到 3 次。');
-  expect(t.notices.join()).toContain('运行已结束');
+  // 运行中已提示过同一组错误，结束时不再补「运行已结束」摘要，原因只出现一次。
+  expect(t.notices.join()).not.toContain('运行已结束');
+  expect(t.notices.filter(line => line.startsWith('[cxb] 原因：'))).toHaveLength(1);
   expect(t.texts.join('') + JSON.stringify(t.json)).not.toContain('[cxb]');
   expect(t.texts.join('') + JSON.stringify(t.json) + t.notices.join()).not.toContain('原始通知不能显示');
   if (json) {

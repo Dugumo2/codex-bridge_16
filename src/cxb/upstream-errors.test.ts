@@ -126,17 +126,41 @@ test("先订阅后快照，迟到旧快照不覆盖新通知与最终失败摘�
     expect(snapshot.run.state).toBe("ended");
     o.observed.failure(snapshot.run); o.observed.failure(snapshot.run);
     expect(o.lines.filter(line => line.startsWith("[cxb] 失败原因"))).toEqual(["[cxb] 失败原因：最终失败（unauthorized）"]);
-    expect(o.lines.filter(line => line.includes("运行已结束"))).toHaveLength(1);
+    // 失败且最终轮有错误：只说「失败原因」，不再补「运行已结束」摘要。
+    expect(o.lines.filter(line => line.includes("运行已结束"))).toHaveLength(0);
   } finally { o.dispose(); }
 });
-test("失败没有最终轮 error 时只称最近上游报错，历史错误与终态同 revision 仍收束", () => {
+test("失败没有最终轮 error 时只称最近上游报错；运行中已提示过同一组则结束时不重复", () => {
   const o = observer();
   try {
     o.emit(1);
     const run = o.observed.apply(runResult({ status: "failed", diagnosticRevision: 1, upstreamError: upstreamError() }));
     o.observed.failure(run); o.observed.failure(run);
-    expect(o.lines.filter(line => line.includes("运行已结束"))).toHaveLength(1);
+    expect(o.lines.filter(line => line.includes("运行已结束"))).toHaveLength(0);
+    expect(o.lines.filter(line => line.startsWith("[cxb] 原因："))).toHaveLength(1);
     expect(o.lines.join()).not.toContain("失败原因");
+  } finally { o.dispose(); }
+});
+test("失败没有最终轮 error 且此前未提示过（晚接入）：补一次运行已结束摘要", () => {
+  const o = observer();
+  try {
+    const run = o.observed.apply(runResult({ status: "failed", diagnosticRevision: 1, upstreamError: upstreamError() }));
+    o.observed.failure(run); o.observed.failure(run);
+    expect(o.lines.filter(line => line.includes("运行已结束"))).toHaveLength(1);
+    expect(o.lines.filter(line => line.startsWith("[cxb] 原因："))).toHaveLength(1);
+    expect(o.lines.join()).not.toContain("失败原因");
+  } finally { o.dispose(); }
+});
+test("失败原因正文与上方已提示的原因相同时只指回去，不把同一段文字再说一遍", () => {
+  const o = observer();
+  try {
+    o.emit(1, upstreamError({ additionalDetails: "额度已用完", willRetry: false }));
+    const run = o.observed.apply(runResult({ status: "failed", diagnosticRevision: 1, upstreamError: upstreamError({ additionalDetails: "额度已用完", willRetry: false }),
+      turns: [{ ...runResult().turns[0]!, status: "failed", error: { message: "额度已用完", codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } } } }] }));
+    o.observed.failure(run);
+    expect(o.lines.filter(line => line.includes("额度已用完"))).toHaveLength(1);
+    expect(o.lines.filter(line => line.startsWith("[cxb] 失败原因"))).toEqual(["[cxb] 失败原因：见上方上游报错（HTTP 429）。"]);
+    expect(o.lines.join()).not.toContain("运行已结束");
   } finally { o.dispose(); }
 });
 test("最终 JSON 只增实际存在字段，SA1b 最终轮错误不能取数组尾项", () => {
