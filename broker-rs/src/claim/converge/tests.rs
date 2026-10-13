@@ -1130,7 +1130,6 @@ fn 预算补核实有总窗_不重复发请求且失败不准入() {
     discover(&mut m, true);
     assert!(!join(&m).automatic_control_revoked);
     retry(&mut m);
-    discover(&mut m, true);
     assert!(m.clock.mono_ms >= verification.deadline_mono_ms);
     assert!(m.take_budget_verification(&verification.token).is_none());
     assert_eq!(
@@ -2019,4 +2018,65 @@ fn 预算到期不经合并goal准入中断工作父轮() {
     );
     assert!(matches!(m.claims[P].state, State::Running { .. }));
     assert!(!join(&m).automatic_control_revoked);
+}
+
+#[test]
+fn 工作期间预算到期在进入收敛时补触发不等活动子树或发现() {
+    for child_running in [true, false] {
+        let (mut m, mut mock, verification) = setup_missing_budget();
+        if !child_running {
+            complete(&mut m, &mut mock, "预算子", "预算子轮", "completed");
+        }
+        notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
+        assert!(matches!(m.claims[P].state, State::Running { .. }));
+        m.clock.mono_ms = verification.deadline_mono_ms;
+        m.convergence_timer(
+            TimerKind::BudgetVerifyDeadline {
+                token: verification.token.clone(),
+            },
+            &mut vec![],
+        );
+        assert_eq!(join(&m).terminal_reason, None);
+        assert!(m.tree_for_run(R).is_none());
+        assert!(m.take_budget_verification(&verification.token).is_none());
+        // 定时器已消费且不会重排；父轮稍后完成时，发现尚未覆盖，子轮也可以仍在工作。
+        m.clock.mono_ms += 123;
+        let facts = m.convergence_facts(R).unwrap();
+        assert_eq!(crate::relations::convergence::settled(&facts), !child_running);
+        assert_ne!(facts.discovery_covered_epoch, Some(facts.work_epoch));
+        complete(&mut m, &mut mock, P, T, "completed");
+        assert_eq!(
+            join(&m).terminal_reason,
+            Some(TerminalReason::BudgetIncomplete)
+        );
+        assert!(m.clock.mono_ms < m.convergences.runs[R].deadline_mono_ms);
+        assert!(join(&m).automatic_control_revoked);
+        assert!(m.tree_for_run(R).is_some());
+        assert!(m.convergences.progress[R].reading.is_none());
+        assert!(m.convergences.progress[R].operations.is_empty());
+    }
+}
+
+#[test]
+fn 收敛等待未到预算原截止不终止且到期不依赖发现完成() {
+    let (mut m, mut mock, verification) = setup_missing_budget();
+    notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
+    m.clock.mono_ms = verification.deadline_mono_ms - 1;
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    assert!(m.convergences.progress[R].discovery.is_some());
+    assert_eq!(join(&m).terminal_reason, None);
+    assert!(m.tree_for_run(R).is_none());
+    m.clock.mono_ms = verification.deadline_mono_ms;
+    m.convergence_timer(
+        TimerKind::BudgetVerifyDeadline {
+            token: verification.token,
+        },
+        &mut vec![],
+    );
+    assert_eq!(
+        join(&m).terminal_reason,
+        Some(TerminalReason::BudgetIncomplete)
+    );
+    assert!(m.tree_for_run(R).is_some());
 }

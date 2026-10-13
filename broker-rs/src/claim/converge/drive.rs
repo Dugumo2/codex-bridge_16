@@ -460,6 +460,10 @@ impl Machine {
             self.convergence_fail(run, reason, actions);
             return;
         }
+        // 工作期间已消费的预算定时器不会再排期；先处理原截止，再等待发现或子树收敛。
+        if self.convergence_budget_timeout(&runtime.token, actions) {
+            return;
+        }
         if self.clock.mono_ms >= runtime.deadline_mono_ms {
             self.convergence_deadline(run, actions);
             return;
