@@ -752,6 +752,7 @@ mod tests {
             "Bearer\tabcdef",
             "bEaReR abcdef",
             "sk-abcdef",
+            "s\u{1b}[31mk-abcdef\u{1b}[0m",
             "sk-proj-abcdef",
             "eyJheader.payload.signature",
             "eyJheader.payload.signature.",
