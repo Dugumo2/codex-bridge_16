@@ -2042,7 +2042,10 @@ fn 工作期间预算到期在进入收敛时补触发不等活动子树或发�
         // 定时器已消费且不会重排；父轮稍后完成时，发现尚未覆盖，子轮也可以仍在工作。
         m.clock.mono_ms += 123;
         let facts = m.convergence_facts(R).unwrap();
-        assert_eq!(crate::relations::convergence::settled(&facts), !child_running);
+        assert_eq!(
+            crate::relations::convergence::settled(&facts),
+            !child_running
+        );
         assert_ne!(facts.discovery_covered_epoch, Some(facts.work_epoch));
         complete(&mut m, &mut mock, P, T, "completed");
         assert_eq!(
