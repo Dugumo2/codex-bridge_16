@@ -280,6 +280,7 @@ fn 上游报错审查早到与完成同批回放恰好记一次并查询执行�
         "turn":{"id":"审查轮","status":"completed","items":[]}}),
         ),
     );
+    apply(&mut machine, upstream("审查线程", "审查轮", false));
     assert!(machine.runs.runs[RUN].upstream_error.is_none());
     assert!(machine.records["审查线程"]
         .ended_turns

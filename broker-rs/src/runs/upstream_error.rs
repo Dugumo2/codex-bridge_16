@@ -105,9 +105,8 @@ pub fn normalized_body(error: &UpstreamError) -> &str {
     let body = error
         .additional_details
         .as_deref()
-        .filter(|details| !details.trim().is_empty())
-        .unwrap_or(&error.message)
-        .trim();
+        .filter(|details| !trim_body(details).is_empty())
+        .map_or_else(|| trim_body(&error.message), trim_body);
     if body
         .strip_prefix("Reconnecting... ")
         .and_then(|suffix| suffix.split_once('/'))
@@ -122,6 +121,16 @@ pub fn normalized_body(error: &UpstreamError) -> &str {
     } else {
         body
     }
+}
+
+/// 与 JavaScript String.trim 一致，避免 BOM 与 U+0085 导致两端分组不同。
+fn trim_body(value: &str) -> &str {
+    value.trim_matches(|c| {
+        matches!(c,
+        '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{00a0}' | '\u{1680}'
+        | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}'
+        | '\u{205f}' | '\u{3000}' | '\u{feff}')
+    })
 }
 
 pub fn same_group(left: &UpstreamError, right: &UpstreamError) -> bool {
@@ -233,12 +242,19 @@ fn strip_controls(text: &str) -> String {
                         }
                     }
                 }
-                Some(']') => {
+                Some(']' | 'P' | 'X' | '^' | '_') => {
                     while let Some(next) = chars.next() {
                         if next == '\u{7}' || next == '\u{1b}' && chars.peek() == Some(&'\\') {
                             if next == '\u{1b}' {
                                 chars.next();
                             }
+                            break;
+                        }
+                    }
+                }
+                Some(' '..='/') => {
+                    for next in chars.by_ref() {
+                        if ('0'..='~').contains(&next) {
                             break;
                         }
                     }
@@ -804,5 +820,25 @@ mod tests {
             ),
         );
         assert_eq!(current.unwrap().count, u32::MAX);
+    }
+
+    #[test]
+    fn 分组裁剪与客户端一致且空详情回退消息() {
+        let mut diagnostic = error(
+            Value::Null,
+            "\u{feff}Reconnecting... 2/5\u{feff}",
+            UpstreamErrorSource::ErrorNotification,
+            1,
+        );
+        diagnostic.additional_details = Some("\u{feff} \t\u{feff}".into());
+        assert_eq!(normalized_body(&diagnostic), "");
+        diagnostic.additional_details = Some("\u{85}原因\u{85}".into());
+        assert_eq!(normalized_body(&diagnostic), "\u{85}原因\u{85}");
+        diagnostic.additional_details = Some("  原因 3/5  ".into());
+        assert_eq!(normalized_body(&diagnostic), "原因 3/5");
+        assert_eq!(
+            sanitize("甲\u{1b}(0乙\u{1b}P终端指令\u{1b}\\丙").0,
+            "甲乙丙"
+        );
     }
 }
