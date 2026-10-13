@@ -233,6 +233,12 @@ impl Machine {
         let claim_id = claim.claim_id;
         let settled_run = claim.run_id.clone();
         self.claims.insert(thread_id.into(), claim);
+        // C1 需要有效认领的 token；定案钩子在放回之后、回放之前执行。
+        if !joined {
+            if let Some(run) = &settled_run {
+                self.stall_owned_settled(run, actions);
+            }
+        }
         self.on_claim_settled(thread_id, claim_id, !joined, actions);
         if joined {
             if let Some(run) = &settled_run {

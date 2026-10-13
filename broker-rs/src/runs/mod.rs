@@ -418,8 +418,6 @@ impl Machine {
         }
         if joined {
             self.stall_joined(run, actions);
-        } else {
-            self.stall_owned_settled(run, actions);
         }
     }
 
@@ -961,7 +959,6 @@ impl Machine {
         let record = self.runs.runs.get_mut(run).expect("运行存在");
         record.review_thread_id = Some(child.into());
         record.review_short_id = Some(short.clone());
-        self.stall_review_moved(run, actions);
         self.runs
             .index
             .threads

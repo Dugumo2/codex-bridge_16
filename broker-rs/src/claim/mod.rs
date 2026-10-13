@@ -2177,6 +2177,22 @@ impl Machine {
         }
         self.restore_moving_stop(moving_stop, child, claim_id);
         self.lifecycle_review_moved(parent, child, actions);
+        // 执行线程及停止目标已迁移，C1 此时能读取新线程的有效 token。
+        if let Some(run) = self
+            .claims
+            .get(child)
+            .and_then(|claim| claim.run_id.clone())
+        {
+            if self
+                .runs
+                .runs
+                .get(&run)
+                .and_then(|record| record.review_thread_id.as_deref())
+                == Some(child)
+            {
+                self.stall_review_moved(&run, actions);
+            }
+        }
         self.reclaim_check(child, actions);
         if let Some(events) = self.unclaimed.remove(child) {
             let mut completed = false;
