@@ -417,6 +417,17 @@ describe("SA1b D：最终交付与协调展示", () => {
       expect(t.fake.subscriptions).toBe(0);
     }
   });
+  test("wait 缺失最终目标时优先合并已收到的同轮结果通知", async () => {
+    const t = context(dir, ["wait", "abcd1234"]);
+    const run = converged();
+    const final = run.turns[0]!;
+    serveRun(t, { ...run, state: "running", status: null, turns: [] });
+    const work = waitRun(t.fake.rpc, { threadId: run.threadId, runId: run.runId, timeoutMs: 1000 });
+    t.fake.emit("broker/thread/result", { runId: run.runId, turn: 0, result: final });
+    t.fake.emit("broker/run/ended", { run: { ...run, turns: [] } });
+    expect(resultTurn(await watchdog(work))).toEqual(final);
+    expect(t.fake.subscriptions).toBe(0);
+  });
   test("模型沿用不随汇总轮改变原运行创建顺序、模型与强度；账本摘要认最终指针", () => {
     const run = converged();
     const newer = converged({ runId: "run-newer", creationOrder: { epoch: 1, sequence: 2 }, meta: { source: "run", model: "后开模型", effort: "low" } });

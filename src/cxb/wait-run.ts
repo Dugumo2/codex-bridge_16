@@ -47,7 +47,7 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     const replacement = current.finalTurnId !== undefined
       ? [...results.values()].find((turn) => turn.turnId === current!.finalTurnId)
       : results.get(current.turnsTotal - 1);
-    if (resultPending(current) && replacement && replacement.turnId === (current.finalTurnId ?? last?.turnId)) {
+    if ((resultPending(current) || !last) && replacement && replacement.turnId === (current.finalTurnId ?? last?.turnId)) {
       current = { ...current, turns: last ? current.turns.map((turn) => turn.turnId === replacement.turnId ? replacement : turn)
         : [...current.turns, replacement] };
     }
