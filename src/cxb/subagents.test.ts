@@ -53,8 +53,11 @@ describe("甲：开发者指令", () => {
     expect(ASK_INSTRUCTIONS.startsWith(ASK_RULES)).toBe(true);
     expect(ASK_INSTRUCTIONS.endsWith(SUBAGENT_RULES)).toBe(true);
     expect(SUBAGENT_RULES).toContain(`v${SUBAGENT_RULES_VERSION}`);
-    for (const text of ["如果本次任务实际使用了子代理", "完成、失败或被明确取消", "等待超时或部分代理完成", "不得猜测答案",
-      "不要仅因等待超时而重新派生", "不要求你主动使用子代理"]) expect(SUBAGENT_RULES).toContain(text);
+    for (const text of ["如果本次任务实际使用了子代理", "派出后不必在本轮等待", "不要反复调用等待工具轮询", "可以先结束本轮",
+      "完成、失败或被明确取消", "交回给你开一轮汇总", "截断、不可用或省略", "必须先拿到某个子代理的结果",
+      "等待超时或部分代理完成", "不得猜测答案", "不要仅因等待超时而重新派生", "不要求你主动使用子代理"]) expect(SUBAGENT_RULES).toContain(text);
+    // v1 要求模型自己守着等，与 SA1b 自动汇总冲突（实测父线程轮询 54 次），v2 不得再要求结束前等待。
+    expect(SUBAGENT_RULES).not.toContain("结束前须等待");
     expect(askOverrides().developerInstructions).toBe(ASK_INSTRUCTIONS);
     // 原有提问规则保留。
     for (const text of ["request_user_input", "update_goal", "blocked"]) expect(ASK_INSTRUCTIONS).toContain(text);
@@ -503,7 +506,7 @@ test.each(["冷恢复", "已加载恢复"])("SA1b 甲 v1：%s 始终提交并登
   const registered = t.fake.calls.find(c => c.method === "broker/threads/resumeOverrides")!.params.overrides;
   expect(resume.developerInstructions).toBe(ASK_INSTRUCTIONS);
   expect(registered.developerInstructions).toBe(ASK_INSTRUCTIONS);
-  expect(SUBAGENT_RULES_VERSION).toBe(1);
+  expect(SUBAGENT_RULES_VERSION).toBe(2);
   expect(ASK_INSTRUCTIONS.startsWith(ASK_RULES)).toBe(true);
   expect(ASK_INSTRUCTIONS).toContain("包括仍在执行的后代任务");
   expect(ASK_INSTRUCTIONS).toContain("待答的审批和提问仍属于未完成的工作");
