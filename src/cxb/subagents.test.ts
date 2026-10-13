@@ -574,6 +574,28 @@ for (const command of ["run", "wait", "show"] as const) test(`SA1b ${command} �
   expect(t.json.at(-1)).toMatchObject({ result: "", ready: "unavailable", origin: "subagentReconcile", finalTurnId: "new-final" });
   expect(t.notices.join()).toContain("最终结果不可用（unavailable）");
 });
+for (const order of ["启用前快照", "通知先于同 revision 快照", "通知先于旧 revision 快照"] as const) test(`SA1b 观察器保留配置：${order}`, async () => {
+  const t = context(dir, ["wait", "abcd1234"]);
+  const config = { maxWakeups: 8 } as NonNullable<RunResult["convergenceConfig"]>;
+  const execution = { model: "原模型", effort: "high" };
+  const observer = observeConvergence(t.fake.rpc, () => "run-test", () => {});
+  try {
+    t.fake.handle = () => ({ run: runResult({ convergenceConfig: config, executionConfig: execution }), revision: order.includes("同 revision") ? 5 : 4 });
+    if (order === "启用前快照") {
+      await observer.rpc.request("broker/threads/watch", {});
+      expect(observer.fields()).not.toHaveProperty("convergenceConfig");
+      expect(observer.fields()).not.toHaveProperty("executionConfig");
+    }
+    t.fake.emit("broker/run/convergenceChanged", { runId: "run-test", revision: 5, subagentJoin: joinState({ phase: "reconciling" }) });
+    if (order !== "启用前快照") await observer.rpc.request("broker/threads/watch", {});
+    expect(observer.fields()).toMatchObject({ convergenceConfig: config, executionConfig: execution, subagentJoin: { phase: "reconciling" } });
+    observer.accept({ runId: "别的运行", revision: 99, executionConfig: { model: "错模型" } });
+    observer.accept({ runId: "run-test", revision: 3, subagentJoin: joinState({ phase: "running" }) });
+    expect(observer.fields().executionConfig).toEqual(execution);
+    expect(observer.fields().subagentJoin?.phase).toBe("reconciling");
+  } finally { observer.dispose(); }
+});
+
 test("SA1b 等待结束后的迟到快照不再输出或复活协调摘要", async () => {
   const t = context(dir, ["wait", "abcd1234"]);
   const lines: string[] = [];
