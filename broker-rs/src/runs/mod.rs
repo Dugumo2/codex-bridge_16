@@ -1910,6 +1910,25 @@ impl Machine {
                     && join.reconciled_epoch >= join.work_epoch)
             {
                 record.final_turn_id = Some(parent.turn.clone());
+                // 树停止可在根轮完成通知之前提交 ended/unconfirmed。此时最终指针仍然是
+                // 合法的父轮定位，但结果项尚未创建；落一个明确 unavailable 的占位事实，
+                // 让持久化补读和 CLI 有界收束，而不是把旧轮误当最终答复。
+                if !record.turns.iter().any(|turn| turn.turn_id == parent.turn) {
+                    record.turns.push(TurnResult {
+                        origin: Some(parent.origin),
+                        reroute: None,
+                        turn_id: parent.turn.clone(),
+                        ready: Ready::Unavailable,
+                        status: TurnStatus::Interrupted,
+                        output: String::new(),
+                        output_source: OutputSource::None,
+                        error: Some(serde_json::json!({
+                            "code": "finalResultUnavailable",
+                            "reason": "树停止期限已到，最终父轮没有完成通知",
+                        })),
+                        completed_at: self.clock.now_ms,
+                    });
+                }
             }
         } else if join.work_epoch == 0 && record.start_confirmation.confirmed {
             record.final_turn_id = record.current_turn_id.clone();

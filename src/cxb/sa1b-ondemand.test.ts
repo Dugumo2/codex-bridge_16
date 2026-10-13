@@ -132,18 +132,18 @@ scenario("新运行跟进旧子线程：按本次跟进绑定，汇总后结束"
 async function locked(h: H, where: string) {
   await h.until(async () => (await h.record()).subagentJoin?.terminalReason === "ownershipConflict", 5000, `${where}发现真实输入后未立即锁定归属冲突`);
 }
-for (const where of ["核实分页", "快轮完成全文"] as const) scenario(`${where}才发现真实输入：明确按归属冲突收尾，wait 能结束`, async h => {
+for (const where of ["核实分页", "快轮完成全文"] as const) for (const negative of [false, true] as const) scenario(`${where}${negative ? "删除真实插话" : "才发现真实输入"}：路径与终态可核验`, async h => {
   await h.spawn(); await h.finish("child", mark());
   // 回包丢失、条目通知扣住：汇总已发出但结果未知，真实输入只能从核实读取或完成全文里看到。
   await h.control("startBehavior", { threadId: P, mode: "replyLost" });
   await h.control("fence", { name: "input", method: "item/completed", threadId: P });
-  await h.control("fence", { name: "started", method: "turn/started", threadId: P });
   if (where === "核实分页") await h.control("fence", { name: "items", direction: "request", method: "thread/items/list", threadId: P });
   await h.finish(P);
   let request: any;
   await h.until(async () => { request = (await h.starts()).slice(1).find(x => x.params.clientUserMessageId); return !!request; }, 4000, "汇总未发出");
   const carrier = (await h.state()).threads.root.turns.at(-1).id;
   await h.control("item", { threadId: P, turnId: carrier, announce: false, item: { id: "external-item", type: "userMessage", content: [{ type: "text", text: "真实用户修改了任务要求" }] } });
+  if (negative) await h.control("removeItem", { threadId: P, itemId: "external-item" });
   if (where === "核实分页") {
     await h.control("release", { name: "items" });
     // 撤权后不能借它中断未证明自有的承载轮；该轮自行结束后停止才能确认、运行收尾。
@@ -155,18 +155,24 @@ for (const where of ["核实分页", "快轮完成全文"] as const) scenario(`$
     await h.control("inject", { message: { method: "turn/completed", params: { threadId: P, turn: { ...turn, itemsView: "full" } } } });
     await locked(h, "完成全文");
   }
-  // 真实输入的条目通知始终收不到（审查指出的触发条件）；只放行轮次开始通知，停止据此确认承载轮已结束。
-  await h.control("release", { name: "started" });
+  // 真实承载轮 started 已先登记；这里只释放独立的分页／全文入口。
   // 结果不明的已发提交保留只读核实直到 20 秒总窗，之后才能确认根线程收尾。
   const run = await terminal(h, 30000).catch(async error => {
     const watch = await h.watch();
     throw new Error(`${error}；记录=${JSON.stringify(watch.run)}；线程=${JSON.stringify(watch.thread)}；调用=${JSON.stringify((await h.state()).calls.slice(-10).map((c: any) => c.method))}`);
   });
-  expect(run.subagentJoin.automaticControlRevoked).toBe(true);
-  expect(run.subagentJoin.terminalReason).toBe("ownershipConflict");
-  expect((await h.starts()).length, "已发提交不重发").toBe(2);
-  const waited = await h.cli(["wait", P, "--json"], 15000);
-  expect(typeof waited.code).toBe("number");
+  if (negative) {
+    expect(run.subagentJoin?.terminalReason).not.toBe("ownershipConflict");
+    expect(run.status).toBe("completed");
+  } else {
+    expect(run.subagentJoin.automaticControlRevoked).toBe(true);
+    expect(run.subagentJoin.terminalReason).toBe("ownershipConflict");
+    expect((await h.starts()).length, "已发提交不重发").toBe(2);
+    const waited = await h.cli(["wait", P, "--json"], 15000);
+    expect(waited.code).toBe(4);
+    const json = JSON.parse(waited.stdout.trim().split(/\r?\n/).at(-1)!);
+    expect(json).toMatchObject({ runId: h.runId, status: "interrupted" });
+  }
 }, 60000);
 
 scenario("detach 时已发汇总仍在核实：迁到新授权只读核实，不重发、不卡住", async h => {
