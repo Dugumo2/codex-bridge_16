@@ -168,19 +168,25 @@ export const handover: Handover = async (rpc, args, opts = {}) => {
 
 const SECRET_KEY = /token|cookie|authorization|password|passwd|secret|api[\W_]*key|credential/i;
 
+function terminalText(value: string): string {
+  const text = value.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-_])|\u009b[0-?]*[ -/]*[@-~]/g, "");
+  return sanitizeForTerminal(text).replace(/[\r\u0080-\u009f\u202a-\u202e\u2066-\u2069]/g, "");
+}
+
 /** N4 inbox 可复用；先收集秘密再渲染，连同摘要中重复引用的原值一起隐藏。 */
 export function redactParams(params: unknown): unknown {
   const secrets = new Set<string>();
   function collect(value: unknown, sensitive = false): void {
-    if (typeof value === "string") { if (sensitive && value) secrets.add(value); return; }
+    if (typeof value === "string") { const text = terminalText(value); if (sensitive && text) secrets.add(text); return; }
     if (Array.isArray(value)) { for (const child of value) collect(child, sensitive); return; }
-    for (const [key, child] of Object.entries(object(value))) collect(child, sensitive || SECRET_KEY.test(key));
+    for (const [key, child] of Object.entries(object(value))) collect(child, sensitive || SECRET_KEY.test(terminalText(key)));
   }
   collect(params);
   const values = [...secrets].sort((a, b) => b.length - a.length);
   function clean(value: unknown): unknown {
     if (typeof value === "string") {
-      let result = value;
+      // 先清除颜色与控制字符，避免它们遮住裸 key 前缀或敏感键名。
+      let result = terminalText(value);
       for (const secret of values) result = result.split(secret).join("***");
       // URL 查询、命令参数及头部文本也可能携带凭据。
       result = result.replace(/\bBearer\s+[^\s,;]+/gi, "Bearer ***")
@@ -191,12 +197,11 @@ export function redactParams(params: unknown): unknown {
         .replace(/\b[A-Za-z0-9+/=]{32,}\b/g, "***")
         .replace(/((?:[\w-]*(?:token|cookie|authorization|password|passwd|secret|api[_-]?key|credential)[\w-]*)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s&;]+)/gi, "$1***")
         .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, "$1***@");
-      result = result.replace(/\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\)|[@-_])|\u009b[0-?]*[ -/]*[@-~]/g, "");
-      return sanitizeForTerminal(result).replace(/[\r\u0080-\u009f\u202a-\u202e\u2066-\u2069]/g, "");
+      return result;
     }
     if (Array.isArray(value)) return value.map(clean);
     if (value !== null && typeof value === "object") {
-      return Object.fromEntries(Object.entries(value).map(([key, child]) => [String(clean(key)), SECRET_KEY.test(key) ? "***" : clean(child)]));
+      return Object.fromEntries(Object.entries(value).map(([key, child]) => [String(clean(key)), SECRET_KEY.test(terminalText(key)) ? "***" : clean(child)]));
     }
     return value;
   }

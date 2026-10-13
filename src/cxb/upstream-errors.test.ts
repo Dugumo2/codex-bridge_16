@@ -3,6 +3,7 @@ import { FakeRpc, runResult } from "./test-fixtures/run-fakes";
 import { upstreamError } from "./test-fixtures/upstream-errors";
 import { diagnosticLine, observeUpstreamErrors, upstreamGroupKey, upstreamNoticeLines, upstreamResultFields, upstreamShowLines } from "./upstream-errors";
 import type { UpstreamErrorCategory } from "./contracts";
+import { redactParams } from "./server-requests";
 
 const categories: Record<UpstreamErrorCategory, string> = {
   authentication: "上游认证失败", paymentRequired: "上游要求付费", permissionDenied: "上游拒绝访问",
@@ -36,6 +37,12 @@ test("原因移除控制与 ESC 序列，合并单行，Unicode 超 300 字符�
   expect(diagnosticLine("😀".repeat(301))).toBe("😀".repeat(300) + "…");
   expect(diagnosticLine("中".repeat(300))).toBe("中".repeat(300));
   expect(upstreamNoticeLines(upstreamError({ additionalDetails: "  ", message: "实际原因" }))[1]).toBe("[cxb] 原因：实际原因");
+});
+test("先去控制序列再脱敏：颜色不能遮住 key、JWT 与敏感键名", () => {
+  expect(diagnosticLine("\u001b[31msk-testColorKey\u001b[0m")).toBe("***");
+  expect(diagnosticLine("s\u0008k-proj-testControlKey")).toBe("***");
+  expect(diagnosticLine("\u001b[31meyJhbGci.aPayload.aSignature\u001b[0m")).toBe("***");
+  expect(redactParams({ "to\u0008ken": "短秘密", text: "短秘密" })).toEqual({ token: "***", text: "***" });
 });
 test("默认 show 两行逐字与已结束／失联不宣称仍在重试", () => {
   expect(upstreamShowLines(runResult({ upstreamError: upstreamError(), state: "running" }))).toEqual([
