@@ -20,10 +20,13 @@ export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, sig
 }
 
 export const exitCodeForRun: ExitCodeForRun = (run) => {
-  if (run.state === "lost") return EXIT.INTERRUPTED;
-  if (run.status === "failed") return EXIT.CODEX_FAILED;
+  if (run.subagentJoin) {
+    if (run.state === "lost") return EXIT.INTERRUPTED;
+    if (run.status === "failed") return EXIT.CODEX_FAILED;
+  }
   if (run.loopGuard || run.interruptReason === "goalLoop" || run.status === "goalBlocked") return EXIT.GOAL_BLOCKED_OR_LIMITED;
   if (run.status === "completed") return EXIT.OK;
+  if (run.status === "failed") return EXIT.CODEX_FAILED;
   return EXIT.INTERRUPTED;
 };
 

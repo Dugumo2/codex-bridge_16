@@ -6,8 +6,11 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { envWithPathPrefix } from "../test-support/broker-harness";
+import { pathToFileURL } from "node:url";
+import { envWithPathPrefix, writeMockCodexScript } from "../test-support/broker-harness";
 import { Sa1bHarness, SA1B_ROOT as P } from "../test-support/sa1b-harness";
+import { readRunLog } from "./ledger";
+import { resolveWorkspace } from "./workspace";
 
 type H = Sa1bHarness;
 const mark = () => `SA1B_${randomUUID().replaceAll("-", "")}`;
@@ -212,25 +215,78 @@ scenario("detach 时已发汇总仍在核实：迁到新授权只读核实，不
   expect(run.finalTurnId).toBe(goalTurn);
 });
 
-test("未启用协调的普通运行：run/show/ls/wait/show --follow 文本与 s4-cli 逐字一致", async () => {
-  const h = new Sa1bHarness();
+/** 只归一化两个独立运行必然不同的标识、工作区路径、时间；其余字节（含字段及提示）原样比较。 */
+function normalizeCli(value: string, h: H, run: any) {
+  for (const [from, to] of [[h.tempDir, "<工作区>"], [h.tempDir.replaceAll("\\", "/"), "<工作区>"],
+    [JSON.stringify(h.tempDir).slice(1, -1), "<工作区>"], [run.runId, "<运行>"], [run.shortId, "<短ID>"]]) {
+    if (from) value = value.replaceAll(from, to);
+  }
+  return value.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<时间>")
+    .replace(/("(?:updatedAt|startedAt|endedAt|lastVerifiedAt)":\s*)\d+/g, '$1"<时间>"')
+    .replace(/(耗时 |等待耗时 )\d+ 毫秒/g, "$1<耗时> 毫秒");
+}
+/** 仅为内联审查补上协议回包，复用原模拟器的轮次、停止及分页，不修改 R 路夹具。 */
+class BaselineHarness extends Sa1bHarness {
+  override async open(options: { pageSize?: number } = {}) {
+    const module = pathToFileURL(join(import.meta.dir, "../test-support/sa1b-mock.ts")).href;
+    writeMockCodexScript(this.tempDir, `import { createSa1bMock } from ${JSON.stringify(module)};
+const reviews = new Map();
+const mock = createSa1bMock(message => {
+  if (message.id !== undefined && reviews.has(message.id)) {
+    if (message.result) message.result.reviewThreadId = reviews.get(message.id);
+    reviews.delete(message.id);
+  }
+  process.stdout.write(JSON.stringify(message) + "\\n");
+}, ${JSON.stringify(options)});
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => { buffer += chunk; let end; while ((end = buffer.indexOf("\\n")) >= 0) {
+  const line = buffer.slice(0,end); buffer = buffer.slice(end+1); if (!line.trim()) continue;
+  const message = JSON.parse(line);
+  if (message.method === "review/start") { reviews.set(message.id, message.params.threadId); message.method = "turn/start"; }
+  mock.handle(message);
+} });
+process.stdin.on("end", () => process.exit(0));`);
+    await this.launch(); this.owner = await this.connect(); return this;
+  }
+}
+async function baselineSession(main: string, status: "completed" | "interrupted", json: boolean, command: "run" | "review") {
+  const h = new BaselineHarness();
   try {
     await h.open({ pageSize: 16 });
-    const running = cli(h, join(import.meta.dir, "main.ts"), ["run", "普通任务", "--model", "original-model", "--reasoning", "high"], 20000);
+    const running = cli(h, main, [command, "普通任务", "--model", "original-model", "--reasoning", "high", ...(json ? ["--json"] : [])], 20000);
     void running.catch(() => {});
     await h.until(async () => { const run = await h.record().catch(() => undefined); if (!run) return false; h.runId = run.runId; h.firstTurn = run.currentTurnId; return !!h.firstTurn; }, 8000, "CLI 初始运行没有开始");
-    await h.finish(P, "普通运行结果");
-    const run = await running;
-    expect(run.code).toBe(0);
-    expect(run.stdout).toContain("普通运行结果");
-    for (const line of ["运行协调", "收敛期限", "自动父轮", "预算：", "最终结果：", "阶段结果"]) expect(run.stdout + run.stderr).not.toContain(line);
-    const record = await h.record();
-    for (const key of ["subagentJoin", "runBudget", "autoTurnsStarted", "finalTurnId"]) expect(record).not.toHaveProperty(key);
-    for (const args of [["show", P], ["show", P, "--follow"], ["wait", P], ["ls"], ["show", P, "--json"], ["wait", P, "--json"]]) {
-      const ours = await cli(h, join(import.meta.dir, "main.ts"), args);
-      const base = await cli(h, BASELINE_CLI, args);
-      expect({ args, code: ours.code }).toEqual({ args, code: 0 });
-      expect({ args, code: ours.code, stdout: ours.stdout }).toEqual({ args, code: base.code, stdout: base.stdout });
+    const workspace = resolveWorkspace(h.tempDir, { ...process.env, CXB_HOME: h.home });
+    await h.until(async () => {
+      const run = await h.record();
+      return !!readRunLog(workspace.workspaceDir, run.shortId)?.some(line => line.runId === h.runId && line.event === "轮次开始");
+    }, 5000, "开始日志未落盘，不能比较跟随输出");
+    const following = cli(h, main, ["show", P, "--follow", "--json"], 20000);
+    const waiting = cli(h, main, ["wait", P, "--json"], 20000);
+    await h.observe(350);
+    expect(h.ended()).toHaveLength(0);
+    if (status === "interrupted") await h.owner.request("broker/threads/stop", { threadId: P, runId: h.runId }, 15000);
+    else await h.finish(P, "普通运行结果");
+    const run = await h.record();
+    expect(run.status).toBe(status);
+    expect(run.meta.source).toBe(command);
+    if (status === "interrupted") { expect(run.interruptReason).toBe("stop"); expect(run.childrenStop).toBeUndefined(); }
+    for (const key of ["subagentJoin", "runBudget", "autoTurnsStarted", "finalTurnId"]) expect(run).not.toHaveProperty(key);
+    const outputs = [{ args: [command, ...(json ? ["--json"] : [])], ...await running },
+      { args: ["show", "--follow", "--json", "运行中"], ...await following },
+      { args: ["wait", "--json", "运行中"], ...await waiting }];
+    expect(outputs[0]!.code).toBe(status === "completed" ? 0 : 4);
+    expect(JSON.parse(outputs[2]!.stdout)).toMatchObject({ runId: h.runId, status, alreadyDone: false });
+    for (const args of [["show", P], ["show", P, "--follow"], ["wait", P], ["ls"], ["show", P, "--json"],
+      ["wait", P, "--json"], ["ls", "--json"], ["show", P, "--follow", "--json"]]) {
+      outputs.push({ args, ...await cli(h, main, args) });
     }
+    return outputs.map(row => ({ ...row, stdout: normalizeCli(row.stdout, h, run), stderr: normalizeCli(row.stderr, h, run) }));
   } finally { await h.close(); }
-}, 60000);
+}
+for (const command of ["run", "review"] as const) for (const status of ["completed", "interrupted"] as const) for (const json of [false, true]) test(`未启用协调的普通${status}运行：${command}${json ? " --json" : ""}/show/ls/wait 双流与 s4-cli 逐字一致`, async () => {
+  const base = await baselineSession(BASELINE_CLI, status, json, command);
+  const ours = await baselineSession(join(import.meta.dir, "main.ts"), status, json, command);
+  expect(ours).toEqual(base);
+}, 90000);

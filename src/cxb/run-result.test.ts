@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { RunResult } from "./contracts";
-import { resultPending, resultReady, resultTurn, selectedResultFields } from "./run-result";
+import { modelTurn, resultPending, resultReady, resultTurn, selectedResultFields } from "./run-result";
 import { modelSummary, runResult } from "./test-fixtures/run-fakes";
 import type { SubagentJoin } from "./sa1b-contracts";
 
@@ -53,4 +53,9 @@ for (const state of ["ended", "lost"] as const) test(`协调运行${state === "l
   expect(resultReady(run)).toBe("unavailable");
   expect(selectedResultFields(run)).toEqual({ ready: "unavailable" });
   expect(modelSummary(run).lastTurn).toBeNull();
+});
+
+test("未启用运行的模型展示保留 s4-cli 尾项规则", () => {
+  const run = record({ currentTurnId: "首轮" });
+  expect(modelTurn(run)?.turnId).toBe("迟到轮");
 });
