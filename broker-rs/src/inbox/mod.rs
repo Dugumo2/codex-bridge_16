@@ -505,6 +505,9 @@ impl Machine {
             );
         }
         self.inbox.insert_entry(entry);
+        if let Some(run) = item.run_id.as_deref() {
+            self.stall_pending_changed(run, true, actions);
+        }
         self.schedule_inbox(
             &item.id,
             item.expires_at.saturating_sub(self.clock.now_ms),

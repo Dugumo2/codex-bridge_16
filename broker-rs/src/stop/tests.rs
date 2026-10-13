@@ -133,6 +133,79 @@ fn running() -> Machine {
     reply(&mut m, &c, Ok(json!({"turn":{"id":"本轮"}})));
     m
 }
+
+pub(super) fn stop_diagnostics_fixture() -> StopDiagnostics {
+    StopDiagnostics {
+        reason: InterruptReason::StallTimeout,
+        started_at: 1,
+        goal_started_at: Some(2),
+        goal_settled_at: Some(3),
+        interrupt_sent: true,
+        interrupt_sent_at: Some(4),
+        interrupt_reply: Some(StopRpcOutcome::Timeout),
+        interrupt_replied_at: Some(5),
+        turn_ended_at: None,
+        unconfirmed_at: Some(6),
+        confirmed_at: None,
+        rpc_issues: vec![crate::runs::StopRpcIssue {
+            method: "turn/interrupt".into(),
+            kind: StopRpcOutcome::Timeout,
+            at: 5,
+            message: "测试超时".into(),
+        }],
+    }
+}
+
+#[test]
+fn 停止回包携带空或完整的根停止诊断() {
+    for diagnostics in [None, Some(stop_diagnostics_fixture())] {
+        let mut m = running();
+        let run = m.claims["线程"].run_id.clone().unwrap();
+        m.runs.runs.get_mut(&run).unwrap().stop_diagnostics = diagnostics.clone();
+        let actions = stop(&mut m, 2, false);
+        let deadline = timer(&actions, |kind| {
+            matches!(kind, TimerKind::Stop(_, StopTimer::Waiter(_)))
+        });
+        let actions = apply(&mut m, deadline);
+        let result = outcome(&actions, 2);
+        assert_eq!(result["stopDiagnostics"], json!(diagnostics));
+        assert_eq!(result["threadId"], "线程");
+        assert_eq!(result["stopOutcome"], "unconfirmed");
+    }
+}
+
+#[test]
+fn 停止回包身份保存发送时轮次并隔离迁移后的目标() {
+    let mut m = running();
+    let actions = stop(&mut m, 2, false);
+    let context = req(&actions, "thread/goal/get");
+    let key = m.stop_diag_rpc_key(&context).unwrap();
+    let saved = m.stops.diagnostic_rpc_sends[&key].clone();
+    assert_eq!(saved.1.turn.as_deref(), Some("本轮"));
+    let id = m.stop_key("线程").unwrap();
+    m.stops.operations.get_mut(&id).unwrap().target = Some("后续轮".into());
+    let current = m.stop_diag_rpc_target(&context).unwrap();
+    assert_eq!(current.2.turn.as_deref(), Some("后续轮"));
+    assert_ne!(saved.1, current.2);
+    m.stop_diag_rpc_reply(&context, &Err(err()), false);
+    assert!(!m.stops.diagnostic_rpc_sends.contains_key(&key));
+    let mut migrated = context;
+    migrated.params = Some(json!({"threadId":"子线程"}));
+    assert!(m.stop_diag_rpc_target(&migrated).is_none());
+}
+
+#[test]
+fn 停止请求超时的诊断只由超时入口记一次() {
+    let mut m = running();
+    let actions = stop(&mut m, 2, false);
+    let context = req(&actions, "thread/goal/get");
+    let key = m.stop_diag_rpc_key(&context).unwrap();
+    m.stop_diag_rpc_reply(&context, &Err(err()), true);
+    assert!(m.stops.diagnostic_rpc_timeouts.contains(&key));
+    m.stop_diag_rpc_reply(&context, &Err(err()), false);
+    assert!(!m.stops.diagnostic_rpc_timeouts.contains(&key));
+    assert!(!m.stops.diagnostic_rpc_sends.contains_key(&key));
+}
 fn stop(m: &mut Machine, id: u64, clear: bool) -> Vec<Action> {
     client(
         m,

@@ -3,6 +3,7 @@
 
 pub mod background;
 pub mod derived;
+pub(crate) mod diagnostics;
 pub mod tree;
 mod unloaded;
 
@@ -12,7 +13,10 @@ use crate::claim::{
     StopReason, TimerKind,
 };
 use crate::proto::{self, code};
-use crate::runs::{ReleaseKind, RunState, StopCheck, StopOutcome};
+use crate::runs::{
+    InterruptReason, ReleaseKind, RunState, StopCheck, StopDiagSend, StopDiagnostics, StopOutcome,
+    StopRpcOutcome,
+};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -151,6 +155,8 @@ pub struct BreakerProbe {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stops {
+    diagnostic_rpc_sends: HashMap<StopDiagRpcKey, (String, StopDiagSend)>,
+    diagnostic_rpc_timeouts: HashSet<StopDiagRpcKey>,
     pub closed_runtimes: HashMap<String, unloaded::ClosedRuntime>,
     pub command_owners: HashMap<(String, String), String>,
     pub command_turns: HashMap<(String, String), String>,
@@ -164,6 +170,15 @@ pub struct Stops {
     pub retired_late_turns: VecDeque<(String, String)>,
     next: u64,
     next_version: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StopDiagRpcKey {
+    source: String,
+    generation: u64,
+    round: u64,
+    method: String,
+    thread: String,
+    turn: Option<String>,
 }
 impl Stops {
     fn allocate(&mut self) -> u64 {
@@ -228,9 +243,27 @@ impl StopOp {
             claim_id: self.claim_id.unwrap_or(0),
         }
     }
-    fn result(&self, outcome: &str) -> Value {
+    fn diagnostic_send(&self, turn: Option<&str>) -> Option<(String, StopDiagSend)> {
+        if self.already_stopped
+            || self.historical_probe
+            || self.history_released
+            || self.foreign_claim
+        {
+            return None;
+        }
+        Some((
+            self.run_id.clone()?,
+            StopDiagSend {
+                stop_generation: self.generation,
+                turn: turn.map(str::to_owned),
+                thread: self.thread.clone(),
+            },
+        ))
+    }
+    fn result(&self, outcome: &str, diagnostics: Option<&StopDiagnostics>) -> Value {
         let mut result = json!({"threadId":self.thread,"runId":self.run_id,"interruptSent":self.interrupt_sent,
-            "backgroundCleanup":self.background.report,"goal":self.goal,"alreadyStopped":self.already_stopped,"stopOutcome":outcome,"run":null});
+            "backgroundCleanup":self.background.report,"goal":self.goal,"alreadyStopped":self.already_stopped,"stopOutcome":outcome,"run":null,
+            "stopDiagnostics":diagnostics});
         if self.history_released {
             result["cleanupState"] = json!(if outcome == "confirmed" {
                 "completed"
@@ -243,6 +276,169 @@ impl StopOp {
 }
 
 impl Machine {
+    fn stop_diag_rpc_key(&self, context: &RequestContext) -> Option<StopDiagRpcKey> {
+        let operation = stop_diag_operation(&context.operation);
+        let (source, generation, round) = match operation {
+            Operation::Stop(tag, _) => (format!("stop:{}", tag.id), tag.generation, tag.round),
+            Operation::DerivedStop {
+                tree_op,
+                generation,
+                thread,
+                round,
+            } => (format!("tree:{tree_op}:{thread}"), *generation, *round),
+            Operation::StatusRead {
+                read_id,
+                generation,
+            } => (format!("read:{read_id}"), *generation, 0),
+            _ => return None,
+        };
+        Some(StopDiagRpcKey {
+            source,
+            generation,
+            round,
+            method: context.method.clone(),
+            thread: context
+                .params
+                .as_ref()?
+                .get("threadId")?
+                .as_str()?
+                .to_owned(),
+            turn: context
+                .params
+                .as_ref()
+                .and_then(|p| p.get("turnId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+
+    fn stop_diag_rpc_target(
+        &self,
+        context: &RequestContext,
+    ) -> Option<(StopDiagRpcKey, String, StopDiagSend)> {
+        let key = self.stop_diag_rpc_key(context)?;
+        let send = match stop_diag_operation(&context.operation) {
+            Operation::Stop(tag, request) => {
+                let op = self.stops.operations.get(&tag.id)?;
+                if op.generation != tag.generation || op.thread != key.thread {
+                    return None;
+                }
+                let valid = match request {
+                    StopRequest::GoalGet { .. } | StopRequest::GoalWrite { .. } => {
+                        op.goal_round == tag.round
+                    }
+                    StopRequest::VerifyGoal { .. } => op.verifying && op.round == tag.round,
+                    StopRequest::Interrupt { turn } => {
+                        op.round == tag.round && op.target.as_deref() == Some(turn)
+                    }
+                    StopRequest::Background { epoch } => {
+                        op.round == tag.round && op.background.epoch == *epoch
+                    }
+                };
+                if !valid {
+                    return None;
+                }
+                op.diagnostic_send(key.turn.as_deref().or(op.target.as_deref()))?
+            }
+            Operation::DerivedStop {
+                tree_op,
+                generation,
+                thread,
+                round,
+            } => {
+                let derived_key = (*tree_op, thread.clone());
+                let op = self.trees.aux.derived.get(&derived_key)?;
+                if op.target.generation != *generation || op.request_round != *round {
+                    return None;
+                }
+                self.derived_diagnostic_send(&derived_key, key.turn.as_deref())?
+            }
+            Operation::StatusRead {
+                read_id,
+                generation,
+            } => {
+                let read = self.status_reads.reads.get(read_id)?;
+                if read.generation != *generation || read.thread != key.thread {
+                    return None;
+                }
+                match &read.caller {
+                    StatusCaller::StopVerify { tag } => {
+                        let op = self.stops.operations.get(&tag.id)?;
+                        if op.generation != tag.generation || op.round != tag.round || !op.verifying
+                        {
+                            return None;
+                        }
+                        op.diagnostic_send(op.target.as_deref())?
+                    }
+                    StatusCaller::DerivedStopVerify {
+                        tree_op,
+                        thread,
+                        round,
+                    } => {
+                        let derived_key = (*tree_op, thread.clone());
+                        let op = self.trees.aux.derived.get(&derived_key)?;
+                        if op.request_round != *round {
+                            return None;
+                        }
+                        self.derived_diagnostic_send(&derived_key, None)?
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        (send.1.thread == key.thread).then_some((key, send.0, send.1))
+    }
+
+    /// 使用发送时保存的原运行、停止代际与执行目标记账；旧目标的回包不能污染新目标。
+    pub(crate) fn stop_diag_rpc_reply(
+        &mut self,
+        context: &RequestContext,
+        result: &Result<Value, Value>,
+        timeout: bool,
+    ) {
+        let Some(key) = self.stop_diag_rpc_key(context) else {
+            return;
+        };
+        if !timeout && self.stops.diagnostic_rpc_timeouts.remove(&key) {
+            return;
+        }
+        let captured = self.stops.diagnostic_rpc_sends.remove(&key);
+        let Some((_, current_run, current_send)) = self.stop_diag_rpc_target(context) else {
+            return;
+        };
+        let (run, send) = captured.unwrap_or((current_run.clone(), current_send.clone()));
+        if run != current_run || send != current_send {
+            return;
+        }
+        if timeout
+            && !matches!(
+                stop_diag_operation(&context.operation),
+                Operation::StatusRead { .. }
+            )
+        {
+            self.stops.diagnostic_rpc_timeouts.insert(key);
+        }
+        let outcome = if timeout {
+            StopRpcOutcome::Timeout
+        } else if result.is_ok() {
+            StopRpcOutcome::Ok
+        } else {
+            StopRpcOutcome::Error
+        };
+        if context.method == "turn/interrupt" {
+            self.stop_diag_interrupt_reply(&run, &send, outcome);
+        }
+        if let Err(error) = result {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| error.to_string());
+            self.stop_diag_rpc_issue(&run, &send, &context.method, outcome, &message);
+        }
+    }
+
     fn cancel_breaker_probe(&mut self, actions: &mut Vec<Action>) {
         let probe = &mut self.stops.probe;
         if probe.scheduled {
@@ -414,7 +610,10 @@ impl Machine {
             thread,
             match reason {
                 StopReason::ClientDisconnected => crate::sa1b::ReconcileCancel::OwnerGone,
-                _ => crate::sa1b::ReconcileCancel::Stop,
+                StopReason::Stop
+                | StopReason::GoalLoop
+                | StopReason::StallTimeout
+                | StopReason::UpstreamAccessError => crate::sa1b::ReconcileCancel::Stop,
             },
             actions,
         );
@@ -523,6 +722,7 @@ impl Machine {
         });
         if let Some(run) = &run_id {
             self.run_stop_began(run, reason, actions);
+            self.stop_diag_began(run, stop_interrupt_reason(reason), generation);
         }
         self.stops.operations.insert(id.clone(), op);
         if let Some(claim) = self.claims.get_mut(thread) {
@@ -789,7 +989,13 @@ impl Machine {
         op.narrow = expected.is_some();
         op.explicit_interrupts = true;
         if op.waiters.len() >= MAX_STOP_WAITERS {
-            let mut result = op.result("unconfirmed");
+            let mut result = op.result(
+                "unconfirmed",
+                op.run_id
+                    .as_deref()
+                    .and_then(|run| self.runs.runs.get(run))
+                    .and_then(|r| r.stop_diagnostics.as_ref()),
+            );
             let run = op.run_id.clone();
             result["threadId"] = json!(thread);
             result["run"] = run
@@ -922,6 +1128,9 @@ impl Machine {
             },
             actions,
         );
+        if let Some((run, send)) = op.diagnostic_send(op.target.as_deref()) {
+            self.stop_diag_goal_started(&run, &send);
+        }
         stop_request(
             id,
             op,
@@ -1031,6 +1240,9 @@ impl Machine {
                     op.goal_round += 1;
                     op.goal_busy = true;
                     op.goal_attempted = true;
+                    if let Some((run, send)) = op.diagnostic_send(op.target.as_deref()) {
+                        self.stop_diag_goal_started(&run, &send);
+                    }
                     stop_request(
                         &id,
                         &op,
@@ -1047,6 +1259,12 @@ impl Machine {
                     && !op.goal_busy
                     && !self.stops.changes.values().any(|c| c.thread == op.thread)
                 {
+                    if let Some((run, send)) = op.diagnostic_send(op.target.as_deref()) {
+                        self.stop_diag_goal_settled(&run, &send);
+                        if op.target.as_ref().is_some_and(|t| op.ended.contains(t)) {
+                            self.stop_diag_turn_ended(&run, &send);
+                        }
+                    }
                     let explicit = std::mem::take(&mut op.explicit_interrupts);
                     self.stop_interrupt(&id, &mut op, explicit, actions);
                 }
@@ -1089,6 +1307,7 @@ impl Machine {
                     }
                     if !op.already_stopped {
                         if let Some(run) = &op.run_id {
+                            self.stop_diag_confirmed(run);
                             self.run_stop_confirmed(run, actions);
                         }
                     }
@@ -1109,7 +1328,13 @@ impl Machine {
         }
     }
 
-    fn stop_interrupt(&self, id: &str, op: &mut StopOp, explicit: bool, actions: &mut Vec<Action>) {
+    fn stop_interrupt(
+        &mut self,
+        id: &str,
+        op: &mut StopOp,
+        explicit: bool,
+        actions: &mut Vec<Action>,
+    ) {
         if op.goal_busy
             || !op.goal_done
             || self.stops.changes.values().any(|c| c.thread == op.thread)
@@ -1133,6 +1358,9 @@ impl Machine {
         }
         op.interrupted.insert(turn.clone());
         op.interrupt_sent = true;
+        if let Some((run, send)) = op.diagnostic_send(Some(&turn)) {
+            self.stop_diag_interrupt_sent(&run, &send);
+        }
         stop_request(
             id,
             op,
@@ -1162,6 +1390,7 @@ impl Machine {
         turn: &str,
         ended: bool,
     ) {
+        let mut diagnostic = None;
         if let Some(id) = self.stop_key(thread) {
             let op = self.stops.operations.get_mut(&id).unwrap();
             if op.claim_id != Some(claim_id) {
@@ -1170,7 +1399,13 @@ impl Machine {
             op.owned_turns.insert(turn.into());
             if ended {
                 op.ended.insert(turn.into());
+                if op.target.as_deref() == Some(turn) {
+                    diagnostic = op.diagnostic_send(Some(turn));
+                }
             }
+        }
+        if let Some((run, send)) = diagnostic {
+            self.stop_diag_turn_ended(&run, &send);
         }
     }
     pub(crate) fn stop_completed(&mut self, thread: &str, _actions: &mut Vec<Action>) {
@@ -1180,15 +1415,22 @@ impl Machine {
             .and_then(|c| c.turn_id())
             .map(str::to_owned);
         let version = self.stops.version(thread);
+        let mut diagnostic = None;
         if let Some(id) = self.stop_key(thread) {
             let op = self.stops.operations.get_mut(&id).unwrap();
             if let Some(target) = target {
+                if op.target.as_deref() == Some(&target) {
+                    diagnostic = op.diagnostic_send(Some(&target));
+                }
                 op.ended.insert(target);
             }
             if op.brake_version != Some(version) {
                 op.goal_attempted = false;
             }
             // 完整结果已在 claim 提交通知、完成去重前交给账本；此处仅保留停止证据。
+        }
+        if let Some((run, send)) = diagnostic {
+            self.stop_diag_turn_ended(&run, &send);
         }
     }
     pub(crate) fn stop_completed_turn(
@@ -1199,17 +1441,22 @@ impl Machine {
     ) {
         // 完整结果由 claim 提交与 review 回放入口交给账本，此处不重复结算。
         let version = self.stops.version(thread);
+        let mut diagnostic = None;
         if let Some(id) = self.stop_key(thread) {
             let op = self.stops.operations.get_mut(&id).unwrap();
             if op.target.as_deref() == Some(turn) || op.owned_turns.contains(turn) {
                 op.ended.insert(turn.into());
                 if op.target.as_deref() == Some(turn) {
+                    diagnostic = op.diagnostic_send(Some(turn));
                     op.invalidate_round();
                 }
                 if op.brake_version != Some(version) {
                     op.goal_attempted = false;
                 }
             }
+        }
+        if let Some((run, send)) = diagnostic {
+            self.stop_diag_turn_ended(&run, &send);
         }
         let ids: Vec<_> = self
             .stops
@@ -1638,6 +1885,7 @@ impl Machine {
                 let tree_owned = self.root_stop_report(&op, tree::RootStopStage::Deadline, actions);
                 if !tree_owned && !op.already_stopped {
                     if let Some(run) = &op.run_id {
+                        self.stop_diag_unconfirmed(run);
                         self.run_stop_check(run, self.stop_check(&op), actions);
                     }
                 }
@@ -1649,6 +1897,9 @@ impl Machine {
             }
             StopTimer::Waiter(id) => {
                 if !self.root_stop_report(&op, tree::RootStopStage::WaiterDeadline(id), actions) {
+                    if let Some((run, _)) = op.diagnostic_send(op.target.as_deref()) {
+                        self.stop_diag_unconfirmed(&run);
+                    }
                     self.answer_waiters(&mut op, Some(id), "unconfirmed", actions);
                 }
             }
@@ -1703,7 +1954,13 @@ impl Machine {
         outcome: &str,
         actions: &mut Vec<Action>,
     ) {
-        let mut result = op.result(outcome);
+        let mut result = op.result(
+            outcome,
+            op.run_id
+                .as_deref()
+                .and_then(|run| self.runs.runs.get(run))
+                .and_then(|r| r.stop_diagnostics.as_ref()),
+        );
         result["run"] = op
             .run_id
             .as_deref()
@@ -1756,6 +2013,8 @@ impl Machine {
         }
         self.stops.retired_late_turns.clear();
         self.stops.changes.clear();
+        self.stops.diagnostic_rpc_sends.clear();
+        self.stops.diagnostic_rpc_timeouts.clear();
     }
 
     /// 变更结果未知最多保留十分钟；过期不是制动证据，必须重新读目标状态。
@@ -1809,6 +2068,31 @@ impl Machine {
         self.stops
             .versions
             .retain(|thread, _| retained.contains(thread.as_str()));
+        let mut diagnostic_sources: HashSet<_> = self
+            .stops
+            .operations
+            .iter()
+            .map(|(id, op)| (format!("stop:{id}"), op.generation))
+            .collect();
+        diagnostic_sources.extend(
+            self.trees
+                .aux
+                .derived
+                .iter()
+                .map(|((tree_op, thread), op)| {
+                    (format!("tree:{tree_op}:{thread}"), op.target.generation)
+                }),
+        );
+        diagnostic_sources.extend(
+            self.status_reads
+                .reads
+                .iter()
+                .map(|(read_id, read)| (format!("read:{read_id}"), read.generation)),
+        );
+        self.stops
+            .diagnostic_rpc_sends
+            .retain(|key, _| diagnostic_sources.contains(&(key.source.clone(), key.generation)));
+        self.stops.diagnostic_rpc_timeouts.clear();
     }
 
     /// 线程当前的 goal 事实版本（没有时分配一个），供续跑预检与 goal 恢复核对读数是否过期。
@@ -1822,6 +2106,9 @@ impl Machine {
             let Action::Request(context) = action else {
                 continue;
             };
+            if let Some((key, run, send)) = self.stop_diag_rpc_target(context) {
+                self.stops.diagnostic_rpc_sends.insert(key, (run, send));
+            }
             let Some(thread) = context
                 .params
                 .as_ref()
@@ -2061,6 +2348,7 @@ impl Machine {
             self.apply_reply(context, Err(error), actions);
             return;
         }
+        self.stop_diag_rpc_reply(&context, &Err(error.clone()), true);
         if let Operation::StatusRead {
             read_id,
             generation,
@@ -3198,6 +3486,23 @@ impl Machine {
             actions.push(Action::Warn("迟到回包登记超过 64 条，丢弃最旧登记".into()));
         }
     }
+}
+
+fn stop_interrupt_reason(reason: StopReason) -> InterruptReason {
+    match reason {
+        StopReason::Stop => InterruptReason::Stop,
+        StopReason::ClientDisconnected => InterruptReason::ClientDisconnected,
+        StopReason::GoalLoop => InterruptReason::GoalLoop,
+        StopReason::StallTimeout => InterruptReason::StallTimeout,
+        StopReason::UpstreamAccessError => InterruptReason::UpstreamAccessError,
+    }
+}
+
+fn stop_diag_operation(mut operation: &Operation) -> &Operation {
+    while let Operation::GoalChange { inner, .. } | Operation::GoalRead { inner, .. } = operation {
+        operation = inner;
+    }
+    operation
 }
 
 fn stop_request(

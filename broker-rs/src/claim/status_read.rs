@@ -79,6 +79,10 @@ pub enum StatusResult {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusCaller {
+    StallVerify {
+        run_id: String,
+        generation: u64,
+    },
     SubagentReconcile {
         token: crate::sa1b::ConvergeToken,
         op_id: crate::sa1b::ReconcileOpId,
@@ -267,6 +271,7 @@ impl Machine {
         #[cfg(test)]
         self.status_reads.observed.push(done.clone());
         match &done.caller {
+            StatusCaller::StallVerify { .. } => self.stall_verify_done(done, actions),
             StatusCaller::SubagentReconcile { .. } => {
                 self.subagent_reconcile_status_done(done, actions)
             }

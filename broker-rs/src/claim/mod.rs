@@ -379,6 +379,10 @@ pub struct RequestContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
+    Stall {
+        run_id: String,
+        generation: u64,
+    },
     BudgetVerifyDeadline {
         token: crate::sa1b::ConvergeToken,
     },
@@ -461,6 +465,7 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    Stall(String),
     BudgetVerifyDeadline(String, u64),
     ConvergeDeadline(String, u64),
     ConvergeRetry(String, u64),
@@ -490,6 +495,7 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::Stall { run_id, .. } => Some(TimerKey::Stall(run_id.clone())),
             TimerKind::BudgetVerifyDeadline { token } => Some(TimerKey::BudgetVerifyDeadline(
                 token.run_id.clone(),
                 token.generation,
@@ -544,6 +550,8 @@ impl TimerKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
+    StallTimeout,
+    UpstreamAccessError,
     ClientDisconnected,
     Stop,
     /// 自动续跑空转刹车（S1-评审第 26 节，私有模式）。
@@ -733,6 +741,7 @@ pub struct Clock {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Machine {
+    pub(crate) diagnostic_batch_active: bool,
     pub convergences: converge::Convergences,
     /// H2 线程状态读取层：在途读取、页代号与活动版本号。
     pub status_reads: status_read::StatusReads,
@@ -796,6 +805,7 @@ pub struct Machine {
 
 /// 所有输入通过同一个纯函数迁移；运行时只持有返回的新状态。
 pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
+    state.diagnostic_batch_active = true;
     let mut actions = Vec::new();
     // 先保留身份，事件完全处理后才撤销线上保护，避免回包处理中的释放触发淘汰。
     let finished_start = match &event {
@@ -1002,6 +1012,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.schedule_next_verifications(&mut actions);
     state.ensure_breaker_probe(&mut actions);
     state.track_review_requests(&mut actions);
+    state.flush_run_diagnostics(&mut actions);
     state.flush_run_notices(&mut actions);
     state.evict_records();
     state.prune_ext_meta();
@@ -1048,6 +1059,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     );
     #[cfg(test)]
     state.assert_held_accounting();
+    state.diagnostic_batch_active = false;
     (state, actions)
 }
 
@@ -1391,6 +1403,49 @@ impl Machine {
 
     /// #2 的屏障：只有 resume 回包进入邮箱后才取出流式请求。
     fn submit_stream(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
+        if let Some(value) = self
+            .claims
+            .get(thread_id)
+            .and_then(|c| c.pending_start.as_ref())
+            .and_then(|r| r.params.as_ref())
+            .and_then(|p| p.get("cxbRunPolicy"))
+            .cloned()
+        {
+            let policy = serde_json::from_value::<crate::runs::RunPolicy>(value)
+                .ok()
+                .filter(|p| p.stall_timeout_ms <= 9_007_199_254_740_991);
+            let Some(policy) = policy else {
+                if let Some(request) = self.claims.get_mut(thread_id).and_then(|c| {
+                    c.request_pending = false;
+                    c.pending_start.take()
+                }) {
+                    send_error(
+                        &request,
+                        -32602,
+                        "cxbRunPolicy 必须是有效的运行策略",
+                        actions,
+                    );
+                }
+                self.release_with_kind(thread_id, ReleaseKind::StartFailed, actions);
+                return;
+            };
+            if let Some(run) = self.claims.get(thread_id).and_then(|c| c.run_id.clone()) {
+                if let Some(record) = self.runs.runs.get_mut(&run) {
+                    record.run_policy = Some(policy);
+                }
+                self.runs.put(&run, actions);
+                self.stall_arm(&run, actions);
+            }
+            if let Some(params) = self
+                .claims
+                .get_mut(thread_id)
+                .and_then(|c| c.pending_start.as_mut())
+                .and_then(|r| r.params.as_mut())
+                .and_then(Value::as_object_mut)
+            {
+                params.remove("cxbRunPolicy");
+            }
+        }
         // 独立收敛配置只在 broker 内保存，不能作为未知扩展参数发给上游。
         if let Some(value) = self
             .claims
@@ -1595,6 +1650,7 @@ impl Machine {
         if self.unwrap_goal_reply(&mut context, &result, false, actions) {
             return;
         }
+        self.stop_diag_rpc_reply(&context, &result, false);
         if let Operation::BudgetVerify { verification } = &context.operation {
             self.convergence_budget_reply(verification, result, actions);
             return;
@@ -2134,6 +2190,14 @@ impl Machine {
                     if let Some(id) = notification_turn_id(&event.params) {
                         self.started(child, id, actions);
                         self.run_diagnostic_event(child, id, true, None, true, actions);
+                        self.dispatch_run_progress(
+                            child,
+                            id,
+                            &event.method,
+                            &event.params,
+                            true,
+                            actions,
+                        );
                     }
                 }
                 completed |= event.method == "turn/completed";
@@ -2320,6 +2384,13 @@ impl Machine {
         mut event: HeldNotification,
         actions: &mut Vec<Action>,
     ) {
+        let child_handled = self.dispatch_child_diagnostic(
+            thread_id,
+            &event.method,
+            &event.params,
+            event.committed,
+            actions,
+        );
         // review 子线程未知归属时延迟到账本回放；其余完成在认领去重前交给账本。
         if self.claims.contains_key(thread_id) || self.pending_reviews == 0 || event.committed {
             self.record_run_notification(thread_id, &event, actions);
@@ -2411,7 +2482,7 @@ impl Machine {
         if !event.committed && event.method == "turn/started" {
             self.lifecycle_observe(thread_id, false, actions);
         }
-        if !has_claim && self.pending_reviews > 0 && !event.committed {
+        if !has_claim && self.pending_reviews > 0 && !event.committed && !child_handled {
             event.committed = true;
             let count: usize = self.unclaimed.values().map(Vec::len).sum();
             if count < MAX_UNCLAIMED {
@@ -2441,6 +2512,14 @@ impl Machine {
             if let Some(id) = notification_turn_id(&event.params) {
                 self.started(thread_id, id, actions);
                 self.run_diagnostic_event(thread_id, id, event.committed, None, true, actions);
+                self.dispatch_run_progress(
+                    thread_id,
+                    id,
+                    &event.method,
+                    &event.params,
+                    event.committed,
+                    actions,
+                );
             }
         } else if event.method == "turn/completed" {
             if self.claims.get(thread_id).is_some_and(|c| {
@@ -2484,6 +2563,31 @@ impl Machine {
         event: &HeldNotification,
         actions: &mut Vec<Action>,
     ) {
+        if event.method != "turn/started" {
+            let turn = event
+                .params
+                .as_ref()
+                .and_then(|p| {
+                    if event.method == "turn/completed" {
+                        p.get("turn").and_then(|t| t.get("id"))
+                    } else {
+                        p.get("turnId")
+                    }
+                })
+                .and_then(Value::as_str);
+            if let Some(turn) = turn {
+                if self.claims.contains_key(thread) {
+                    self.dispatch_run_progress(
+                        thread,
+                        turn,
+                        &event.method,
+                        &event.params,
+                        event.committed,
+                        actions,
+                    );
+                }
+            }
+        }
         if self
             .claims
             .get(thread)
@@ -3137,6 +3241,9 @@ impl Machine {
             return;
         }
         match kind {
+            TimerKind::Stall { run_id, generation } => {
+                self.stall_timer(&run_id, generation, actions)
+            }
             TimerKind::BudgetVerifyDeadline { .. }
             | TimerKind::ConvergeDeadline { .. }
             | TimerKind::ConvergeRetry { .. }
@@ -3206,6 +3313,7 @@ impl Machine {
         }
     }
     fn shutdown(&mut self, actions: &mut Vec<Action>) {
+        self.stall_shutdown(actions);
         self.convergence_shutdown(actions);
         if self.closing {
             return;

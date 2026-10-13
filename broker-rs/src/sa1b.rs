@@ -216,6 +216,8 @@ pub enum TerminalReason {
     RootNoDirectInput,
     Abandoned,
     BrokerShutdown,
+    StallTimeout,
+    UpstreamAccessError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

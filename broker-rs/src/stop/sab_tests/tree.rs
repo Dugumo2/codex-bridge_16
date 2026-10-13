@@ -9,6 +9,68 @@ fn stop(s: &mut Sim, conn: u64, params: Value) -> (u64, Vec<Action>) {
 }
 
 #[test]
+fn 整树停止回包携带根停止诊断() {
+    for diagnostics in [None, Some(crate::stop::tests::stop_diagnostics_fixture())] {
+        let mut s = Sim::new();
+        s.spawn_v1("子甲", "派生1", "子轮甲");
+        s.m.runs.runs.get_mut(R).unwrap().stop_diagnostics = diagnostics.clone();
+        let (id, _) = stop(&mut s, OWNER, json!({"threadId": P}));
+        let result = &s.response(&s.log, id).unwrap()["result"];
+        assert_eq!(result["stopDiagnostics"], json!(diagnostics));
+        assert_eq!(result["stopOutcome"], "confirmed");
+    }
+}
+
+#[test]
+fn 派生根核实目标沿用最近一次同代际发送轮次() {
+    let mut s = Sim::new();
+    s.spawn_v1("子甲", "派生1", "子轮甲");
+    s.hold.push(("turn/interrupt".into(), "子甲".into()));
+    stop(&mut s, OWNER, json!({"threadId": P}));
+    let tree_op = s.tree_op().unwrap();
+    let key = (tree_op, P.to_owned());
+    assert!(s.m.trees.aux.derived[&key].root);
+    let generation = s.m.trees.aux.work[&tree_op].root_diag_generation.unwrap();
+    let original = s.m.derived_diagnostic_send(&key, None).unwrap().1.turn;
+    s.m.runs.stop_diag_sends.insert(
+        R.into(),
+        crate::runs::StopDiagSend {
+            stop_generation: generation,
+            thread: P.into(),
+            turn: Some("后续根轮".into()),
+        },
+    );
+    assert_eq!(
+        s.m.derived_diagnostic_send(&key, None)
+            .unwrap()
+            .1
+            .turn
+            .as_deref(),
+        Some("后续根轮")
+    );
+    assert_eq!(
+        s.m.derived_diagnostic_send(&key, Some("明确轮"))
+            .unwrap()
+            .1
+            .turn
+            .as_deref(),
+        Some("明确轮")
+    );
+    for mismatched_thread in [false, true] {
+        let send = s.m.runs.stop_diag_sends.get_mut(R).unwrap();
+        if mismatched_thread {
+            send.thread = "旧执行线程".into();
+        } else {
+            send.stop_generation = generation + 1;
+        }
+        assert_eq!(
+            s.m.derived_diagnostic_send(&key, None).unwrap().1.turn,
+            original
+        );
+    }
+}
+
+#[test]
 fn 收尾发现一次失败后周期重查恢复且保留调用者期限() {
     let mut s = Sim::new();
     s.spawn_v1("子甲", "派生1", "子轮甲");

@@ -70,6 +70,10 @@ impl Drop for Temp {
 
 pub(crate) fn run(id: &str, thread: &str, started: u64) -> RunRecord {
     RunRecord {
+        run_policy: None,
+        stall: None,
+        stop_diagnostics: None,
+        child_upstream_errors: Vec::new(),
         upstream_error: None,
         diagnostic_revision: 0,
         last_progress_at: None,

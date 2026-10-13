@@ -51,6 +51,8 @@ pub enum TreeTrigger {
     LoopGuard,
     ParentFailed,
     ParentInterrupted,
+    StallTimeout,
+    UpstreamAccessError,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,6 +205,7 @@ pub struct TreeWork {
     pub root_derived: bool,
     /// 根单线程停止的代号（认领模式）。
     pub root_stop_gen: Option<u64>,
+    pub root_diag_generation: Option<u64>,
     pub root_done: bool,
     pub root_goal: String,
     pub root_interrupt_sent: bool,
@@ -529,6 +532,7 @@ impl Machine {
                 root_thread: root_thread.clone(),
                 root_derived,
                 root_stop_gen: None,
+                root_diag_generation: None,
                 root_done: false,
                 root_goal: "unchanged".into(),
                 root_interrupt_sent: false,
@@ -665,7 +669,26 @@ impl Machine {
             let reason = match op.request.trigger {
                 TreeTrigger::OwnerGone => StopReason::ClientDisconnected,
                 TreeTrigger::LoopGuard => StopReason::GoalLoop,
-                _ => StopReason::Stop,
+                TreeTrigger::StallTimeout => StopReason::StallTimeout,
+                TreeTrigger::UpstreamAccessError => StopReason::UpstreamAccessError,
+                TreeTrigger::BudgetExhausted
+                | TreeTrigger::BudgetIncomplete
+                | TreeTrigger::ConvergeDeadline
+                | TreeTrigger::WakeLimit
+                | TreeTrigger::AutoTurnLimit
+                | TreeTrigger::DiscoveryIncomplete
+                | TreeTrigger::OwnershipConflict
+                | TreeTrigger::WakeUnknown
+                | TreeTrigger::WakeFailed
+                | TreeTrigger::GoalPaused
+                | TreeTrigger::GoalBlocked
+                | TreeTrigger::GoalBudgetLimited
+                | TreeTrigger::GoalUsageLimited
+                | TreeTrigger::RootNoDirectInput
+                | TreeTrigger::UserStop
+                | TreeTrigger::ParentFinishedEarly
+                | TreeTrigger::ParentFailed
+                | TreeTrigger::ParentInterrupted => StopReason::Stop,
             };
             (
                 op.request.snapshot.identity.execution_thread_id.clone(),
@@ -704,6 +727,7 @@ impl Machine {
             let gen = op.generation;
             if let Some(work) = self.trees.aux.work.get_mut(&tree_op) {
                 work.root_stop_gen = Some(gen);
+                work.root_diag_generation = Some(gen);
             }
         }
         for waiter in moved {
@@ -744,8 +768,44 @@ impl Machine {
             reason: op.request.trigger,
             clear: op.request.clear,
         };
+        let diagnostic_reason =
+            crate::claim::converge::terminal::trigger_reason(op.request.trigger)
+                .and_then(|reason| {
+                    crate::claim::converge::terminal::terminal(&crate::sa1b::TerminalInput {
+                        reason,
+                        parent_status: None,
+                        existing_interrupt: self
+                            .runs
+                            .runs
+                            .get(&identity.run_id)
+                            .and_then(|r| r.interrupt_reason),
+                    })
+                })
+                .and_then(|disposition| disposition.interrupt_reason)
+                .unwrap_or(InterruptReason::Stop);
+        let diagnostic_generation = target.generation;
+        let new_diagnostic = self
+            .trees
+            .aux
+            .work
+            .get(&tree_op)
+            .is_some_and(|w| w.root_diag_generation.is_none() && !w.historical_unloaded);
         if let Some(work) = self.trees.aux.work.get_mut(&tree_op) {
             work.root_derived = true;
+            if work.root_diag_generation.is_none() {
+                work.root_diag_generation = Some(diagnostic_generation);
+            }
+        }
+        if new_diagnostic
+            && !stopped
+            && self.runs.runs.get(&identity.run_id).is_some_and(|r| {
+                matches!(
+                    r.state,
+                    crate::runs::RunState::Running | crate::runs::RunState::Stopping
+                )
+            })
+        {
+            self.stop_diag_began(&identity.run_id, diagnostic_reason, diagnostic_generation);
         }
         let key = (tree_op, thread);
         let mut derived = DerivedOp::new(target, true);
@@ -907,6 +967,7 @@ impl Machine {
             "stopOutcome": outcome,
             "run": self.run_snapshot(run),
             "childrenStop": op.report.children,
+            "stopDiagnostics": self.runs.runs.get(run).and_then(|r| r.stop_diagnostics.as_ref()),
         })
     }
 
@@ -2268,6 +2329,8 @@ impl Machine {
             StopReason::Stop => TreeTrigger::UserStop,
             StopReason::ClientDisconnected => TreeTrigger::OwnerGone,
             StopReason::GoalLoop => TreeTrigger::LoopGuard,
+            StopReason::StallTimeout => TreeTrigger::StallTimeout,
+            StopReason::UpstreamAccessError => TreeTrigger::UpstreamAccessError,
         };
         let request = self.tree_request(
             thread,

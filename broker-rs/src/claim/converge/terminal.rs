@@ -8,11 +8,27 @@ pub(crate) fn terminal(input: &TerminalInput) -> Option<TerminalDisposition> {
     if input.reason == R::BrokerShutdown {
         return None;
     }
-    let kept = input
-        .existing_interrupt
-        .filter(|r| matches!(r, I::Stop | I::ClientDisconnected | I::GoalLoop));
+    let kept = input.existing_interrupt.filter(|r| {
+        matches!(
+            r,
+            I::Stop
+                | I::ClientDisconnected
+                | I::GoalLoop
+                | I::StallTimeout
+                | I::UpstreamAccessError
+        )
+    });
+    let new_reason = match kept {
+        Some(I::StallTimeout) => Some(R::StallTimeout),
+        Some(I::UpstreamAccessError) => Some(R::UpstreamAccessError),
+        None if matches!(input.reason, R::StallTimeout | R::UpstreamAccessError) => {
+            Some(input.reason)
+        }
+        _ => None,
+    };
     let reason = match input.parent_status {
         Some(TurnStatus::Failed) => R::ParentFailed,
+        _ if new_reason.is_some() => new_reason.expect("新停止原因已核对"),
         Some(TurnStatus::Interrupted) => R::ParentInterrupted,
         _ if input.reason == R::Abandoned => R::Abandoned,
         _ => match kept {
@@ -23,7 +39,17 @@ pub(crate) fn terminal(input: &TerminalInput) -> Option<TerminalDisposition> {
         },
     };
     let (status, interrupt, trigger) = match reason {
-        R::ParentFailed => (S::Failed, kept, Some(T::ParentFailed)),
+        R::ParentFailed => (
+            S::Failed,
+            kept.or_else(|| {
+                new_reason.map(|r| match r {
+                    R::StallTimeout => I::StallTimeout,
+                    R::UpstreamAccessError => I::UpstreamAccessError,
+                    _ => unreachable!("仅包含新停止原因"),
+                })
+            }),
+            Some(T::ParentFailed),
+        ),
         R::ParentInterrupted => (S::Interrupted, kept, Some(T::ParentInterrupted)),
         R::UserStop => (S::Interrupted, Some(I::Stop), Some(T::UserStop)),
         R::OwnerGone => (
@@ -82,6 +108,12 @@ pub(crate) fn terminal(input: &TerminalInput) -> Option<TerminalDisposition> {
             Some(I::RootNoDirectInput),
             Some(T::RootNoDirectInput),
         ),
+        R::StallTimeout => (S::Interrupted, Some(I::StallTimeout), Some(T::StallTimeout)),
+        R::UpstreamAccessError => (
+            S::Interrupted,
+            Some(I::UpstreamAccessError),
+            Some(T::UpstreamAccessError),
+        ),
         R::Abandoned => (
             S::Interrupted,
             input.existing_interrupt.or(Some(I::Abandoned)),
@@ -92,6 +124,8 @@ pub(crate) fn terminal(input: &TerminalInput) -> Option<TerminalDisposition> {
     let exit_code = match status {
         S::Failed => 7,
         S::GoalBlocked => 9,
+        S::Interrupted if interrupt == Some(I::StallTimeout) => 3,
+        S::Interrupted if interrupt == Some(I::UpstreamAccessError) => 4,
         S::Interrupted if reason == R::NoAction => 9,
         S::Interrupted => 4,
         S::Completed => 0,
@@ -127,5 +161,81 @@ pub(crate) fn trigger_reason(trigger: T) -> Option<R> {
         T::GoalBudgetLimited => R::GoalBudgetLimited,
         T::GoalUsageLimited => R::GoalUsageLimited,
         T::RootNoDirectInput => R::RootNoDirectInput,
+        T::StallTimeout => R::StallTimeout,
+        T::UpstreamAccessError => R::UpstreamAccessError,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_reasons_keep_failed_parent_and_precede_interrupted_or_goal_blocked() {
+        for (interrupt, reason, trigger, exit_code) in [
+            (I::StallTimeout, R::StallTimeout, T::StallTimeout, 3),
+            (
+                I::UpstreamAccessError,
+                R::UpstreamAccessError,
+                T::UpstreamAccessError,
+                4,
+            ),
+        ] {
+            for parent_status in [
+                None,
+                Some(TurnStatus::Completed),
+                Some(TurnStatus::Interrupted),
+            ] {
+                for requested in [reason, R::GoalBlocked, R::NoAction, R::Abandoned] {
+                    let result = terminal(&TerminalInput {
+                        reason: requested,
+                        parent_status,
+                        existing_interrupt: Some(interrupt),
+                    })
+                    .unwrap();
+                    assert_eq!(result.status, S::Interrupted);
+                    assert_eq!(result.interrupt_reason, Some(interrupt));
+                    assert_eq!(result.terminal_reason, reason);
+                    assert_eq!(result.tree_trigger, Some(trigger));
+                    assert_eq!(result.exit_code, exit_code);
+                }
+            }
+            for existing_interrupt in [None, Some(interrupt)] {
+                let result = terminal(&TerminalInput {
+                    reason,
+                    parent_status: Some(TurnStatus::Failed),
+                    existing_interrupt,
+                })
+                .unwrap();
+                assert_eq!(result.status, S::Failed);
+                assert_eq!(result.interrupt_reason, Some(interrupt));
+                assert_eq!(result.terminal_reason, R::ParentFailed);
+                assert_eq!(result.exit_code, 7);
+            }
+            assert_eq!(trigger_reason(trigger), Some(reason));
+        }
+    }
+
+    #[test]
+    fn old_reasons_keep_parent_order_and_first_stopper() {
+        for old in [I::Stop, I::ClientDisconnected, I::GoalLoop] {
+            let result = terminal(&TerminalInput {
+                reason: R::StallTimeout,
+                parent_status: Some(TurnStatus::Interrupted),
+                existing_interrupt: Some(old),
+            })
+            .unwrap();
+            assert_eq!(result.terminal_reason, R::ParentInterrupted);
+            assert_eq!(result.interrupt_reason, Some(old));
+            assert_eq!(result.exit_code, 4);
+        }
+        let result = terminal(&TerminalInput {
+            reason: R::GoalBlocked,
+            parent_status: None,
+            existing_interrupt: None,
+        })
+        .unwrap();
+        assert_eq!(result.status, S::GoalBlocked);
+        assert_eq!(result.exit_code, 9);
+    }
 }

@@ -362,7 +362,8 @@ impl Runs {
                     self.notices.iter().any(|n| match n {
                         RunNotice::TurnResult { run_id, .. }
                         | RunNotice::RunEnded { run_id, .. } => run_id == &r.run_id,
-                    }) || self.tree_retention_required(&r.run_id)
+                    }) || self.diagnostic_dirty.contains_key(&r.run_id)
+                        || self.tree_retention_required(&r.run_id)
                         || self.reconciliation.operations.values().any(|p| {
                             p.operation.token.run_id == r.run_id && p.operation.outcome_unknown
                         })

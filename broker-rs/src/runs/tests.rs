@@ -59,6 +59,8 @@ use crate::store::{StoreOp, RETENTION_MS};
 use serde_json::json;
 
 mod model_inherit;
+mod ue2_diagnostics;
+mod ue2_release;
 
 #[test]
 fn n7_每类日志带运行编号且内容清洗与空内容符合四段格式() {

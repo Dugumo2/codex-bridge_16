@@ -37,10 +37,14 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub mod budget;
+pub mod child_diag;
+mod diagnostics;
+pub mod stall;
 #[cfg(test)]
 mod tests;
 pub mod types;
 pub mod upstream_error;
+pub use diagnostics::PROGRESS_METHODS;
 
 pub use types::*;
 
@@ -151,6 +155,15 @@ pub enum ReleaseKind {
 /// 内存账本。活动记录随认领，历史最多 200 个线程；内部登记的清理随结果、释放和淘汰。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Runs {
+    pub stall_states: HashMap<RunId, StallState>,
+    pub progress_dedup: HashMap<RunId, ProgressDedup>,
+    pub stop_diag_sends: HashMap<RunId, StopDiagSend>,
+    pub diagnostic_dirty: std::collections::BTreeMap<RunId, DiagnosticDirty>,
+    pub access_stopped: std::collections::HashSet<RunId>,
+    #[cfg(test)]
+    pub child_activity_override: Option<ChildRunRef>,
+    #[cfg(test)]
+    pub child_event_log: Vec<(String, String)>,
     pub(crate) reconciliation: crate::claim::subagent_reconcile::Reconciliations,
     pub(crate) child_results: crate::relations::results::ChildReads,
     pub(crate) epoch: u64,
@@ -306,6 +319,10 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                run_policy: None,
+                stall: None,
+                stop_diagnostics: None,
+                child_upstream_errors: Vec::new(),
                 upstream_error: None,
                 diagnostic_revision: 0,
                 last_progress_at: None,
@@ -398,6 +415,11 @@ impl Machine {
                 self.runs.updated.insert(run.into(), self.clock.now_ms);
                 self.runs.put(run, actions);
             }
+        }
+        if joined {
+            self.stall_joined(run, actions);
+        } else {
+            self.stall_owned_settled(run, actions);
         }
     }
 
@@ -939,6 +961,7 @@ impl Machine {
         let record = self.runs.runs.get_mut(run).expect("运行存在");
         record.review_thread_id = Some(child.into());
         record.review_short_id = Some(short.clone());
+        self.stall_review_moved(run, actions);
         self.runs
             .index
             .threads
@@ -1011,6 +1034,8 @@ impl Machine {
             StopReason::ClientDisconnected => InterruptReason::ClientDisconnected,
             StopReason::Stop => InterruptReason::Stop,
             StopReason::GoalLoop => InterruptReason::GoalLoop,
+            StopReason::StallTimeout => InterruptReason::StallTimeout,
+            StopReason::UpstreamAccessError => InterruptReason::UpstreamAccessError,
         });
         if let Some(active) = self.runs.active.get_mut(run) {
             active.stop_started = true;
@@ -1106,6 +1131,9 @@ impl Machine {
             record.stop_outcome = Some(StopOutcome::Unconfirmed);
             record.stop_check = Some(check);
             self.runs.updated.insert(run.into(), self.clock.now_ms);
+            self.mark_run_diagnostic(run, DiagnosticField::StopOutcome, None);
+            self.mark_run_diagnostic(run, DiagnosticField::StopCheck, None);
+            self.stop_diag_unconfirmed(run);
             self.runs.put(run, actions);
         }
     }
@@ -1125,6 +1153,9 @@ impl Machine {
         record.stop_check = None;
         self.runs.verifying_history.remove(run);
         self.runs.updated.insert(run.into(), self.clock.now_ms);
+        self.mark_run_diagnostic(run, DiagnosticField::StopOutcome, None);
+        self.mark_run_diagnostic(run, DiagnosticField::StopCheck, None);
+        self.stop_diag_confirmed(run);
         self.runs.put(run, actions);
         self.runs.log(
             run,
@@ -1155,6 +1186,8 @@ impl Machine {
         }
     }
     pub(crate) fn run_released(&mut self, run: &str, kind: ReleaseKind, actions: &mut Vec<Action>) {
+        let sa1b_enabled = self.sa1b_active(run);
+        self.stall_released(run, actions);
         self.on_run_finishing(run, kind, actions);
         self.finalize_parent_pointer(run);
         let convergence_terminal = self.run_convergence_terminal(
@@ -1182,7 +1215,26 @@ impl Machine {
             .review_thread_id
             .as_ref()
             .unwrap_or(&record.thread_id);
-        let status = if self.runs.goals.get(thread).is_some_and(|status| {
+        let new_reason = matches!(
+            record.interrupt_reason,
+            Some(InterruptReason::StallTimeout | InterruptReason::UpstreamAccessError)
+        );
+        let completed_exception = kind == ReleaseKind::StopConfirmed
+            && active.completed_after_stop
+            && !active.goal_active_at_stop
+            && last == Some(TurnStatus::Completed)
+            && !sa1b_enabled
+            && record.children_stop.is_none();
+        let status = if new_reason {
+            if last == Some(TurnStatus::Failed) {
+                RunStatus::Failed
+            } else if completed_exception {
+                record.interrupt_reason = None;
+                RunStatus::Completed
+            } else {
+                RunStatus::Interrupted
+            }
+        } else if self.runs.goals.get(thread).is_some_and(|status| {
             matches!(
                 status.as_str(),
                 "blocked" | "budgetLimited" | "usageLimited"
@@ -1638,6 +1690,14 @@ impl Machine {
             return;
         }
         let confirmed = commit.report.children.phase == crate::stop::tree::TreePhase::Confirmed;
+        let new_outcome = Some(if confirmed {
+            StopOutcome::Confirmed
+        } else {
+            StopOutcome::Unconfirmed
+        });
+        let new_check = (!confirmed).then_some(check);
+        let diagnostics_changed =
+            record.stop_outcome != new_outcome || record.stop_check != new_check;
         self.runs.active.remove(&run);
         record.children_stop = Some(commit.report.children.clone());
         record.stop_outcome = Some(if confirmed {
@@ -1656,6 +1716,15 @@ impl Machine {
             convergence_terminal.map_or(commit.interrupt_reason, |t| t.interrupt_reason);
         record.ended_at = Some(self.clock.now_ms);
         let thread = record.thread_id.clone();
+        if diagnostics_changed {
+            self.mark_run_diagnostic(&run, DiagnosticField::StopOutcome, None);
+            self.mark_run_diagnostic(&run, DiagnosticField::StopCheck, None);
+        }
+        if confirmed {
+            self.stop_diag_confirmed(&run);
+        } else {
+            self.stop_diag_unconfirmed(&run);
+        }
         if confirmed {
             self.runs.verifying_history.remove(&run);
         }
@@ -1704,6 +1773,7 @@ impl Machine {
         {
             return;
         }
+        let diagnostics_changed = record.stop_outcome != outcome || record.stop_check != stop_check;
         record.children_stop = Some(report);
         record.stop_outcome = outcome;
         record.stop_check = stop_check;
@@ -1711,6 +1781,15 @@ impl Machine {
             self.runs.verifying_history.remove(run);
         }
         self.runs.updated.insert(run.into(), self.clock.now_ms);
+        if diagnostics_changed {
+            self.mark_run_diagnostic(run, DiagnosticField::StopOutcome, None);
+            self.mark_run_diagnostic(run, DiagnosticField::StopCheck, None);
+        }
+        if outcome == Some(StopOutcome::Confirmed) {
+            self.stop_diag_confirmed(run);
+        } else if outcome == Some(StopOutcome::Unconfirmed) {
+            self.stop_diag_unconfirmed(run);
+        }
         self.runs.put(run, actions);
     }
 }
@@ -1730,6 +1809,7 @@ impl Machine {
         if run.background_cleanup.as_ref() == Some(&op.background.report) {
             return;
         }
+        let old_outcome = run.stop_outcome;
         run.background_cleanup = Some(op.background.report.clone());
         if run.stop_outcome == Some(StopOutcome::Confirmed) && !op.background.confirmed {
             run.stop_outcome = Some(StopOutcome::Unconfirmed);
@@ -1737,6 +1817,9 @@ impl Machine {
         if op.already_stopped && op.background.confirmed {
             run.stop_outcome = Some(StopOutcome::Confirmed);
             self.runs.verifying_history.remove(id);
+        }
+        if run.stop_outcome != old_outcome {
+            self.mark_run_diagnostic(id, DiagnosticField::StopOutcome, None);
         }
         self.runs.put(id, actions);
     }

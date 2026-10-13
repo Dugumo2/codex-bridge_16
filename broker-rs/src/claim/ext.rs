@@ -1015,9 +1015,9 @@ impl Machine {
     }
 
     /// 在认领删除或迁移之前取收件人，诊断仅通过扩展连接发送。
-    pub(crate) fn notify_run_updated(&self, run: &str, actions: &mut Vec<Action>) {
+    pub(crate) fn run_update_recipients(&self, run: &str) -> Vec<ConnId> {
         let Some(record) = self.runs.runs.get(run) else {
-            return;
+            return Vec::new();
         };
         let mut recipients = self.run_recipients(run);
         for thread in
@@ -1039,6 +1039,19 @@ impl Machine {
                 }
             }
         }
+        recipients
+    }
+
+    pub(crate) fn notify_run_diagnostic_snapshot(
+        &self,
+        run: &str,
+        recipients: &[ConnId],
+        child: Option<&crate::runs::ChildUpstreamError>,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(record) = self.runs.runs.get(run) else {
+            return;
+        };
         let message = proto::notification(
             "broker/run/updated",
             Some(json!({
@@ -1049,9 +1062,16 @@ impl Machine {
                 "lastProgressAt": record.last_progress_at,
                 "state": record.state,
                 "status": record.status,
+                "interruptReason": record.interrupt_reason,
+                "stopOutcome": record.stop_outcome,
+                "stopCheck": record.stop_check,
+                "stall": record.stall,
+                "stopDiagnostics": record.stop_diagnostics,
+                "childUpstreamErrors": record.child_upstream_errors,
+                "childUpstreamError": child,
             })),
         );
-        for conn in recipients {
+        for &conn in recipients {
             self.send_ext(conn, message.clone(), actions);
         }
     }
