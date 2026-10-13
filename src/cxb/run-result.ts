@@ -5,8 +5,8 @@ function finalMissing(run: RunResult): boolean {
   return run.finalTurnId === undefined && !!run.subagentJoin && (run.state === "ended" || run.state === "lost");
 }
 function finalUnavailable(run: RunResult): boolean {
-  return run.finalTurnId !== undefined && (run.state === "ended" || run.state === "lost")
-    && !run.turns.some(turn => turn.turnId === run.finalTurnId);
+  return (run.finalTurnId !== undefined
+    && (run.state === "ended" || run.state === "lost") && !run.turns.some(turn => turn.turnId === run.finalTurnId));
 }
 
 /**
@@ -24,9 +24,7 @@ export function resultTurn(run: RunResult) {
 
 export function resultPending(run: RunResult): boolean {
   const turn = resultTurn(run);
-  return turn?.ready === "pending"
-    || (run.finalTurnId !== undefined && !turn && run.state !== "ended" && run.state !== "lost")
-    || (finalMissing(run) && run.state !== "ended" && run.state !== "lost");
+  return turn?.ready === "pending" || (run.finalTurnId !== undefined && !turn && !finalUnavailable(run));
 }
 
 /** 选定结果的就绪状态：缺最终指针的已结束协调运行明确为 unavailable，不让 wait 无限等待。 */
@@ -43,6 +41,7 @@ export function selectedResultFields(run: RunResult) {
 
 /** 模型改道跟随已确认当前父轮；历史新记录跟随最终轮，旧记录保留原回退。 */
 export function modelTurn(run: RunResult) {
+  if (!run.subagentJoin && run.finalTurnId === undefined) return run.turns.at(-1);
   const id = run.finalTurnId ?? run.currentTurnId;
   return id != null ? run.turns.find((turn) => turn.turnId === id) : resultTurn(run);
 }

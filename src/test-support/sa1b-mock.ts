@@ -184,11 +184,6 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
         if (!turn) { error(msg.id, "轮次不存在"); break; }
         item(t!, turn, p.item, p.announce !== false); reply(msg.id, {}); break;
       }
-      case "removeItem": {
-        for (const turn of t!.turns) turn.items = turn.items.filter(x => x.id !== p.itemId);
-        t!.inputs = t!.inputs.filter(x => x.id !== p.itemId);
-        reply(msg.id, {}); break;
-      }
       case "inject": {
         const value = p.message as RpcMessage;
         if (value.id !== undefined && value.method) thread(value.params.threadId).pendingRequests.push(clone(value));

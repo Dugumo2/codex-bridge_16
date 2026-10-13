@@ -7,7 +7,7 @@ import { CxbError, rpcData, rpcFailure, type BackgroundCleanup, type ChildrenSto
 import { readPendingInbox, readThreadIndex, type ThreadIndexEntry } from "./ledger";
 import type { CommandContext } from "./main";
 import { convergenceLines } from "./convergence";
-import { resultTurn } from "./run-result";
+import { resultReady } from "./run-result";
 
 const safe = (text: string) => sanitizeForTerminal(text).replace(/[\r\n\u2028\u2029]/g, " ");
 
@@ -77,7 +77,7 @@ export function unfinishedNotice(run: RunResult, label: string): string[] {
 
 /** `show P`、`wait`：子代理数量、待答数、未确认的停止明细；因子代理未完成而中断时显示说明。 */
 export function showSubagents(ctx: CommandContext, run: RunResult): void {
-  if (run.finalTurnId !== undefined && resultTurn(run)?.ready === "unavailable") ctx.out.notice("最终结果不可用（unavailable）");
+  if (run.finalTurnId !== undefined && resultReady(run) === "unavailable") ctx.out.notice("最终结果不可用（unavailable）");
   for (const line of convergenceLines(run, pendingCount(ctx, run) ?? 0)) ctx.out.notice(line);
   if (run.backgroundCleanup && !run.childrenStop) for (const line of backgroundLines(run.threadId, run.backgroundCleanup)) ctx.out.notice(line);
   const children = subagentThreads(run);

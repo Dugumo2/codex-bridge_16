@@ -1905,32 +1905,23 @@ impl Machine {
             .get(run)
             .and_then(|p| p.last());
         if let Some(parent) = last {
-            if join.terminal_reason.is_some()
-                || (parent.completed == Some(TurnStatus::Completed)
-                    && join.reconciled_epoch >= join.work_epoch)
+            // 异常停树的交付期限可能先于根轮结束。没有完成证据就没有最终答复；
+            // 以 ended + subagentJoin + 无 finalTurnId 明确 unavailable，保留 currentTurnId
+            // 作定位，不伪造已完成的 TurnResult。已有结果项仍走原有有界补读。
+            if record.turns.iter().any(|turn| turn.turn_id == parent.turn)
+                && (join.terminal_reason.is_some()
+                    || (parent.completed == Some(TurnStatus::Completed)
+                        && join.reconciled_epoch >= join.work_epoch))
             {
                 record.final_turn_id = Some(parent.turn.clone());
-                // 树停止可在根轮完成通知之前提交 ended/unconfirmed。此时最终指针仍然是
-                // 合法的父轮定位，但结果项尚未创建；落一个明确 unavailable 的占位事实，
-                // 让持久化补读和 CLI 有界收束，而不是把旧轮误当最终答复。
-                if !record.turns.iter().any(|turn| turn.turn_id == parent.turn) {
-                    record.turns.push(TurnResult {
-                        origin: Some(parent.origin),
-                        reroute: None,
-                        turn_id: parent.turn.clone(),
-                        ready: Ready::Unavailable,
-                        status: TurnStatus::Interrupted,
-                        output: String::new(),
-                        output_source: OutputSource::None,
-                        error: Some(serde_json::json!({
-                            "code": "finalResultUnavailable",
-                            "reason": "树停止期限已到，最终父轮没有完成通知",
-                        })),
-                        completed_at: self.clock.now_ms,
-                    });
-                }
             }
-        } else if join.work_epoch == 0 && record.start_confirmation.confirmed {
+        } else if join.work_epoch == 0
+            && record.start_confirmation.confirmed
+            && record
+                .current_turn_id
+                .as_ref()
+                .is_some_and(|id| record.turns.iter().any(|turn| &turn.turn_id == id))
+        {
             record.final_turn_id = record.current_turn_id.clone();
         }
     }
