@@ -982,3 +982,39 @@ test("上游诊断 run 活动轮：默认即时提示，willRetry:false 仍等�
     await bounded(work.catch(() => undefined), 3000);
   }
 });
+
+test("上游诊断 run 启动 RPC 失败：等待本运行失败记录，输出单对象与真实错误", async () => {
+  const unit = unitExecution(["run", "中文", "--json"]);
+  const original = unit.fake.handle;
+  const snapshot = deferred<{ run: RunResult }>();
+  const error = { code: -32603, message: "启动失败 sk-privateStartKey", data: { codexErrorInfo: "unauthorized" } };
+  const diagnostic = upstreamError({ source: "rpcResponse", willRetry: null, turnId: null, count: 1 });
+  unit.fake.handle = (method, params) => {
+    if (method === "turn/start") {
+      unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
+      unit.fake.emit("broker/run/updated", { runId: "run-test", threadId: "thread-test", diagnosticRevision: 1,
+        upstreamError: diagnostic, lastProgressAt: null, state: "ended", status: "failed" });
+      throw wireError(-32603, error.message);
+    }
+    if (method === "broker/threads/watch") return snapshot.promise;
+    return original(method, params);
+  };
+  const work = handler()(unit.ctx);
+  void work.catch(() => undefined);
+  try {
+    await until(() => unit.fake.calls.some(call => call.method === "broker/threads/watch"));
+    await messageBarrier(() => [unit.fake.calls.length]);
+    snapshot.resolve({ run: runResult({ status: "failed", diagnosticRevision: 1, upstreamError: diagnostic,
+      turns: [{ ...runResult().turns[0]!, error, status: "failed" }] }) });
+    expect(await bounded(work, 3000)).toBe(7);
+    await unit.out.flush();
+    expect(JSON.parse(unit.output().stdout)).toMatchObject({ status: "failed", upstreamError: diagnostic,
+      error: { ...error, message: "启动失败 ***" } });
+    expect(unit.output().stdout.trim().split("\n")).toHaveLength(1);
+    expect(unit.output().stderr).toContain("[cxb] 失败原因：启动失败 ***（unauthorized）");
+    expect(unit.output().stderr + unit.output().stdout).not.toContain("privateStartKey");
+  } finally {
+    snapshot.resolve({ run: runResult() });
+    await bounded(work.catch(() => undefined), 3000);
+  }
+});

@@ -468,7 +468,12 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       controller.signal.addEventListener("abort", abortWait, { once: true });
       disposers.push(() => controller.signal.removeEventListener("abort", abortWait));
       // 启动 RPC 失败不能被已收到 started 的 Promise 吞掉。
-      const failedStart = startReply.then(() => new Promise<never>(() => {}));
+      const failedStart = startReply.then(() => new Promise<never>(() => {}), (error: unknown) => {
+        // broker 已确认这是本运行的上游启动错误时，仍等真实失败记录，才能展示选定轮错误与单个最终 JSON。
+        // 无诊断的旧 broker／归属拒绝保持原来的请求失败路径。
+        if (upstream.fields().upstreamError?.source === "rpcResponse") return waiting;
+        throw error;
+      });
       const first = await bounded(Promise.race([waiting, needsHuman, failedStart]), remaining(), controller.signal);
       if (first === "human") {
         const transferred = await handover();

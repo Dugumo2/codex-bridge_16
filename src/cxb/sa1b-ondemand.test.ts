@@ -7,9 +7,10 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { envWithPathPrefix, writeMockCodexScript } from "../test-support/broker-harness";
 import { Sa1bHarness, SA1B_ROOT as P } from "../test-support/sa1b-harness";
-import { readRunLog } from "./ledger";
+import { readRunLog, readRunRecord, readThreadIndex } from "./ledger";
 import { resolveWorkspace } from "./workspace";
 import { upstreamBaselineCli } from "./test-fixtures/upstream-baseline";
 
@@ -290,6 +291,15 @@ async function baselineSession(main: string, status: "completed" | "interrupted"
     const waitedJson = JSON.parse(outputs[2]!.stdout);
     expect(waitedJson).toMatchObject({ runId: h.runId, status });
     expect(typeof waitedJson.alreadyDone).toBe("boolean");
+    // run/ended 只确认内存终态，存储队列尚可能在写：对照前必须让两边读取相同的完整落盘输入。
+    await h.until(async () => {
+      const snapshot = await h.watch();
+      const disk = readRunRecord(workspace.workspaceDir, h.runId);
+      const index = readThreadIndex(workspace.workspaceDir).find(entry => entry.threadId === P);
+      const endedLog = readRunLog(workspace.workspaceDir, run.shortId)?.some(line => line.runId === h.runId && line.event === "运行结束");
+      return disk?.state === "ended" && isDeepStrictEqual(disk, snapshot.run)
+        && index?.lastRunId === h.runId && index.updatedAt === snapshot.thread.updatedAt && !!endedLog;
+    }, 10000, "终态运行、线程索引或结束日志未完全落盘，不能逐字比较");
     for (const args of [["show", P], ["show", P, "--follow"], ["wait", P], ["ls"], ["show", P, "--json"],
       ["wait", P, "--json"], ["ls", "--json"], ["show", P, "--follow", "--json"],
       ["show", P, "--server"], ["show", P, "--server", "--json"], ["show", P, "--log"], ["show", P, "--log", "--json"]]) {
