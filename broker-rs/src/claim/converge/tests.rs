@@ -1785,3 +1785,148 @@ fn 自有v1在途派生立即启用() {
     assert!(m.relations.contexts[R].in_flight_spawns.contains(key));
     assert!(m.sa1b_active(R));
 }
+
+fn setup_initial_input(shared: bool) -> (Machine, SubagentMock, serde_json::Value) {
+    let (mut m, mock, context) = setup_pending_mode(shared);
+    let initial = json!({"id":"初始条目","type":"userMessage","clientId":context.params.as_ref().unwrap()["clientUserMessageId"],"content":[{"type":"text","text":"任务"}]});
+    assert!(initial["clientId"].is_string());
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":T,"status":"inProgress"}}),
+    );
+    apply(
+        &mut m,
+        Event::Reply {
+            context,
+            result: Ok(json!({"turn":{"id":T}})),
+        },
+    );
+    (m, mock, initial)
+}
+
+fn first_turn_input_veto(entrance: usize) {
+    for shared in [false, true] {
+        let (mut m, mut mock, initial) = setup_initial_input(shared);
+        assert!(!m.sa1b_active(R));
+        assert!(m.loop_guards.contains_key(R));
+        notify(
+            &mut m,
+            "thread/goal/updated",
+            json!({"threadId":P,"goal":{"status":"active","objective":"任务","createdAt":1}}),
+        );
+        m.record(P).goal_controlled = true;
+        let control_epoch = m.records[P].goal_control_epoch;
+        // 文本与初始请求相同也不能豁免第二条输入；只信任原请求的 clientId。
+        let extra = json!({"id":"追加条目","type":"userMessage","clientId":"外部输入","content":[{"type":"text","text":"任务"}]});
+        if entrance == 0 {
+            for method in ["item/started", "item/completed"] {
+                notify(
+                    &mut m,
+                    method,
+                    json!({"threadId":P,"turnId":T,"item":initial}),
+                );
+            }
+            assert!(!m.loop_guards[R].user_input_seen());
+            notify(
+                &mut m,
+                "item/started",
+                json!({"threadId":P,"turnId":T,"item":extra}),
+            );
+        } else if entrance == 1 {
+            notify(
+                &mut m,
+                "turn/completed",
+                json!({"threadId":P,"turn":{"id":T,"status":"completed","itemsView":"full","items":[initial,extra]}}),
+            );
+        } else {
+            let out = notify(
+                &mut m,
+                "turn/completed",
+                json!({"threadId":P,"turn":{"id":T,"status":"completed","itemsView":"notLoaded","items":[]}}),
+            );
+            let context = out
+                .into_iter()
+                .find_map(|a| match a {
+                    Action::Request(c)
+                        if matches!(c.operation, crate::claim::Operation::ResultRead(_)) =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                })
+                .expect("首轮输出触发真实条目分页");
+            apply(
+                &mut m,
+                Event::Reply {
+                    context,
+                    result: Ok(crate::test_support::status_read::items_page(
+                        T,
+                        &[initial, extra],
+                        Some("下一页"),
+                    )),
+                },
+            );
+        }
+        assert!(m.loop_guards[R].user_input_seen(), "入口 {entrance}");
+        assert!(
+            m.records[P].goal_controlled,
+            "被动记录不能撤销旧共享控制资格"
+        );
+        assert_eq!(m.records[P].goal_control_epoch, control_epoch);
+        assert_eq!(m.loop_guards[R].continuations, 0);
+        spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+        assert!(m.run_subagent_evidence(R));
+        assert!(!m.sa1b_active(R));
+        if entrance == 0 {
+            complete(&mut m, &mut mock, P, T, "completed");
+        }
+        notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
+        assert!(m.tree_for_run(R).is_some(), "自然结束交 SA1a 停树");
+        assert!(m.runs.runs[R].subagent_join.is_none());
+        assert_eq!(
+            m.trees.operations[&m.tree_for_run(R).unwrap()]
+                .request
+                .trigger,
+            crate::stop::tree::TreeTrigger::ParentFinishedEarly
+        );
+    }
+}
+
+#[test]
+fn 首轮真实插话通知阻止派生启用并交sa1a() {
+    first_turn_input_veto(0);
+}
+#[test]
+fn 首轮真实插话全文阻止派生启用并交sa1a() {
+    first_turn_input_veto(1);
+}
+#[test]
+fn 首轮真实插话分页前缀阻止派生启用并交sa1a() {
+    first_turn_input_veto(2);
+}
+
+#[test]
+fn 首轮仅初始输入重复或全文回放仍可按需启用() {
+    for shared in [false, true] {
+        let (mut m, mut mock, initial) = setup_initial_input(shared);
+        for method in ["item/started", "item/completed"] {
+            notify(
+                &mut m,
+                method,
+                json!({"threadId":P,"turnId":T,"item":initial}),
+            );
+        }
+        assert!(!m.loop_guards[R].user_input_seen());
+        spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+        assert!(m.sa1b_active(R));
+        notify(
+            &mut m,
+            "turn/completed",
+            json!({"threadId":P,"turn":{"id":T,"status":"completed","itemsView":"full","items":[initial]}}),
+        );
+        assert!(matches!(m.claims[P].state, State::Converging { .. }));
+        assert!(!join(&m).automatic_control_revoked);
+        assert!(!m.loop_guards[R].user_input_seen());
+    }
+}
