@@ -64,13 +64,21 @@ impl Machine {
             {
                 // 同事件其它账本钩子可能已经排盘，只保留最后的完整诊断快照。
                 actions.retain(|action| !matches!(action, Action::Store(crate::store::StoreOp::PutRun(record)) if record.run_id == run));
-                self.runs.put(&run, actions);
+                let mut commit_actions = Vec::new();
+                self.runs.put(&run, &mut commit_actions);
                 self.notify_run_diagnostic_snapshot(
                     &run,
                     &dirty.recipients,
                     dirty.child.as_ref(),
-                    actions,
+                    &mut commit_actions,
                 );
+                // 启动失败的 CLI 先取诊断再处理 RPC 错误；写盘与通知仍按序一次提交。
+                let before_error = actions.iter().position(|action| matches!(action, Action::Send {conn, message} if dirty.recipients.contains(conn) && message.get("id").is_some() && message.get("error").is_some()));
+                if let Some(index) = before_error {
+                    actions.splice(index..index, commit_actions);
+                } else {
+                    actions.extend(commit_actions);
+                }
             } else {
                 let already_queued = actions.iter().any(|action| matches!(action, Action::Store(crate::store::StoreOp::PutRun(record)) if record.run_id == run));
                 if already_queued {

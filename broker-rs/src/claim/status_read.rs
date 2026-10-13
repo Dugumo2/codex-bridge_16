@@ -268,6 +268,7 @@ impl Machine {
 
     /// 按调用方分派完成结果；有效性（round、generation、token 是否当前）由各处理函数自己判断。
     pub fn status_read_done(&mut self, done: StatusDone, actions: &mut Vec<Action>) {
+        self.stop_diag_status_done(&done);
         #[cfg(test)]
         self.status_reads.observed.push(done.clone());
         match &done.caller {

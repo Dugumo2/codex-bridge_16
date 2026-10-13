@@ -8,7 +8,7 @@ pub mod tree;
 mod unloaded;
 
 use crate::claim::{
-    status_read::{StatusCaller, StatusDone, StatusQuery, StatusResult, StatusTurn},
+    status_read::{StatusCaller, StatusDone, StatusQuery, StatusResult, StatusTurn, StatusUnknown},
     Action, ClaimToken, ClientRequest, ConnId, Machine, Operation, RequestContext, State,
     StopReason, TimerKind,
 };
@@ -437,6 +437,89 @@ impl Machine {
                 .unwrap_or_else(|| error.to_string());
             self.stop_diag_rpc_issue(&run, &send, &context.method, outcome, &message);
         }
+    }
+
+    fn stop_diag_status_target(&self, done: &StatusDone) -> Option<(String, StopDiagSend)> {
+        match &done.caller {
+            StatusCaller::StopVerify { tag } => {
+                let op = self.stops.operations.get(&tag.id)?;
+                if op.generation != tag.generation
+                    || op.round != tag.round
+                    || !op.verifying
+                    || op.thread != done.thread
+                    || self.claims.get(&op.thread).is_some_and(|claim| {
+                        Some(claim.claim_id) != op.claim_id || claim.run_id != op.run_id
+                    })
+                {
+                    return None;
+                }
+                op.diagnostic_send(op.target.as_deref())
+            }
+            StatusCaller::DerivedStopVerify {
+                tree_op,
+                thread,
+                round,
+            } => {
+                let key = (*tree_op, thread.clone());
+                let op = self.trees.aux.derived.get(&key)?;
+                if done.thread != *thread
+                    || op.stage != derived::DerivedStage::Verify
+                    || op.request_round != *round
+                    || op.read_id != Some(done.read_id)
+                {
+                    return None;
+                }
+                self.derived_diagnostic_send(&key, None)
+            }
+            _ => None,
+        }
+    }
+
+    fn take_stop_diag_status_issue(
+        &mut self,
+        done: &StatusDone,
+    ) -> Option<(String, StopDiagSend, String)> {
+        if !matches!(
+            done.result,
+            StatusResult::Unknown(StatusUnknown::Timeout | StatusUnknown::Unresponsive)
+        ) {
+            return None;
+        }
+        let (run, send) = self.stop_diag_status_target(done)?;
+        let source = format!("read:{}", done.read_id);
+        let key = self
+            .stops
+            .diagnostic_rpc_sends
+            .iter()
+            .filter(|(key, _)| key.source == source)
+            .max_by_key(|(key, _)| key.generation)
+            .map(|(key, _)| key.clone())?;
+        let (sent_run, sent) = self.stops.diagnostic_rpc_sends.remove(&key)?;
+        self.stops
+            .diagnostic_rpc_sends
+            .retain(|key, _| key.source != source);
+        if run != sent_run || send != sent || key.thread != done.thread {
+            return None;
+        }
+        Some((run, send, key.method))
+    }
+
+    /// 状态读取总期限先于 RPC 期限时，使用最后一页的真实发送方法补记根核实超时。
+    pub(crate) fn stop_diag_status_done(&mut self, done: &StatusDone) {
+        if let Some((run, send, method)) = self.take_stop_diag_status_issue(done) {
+            let message = match done.result {
+                StatusResult::Unknown(StatusUnknown::Timeout) => "停止核实状态读取总期限已到",
+                StatusResult::Unknown(StatusUnknown::Unresponsive) => "停止核实状态读取请求无响应",
+                _ => unreachable!("仅接受核实超时"),
+            };
+            self.stop_diag_rpc_issue(&run, &send, &method, StopRpcOutcome::Timeout, message);
+        }
+    }
+
+    fn stop_diag_idle_target(&self, op: &StopOp) -> Option<(String, StopDiagSend)> {
+        op.target
+            .as_deref()
+            .and_then(|turn| op.diagnostic_send(Some(turn)))
     }
 
     fn cancel_breaker_probe(&mut self, actions: &mut Vec<Action>) {
@@ -2107,6 +2190,14 @@ impl Machine {
                 continue;
             };
             if let Some((key, run, send)) = self.stop_diag_rpc_target(context) {
+                if matches!(
+                    stop_diag_operation(&context.operation),
+                    Operation::StatusRead { .. }
+                ) {
+                    self.stops
+                        .diagnostic_rpc_sends
+                        .retain(|old, _| old.source != key.source);
+                }
                 self.stops.diagnostic_rpc_sends.insert(key, (run, send));
             }
             let Some(thread) = context
@@ -3652,6 +3743,9 @@ impl Machine {
             StatusResult::Idle => {
                 op.turn_absent = true;
                 op.snapshot_absent = Some(op.round);
+                if let Some((run, send)) = self.stop_diag_idle_target(&op) {
+                    self.stop_diag_turn_ended(&run, &send);
+                }
             }
             StatusResult::Active(active) => {
                 op.background.invalidate();

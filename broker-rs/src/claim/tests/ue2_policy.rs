@@ -2,6 +2,68 @@ use super::*;
 use crate::runs::{ChildRunRef, RunState, UpstreamErrorPolicy};
 
 #[test]
+fn 统一诊断在启动rpc错误回包前发送() {
+    let (mut m, context) = start(false, "turn/start");
+    m.live_conns.insert(1);
+    m.cxb_conns.insert(1);
+    let actions = reply(
+        &mut m,
+        &context,
+        Err(json!({"code":-32602,"message":"不支持审查模式"})),
+    );
+    let diagnostic = actions.iter().position(|a| matches!(a, Action::Send {conn:1,message} if message["method"] == "broker/run/updated")).unwrap();
+    let rpc_error = actions.iter().position(|a| matches!(a, Action::Send {conn:1,message} if message["id"] == 42 && message.get("error").is_some())).unwrap();
+    assert!(diagnostic < rpc_error);
+}
+
+#[test]
+fn 核实得到父轮真实终态只收尾一次且不伪造上游通知() {
+    for (status, wire, expected) in [
+        (
+            status_read::StatusTurn::Completed,
+            "completed",
+            crate::runs::RunStatus::Completed,
+        ),
+        (
+            status_read::StatusTurn::Failed,
+            "failed",
+            crate::runs::RunStatus::Failed,
+        ),
+        (
+            status_read::StatusTurn::Interrupted,
+            "interrupted",
+            crate::runs::RunStatus::Interrupted,
+        ),
+    ] {
+        let (mut m, _) = running();
+        let token = m.token("线程").unwrap();
+        let shell = json!({"id":"本轮","status":wire,"items":[]});
+        let mut a = vec![];
+        let mut stale = token.clone();
+        stale.claim_id += 1;
+        assert!(!m.commit_verified_turn_end("run-测试-000001", &stale, status, &shell, &mut a));
+        assert!(!m.commit_verified_turn_end("其他运行", &token, status, &shell, &mut a));
+        assert!(!m.commit_verified_turn_end(
+            "run-测试-000001",
+            &token,
+            status,
+            &json!({"id":"旧轮","status":wire}),
+            &mut a
+        ));
+        assert!(m.commit_verified_turn_end("run-测试-000001", &token, status, &shell, &mut a));
+        assert_eq!(m.runs.runs["run-测试-000001"].state, RunState::Ended);
+        assert_eq!(m.runs.runs["run-测试-000001"].status, Some(expected));
+        assert_eq!(m.runs.runs["run-测试-000001"].turns.len(), 1);
+        assert!(!a.iter().any(
+            |a| matches!(a,Action::Send {message,..} if message["method"] == "turn/completed")
+        ));
+        a.clear();
+        assert!(!m.commit_verified_turn_end("run-测试-000001", &token, status, &shell, &mut a));
+        assert!(a.is_empty());
+    }
+}
+
+#[test]
 fn 进展查询严格区分自有轮和子轮且显式策略留给去重钩子() {
     let (mut m, _) = running();
     assert!(

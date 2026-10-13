@@ -2821,6 +2821,63 @@ impl Machine {
         self.stop_started(thread_id, id);
     }
 
+    /// C1 核实读发现的真实终态走原有收尾，不转发合成的上游完成通知。
+    #[allow(dead_code)] // 骨架阶段由 C1 填写 stall_verify_done 后调用。
+    pub(crate) fn commit_verified_turn_end(
+        &mut self,
+        run: &str,
+        token: &ClaimToken,
+        status: status_read::StatusTurn,
+        shell: &Value,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        let expected = match status {
+            status_read::StatusTurn::Completed => "completed",
+            status_read::StatusTurn::Failed => "failed",
+            status_read::StatusTurn::Interrupted => "interrupted",
+            status_read::StatusTurn::InProgress => return false,
+        };
+        let Some(turn) = shell
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+        else {
+            return false;
+        };
+        let thread = &token.thread_id;
+        if self.closing
+            || self.quiescing
+            || !self.current(token)
+            || shell.get("status").and_then(Value::as_str) != Some(expected)
+            || self.claims.get(thread).is_none_or(|claim| {
+                claim.run_id.as_deref() != Some(run) || claim.joined() || claim.settling()
+            })
+            || self.diagnostic_run(thread, turn, false).as_deref() != Some(run)
+        {
+            return false;
+        }
+        self.status_activity_changed(thread);
+        self.parent_turn_ended(thread, turn, actions);
+        self.record_run_notification(
+            thread,
+            &HeldNotification {
+                method: "turn/completed".into(),
+                params: Some(json!({"threadId":thread,"turn":shell})),
+                committed: false,
+            },
+            actions,
+        );
+        if !self.mark_ended(thread, turn) {
+            return false;
+        }
+        if self.stop_busy(thread) {
+            self.stop_completed_turn(thread, turn, actions);
+        } else {
+            self.completed(thread, turn, actions);
+        }
+        true
+    }
+
     fn completed(&mut self, thread_id: &str, convergence_turn: &str, actions: &mut Vec<Action>) {
         if self.convergence_enabled()
             && self

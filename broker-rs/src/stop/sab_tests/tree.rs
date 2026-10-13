@@ -71,6 +71,57 @@ fn 派生根核实目标沿用最近一次同代际发送轮次() {
 }
 
 #[test]
+fn 派生根核实总期限只归原根停止代际且不接纳子成员() {
+    use crate::claim::status_read::{StatusCaller, StatusDone, StatusResult, StatusUnknown};
+    use crate::stop::derived::DerivedStage;
+    let mut s = Sim::new();
+    s.spawn_v1("子甲", "派生1", "子轮甲");
+    s.hold.push(("turn/interrupt".into(), "子甲".into()));
+    stop(&mut s, OWNER, json!({"threadId": P}));
+    let tree_op = s.tree_op().unwrap();
+    let key = (tree_op, P.to_owned());
+    let derived = s.m.trees.aux.derived.get_mut(&key).unwrap();
+    derived.stage = DerivedStage::Verify;
+    derived.request_round = 23;
+    derived.read_id = Some(123);
+    let (run, send) = s.m.derived_diagnostic_send(&key, None).unwrap();
+    assert_eq!(
+        Some(send.stop_generation),
+        s.m.trees.aux.work[&tree_op].root_diag_generation
+    );
+    let rpc_key = crate::stop::StopDiagRpcKey {
+        source: "read:123".into(),
+        generation: 7,
+        round: 0,
+        method: "thread/turns/list".into(),
+        thread: P.into(),
+        turn: None,
+    };
+    s.m.stops
+        .diagnostic_rpc_sends
+        .insert(rpc_key.clone(), (run.clone(), send.clone()));
+    let done = StatusDone {
+        read_id: 123,
+        thread: P.into(),
+        token: None,
+        caller: StatusCaller::DerivedStopVerify {
+            tree_op,
+            thread: P.into(),
+            round: 23,
+        },
+        result: StatusResult::Unknown(StatusUnknown::Timeout),
+    };
+    let (actual_run, actual_send, method) = s.m.take_stop_diag_status_issue(&done).unwrap();
+    assert_eq!(actual_run, R);
+    assert_eq!(actual_send, send);
+    assert_eq!(method, "thread/turns/list");
+    assert!(s.m.take_stop_diag_status_issue(&done).is_none());
+    s.m.trees.aux.derived.get_mut(&key).unwrap().root = false;
+    s.m.stops.diagnostic_rpc_sends.insert(rpc_key, (run, send));
+    assert!(s.m.take_stop_diag_status_issue(&done).is_none());
+}
+
+#[test]
 fn 收尾发现一次失败后周期重查恢复且保留调用者期限() {
     let mut s = Sim::new();
     s.spawn_v1("子甲", "派生1", "子轮甲");

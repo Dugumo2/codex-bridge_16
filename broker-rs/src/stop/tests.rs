@@ -206,6 +206,101 @@ fn 停止请求超时的诊断只由超时入口记一次() {
     assert!(!m.stops.diagnostic_rpc_timeouts.contains(&key));
     assert!(!m.stops.diagnostic_rpc_sends.contains_key(&key));
 }
+
+fn stop_status_diag_fixture() -> (Machine, StatusDone, StopDiagRpcKey, RequestContext) {
+    let mut m = running();
+    stop(&mut m, 2, false);
+    let id = m.stop_key("线程").unwrap();
+    let mut op = m.stops.operations.remove(&id).unwrap();
+    op.goal_busy = false;
+    let mut actions = Vec::new();
+    m.start_verification(&id, &mut op, &mut actions);
+    m.stops.operations.insert(id, op);
+    m.track_goal_requests(&mut actions);
+    let mut context = req(&actions, "thread/read");
+    let Operation::StatusRead {
+        read_id,
+        generation,
+    } = context.operation.clone()
+    else {
+        panic!("核实使用状态读取");
+    };
+    // 模拟下一页，最后实际发送的方法必须成为诊断摘要的方法。
+    m.status_reads.reads.get_mut(&read_id).unwrap().generation = generation + 1;
+    context.operation = Operation::StatusRead {
+        read_id,
+        generation: generation + 1,
+    };
+    context.method = "thread/turns/list".into();
+    m.track_goal_requests(&mut [Action::Request(context.clone())]);
+    let key = m.stop_diag_rpc_key(&context).unwrap();
+    let done = StatusDone {
+        read_id,
+        thread: "线程".into(),
+        token: context.token.clone(),
+        caller: m.status_reads.reads[&read_id].caller.clone(),
+        result: StatusResult::Unknown(StatusUnknown::Timeout),
+    };
+    (m, done, key, context)
+}
+
+#[test]
+fn 根核实本地总期限用最后实际方法记一次超时() {
+    for reason in [StatusUnknown::Timeout, StatusUnknown::Unresponsive] {
+        let (mut m, mut done, key, _) = stop_status_diag_fixture();
+        done.result = StatusResult::Unknown(reason);
+        m.status_reads.reads.remove(&done.read_id);
+        let (run, send, method) = m.take_stop_diag_status_issue(&done).unwrap();
+        assert_eq!(run, "run-1");
+        assert_eq!(send.turn.as_deref(), Some("本轮"));
+        assert_eq!(method, "thread/turns/list");
+        assert!(!m.stops.diagnostic_rpc_sends.contains_key(&key));
+        assert!(m.take_stop_diag_status_issue(&done).is_none());
+    }
+}
+
+#[test]
+fn 根核实真实请求超时或错误不被读取完成重复记账() {
+    let (mut m, mut done, _, context) = stop_status_diag_fixture();
+    m.stop_diag_rpc_reply(&context, &Err(err()), true);
+    m.status_reads.reads.remove(&done.read_id);
+    done.result = StatusResult::Unknown(StatusUnknown::Unresponsive);
+    assert!(m.take_stop_diag_status_issue(&done).is_none());
+    let (mut m, mut done, _, context) = stop_status_diag_fixture();
+    m.stop_diag_rpc_reply(&context, &Err(err()), false);
+    m.status_reads.reads.remove(&done.read_id);
+    done.result = StatusResult::Unknown(StatusUnknown::ErrorReply);
+    assert!(m.take_stop_diag_status_issue(&done).is_none());
+}
+
+#[test]
+fn 根核实期限诊断拒绝旧轮旧代际和其它调用者() {
+    for mismatch in 0..4 {
+        let (mut m, mut done, _, _) = stop_status_diag_fixture();
+        m.status_reads.reads.remove(&done.read_id);
+        match mismatch {
+            0 => m.stops.operations.get_mut("run-1").unwrap().target = Some("新轮".into()),
+            1 => m.stops.operations.get_mut("run-1").unwrap().generation += 1,
+            2 => done.thread = "旧执行线程".into(),
+            _ => done.caller = StatusCaller::ContinueCheck { round: 1 },
+        }
+        assert!(m.take_stop_diag_status_issue(&done).is_none());
+    }
+}
+
+#[test]
+fn 普通停止核实空闲只在确有目标轮时记录轮结束身份() {
+    let mut m = running();
+    stop(&mut m, 2, false);
+    let mut operation = op(&m).clone();
+    let (_, send) = m.stop_diag_idle_target(&operation).unwrap();
+    assert_eq!(send.turn.as_deref(), Some("本轮"));
+    operation.target = None;
+    assert!(m.stop_diag_idle_target(&operation).is_none());
+    operation.target = Some("本轮".into());
+    operation.already_stopped = true;
+    assert!(m.stop_diag_idle_target(&operation).is_none());
+}
 fn stop(m: &mut Machine, id: u64, clear: bool) -> Vec<Action> {
     client(
         m,
