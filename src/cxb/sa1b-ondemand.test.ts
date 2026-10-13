@@ -93,7 +93,8 @@ scenario("无子代理时插话撤权→派生→父完成：交 SA1a 停树收�
   const run = await terminal(h);
   expect(run.subagentJoin).toBeUndefined();
   expect(run.interruptReason).toBe("subagentsUnfinished");
-  expect((await h.starts()).filter(x => x.params.clientUserMessageId)).toHaveLength(0);
+  // 初始请求也登记输入身份；本场景只允许那一次请求，不能再提交汇总 start/steer。
+  expect(await h.starts()).toHaveLength(1);
 });
 
 scenario("无子代理带 tokenBudget 运行超过 20 秒：不被预算核实误停，行为同 s4-cli", async h => {
