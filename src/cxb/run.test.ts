@@ -15,6 +15,7 @@ import { bounded, waitRun } from "./wait-run";
 import { deferred, messageBarrier, watchdog } from "./test-fixtures/test-watchdog";
 import { attachServerRequests, handover, renderPending } from "./server-requests";
 import { CLEANUP_BUDGET, TEST_BUDGET, RunHarness, fakeServerRequests, until, alive } from "./test-fixtures/run-harness";
+import { upstreamError } from "./test-fixtures/upstream-errors";
 
 let h: RunHarness;
 let oldHome: string | undefined;
@@ -871,4 +872,149 @@ test("共享服务器：定案通知缺 absorbedBy 不算定案，继续等明�
   expect(unit.fake.calls.filter((call) => call.method === "broker/threads/watch")).toHaveLength(1);
   unit.fake.emit("broker/run/settled", { threadId: "thread-test", runId: "run-test", absorbedBy: "turn-外部" });
   await expect(bounded(work, 5000)).rejects.toMatchObject({ code: "THREAD_HELD", exitCode: 8 });
+});
+
+for (const json of [false, true]) for (const command of ['run', 'review'] as const) test(`上游诊断 ${command}${json ? ' --json' : ''}：不加 -v 即时 stderr 提示，最终单对象与退出七`, async () => {
+  const unit = unitExecution([command, '中文', ...(json ? ['--json'] : [])]);
+  const original = unit.fake.handle;
+  const error = { message: '最终失败 Bearer private-final', codexErrorInfo: { responseTooManyFailedAttempts: { httpStatusCode: 429 } } };
+  const result = runResult({ status: 'failed', diagnosticRevision: 2, upstreamError: upstreamError({ willRetry: false }),
+    turns: [{ ...runResult().turns[0]!, status: 'failed', error }] });
+  unit.fake.handle = (method, params) => {
+    if (method === 'turn/start' || method === 'review/start') {
+      // 诊断早于 runId：订阅必须在开轮前生效，且不可回显原始 error 通知。
+      unit.fake.emit('error', { threadId: 'thread-test', error: { message: '原始通知不应显示' }, willRetry: true });
+      unit.fake.emit('broker/run/updated', { runId: 'run-test', threadId: 'thread-test', diagnosticRevision: 1,
+        upstreamError: upstreamError(), lastProgressAt: null, state: 'running', status: null });
+      unit.fake.emit('broker/run/started', { threadId: 'thread-test', runId: 'run-test' });
+      return { runId: 'run-test' };
+    }
+    if (method === 'broker/threads/watch') return { run: result };
+    return original(method, params);
+  };
+  const handler = command === 'review' ? createReviewHandler(fakeServerRequests()) : createRunHandler(fakeServerRequests());
+  expect(await handler(unit.ctx)).toBe(7);
+  await unit.out.flush();
+  const output = unit.output();
+  expect(output.stderr).toContain('[cxb] 上游认证失败（HTTP 401），Codex 正在重试；已观察到 3 次。');
+  expect(output.stderr).toContain('[cxb] 失败原因：最终失败 Bearer ***（HTTP 429）');
+  expect(output.stderr.indexOf('Codex 执行失败')).toBeLessThan(output.stderr.indexOf('[cxb] 失败原因'));
+  expect(output.stderr).not.toContain('原始通知不应显示');
+  expect(output.stdout).not.toContain('[cxb]');
+  expect(output.stdout + output.stderr).not.toContain('private-final');
+  if (json) {
+    const object = JSON.parse(output.stdout);
+    expect(output.stdout.trim().split('\n')).toHaveLength(1);
+    expect(object).toMatchObject({ command, status: 'failed', upstreamError: result.upstreamError,
+      error: { message: '最终失败 Bearer ***', codexErrorInfo: error.codexErrorInfo } });
+    expect(object).not.toHaveProperty('diagnosticRevision');
+    expect(object).not.toHaveProperty('lastProgressAt');
+  } else expect(output.stdout).toBe('中文结果');
+  expect(unit.fake.subscriptions).toBe(0);
+  expect(unit.fake.notificationErrors).toEqual([]);
+});
+
+test('上游诊断 run SA1b 最终轮选择：失败摘要与 JSON 取 finalTurnId，阶段错误不冒充最终原因', async () => {
+  for (const hasFinalError of [true, false]) {
+    const unit = unitExecution(['run', '中文', '--json']);
+    const original = unit.fake.handle;
+    const stage = { ...runResult().turns[0]!, turnId: 'stage', status: 'failed' as const, error: { message: '旧阶段错误' } };
+    const final = { ...stage, turnId: 'final', error: hasFinalError ? { message: '真正最终错误' } : null };
+    unit.fake.handle = (method, params) => method === 'broker/threads/watch' ? { run: runResult({ status: 'failed', finalTurnId: 'final',
+      diagnosticRevision: 1, upstreamError: upstreamError(), turns: [final, stage] }) } : original(method, params);
+    expect(await handler()(unit.ctx)).toBe(7);
+    await unit.out.flush();
+    const output = unit.output(), value = JSON.parse(output.stdout);
+    expect(output.stderr).not.toContain('旧阶段错误');
+    if (hasFinalError) {
+      expect(output.stderr).toContain('[cxb] 失败原因：真正最终错误');
+      expect(value.error).toEqual({ message: '真正最终错误' });
+    } else {
+      expect(output.stderr).not.toContain('失败原因');
+      expect(output.stderr).toContain('最近上游报错：上游认证失败（HTTP 401）');
+      expect(value).not.toHaveProperty('error');
+    }
+  }
+});
+
+test("上游诊断 run 无报错：只有进展版本时 stdout 不增字段、stderr 不增提示", async () => {
+  const unit = unitExecution(["run", "中文", "--json"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => method === "broker/threads/watch"
+    ? { run: runResult({ diagnosticRevision: 9, lastProgressAt: 1234 }) } : original(method, params);
+  expect(await handler()(unit.ctx)).toBe(0);
+  await unit.out.flush();
+  const value = JSON.parse(unit.output().stdout);
+  for (const key of ["upstreamError", "diagnosticRevision", "lastProgressAt", "error"]) expect(value).not.toHaveProperty(key);
+  expect(unit.output().stderr).toBe("");
+});
+
+test("上游诊断 run 活动轮：默认即时提示，willRetry:false 仍等待真实收尾", async () => {
+  const unit = unitExecution(["run", "中文"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => method === "broker/threads/watch"
+    ? { run: runResult({ state: "running", status: null }) } : original(method, params);
+  let settled = false;
+  const work = handler()(unit.ctx);
+  void work.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await until(() => unit.fake.calls.some(call => call.method === "broker/threads/watch"));
+    const emit = (revision: number, willRetry: boolean) => unit.fake.emit("broker/run/updated", {
+      runId: "run-test", threadId: "thread-test", diagnosticRevision: revision,
+      upstreamError: upstreamError({ willRetry }), lastProgressAt: null, state: "running", status: null,
+    });
+    emit(1, true);
+    await unit.out.flush();
+    expect(unit.output().stderr).toContain("Codex 正在重试");
+    expect(unit.output().stdout).toBe("");
+    expect(settled).toBe(false);
+    emit(2, false);
+    await unit.out.flush();
+    expect(unit.output().stderr).toContain("上游已报告终止错误，等待轮次结束确认");
+    expect(settled).toBe(false);
+    expect(unit.fake.calls.some(call => call.method === "broker/threads/stop")).toBe(false);
+    unit.fake.emit("broker/run/ended", { run: runResult({ upstreamError: upstreamError({ willRetry: false }), diagnosticRevision: 2 }) });
+    expect(await bounded(work, 3000)).toBe(0);
+    await unit.out.flush();
+    expect(unit.output().stdout).toBe("中文结果");
+  } finally {
+    if (!settled) unit.fake.emit("broker/run/ended", { run: runResult() });
+    await bounded(work.catch(() => undefined), 3000);
+  }
+});
+
+test("上游诊断 run 启动 RPC 失败：等待本运行失败记录，输出单对象与真实错误", async () => {
+  const unit = unitExecution(["run", "中文", "--json"]);
+  const original = unit.fake.handle;
+  const snapshot = deferred<{ run: RunResult }>();
+  const error = { code: -32603, message: "启动失败 sk-privateStartKey", data: { codexErrorInfo: "unauthorized" } };
+  const diagnostic = upstreamError({ source: "rpcResponse", willRetry: null, turnId: null, count: 1 });
+  unit.fake.handle = (method, params) => {
+    if (method === "turn/start") {
+      unit.fake.emit("broker/run/started", { threadId: "thread-test", runId: "run-test" });
+      unit.fake.emit("broker/run/updated", { runId: "run-test", threadId: "thread-test", diagnosticRevision: 1,
+        upstreamError: diagnostic, lastProgressAt: null, state: "ended", status: "failed" });
+      throw wireError(-32603, error.message);
+    }
+    if (method === "broker/threads/watch") return snapshot.promise;
+    return original(method, params);
+  };
+  const work = handler()(unit.ctx);
+  void work.catch(() => undefined);
+  try {
+    await until(() => unit.fake.calls.some(call => call.method === "broker/threads/watch"));
+    await messageBarrier(() => [unit.fake.calls.length]);
+    snapshot.resolve({ run: runResult({ status: "failed", diagnosticRevision: 1, upstreamError: diagnostic,
+      turns: [{ ...runResult().turns[0]!, error, status: "failed" }] }) });
+    expect(await bounded(work, 3000)).toBe(7);
+    await unit.out.flush();
+    expect(JSON.parse(unit.output().stdout)).toMatchObject({ status: "failed", upstreamError: diagnostic,
+      error: { ...error, message: "启动失败 ***" } });
+    expect(unit.output().stdout.trim().split("\n")).toHaveLength(1);
+    expect(unit.output().stderr).toContain("[cxb] 失败原因：启动失败 ***（unauthorized）");
+    expect(unit.output().stderr + unit.output().stdout).not.toContain("privateStartKey");
+  } finally {
+    snapshot.resolve({ run: runResult() });
+    await bounded(work.catch(() => undefined), 3000);
+  }
 });

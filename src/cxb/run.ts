@@ -22,6 +22,7 @@ import { childEntry, showSubagents, subagentRefusal } from "./subagents";
 import { bounded, exitCodeForRun, waitRun } from "./wait-run";
 import { convergenceFields, resultPending, resultTurn, selectedResultFields } from "./run-result";
 import { convergenceLines, observeConvergence } from "./convergence";
+import { observeUpstreamErrors, upstreamResultFields } from "./upstream-errors";
 
 /** 不把上游消息直接输出，防止错误文本回显提示词或凭据。 */
 export function rpcDetail(error: unknown): { code?: number; message: string } {
@@ -354,6 +355,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     attach(threadId);
     const convergence = observeConvergence(rpc, () => runId, (line) => out.notice(line));
     disposers.push(convergence.dispose);
+    const upstream = observeUpstreamErrors(convergence.rpc, () => runId, (line) => out.notice(line));
+    disposers.push(upstream.dispose);
     let started!: (id: string) => void;
     let startFailed!: (error: unknown) => void;
     const startedPromise = new Promise<string>((resolve, reject) => { started = resolve; startFailed = reject; });
@@ -362,6 +365,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       if (event.threadId !== threadId || !event.runId) return;
       runId = event.runId;
       shortId = event.shortId ?? shortId;
+      upstream.refresh();
       started(runId);
     }));
     // 本次运行一结束（认领释放）就不再由信号清理发 stop：之后线程上可能已是别的连接的运行。
@@ -413,6 +417,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       reviewReady();
       if (!runId && reply.runId) { runId = reply.runId; shortId = reply.shortId ?? shortId; started(runId); }
       if (!runId) throw new CxbError("BROKER_UNAVAILABLE", "broker 未返回运行标识");
+      upstream.refresh();
       return reply;
     });
     // 审批可能卡住启动回包：通知已经给出 runId 时必须能立即交接。
@@ -437,6 +442,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
         // 交接不重置协调期限；订阅后取同运行快照，补齐待答／detach 的展示。
         const view = await request<{ run?: RunResult; revision?: number } & import("./sa1b-contracts").ConvergenceSummary>("broker/threads/watch", { threadId, runId });
         convergence.accept({ ...view.run, ...view, runId });
+        if (view.run) upstream.apply(view.run);
         const health = await request<{ survivesParentJob: boolean }>("broker/health", {});
         if (!health.survivesParentJob) out.notice("当前环境下 broker 可能随本命令所在的进程组一起退出，托管不保证可靠");
       }
@@ -447,22 +453,27 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       const transferred = await handover();
       if (transferred.outcome !== "runEnded") {
         out.result(`${threadId} ${shortId} ${runId} 运行中\n`);
-        out.resultJson({ threadId, shortId, runId, status: "running", ...convergence.fields() });
+        out.resultJson({ threadId, shortId, runId, status: "running", ...convergence.fields(), ...upstream.fields() });
         return EXIT.OK;
       }
       // 交接恰逢运行结束：已就绪的结果直接用，否则按共用等待补全，再照常输出与退出。
       const known = transferred.result;
       result = known && known.runId === runId && !resultPending(known) ? known
-        : await bounded(waitRun(convergence.rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir }),
+        : await bounded(waitRun(upstream.rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir }),
           remaining(), controller.signal);
     } else {
-      const waiting = waitRun(convergence.rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir });
+      const waiting = waitRun(upstream.rpc, { threadId, runId, timeoutMs: remaining(), signal: waitController.signal, workspaceDir: ctx.workspace.workspaceDir });
       void waiting.catch(() => {});
       const abortWait = () => waitController.abort();
       controller.signal.addEventListener("abort", abortWait, { once: true });
       disposers.push(() => controller.signal.removeEventListener("abort", abortWait));
       // 启动 RPC 失败不能被已收到 started 的 Promise 吞掉。
-      const failedStart = startReply.then(() => new Promise<never>(() => {}));
+      const failedStart = startReply.then(() => new Promise<never>(() => {}), (error: unknown) => {
+        // broker 已确认这是本运行的上游启动错误时，仍等真实失败记录，才能展示选定轮错误与单个最终 JSON。
+        // 无诊断的旧 broker／归属拒绝保持原来的请求失败路径。
+        if (upstream.fields().upstreamError?.source === "rpcResponse") return waiting;
+        throw error;
+      });
       const first = await bounded(Promise.race([waiting, needsHuman, failedStart]), remaining(), controller.signal);
       if (first === "human") {
         const transferred = await handover();
@@ -471,12 +482,13 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
           const rendered = deps.renderPending(transferred.pending, { threadId, shortId });
           out.result(rendered.text);
           for (const line of convergenceLines(convergence.fields(), transferred.pending.length)) out.notice(line);
-          if (rendered.json && typeof rendered.json === "object") out.resultJson({ ...rendered.json, ...convergence.fields() });
+          if (rendered.json && typeof rendered.json === "object") out.resultJson({ ...rendered.json, ...convergence.fields(), ...upstream.fields() });
           return EXIT.WAITING_RESPONSE;
         }
         result = await bounded(waiting, remaining(), controller.signal);
       } else result = first;
     }
+    result = upstream.apply(result);
     finished = true;
     const code = exitCodeForRun(result);
     showSubagents(ctx, result);
@@ -497,11 +509,12 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
           : report.servers.filter((server) => server.risk && detail.includes(server.name)).map((server) => safe(server.name));
         out.notice(`Codex 的 MCP 请求失败${names.length ? `（服务器：${names.join("、")}）` : ""}；需要搜索/MCP 时请加 --approval auto。`);
       } else out.notice("Codex 执行失败，请用 cxb show 查看运行结果");
+      upstream.failure(result);
     }
     out.progress(`运行结束：${result.status ?? result.state}，耗时 ${Math.max(0, (result.endedAt ?? Date.now()) - result.startedAt)} 毫秒`);
     out.result(last?.output ?? "");
     const common = { ok: code === EXIT.OK, command: plan.command, thread: { id: result.threadId, shortId: result.shortId },
-      runId: result.runId, status: result.status ?? result.state, result: last?.output ?? "", ...convergenceFields(result), ...selectedResultFields(result),
+      runId: result.runId, status: result.status ?? result.state, result: last?.output ?? "", ...convergenceFields(result), ...selectedResultFields(result), ...upstreamResultFields(result),
       ...(result.interruptReason ? { interruptReason: result.interruptReason } : {}),
       ...(result.childrenStop ? { childrenStop: result.childrenStop, stopOutcome: result.stopOutcome } : {}),
       ...(result.loopGuard ? { loopGuard: result.loopGuard } : {}) };

@@ -262,6 +262,9 @@ export interface LoopGuardReport {
 }
 
 export interface RunResult extends ConvergenceSummary {
+  upstreamError?: UpstreamError;
+  diagnosticRevision?: number;
+  lastProgressAt?: number | null;
   convergenceConfig?: ConvergenceConfig;
   executionConfig?: RunExecutionConfig;
   /** 最近一次已开始的轮次；结束后保留，旧记录缺省为 null。 */
@@ -298,6 +301,7 @@ export interface RunResult extends ConvergenceSummary {
 
 /** broker/runs/modelSummaries 的轻量回包，不含输入、输出正文。 */
 export interface RunModelSummary {
+  upstreamError?: UpstreamError;
   finalTurnId?: string;
   runId: string;
   threadId: string;
@@ -313,6 +317,26 @@ export interface RunModelSummary {
 }
 
 export type ModelRun = RunResult | RunModelSummary;
+
+export type UpstreamErrorCategory = "authentication" | "paymentRequired" | "permissionDenied" | "usageLimit"
+  | "rateLimit" | "server" | "network" | "unknown";
+export type UpstreamErrorSource = "errorNotification" | "turnCompleted" | "rpcResponse";
+/** broker 已脱敏的最近一组上游诊断；CLI 展示前仍会再次脱敏。 */
+export interface UpstreamError {
+  threadId: string;
+  turnId: string | null;
+  source: UpstreamErrorSource;
+  category: UpstreamErrorCategory;
+  httpStatusCode: number | null;
+  codexErrorInfo: unknown;
+  message: string;
+  additionalDetails: string | null;
+  truncated: boolean;
+  willRetry: boolean | null;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  count: number;
+}
 
 export type InboxKind = "approval" | "question" | "mcp" | "guardian";
 

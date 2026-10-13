@@ -4,6 +4,7 @@
 //! core 执行。本模块仅依赖标准库、proto 与 serde_json。
 
 use crate::proto::{self, code};
+use crate::runs::upstream_error::{UpstreamError, UpstreamErrorSource};
 use crate::runs::{ReleaseKind, RunOpen};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1831,6 +1832,17 @@ impl Machine {
             self.deliver(&context, result, actions);
             return;
         }
+        // 认领仍在表中时发诊断，保证启动失败的 owner 不因删除认领而漏收通知。
+        if let Err(error) = &result {
+            if let Some(run) = self
+                .claims
+                .get(&thread_id)
+                .filter(|claim| matches!(claim.state, State::Starting { turn_id: None, .. }))
+                .and_then(|claim| claim.run_id.clone())
+            {
+                self.run_rpc_error(&run, &thread_id, error, actions);
+            }
+        }
         let Some(mut claim) = self.claims.remove(&thread_id) else {
             self.deliver(&context, result, actions);
             return;
@@ -2121,6 +2133,7 @@ impl Machine {
                 if event.method == "turn/started" {
                     if let Some(id) = notification_turn_id(&event.params) {
                         self.started(child, id, actions);
+                        self.run_diagnostic_event(child, id, true, None, true, actions);
                     }
                 }
                 completed |= event.method == "turn/completed";
@@ -2427,6 +2440,7 @@ impl Machine {
         if event.method == "turn/started" {
             if let Some(id) = notification_turn_id(&event.params) {
                 self.started(thread_id, id, actions);
+                self.run_diagnostic_event(thread_id, id, event.committed, None, true, actions);
             }
         } else if event.method == "turn/completed" {
             if self.claims.get(thread_id).is_some_and(|c| {
@@ -2508,8 +2522,36 @@ impl Machine {
             })
             .and_then(|claim| claim.run_id.clone());
         match event.method.as_str() {
+            "error" => {
+                if let (Some(turn), Some(params)) = (turn, event.params.as_ref()) {
+                    if let (Some(error), Some(will_retry)) = (
+                        params.get("error").filter(|error| error.is_object()),
+                        params.get("willRetry").and_then(Value::as_bool),
+                    ) {
+                        let diagnostic = UpstreamError::from_error(
+                            thread,
+                            Some(turn),
+                            UpstreamErrorSource::ErrorNotification,
+                            error,
+                            Some(will_retry),
+                            self.clock.now_ms,
+                        );
+                        self.run_diagnostic_event(
+                            thread,
+                            turn,
+                            event.committed,
+                            Some(diagnostic),
+                            false,
+                            actions,
+                        );
+                    }
+                }
+            }
             "model/rerouted" => self.run_rerouted(&event.params, actions),
             "item/started" | "item/completed" => {
+                if let Some(turn) = turn {
+                    self.run_diagnostic_event(thread, turn, event.committed, None, true, actions);
+                }
                 if let (Some(turn), Some(item)) =
                     (turn, event.params.as_ref().and_then(|p| p.get("item")))
                 {
@@ -2525,6 +2567,32 @@ impl Machine {
             }
             "turn/completed" => {
                 if let Some(turn) = event.params.as_ref().and_then(|p| p.get("turn")) {
+                    if let Some(id) = turn.get("id").and_then(Value::as_str) {
+                        let diagnostic = turn
+                            .get("error")
+                            .filter(|error| {
+                                turn.get("status").and_then(Value::as_str) == Some("failed")
+                                    && error.is_object()
+                            })
+                            .map(|error| {
+                                UpstreamError::from_error(
+                                    thread,
+                                    Some(id),
+                                    UpstreamErrorSource::TurnCompleted,
+                                    error,
+                                    Some(false),
+                                    self.clock.now_ms,
+                                )
+                            });
+                        self.run_diagnostic_event(
+                            thread,
+                            id,
+                            event.committed,
+                            diagnostic,
+                            true,
+                            actions,
+                        );
+                    }
                     if run.is_none() {
                         if let Some(current_run) =
                             self.claims.get(thread).and_then(|c| c.run_id.clone())

@@ -40,6 +40,7 @@ pub mod budget;
 #[cfg(test)]
 mod tests;
 pub mod types;
+pub mod upstream_error;
 
 pub use types::*;
 
@@ -305,6 +306,9 @@ impl Machine {
         self.runs.runs.insert(
             run_id.clone(),
             RunRecord {
+                upstream_error: None,
+                diagnostic_revision: 0,
+                last_progress_at: None,
                 final_turn_id: None,
                 auto_turns_started: None,
                 subagent_join: None,
@@ -852,6 +856,12 @@ impl Machine {
         if self.runs.phase != Phase::Open || !self.runs.active.contains_key(run) {
             return;
         }
+        let thread = self.runs.runs[run]
+            .review_thread_id
+            .as_ref()
+            .unwrap_or(&self.runs.runs[run].thread_id)
+            .clone();
+        self.run_rpc_error(run, &thread, error, actions);
         let record = self.runs.runs.get_mut(run).expect("运行存在");
         if record.turns.iter().any(|t| t.turn_id.is_empty()) {
             return;

@@ -7,7 +7,8 @@ import { ls } from "./ls";
 import { show } from "./show";
 import { removeTemp } from "./test-fixtures/main-test-support";
 import { context, ledger, summary } from "./test-fixtures/n4a-unit";
-import { runResult, wireError } from "./test-fixtures/run-fakes";
+import { modelSummary, runResult, wireError } from "./test-fixtures/run-fakes";
+import { upstreamError } from "./test-fixtures/upstream-errors";
 import { N4Broker } from "./test-fixtures/n4a-broker";
 
 let dir: string;
@@ -176,4 +177,43 @@ describe("ls 真 broker", () => {
     expect(data.items[1].model).toBe("本地模型");
     expect(data.items[0].shortId).toBeNull();
   }, 30_000);
+});
+
+for (const code of [401, null]) for (const json of [false, true]) test(`上游诊断 ls${json ? ' --json' : ''}：STATUS 后缀 ${code ?? '类别'} 与缺省字段`, async () => {
+  const run = runResult({ state: 'running', status: null, upstreamError: upstreamError({ httpStatusCode: code, category: code ? 'authentication' : 'rateLimit' }) });
+  ledger(dir, [run]);
+  const t = context(dir, ['ls', '--local', ...(json ? ['--json'] : [])]);
+  expect(await ls(t.ctx)).toBe(0);
+  if (json) {
+    expect(t.json[0].items[0].status).toBe('running');
+    expect(t.json[0].items[0].upstreamError).toEqual(run.upstreamError);
+  } else expect(t.texts.join('')).toContain(`abcd1234 running（上游 ${code ?? 'rateLimit'}×3） run-test`);
+});
+
+test('上游诊断 ls 严格按 lastRunId：在线同 run 优先，review／无模型／未确认启动不丢诊断', async () => {
+  const target = runResult({ runId: 'run-review', state: 'running', status: null, meta: { source: 'review' },
+    upstreamError: upstreamError({ count: 1 }) });
+  const newerModel = runResult({ runId: 'run-model', startedAt: 9000, meta: { source: 'run', model: '新模型' },
+    startConfirmation: { confirmed: true, owned: true, threadId: 'thread-test', turnId: 'turn-test' },
+    upstreamError: upstreamError({ count: 100, category: 'server' }) });
+  ledger(dir, [target, newerModel], [summary({ lastRunId: target.runId })]);
+  const t = context(dir, ['ls', '--json']);
+  t.fake.handle = (method) => method === 'broker/threads/list' ? { threads: [summary({ lastRunId: target.runId })] }
+    : method === 'broker/runs/modelSummaries' ? { runs: [modelSummary({ ...target, upstreamError: upstreamError({ count: 9 }) }), modelSummary(newerModel)] }
+      : { data: [], nextCursor: null };
+  expect(await ls(t.ctx)).toBe(0);
+  expect(t.json[0].items[0].upstreamError.count).toBe(9);
+  expect(t.json[0].items[0].upstreamError.category).toBe('authentication');
+  expect(t.json[0].items[0].model).toBe('新模型');
+});
+
+test('上游诊断 ls 在线摘要无对应 run 时精确回退落盘，不借其他 run 报错', async () => {
+  const target = runResult({ upstreamError: upstreamError({ count: 2 }) });
+  const other = runResult({ runId: 'other', upstreamError: upstreamError({ count: 99 }) });
+  ledger(dir, [target, other]);
+  const t = context(dir, ['ls', '--json']);
+  t.fake.handle = (method) => method === 'broker/threads/list' ? { threads: [summary()] }
+    : method === 'broker/runs/modelSummaries' ? { runs: [modelSummary(other)] } : { data: [], nextCursor: null };
+  expect(await ls(t.ctx)).toBe(0);
+  expect(t.json[0].items[0].upstreamError.count).toBe(2);
 });
