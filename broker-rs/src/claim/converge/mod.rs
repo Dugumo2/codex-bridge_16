@@ -40,7 +40,6 @@ pub struct Progress {
     pub terminal_locked: bool,
     pub parent_before_stop: Option<TurnStatus>,
     pub interrupt_before_stop: Option<InterruptReason>,
-    pub budget_verify_started: Option<u64>,
     pub operations: BTreeMap<u64, ReconcileOperation>,
 }
 

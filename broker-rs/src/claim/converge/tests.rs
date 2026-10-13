@@ -33,8 +33,14 @@ fn notify(m: &mut Machine, method: &str, params: serde_json::Value) -> Vec<Actio
         },
     )
 }
-fn setup() -> (Machine, SubagentMock) {
-    let mut m = Machine::default();
+fn setup_pending() -> (Machine, SubagentMock, crate::claim::RequestContext) {
+    setup_pending_mode(false)
+}
+fn setup_pending_mode(shared: bool) -> (Machine, SubagentMock, crate::claim::RequestContext) {
+    let mut m = Machine {
+        shared,
+        ..Machine::default()
+    };
     m.clock.mono_ms = 1_000;
     m.clock.now_ms = 100_000;
     // 与生产 Core 相同：broker 启动即打开门禁，运行按需启用（不再绕过启用前的初始化路径）。
@@ -61,6 +67,17 @@ fn setup() -> (Machine, SubagentMock) {
             _ => None,
         })
         .unwrap();
+    m.convergences
+        .capabilities
+        .insert(P.into(), (m.relations.conn_epoch, true));
+    m.convergences.test_budget = Some(BudgetAdmission::Allowed);
+    m.convergences.test_read = Some(BatchReadId(9));
+    let mut mock = SubagentMock::default();
+    mock.register(P, None, "v1", false, true);
+    (m, mock, context)
+}
+fn setup() -> (Machine, SubagentMock) {
+    let (mut m, mock, context) = setup_pending();
     apply(
         &mut m,
         Event::Reply {
@@ -73,13 +90,6 @@ fn setup() -> (Machine, SubagentMock) {
         "turn/started",
         json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
     );
-    m.convergences
-        .capabilities
-        .insert(P.into(), (m.relations.conn_epoch, true));
-    m.convergences.test_budget = Some(BudgetAdmission::Allowed);
-    m.convergences.test_read = Some(BatchReadId(9));
-    let mut mock = SubagentMock::default();
-    mock.register(P, None, "v1", false, true);
     (m, mock)
 }
 /// 已纳管一个先完成的子代理：只有确有子代理的运行才进入收敛（用户 2026-10-11 定）。
@@ -1111,19 +1121,17 @@ fn 有界批次形状与活动范围二次核实() {
 }
 #[test]
 fn 预算补核实有总窗_不重复发请求且失败不准入() {
-    let (mut m, mut mock) = setup();
-    m.convergences.test_budget = Some(BudgetAdmission::NeedsVerification);
-    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
-    complete(&mut m, &mut mock, "子", "子轮", "completed");
+    let (mut m, mut mock, verification) = setup_missing_budget();
+    complete(&mut m, &mut mock, "预算子", "预算子轮", "completed");
+    notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
     complete(&mut m, &mut mock, P, T, "completed");
     discover(&mut m, true);
-    let at = m.convergences.progress[R].budget_verify_started.unwrap();
     retry(&mut m);
     discover(&mut m, true);
     assert!(!join(&m).automatic_control_revoked);
     retry(&mut m);
-    discover(&mut m, true);
-    assert!(m.clock.mono_ms >= at + 20_000);
+    assert!(m.clock.mono_ms >= verification.deadline_mono_ms);
+    assert!(m.take_budget_verification(&verification.token).is_none());
     assert_eq!(
         join(&m).terminal_reason,
         Some(TerminalReason::BudgetIncomplete)
@@ -1661,4 +1669,417 @@ fn 按需启用时只发布运行中且未计时_不排期也不公布收敛期�
     assert!(matches!(m.claims[P].state, State::Converging { .. }));
     assert!(join(&m).deadline_at > 0, "首次收敛门禁才开始计时");
     assert!(m.convergences.runs[R].deadline_mono_ms < u64::MAX);
+}
+
+#[test]
+fn 启动回包最后到仍启用收敛且不复活父轮() {
+    let (mut m, mut mock, context) = setup_pending();
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
+    );
+    assert!(matches!(
+        m.claims[P].state,
+        State::Starting {
+            settling: false,
+            ..
+        }
+    ));
+    assert!(m.claims[P].owned_turns.contains(T));
+    spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+    assert!(m.sa1b_active(R));
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    assert!(m.tree_for_run(R).is_none());
+    let deadline = m.convergences.runs[R].deadline_mono_ms;
+    // 迟到的旧完成不能覆盖当前完成目标，启动回包只能清 pending。
+    complete(&mut m, &mut mock, P, "旧父轮", "failed");
+    apply(
+        &mut m,
+        Event::Reply {
+            context,
+            result: Ok(json!({"turn":{"id":T}})),
+        },
+    );
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    assert!(!m.claims[P].request_pending);
+    assert_eq!(m.claims[P].turn_id(), Some(T));
+    assert_eq!(m.convergences.runs[R].deadline_mono_ms, deadline);
+    assert!(m.tree_for_run(R).is_none());
+    complete(&mut m, &mut mock, "子", "子轮", "completed");
+    discover(&mut m, true);
+    assert_eq!(
+        m.convergences.progress[R].reading,
+        Some((BatchReadId(9), join(&m).work_epoch))
+    );
+}
+
+#[test]
+fn settling外部派生不启用而自有派生定案后启用() {
+    for own_spawn in [false, true] {
+        for spawn_completed in [false, true] {
+            let (mut m, mut mock, context) = setup_pending_mode(true);
+            let parent = if own_spawn { T } else { "外部X" };
+            notify(
+                &mut m,
+                "turn/started",
+                json!({"threadId":P,"turn":{"id":parent,"status":"inProgress","items":[]}}),
+            );
+            let (started, completed) = SubagentMock::v1_spawn(P, parent, "派生", "子", false);
+            apply(&mut m, started);
+            if spawn_completed {
+                apply(&mut m, completed);
+            }
+            assert!(m.claims[P].settling());
+            let key = m.relations.operations.keys().next().unwrap().clone();
+            assert_eq!(m.relations.operations[&key].run_id, R);
+            assert!(!m.op_confirmed(&key));
+            assert!(!m.sa1b_active(R));
+            if !own_spawn {
+                notify(
+                    &mut m,
+                    "turn/started",
+                    json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
+                );
+            }
+            // started 已有证明，启动回包经 begin_settlement 同步定案，触发 confirm_waiting。
+            apply(
+                &mut m,
+                Event::Reply {
+                    context,
+                    result: Ok(json!({"turn":{"id":T}})),
+                },
+            );
+            assert!(!m.claims[P].settling());
+            assert!(m.claims[P].owned_turns.contains(T));
+            assert_eq!(m.run_subagent_evidence(R), own_spawn);
+            assert_eq!(m.sa1b_active(R), own_spawn);
+            if own_spawn {
+                assert!(m.op_confirmed(&key));
+                if !spawn_completed {
+                    assert!(m.relations.contexts[R].in_flight_spawns.contains(&key));
+                }
+            } else {
+                assert_eq!(
+                    m.relations.operations[&key].outcome,
+                    EvidenceOutcome::Unproven
+                );
+                assert_eq!(m.relations.operations[&key].run_id, R);
+                complete(&mut m, &mut mock, P, T, "completed");
+                assert!(!m.sa1b_active(R));
+            }
+        }
+    }
+}
+
+#[test]
+fn 自有v1在途派生立即启用() {
+    let (mut m, _) = setup();
+    let (started, _) = SubagentMock::v1_spawn(P, T, "派生", "子", false);
+    apply(&mut m, started);
+    let key = m.relations.operations.keys().next().unwrap();
+    assert!(m.op_confirmed(key));
+    assert!(m.relations.contexts[R].in_flight_spawns.contains(key));
+    assert!(m.sa1b_active(R));
+}
+
+fn setup_initial_input(shared: bool) -> (Machine, SubagentMock, serde_json::Value) {
+    let (mut m, mock, context) = setup_pending_mode(shared);
+    let initial = json!({"id":"初始条目","type":"userMessage","clientId":context.params.as_ref().unwrap()["clientUserMessageId"],"content":[{"type":"text","text":"任务"}]});
+    assert!(initial["clientId"].is_string());
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":T,"status":"inProgress"}}),
+    );
+    apply(
+        &mut m,
+        Event::Reply {
+            context,
+            result: Ok(json!({"turn":{"id":T}})),
+        },
+    );
+    (m, mock, initial)
+}
+
+fn first_turn_input_veto(entrance: usize) {
+    for shared in [false, true] {
+        let (mut m, mut mock, initial) = setup_initial_input(shared);
+        assert!(!m.sa1b_active(R));
+        assert!(m.loop_guards.contains_key(R));
+        notify(
+            &mut m,
+            "thread/goal/updated",
+            json!({"threadId":P,"goal":{"status":"active","objective":"任务","createdAt":1}}),
+        );
+        m.record(P).goal_controlled = true;
+        let control_epoch = m.records[P].goal_control_epoch;
+        // 文本与初始请求相同也不能豁免第二条输入；只信任原请求的 clientId。
+        let extra = json!({"id":"追加条目","type":"userMessage","clientId":"外部输入","content":[{"type":"text","text":"任务"}]});
+        if entrance == 0 {
+            for method in ["item/started", "item/completed"] {
+                notify(
+                    &mut m,
+                    method,
+                    json!({"threadId":P,"turnId":T,"item":initial}),
+                );
+            }
+            assert!(!m.loop_guards[R].user_input_seen());
+            notify(
+                &mut m,
+                "item/started",
+                json!({"threadId":P,"turnId":T,"item":extra}),
+            );
+        } else if entrance == 1 {
+            notify(
+                &mut m,
+                "turn/completed",
+                json!({"threadId":P,"turn":{"id":T,"status":"completed","itemsView":"full","items":[initial,extra]}}),
+            );
+        } else {
+            let out = notify(
+                &mut m,
+                "turn/completed",
+                json!({"threadId":P,"turn":{"id":T,"status":"completed","itemsView":"notLoaded","items":[]}}),
+            );
+            let context = out
+                .into_iter()
+                .find_map(|a| match a {
+                    Action::Request(c)
+                        if matches!(c.operation, crate::claim::Operation::ResultRead(_)) =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                })
+                .expect("首轮输出触发真实条目分页");
+            apply(
+                &mut m,
+                Event::Reply {
+                    context,
+                    result: Ok(crate::test_support::status_read::items_page(
+                        T,
+                        &[initial, extra],
+                        Some("下一页"),
+                    )),
+                },
+            );
+        }
+        assert!(m.loop_guards[R].user_input_seen(), "入口 {entrance}");
+        assert!(
+            m.records[P].goal_controlled,
+            "被动记录不能撤销旧共享控制资格"
+        );
+        assert_eq!(m.records[P].goal_control_epoch, control_epoch);
+        assert_eq!(m.loop_guards[R].continuations, 0);
+        spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+        assert!(m.run_subagent_evidence(R));
+        assert!(!m.sa1b_active(R));
+        if entrance == 0 {
+            complete(&mut m, &mut mock, P, T, "completed");
+        }
+        notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
+        assert!(m.tree_for_run(R).is_some(), "自然结束交 SA1a 停树");
+        assert!(m.runs.runs[R].subagent_join.is_none());
+        assert_eq!(
+            m.trees.operations[&m.tree_for_run(R).unwrap()]
+                .request
+                .trigger,
+            crate::stop::tree::TreeTrigger::ParentFinishedEarly
+        );
+    }
+}
+
+#[test]
+fn 首轮真实插话通知阻止派生启用并交sa1a() {
+    first_turn_input_veto(0);
+}
+#[test]
+fn 首轮真实插话全文阻止派生启用并交sa1a() {
+    first_turn_input_veto(1);
+}
+#[test]
+fn 首轮真实插话分页前缀阻止派生启用并交sa1a() {
+    first_turn_input_veto(2);
+}
+
+#[test]
+fn 首轮仅初始输入重复或全文回放仍可按需启用() {
+    for shared in [false, true] {
+        let (mut m, mut mock, initial) = setup_initial_input(shared);
+        for method in ["item/started", "item/completed"] {
+            notify(
+                &mut m,
+                method,
+                json!({"threadId":P,"turnId":T,"item":initial}),
+            );
+        }
+        assert!(!m.loop_guards[R].user_input_seen());
+        spawn(&mut m, &mut mock, P, T, "子", "派生", "子轮");
+        assert!(m.sa1b_active(R));
+        notify(
+            &mut m,
+            "turn/completed",
+            json!({"threadId":P,"turn":{"id":T,"status":"completed","itemsView":"full","items":[initial]}}),
+        );
+        assert!(matches!(m.claims[P].state, State::Converging { .. }));
+        assert!(!join(&m).automatic_control_revoked);
+        assert!(!m.loop_guards[R].user_input_seen());
+    }
+}
+
+fn setup_missing_budget() -> (
+    Machine,
+    SubagentMock,
+    crate::runs::budget::BudgetVerification,
+) {
+    let (mut m, mut mock) = setup();
+    m.convergences.test_budget = None;
+    notify(
+        &mut m,
+        "thread/goal/updated",
+        json!({"threadId":P,"goal":{"id":"预算goal","status":"active","tokenBudget":100000,"tokensUsed":10}}),
+    );
+    mock.register("预算子", Some(P), "v1", false, true);
+    let (started, completed) = SubagentMock::v1_spawn(P, T, "预算派生", "预算子", false);
+    let out = apply(&mut m, started);
+    let verification = out
+        .iter()
+        .find_map(|a| match a {
+            Action::Request(c) => match &c.operation {
+                crate::claim::Operation::GoalRead { inner, .. } => match inner.as_ref() {
+                    crate::claim::Operation::BudgetVerify { verification } => {
+                        Some(verification.clone())
+                    }
+                    _ => None,
+                },
+                crate::claim::Operation::BudgetVerify { verification } => {
+                    Some(verification.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("真实预算缺口登记并领取一次核实请求");
+    assert!(out.iter().any(|a| matches!(
+        a,
+        Action::Schedule {
+            kind: TimerKind::BudgetVerifyDeadline { .. },
+            delay_ms: 20_000,
+            ..
+        }
+    )));
+    apply(&mut m, completed);
+    apply(&mut m, mock.turn_started("预算子", "预算子轮"));
+    notify(&mut m, "thread/goal/cleared", json!({"threadId":"预算子"}));
+    assert_eq!(
+        m.reconcile_budget_admission(&verification.token),
+        BudgetAdmission::NeedsVerification
+    );
+    assert!(m.take_budget_verification(&verification.token).is_none());
+    (m, mock, verification)
+}
+
+#[test]
+fn 预算到期不经合并goal准入中断工作父轮() {
+    let (mut m, mut mock, verification) = setup_missing_budget();
+    complete(&mut m, &mut mock, "预算子", "预算子轮", "completed");
+    complete(&mut m, &mut mock, P, T, "completed");
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":"工作goal轮","status":"inProgress","items":[]}}),
+    );
+    assert_eq!(
+        m.reconcile_goal_target(&verification.token).as_deref(),
+        Some("工作goal轮")
+    );
+    discover(&mut m, true);
+    assert!(crate::relations::convergence::settled(
+        &m.convergence_facts(R).unwrap()
+    ));
+    for _ in 0..2 {
+        retry(&mut m);
+        discover(&mut m, true);
+    }
+    assert!(m.clock.mono_ms >= verification.deadline_mono_ms);
+    assert!(m.budget_verification_expired(&verification.token));
+    assert!(matches!(m.claims[P].state, State::Running { .. }));
+    assert_eq!(join(&m).terminal_reason, None);
+    assert!(m.tree_for_run(R).is_none());
+    assert!(m.convergences.progress[R].reading.is_none());
+    assert!(m.convergences.progress[R].operations.is_empty());
+    m.convergence_timer(
+        TimerKind::BudgetVerifyDeadline {
+            token: verification.token,
+        },
+        &mut vec![],
+    );
+    assert!(matches!(m.claims[P].state, State::Running { .. }));
+    assert!(!join(&m).automatic_control_revoked);
+}
+
+#[test]
+fn 工作期间预算到期在进入收敛时补触发不等活动子树或发现() {
+    for child_running in [true, false] {
+        let (mut m, mut mock, verification) = setup_missing_budget();
+        if !child_running {
+            complete(&mut m, &mut mock, "预算子", "预算子轮", "completed");
+        }
+        notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
+        assert!(matches!(m.claims[P].state, State::Running { .. }));
+        m.clock.mono_ms = verification.deadline_mono_ms;
+        m.convergence_timer(
+            TimerKind::BudgetVerifyDeadline {
+                token: verification.token.clone(),
+            },
+            &mut vec![],
+        );
+        assert_eq!(join(&m).terminal_reason, None);
+        assert!(m.tree_for_run(R).is_none());
+        assert!(m.take_budget_verification(&verification.token).is_none());
+        // 定时器已消费且不会重排；父轮稍后完成时，发现尚未覆盖，子轮也可以仍在工作。
+        m.clock.mono_ms += 123;
+        let facts = m.convergence_facts(R).unwrap();
+        assert_eq!(
+            crate::relations::convergence::settled(&facts),
+            !child_running
+        );
+        assert_ne!(facts.discovery_covered_epoch, Some(facts.work_epoch));
+        complete(&mut m, &mut mock, P, T, "completed");
+        assert_eq!(
+            join(&m).terminal_reason,
+            Some(TerminalReason::BudgetIncomplete)
+        );
+        assert!(m.clock.mono_ms < m.convergences.runs[R].deadline_mono_ms);
+        assert!(join(&m).automatic_control_revoked);
+        assert!(m.tree_for_run(R).is_some());
+        assert!(m.convergences.progress[R].reading.is_none());
+        assert!(m.convergences.progress[R].operations.is_empty());
+    }
+}
+
+#[test]
+fn 收敛等待未到预算原截止不终止且到期不依赖发现完成() {
+    let (mut m, mut mock, verification) = setup_missing_budget();
+    notify(&mut m, "thread/goal/cleared", json!({"threadId":P}));
+    m.clock.mono_ms = verification.deadline_mono_ms - 1;
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    assert!(m.convergences.progress[R].discovery.is_some());
+    assert_eq!(join(&m).terminal_reason, None);
+    assert!(m.tree_for_run(R).is_none());
+    m.clock.mono_ms = verification.deadline_mono_ms;
+    m.convergence_timer(
+        TimerKind::BudgetVerifyDeadline {
+            token: verification.token,
+        },
+        &mut vec![],
+    );
+    assert_eq!(
+        join(&m).terminal_reason,
+        Some(TerminalReason::BudgetIncomplete)
+    );
+    assert!(m.tree_for_run(R).is_some());
 }

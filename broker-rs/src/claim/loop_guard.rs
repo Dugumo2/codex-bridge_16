@@ -60,8 +60,10 @@ pub struct Guard {
     next_seq: u64,
     /// 已触发过；同一运行只刹一次。
     pub tripped: bool,
-    /// 本运行的非首轮里出现过真实用户输入；SA1b 启用前出现则不再启用，交回 SA1a 收尾。
+    /// 本运行出现过初始请求以外的真实用户输入；启用前出现则交回 SA1a 收尾。
     user_input: bool,
+    /// 发初始请求前登记，上游回显后只豁免已确认自有首轮中的该条输入。
+    pub(crate) initial_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +108,7 @@ impl Guard {
             next_seq: 0,
             tripped: false,
             user_input: false,
+            initial_client_id: None,
         }
     }
 
@@ -131,9 +134,11 @@ impl Guard {
         let next_seq = self.next_seq;
         let safeguards = self.safeguards.take();
         let user_input = self.user_input;
+        let initial_client_id = self.initial_client_id.take();
         *self = Self::new(&self.thread);
         self.safeguards = safeguards;
         self.user_input = user_input;
+        self.initial_client_id = initial_client_id;
         self.auto_turns = auto_turns;
         self.next_seq = next_seq;
     }
@@ -393,13 +398,10 @@ impl Machine {
         turn: &str,
         activity: Activity,
     ) {
-        let original_user_turn = self.runs.runs.get(run).is_some_and(|r| {
-            r.start_confirmation.turn_id.as_deref() == Some(turn) && r.start_confirmation.confirmed
-        });
         let Some(guard) = self.loop_guards.get_mut(run).filter(|g| g.thread == thread) else {
             return;
         };
-        if activity.user_input && !original_user_turn {
+        if activity.user_input {
             guard.user_input = true;
             if let Some(safeguards) = &mut guard.safeguards {
                 safeguards.revoked = true;
@@ -562,6 +564,13 @@ impl Machine {
             return;
         }
         for (run, turn, activity) in evidence {
+            // 分页只交回已校验的活动证据；首轮也记录插话，但旧刹车仍只处理自动候选。
+            if let (Some(activity), Some(thread)) = (
+                activity,
+                self.loop_guards.get(&run).map(|g| g.thread.clone()),
+            ) {
+                self.guard_activity(&run, &thread, &turn, activity);
+            }
             let Some(guard) = self.loop_guards.get_mut(&run) else {
                 continue;
             };

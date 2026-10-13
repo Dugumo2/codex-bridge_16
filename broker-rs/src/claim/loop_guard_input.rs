@@ -293,6 +293,10 @@ impl Machine {
         turn: &str,
         item: &Value,
     ) -> InputSource {
+        if initial_input_matches(self.initial_input_id(run, thread, turn), item) {
+            // 与可信汇总共用“已核实、非插话”的分类；这里只豁免原请求的精确 clientId。
+            return InputSource::TrustedReconcile;
+        }
         let Some(runtime) = self.convergences.runs.get(run) else {
             return crate::results::classify_untrusted_input(item);
         };
@@ -302,15 +306,31 @@ impl Machine {
         classify_registered(&guard.trusted, &runtime.token, thread, turn, item)
     }
 
+    fn initial_input_id(&self, run: &str, thread: &str, turn: &str) -> Option<&str> {
+        let record = self.runs.runs.get(run)?;
+        let guard = self.loop_guards.get(run)?;
+        (guard.thread == thread
+            && record.start_confirmation.confirmed
+            && record.start_confirmation.owned == Some(true)
+            && record.start_confirmation.turn_id.as_deref() == Some(turn))
+        .then_some(guard.initial_client_id.as_deref())
+        .flatten()
+    }
+
     /// B 借用 Runs 前取得快照，每次接受页面前重新取得，不跨异步等待保存。
     pub fn run_input_classifier(&self, run: &str, thread: &str, turn: &str) -> RunInputClassifier {
+        let initial_client_id = self.initial_input_id(run, thread, turn).map(str::to_owned);
         let Some(runtime) = self.convergences.runs.get(run) else {
-            return RunInputClassifier::default();
+            return RunInputClassifier {
+                initial_client_id,
+                ..Default::default()
+            };
         };
         let Some(guard) = self.safeguards(&runtime.token) else {
             return RunInputClassifier::default();
         };
         RunInputClassifier {
+            initial_client_id,
             context: Some((runtime.token.clone(), thread.into(), turn.into())),
             registrations: guard.trusted.clone(),
         }
@@ -344,15 +364,24 @@ fn classify_registered(
 
 #[derive(Debug, Clone, Default)]
 pub struct RunInputClassifier {
+    initial_client_id: Option<String>,
     context: Option<(ConvergeToken, String, String)>,
     registrations: Vec<TrustedInputRegistration>,
 }
 impl RunInputClassifier {
     pub fn classify(&self, item: &Value) -> InputSource {
+        if initial_input_matches(self.initial_client_id.as_deref(), item) {
+            return InputSource::TrustedReconcile;
+        }
         if let Some((token, thread, turn)) = &self.context {
             classify_registered(&self.registrations, token, thread, turn, item)
         } else {
             crate::results::classify_untrusted_input(item)
         }
     }
+}
+
+fn initial_input_matches(id: Option<&str>, item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("userMessage")
+        && id.is_some_and(|id| item.get("clientId").and_then(Value::as_str) == Some(id))
 }

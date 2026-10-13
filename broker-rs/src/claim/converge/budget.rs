@@ -4,6 +4,25 @@ use crate::claim::{Operation, RequestContext};
 use serde_json::{json, Value};
 
 impl Machine {
+    /// 预算缺口只在父轮之间的收敛等待中终止；所有入口共用核实任务的原截止。
+    pub(super) fn convergence_budget_timeout(
+        &mut self,
+        token: &ConvergeToken,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        if !self.convergence_token_current(token)
+            || !matches!(
+                self.claims.get(&token.claim.thread_id).map(|c| &c.state),
+                Some(State::Converging { .. })
+            )
+            || !self.budget_verification_expired(token)
+        {
+            return false;
+        }
+        self.convergence_fail(&token.run_id, TerminalReason::BudgetIncomplete, actions);
+        true
+    }
+
     pub(crate) fn initial_convergence_budget(&self, thread: &str) -> Option<RunBudget> {
         let goal = self.convergences.goal_evidence.get(thread)?;
         let limit = goal.get("tokenBudget")?.as_u64()?;
@@ -42,14 +61,21 @@ impl Machine {
         if self.sa1b_active(&run) {
             return true;
         }
+        // 私有首轮的 started 可早于启动回包；必须已有自有轮证明，不能仅凭暂存轮号启用。
+        let confirmed_starting = matches!(
+            &claim.state,
+            State::Starting { turn_id: Some(turn), settling: false, .. }
+                if claim.owned_turns.contains(turn)
+        );
         if claim.joined()
             || claim.settling()
             || claim.precheck()
             || claim.owner_gone
-            || !matches!(
-                claim.state,
-                State::Running { .. } | State::AwaitingContinuation { .. }
-            )
+            || !(confirmed_starting
+                || matches!(
+                    claim.state,
+                    State::Running { .. } | State::AwaitingContinuation { .. }
+                ))
             || self.convergences.review_runs.contains(&run)
             || self.stop_busy(thread)
             || self.tree_for_run(&run).is_some()

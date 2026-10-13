@@ -233,7 +233,7 @@ impl Machine {
         self.relations
             .contexts
             .get(run_id)
-            .is_some_and(|c| !c.in_flight_spawns.is_empty())
+            .is_some_and(|c| c.in_flight_spawns.iter().any(|key| self.op_confirmed(key)))
             || self.relations.operations.values().any(|op| {
                 op.run_id == run_id
                     && matches!(
@@ -244,6 +244,16 @@ impl Machine {
                             | EvidenceKind::V1ResumeAgent
                             | EvidenceKind::V2Interacted
                     )
+                    // settling 可能暂存外部派生的 run_id；只有归属已定案且结果
+                    // 不是 Unproven 的操作才是本运行的启用证据。
+                    && (self.op_confirmed(&op.key)
+                        // 未接通 SA1b 的旧跟进路径用 Unproven 表示“不证明子轮”；
+                        // 保留其只读查询语义，但仍重新核实父轮确属本运行。
+                        || (!self.convergence_enabled()
+                            && matches!(
+                                self.parent_run(&op.key.parent_thread_id, &op.key.parent_turn_id),
+                                facts::ParentRun::Own { run, .. } if run == run_id
+                            )))
                     && !matches!(
                         op.outcome,
                         EvidenceOutcome::Failed | EvidenceOutcome::Revoked

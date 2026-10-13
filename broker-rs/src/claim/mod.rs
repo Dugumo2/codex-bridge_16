@@ -1489,6 +1489,31 @@ impl Machine {
         let stream_id = claim.stream_id;
         let claim_id = claim.claim_id;
         let run_id = claim.run_id.clone();
+        let mut request = request;
+        if self.convergence_enabled() && request.method == "turn/start" {
+            if let Some(run) = &run_id {
+                // 初始请求也登记输入身份；只用于被动识别首轮插话，不授予 SA1b 或共享控制权。
+                let guard = self
+                    .loop_guards
+                    .entry(run.clone())
+                    .or_insert_with(|| loop_guard::Guard::new(thread_id));
+                if let Some(params) = request.params.as_mut().and_then(Value::as_object_mut) {
+                    if params.get("clientUserMessageId").is_none_or(Value::is_null) {
+                        params.insert(
+                            "clientUserMessageId".into(),
+                            json!(format!(
+                                "cxb-initial-{}-{}-{}",
+                                self.runs.epoch, self.clock.entropy, claim_id
+                            )),
+                        );
+                    }
+                    guard.initial_client_id = params["clientUserMessageId"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                }
+            }
+        }
         if let (Some(run), Some(params)) = (&run_id, &request.params) {
             self.run_save_execution_config(run, params, actions);
         }
