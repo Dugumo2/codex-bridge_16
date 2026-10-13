@@ -948,3 +948,37 @@ test("上游诊断 run 无报错：只有进展版本时 stdout 不增字段、s
   for (const key of ["upstreamError", "diagnosticRevision", "lastProgressAt", "error"]) expect(value).not.toHaveProperty(key);
   expect(unit.output().stderr).toBe("");
 });
+
+test("上游诊断 run 活动轮：默认即时提示，willRetry:false 仍等待真实收尾", async () => {
+  const unit = unitExecution(["run", "中文"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => method === "broker/threads/watch"
+    ? { run: runResult({ state: "running", status: null }) } : original(method, params);
+  let settled = false;
+  const work = handler()(unit.ctx);
+  void work.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await until(() => unit.fake.calls.some(call => call.method === "broker/threads/watch"));
+    const emit = (revision: number, willRetry: boolean) => unit.fake.emit("broker/run/updated", {
+      runId: "run-test", threadId: "thread-test", diagnosticRevision: revision,
+      upstreamError: upstreamError({ willRetry }), lastProgressAt: null, state: "running", status: null,
+    });
+    emit(1, true);
+    await unit.out.flush();
+    expect(unit.output().stderr).toContain("Codex 正在重试");
+    expect(unit.output().stdout).toBe("");
+    expect(settled).toBe(false);
+    emit(2, false);
+    await unit.out.flush();
+    expect(unit.output().stderr).toContain("上游已报告终止错误，等待轮次结束确认");
+    expect(settled).toBe(false);
+    expect(unit.fake.calls.some(call => call.method === "broker/threads/stop")).toBe(false);
+    unit.fake.emit("broker/run/ended", { run: runResult({ upstreamError: upstreamError({ willRetry: false }), diagnosticRevision: 2 }) });
+    expect(await bounded(work, 3000)).toBe(0);
+    await unit.out.flush();
+    expect(unit.output().stdout).toBe("中文结果");
+  } finally {
+    if (!settled) unit.fake.emit("broker/run/ended", { run: runResult() });
+    await bounded(work.catch(() => undefined), 3000);
+  }
+});

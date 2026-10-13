@@ -51,6 +51,9 @@ test("分组键逐项一致：只归一整段重连提示，保留其他 n/m 与
   for (const patch of [{ threadId: "另线程" }, { turnId: "另轮" }, { category: "unknown" as const }, { httpStatusCode: 403 },
     { codexErrorInfo: "unauthorized" }, { additionalDetails: "payload 1/5" }, { message: "Reconnecting...  1/5" }, { message: "Reconnecting... 1/5 failed" }]) expect(upstreamGroupKey({ ...error, ...patch })).not.toBe(key);
   expect(upstreamGroupKey({ ...error, additionalDetails: "实际 1/5", message: "忽略" })).not.toBe(upstreamGroupKey({ ...error, additionalDetails: "实际 2/5" }));
+  // A 路显式采用 JS trim 的空白集合：移除 BOM，但保留 U+0085，跨语言分组才一致。
+  expect(upstreamGroupKey({ ...error, additionalDetails: "\uFEFF正文\uFEFF" })).toBe(upstreamGroupKey({ ...error, additionalDetails: "正文" }));
+  expect(upstreamGroupKey({ ...error, additionalDetails: "\u0085正文\u0085" })).not.toBe(upstreamGroupKey({ ...error, additionalDetails: "正文" }));
 });
 
 function observer(initial: string | null = "run-test") {
