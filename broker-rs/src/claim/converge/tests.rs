@@ -1630,3 +1630,35 @@ fn 无子代理时不建协调器_detach后再派生用当前授权代际启用(
         "收敛继续推进到读取子结果"
     );
 }
+#[test]
+fn 按需启用时只发布运行中且未计时_不排期也不公布收敛期限() {
+    let (mut m, mut mock) = setup();
+    mock.register("子", Some(P), "v1", false, true);
+    let (a, b) = SubagentMock::v1_spawn(P, T, "派生", "子", false);
+    let mut out = apply(&mut m, a);
+    out.extend(apply(&mut m, b));
+    assert!(m.sa1b_active(R));
+    assert_eq!(join(&m).phase, JoinPhase::Running);
+    assert_eq!(join(&m).deadline_at, 0);
+    assert_eq!(m.convergences.runs[R].deadline_mono_ms, u64::MAX);
+    assert!(!out.iter().any(|a| matches!(
+        a,
+        Action::Schedule {
+            kind: TimerKind::ConvergeDeadline { .. },
+            ..
+        }
+    )));
+    // 真实实测发现：启用中途曾广播「等待子代理＋期限」再改回运行中，CLI 显示了不存在的期限。
+    for action in &out {
+        if let Action::Send { message, .. } = action {
+            if message["method"] == "broker/run/convergenceChanged" {
+                assert_eq!(message["params"]["subagentJoin"]["phase"], "running");
+                assert_eq!(message["params"]["subagentJoin"]["deadlineAt"], 0);
+            }
+        }
+    }
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    assert!(join(&m).deadline_at > 0, "首次收敛门禁才开始计时");
+    assert!(m.convergences.runs[R].deadline_mono_ms < u64::MAX);
+}

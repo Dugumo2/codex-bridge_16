@@ -107,10 +107,12 @@ impl Machine {
             .convergence_config
             .clone()
             .unwrap_or_default();
+        // 新建即「已启用、尚未收敛」：总期限从首次收敛门禁才开始（再次调用本函数时排期），
+        // 不发布任何不存在的期限或等待阶段。
         let runtime = ConvergeRuntime {
             token: token.clone(),
             started_mono_ms: self.clock.mono_ms,
-            deadline_mono_ms: self.clock.mono_ms.saturating_add(config.timeout_ms),
+            deadline_mono_ms: u64::MAX,
             automatic_control_revoked: false,
             discovery_retry: 0,
         };
@@ -124,7 +126,7 @@ impl Machine {
         record.convergence_config = Some(config.clone());
         // 计数和预算由 C 的运行初始化共同建立。
         record.subagent_join = Some(SubagentJoin {
-            phase: JoinPhase::WaitingSubtree,
+            phase: JoinPhase::Running,
             wakeups_started: 0,
             wakeup_attempts: 0,
             start_retries_used: 0,
@@ -132,18 +134,13 @@ impl Machine {
             delivered_epoch: 0,
             reconciled_epoch: 0,
             last_reconcile_turn_id: None,
-            deadline_at: self.clock.now_ms.saturating_add(config.timeout_ms),
+            deadline_at: 0,
             terminal_reason: None,
             result_coverage: None,
             automatic_control_revoked: false,
         });
         let budget = self.initial_convergence_budget(thread);
         self.initialize_run_safeguards(&token, budget, actions);
-        actions.push(Action::Schedule {
-            token: token.claim.clone(),
-            kind: TimerKind::ConvergeDeadline { token },
-            delay_ms: config.timeout_ms,
-        });
         self.convergence_changed(&run, actions);
         Some(run)
     }

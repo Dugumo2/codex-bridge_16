@@ -61,37 +61,10 @@ impl Machine {
         {
             return false;
         }
-        let before = actions.len();
+        // 先建立可信身份和计数；总期限从首次收敛门禁开始。
         if self.convergence_begin(thread, actions).is_none() {
             return false;
         }
-        // 先建立可信身份和计数；总期限从首次收敛门禁开始。
-        self.convergences
-            .runs
-            .get_mut(&run)
-            .expect("刚建立的协调器")
-            .deadline_mono_ms = u64::MAX;
-        let kept: Vec<_> = actions
-            .drain(before..)
-            .filter(|a| {
-                !matches!(
-                    a,
-                    Action::Schedule {
-                        kind: TimerKind::ConvergeDeadline { .. },
-                        ..
-                    }
-                )
-            })
-            .collect();
-        actions.extend(kept);
-        let join = self
-            .runs
-            .runs
-            .get_mut(&run)
-            .and_then(|r| r.subagent_join.as_mut())
-            .expect("启用时建立摘要");
-        join.phase = JoinPhase::Running;
-        join.deadline_at = 0;
         // 启用前开始的自有父轮按开始顺序登记：原始用户轮在前，正在跑的 goal 自动轮在后。
         let token = self.convergences.runs[&run].token.clone();
         let record = &self.runs.runs[&run];
