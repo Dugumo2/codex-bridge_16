@@ -11,7 +11,7 @@ import { NO_RESPONSE, type AnyServerRequestHandler } from "../rpc";
 import { askOverrides } from "./ask-instructions";
 import { absorbedRefusal, buildContinuePrompt, continueRefusal, localContinueRefusal, resolveRunChain } from "./continue-prompt";
 import { ASK_FEATURE_KEY, CxbError, EXIT, rpcFailure, type BrokerConnection, type BrokerRpc, type ExitCode,
-  type ResumeOverrides, type RunResult, type ServerRequestDeps } from "./contracts";
+  type ResumeOverrides, type RunPolicy, type RunResult, type ServerRequestDeps } from "./contracts";
 import { readRunRecord } from "./ledger";
 import { lifecyclePendingError } from "./lifecycle";
 import { resolveThreadViaBroker } from "./thread-ref";
@@ -400,11 +400,16 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     void connectionLost.catch(() => {});
     disposers.push(rpc.onClose(() => disconnected(new CxbError("BROKER_UNAVAILABLE", "等待续跑定案时 broker 连接断开", { retryable: true }))));
     const startMethod = plan.command === "review" ? "review/start" : "turn/start";
+    const cxbRunPolicy: RunPolicy = {
+      stallTimeoutMs: (options["stall-timeout"] ?? 600) * 1000,
+      upstreamErrorPolicy: options["upstream-error-policy"] === "stop-access" ? "stopAccess" : "observe",
+    };
     const startParams = plan.command === "review"
-      ? { threadId, target: plan.review!.target, delivery: "inline", cxbConvergence: { timeoutMs: (options["converge-timeout"] ?? 3600) * 1000 } }
+      ? { threadId, target: plan.review!.target, delivery: "inline", cxbConvergence: { timeoutMs: (options["converge-timeout"] ?? 3600) * 1000 }, cxbRunPolicy }
       : { threadId, input: [{ type: "text", text: continued ? continued.prompt : plan.prompt!, text_elements: [] }], clientUserMessageId: randomUUID(),
         sandboxPolicy: sandboxPolicyFor(plan.sandbox), ...(model ? { model } : {}), ...(reasoning ? { effort: reasoning } : {}), ...approval,
         cxbConvergence: { timeoutMs: (options["converge-timeout"] ?? 3600) * 1000 },
+        cxbRunPolicy,
         // 条件请求：broker 在开工那一刻核实原运行仍可续，不满足就不开工（详细设计 2.3 节「续跑的条件请求」）。
         ...(continued ? { cxbContinue: { fromRunId: continued.from.runId } } : {}) };
     type StartReply = { runId?: string; shortId?: string; reviewThreadId?: string; absorbedBy?: unknown };

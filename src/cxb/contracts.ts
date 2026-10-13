@@ -261,8 +261,39 @@ export interface LoopGuardReport {
   pause?: "pending" | "paused" | "superseded" | "failed";
 }
 
+/** 开轮策略使用毫秒；缺省字段表示旧客户端未启用策略。 */
+export interface RunPolicy {
+  stallTimeoutMs: number;
+  upstreamErrorPolicy: "observe" | "stopAccess";
+}
+export type StallPhase = "verifying" | "resumed" | "stopping" | "deferred";
+export type StallVerify = "progressed" | "turnEnded" | "inProgress" | "absent" | "unknown";
+export interface StallReport {
+  timeoutMs: number; phase: StallPhase; expiredAt: number; idleMs: number;
+  lastProgressAt: number | null; verify: StallVerify | null; expiries: number;
+}
+export type StopRpcOutcome = "ok" | "error" | "timeout";
+export interface StopRpcIssue {
+  method: string; kind: "error" | "timeout"; at: number; message: string;
+}
+/** 根停止的阶段时间；确认时间对应整个停止范围。 */
+export interface StopDiagnostics {
+  reason: NonNullable<RunResult["interruptReason"]>; startedAt: number;
+  goalStartedAt: number | null; goalSettledAt: number | null;
+  interruptSent: boolean; interruptSentAt: number | null; interruptReply: StopRpcOutcome | null;
+  interruptRepliedAt: number | null; turnEndedAt: number | null;
+  unconfirmedAt: number | null; confirmedAt: number | null; rpcIssues: StopRpcIssue[];
+}
+export interface ChildUpstreamError {
+  threadId: string; parentThreadId: string; upstreamError: UpstreamError;
+}
+
 export interface RunResult extends ConvergenceSummary {
   upstreamError?: UpstreamError;
+  runPolicy?: RunPolicy;
+  stall?: StallReport;
+  stopDiagnostics?: StopDiagnostics;
+  childUpstreamErrors?: ChildUpstreamError[];
   diagnosticRevision?: number;
   lastProgressAt?: number | null;
   convergenceConfig?: ConvergenceConfig;
@@ -475,6 +506,8 @@ export interface BackgroundCleanup {
   remaining: string[]; lastVerifiedAt: number | null; failureReason: string | null;
 }
 export interface StopReply {
+  /** 单线程停止与整树停止共用的根停止诊断；未发起时为 null。 */
+  stopDiagnostics?: StopDiagnostics | null;
   cleanupState?: "completed" | "released";
   backgroundCleanup?: BackgroundCleanup;
   actionApplied?: boolean;
@@ -540,7 +573,8 @@ export interface InboxWaitReply {
   run?: RunResult;
 }
 
-/** 运行终态 → 退出码：completed 0；interrupted 4（interruptReason goalLoop 为 9）；failed 7；goalBlocked 9；
+/** 新停止原因优先认真实 failed（7），无进展与停止未确认为 3，访问报错即停为 4。
+ *  旧运行终态 → 退出码：completed 0；interrupted 4（interruptReason goalLoop 为 9）；failed 7；goalBlocked 9；
  *  loopGuard 存在（含共享模式 pauseGoal 而 status 为 completed）一律 9。 */
 export type ExitCodeForRun = (run: RunResult) => ExitCode;
 

@@ -14,7 +14,8 @@ export interface UserConfig {
 
 export const CONFIG_DEFAULTS: Readonly<Record<ConfigKey, string | number | boolean | null>> = Object.freeze({
   model: null, reasoning: null, sandbox: config.defaultSandbox, approval: config.defaultApprovalPolicy,
-  timeout: config.defaultTimeout, "converge-timeout": 3600, memory: false, server: "auto", "broker-idle-timeout": 300,
+  timeout: config.defaultTimeout, "converge-timeout": 3600, "stall-timeout": 600, "upstream-error-policy": "observe",
+  memory: false, server: "auto", "broker-idle-timeout": 300,
 });
 
 function invalid(path: string): CxbError {
@@ -86,6 +87,8 @@ export function applyUserConfig(parsed: ParsedCommand, stored: UserConfig): void
       case "approval": parsed.globals.approval = value as typeof parsed.globals.approval; break;
       case "timeout": parsed.globals.timeout = value as number; break;
       case "converge-timeout": if (parsed.command === "run" || parsed.command === "review") parsed.options["converge-timeout"] = value as number; break;
+      case "stall-timeout": if (parsed.command === "run" || parsed.command === "review") parsed.options["stall-timeout"] = value as number; break;
+      case "upstream-error-policy": if (parsed.command === "run" || parsed.command === "review") parsed.options["upstream-error-policy"] = value as typeof parsed.options["upstream-error-policy"]; break;
       case "memory": if (parsed.command === "run") parsed.options.memory = value as boolean; break;
     }
   }

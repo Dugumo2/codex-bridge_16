@@ -20,6 +20,12 @@ export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, sig
 }
 
 export const exitCodeForRun: ExitCodeForRun = (run) => {
+  if (run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError") {
+    if (run.status === "failed") return EXIT.CODEX_FAILED;
+    if (run.stopOutcome === "unconfirmed") return EXIT.TIMEOUT;
+    if (run.interruptReason === "stallTimeout") return EXIT.TIMEOUT;
+    if (run.interruptReason === "upstreamAccessError") return EXIT.INTERRUPTED;
+  }
   if (run.subagentJoin) {
     if (run.state === "lost") return EXIT.INTERRUPTED;
     if (run.status === "failed") return EXIT.CODEX_FAILED;

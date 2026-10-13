@@ -70,6 +70,7 @@ function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
       goalInactive: "目标禁止自动续轮",
       rootNoDirectInput: "根线程不能直接输入",
       abandoned: "已放弃子树清理责任",
+      stallTimeout: "无进展超时", upstreamAccessError: "上游访问报错即停",
       clientDisconnected: "客户端断开", stop: "主动停止", brokerLost: "broker 失联", goalLoop: "空转刹车", subagentsUnfinished: "子代理未完成" };
     ctx.out.notice(`已中断（${run.interruptReason ? reasons[run.interruptReason] : "服务器中断"}），可继续：cxb run --resume ${id} --continue`);
   }

@@ -11,6 +11,7 @@ const reasons: Record<TerminalReason, string> = {
   discoveryIncomplete: "子树发现不完整", ownershipConflict: "轮次归属冲突", wakeUnknown: "汇总启动结果不明",
   wakeFailed: "汇总启动失败", goalPaused: "目标已暂停", goalBlocked: "目标受阻", goalBudgetLimited: "目标预算受限",
   goalUsageLimited: "目标用量受限", rootNoDirectInput: "根线程不能直接输入", abandoned: "已放弃清理责任", brokerShutdown: "broker 关闭或失联",
+  stallTimeout: "无进展超时", upstreamAccessError: "上游访问报错即停",
 };
 
 /** 协调状态是运行的附加说明，不另造生命周期或停止成功结论。 */

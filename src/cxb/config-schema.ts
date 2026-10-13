@@ -47,6 +47,12 @@ function seconds(max: number): ConfigKeySpec {
     Number, (value) => /^\d+$/.test(value));
 }
 
+function secondsOrZero(max: number): ConfigKeySpec {
+  return spec(`0–${max} 秒整数（0 关闭）`,
+    (value) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= max,
+    Number, (value) => /^\d+$/.test(value));
+}
+
 /** cxb 的持久配置白名单；迁移与后续 config 命令共用。秒数在存储时不转为毫秒。 */
 export const CONFIG_SCHEMA = Object.freeze({
   model: spec("非空模型名（字母、数字及 . _ - / : [ ]）",
@@ -56,6 +62,8 @@ export const CONFIG_SCHEMA = Object.freeze({
   approval: enumeration(config.approvalModes),
   timeout: seconds(config.maxTimeoutSeconds),
   "converge-timeout": seconds(Math.floor(Number.MAX_SAFE_INTEGER / 1000)),
+  "stall-timeout": secondsOrZero(Math.floor(Number.MAX_SAFE_INTEGER / 1000)),
+  "upstream-error-policy": enumeration(["observe", "stop-access"]),
   memory: spec("true 或 false", (value) => typeof value === "boolean",
     (value) => value === "true", (value) => value === "true" || value === "false"),
   server: enumeration(SERVER_PREFERENCES),

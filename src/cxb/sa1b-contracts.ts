@@ -4,13 +4,15 @@ export type JoinPhase = "running" | "waitingSubtree" | "preparingReconcile" | "r
 export type TerminalReason = "parentFailed" | "parentInterrupted" | "userStop" | "ownerGone"
   | "budgetExhausted" | "budgetIncomplete" | "convergeDeadline" | "wakeLimit" | "autoTurnLimit" | "noAction"
   | "discoveryIncomplete" | "ownershipConflict" | "wakeUnknown" | "wakeFailed" | "goalPaused" | "goalBlocked"
-  | "goalBudgetLimited" | "goalUsageLimited" | "rootNoDirectInput" | "abandoned" | "brokerShutdown";
+  | "goalBudgetLimited" | "goalUsageLimited" | "rootNoDirectInput" | "abandoned" | "brokerShutdown"
+  | "stallTimeout" | "upstreamAccessError";
 export type Sa1bInterruptReason = "budgetExhausted" | "budgetIncomplete" | "convergeDeadline" | "wakeLimit"
   | "autoTurnLimit" | "discoveryIncomplete" | "ownershipConflict" | "wakeUnknown" | "wakeFailed"
-  | "goalInactive" | "rootNoDirectInput" | "abandoned";
+  | "goalInactive" | "rootNoDirectInput" | "abandoned" | "stallTimeout" | "upstreamAccessError";
 export type Sa1bTreeTrigger = "budgetExhausted" | "budgetIncomplete" | "convergeDeadline" | "wakeLimit"
   | "autoTurnLimit" | "discoveryIncomplete" | "ownershipConflict" | "wakeUnknown" | "wakeFailed"
-  | "goalPaused" | "goalBlocked" | "goalBudgetLimited" | "goalUsageLimited" | "rootNoDirectInput";
+  | "goalPaused" | "goalBlocked" | "goalBudgetLimited" | "goalUsageLimited" | "rootNoDirectInput"
+  | "stallTimeout" | "upstreamAccessError";
 
 export interface ActivityKey { threadId: string; activitySeq: number; turnId?: string }
 export interface ResultLocator { threadId: string; turnId?: string; resultVersion: number }

@@ -14,16 +14,16 @@ test("显示全部及单键 JSON 形状，不连接 broker", async () => {
   const all = await h.invoke(["config", "--json"]);
   expect(all.code).toBe(0);
   expect(JSON.parse(all.stdout)).toEqual({ ok: true, command: "config", path: join(h.home, "config.json"), values: {
-    model: { value: null, source: "default" }, reasoning: { value: null, source: "default" }, sandbox: { value: "workspace-write", source: "default" }, approval: { value: "never", source: "default" }, timeout: { value: 3600, source: "default" }, "converge-timeout": { value: 3600, source: "default" }, memory: { value: false, source: "default" }, server: { value: "auto", source: "default" }, "broker-idle-timeout": { value: 300, source: "default" },
+    model: { value: null, source: "default" }, reasoning: { value: null, source: "default" }, sandbox: { value: "workspace-write", source: "default" }, approval: { value: "never", source: "default" }, timeout: { value: 3600, source: "default" }, "converge-timeout": { value: 3600, source: "default" }, "stall-timeout": { value: 600, source: "default" }, "upstream-error-policy": { value: "observe", source: "default" }, memory: { value: false, source: "default" }, server: { value: "auto", source: "default" }, "broker-idle-timeout": { value: 300, source: "default" },
   }, unknownKeys: [] });
   expect(JSON.parse((await h.invoke(["config", "timeout", "--json"])).stdout)).toEqual({ ok: true, command: "config", key: "timeout", value: 3600, source: "default" });
   expect((await h.invoke(["config"])).stdout).toContain("配置文件");
 });
 
-const valid = { model: "model-a", reasoning: "high", sandbox: "read-only", approval: "auto", timeout: "7", memory: "true", server: "private", "converge-timeout": "81", "broker-idle-timeout": "42" };
+const valid = { model: "model-a", reasoning: "high", sandbox: "read-only", approval: "auto", timeout: "7", memory: "true", server: "private", "converge-timeout": "81", "stall-timeout": "0", "upstream-error-policy": "stop-access", "broker-idle-timeout": "42" };
 for (const key of CONFIG_KEYS) test(`设置、读取、单键清除及生效提示：${key}`, async () => {
   writeUserConfig(h.home, { future: { x: 1 } });
-  const value = ["timeout", "converge-timeout", "broker-idle-timeout"].includes(key) ? Number(valid[key]) : key === "memory" ? true : valid[key];
+  const value = ["timeout", "converge-timeout", "stall-timeout", "broker-idle-timeout"].includes(key) ? Number(valid[key]) : key === "memory" ? true : valid[key];
   const set = await h.invoke(["config", key, valid[key], "--json", "-v"]);
   expect(set.code).toBe(0);
   expect(JSON.parse(set.stdout)).toEqual({ ok: true, command: "config", action: "set", key, value, appliesTo: ["server", "broker-idle-timeout"].includes(key) ? "brokerRestart" : "newRuns" });
