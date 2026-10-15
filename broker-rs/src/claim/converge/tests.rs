@@ -2083,3 +2083,27 @@ fn 收敛等待未到预算原截止不终止且到期不依赖发现完成() {
     );
     assert!(m.tree_for_run(R).is_some());
 }
+#[test]
+fn 无进展到期_收敛中父轮已结束按absent走收敛失败且不无限重排() {
+    let (mut m, mut mock) = setup();
+    spawn(&mut m, &mut mock, P, T, "C1", "spawn-c1", "c1-t1");
+    complete(&mut m, &mut mock, P, T, "completed");
+    assert!(matches!(m.claims[P].state, State::Converging { .. }));
+    m.runs.runs.get_mut(R).unwrap().run_policy = Some(crate::runs::RunPolicy {
+        stall_timeout_ms: 3_000,
+        upstream_error_policy: crate::runs::UpstreamErrorPolicy::Observe,
+    });
+    m.stall_arm(R, &mut vec![]);
+    m.clock.mono_ms += 3_000;
+    let generation = m.runs.stall_states[R].generation;
+    let mut actions = vec![];
+    m.stall_timer(R, generation, &mut actions);
+    // 历史 currentTurnId 是已完成父轮：不读取、直接 absent 并停止，不重排。
+    assert!(!actions
+        .iter()
+        .any(|a| matches!(a, Action::Request(c) if c.method == "thread/turns/list")));
+    let report = m.runs.runs[R].stall.clone().unwrap();
+    assert_eq!(report.verify, Some(crate::runs::StallVerify::Absent));
+    assert_eq!(report.phase, crate::runs::StallPhase::Stopping);
+    assert_eq!(join(&m).terminal_reason, Some(TerminalReason::StallTimeout));
+}

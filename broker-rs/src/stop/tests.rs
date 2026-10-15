@@ -168,7 +168,13 @@ fn 停止回包携带空或完整的根停止诊断() {
         });
         let actions = apply(&mut m, deadline);
         let result = outcome(&actions, 2);
-        assert_eq!(result["stopDiagnostics"], json!(diagnostics));
+        // 回包与运行记录是同一份诊断；新停止由 C1 建立，已有诊断保留首次原因与开始时间。
+        let current = m.runs.runs[&run].stop_diagnostics.clone().unwrap();
+        assert_eq!(result["stopDiagnostics"], json!(current));
+        let (reason, started_at) =
+            diagnostics.map_or((InterruptReason::Stop, 0), |d| (d.reason, d.started_at));
+        assert_eq!((current.reason, current.started_at), (reason, started_at));
+        assert!(current.unconfirmed_at.is_some());
         assert_eq!(result["threadId"], "线程");
         assert_eq!(result["stopOutcome"], "unconfirmed");
     }
