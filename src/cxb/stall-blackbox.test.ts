@@ -216,7 +216,13 @@ scenario("S12", "Converging 的父轮已结束，不读历史父轮并以 absent
   await h.sa1b("spawn", { parentThreadId: "root", parentTurnId: turnId, childThreadId: "silent-child" });
   await h.control("finish");
   await h.until(async () => (await h.record()).subagentJoin?.phase === "waitingSubtree", 5000, "父完成后未进入 Converging");
-  const { record } = await stallResult(h, proc, 3, "absent", 35_000);
+  const result = await done(proc, 35_000); expect(result.code).toBe(3);
+  const final = json(result), record = await h.persisted();
+  expect(final.status).toBe("interrupted"); expect(record.interruptReason).toBe("stallTimeout"); expect(record.stall.verify).toBe("absent");
+  expect(final.stall).toEqual(record.stall); expect(final.stopDiagnostics).toEqual(record.stopDiagnostics);
+  // 无活动父轮会在同一输入中直接进入 stopping；根已结束也不要求给根再发 interrupt。
+  expect(snapshots(h).some((event) => event.params.stall?.phase === "stopping" && event.params.stall?.verify === "absent")).toBe(true);
+  exact(result, "[cxb] 无进展核实结束（没有进行中的父轮），正在停止本次运行。");
   expect(record.childrenStop).toBeDefined(); expect(record.subagentJoin.terminalReason).toBe("stallTimeout");
   expect((await h.state()).threads["silent-child"].turns.at(-1).status).toBe("interrupted");
 }, 50_000);
