@@ -127,6 +127,19 @@ test("完整诊断中的null和空数组清除旧字段，终态独立于诊断�
   expect(run).not.toHaveProperty("stall"); expect(run).not.toHaveProperty("upstreamError"); expect(run.childUpstreamErrors).toEqual([]);
 });
 
+test("包含多项新诊断但缺少原因的通知仍是部分字段，不清除已有停止原因", () => {
+  const o = observer();
+  try {
+    o.observed.apply(runResult({ state: "stopping", status: null, diagnosticRevision: 1, interruptReason: "stallTimeout" }));
+    o.fake.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 2, state: "stopping", status: null,
+      stall: null, stopDiagnostics: stopDiagnostics(), childUpstreamErrors: [], stopOutcome: "unconfirmed", stopCheck: null });
+    const run = o.observed.apply(runResult({ state: "running", status: null, diagnosticRevision: 0 }));
+    expect(run.interruptReason).toBe("stallTimeout");
+    expect(run.stopOutcome).toBe("unconfirmed");
+    expect(o.lines).toContain("[cxb] 停止尚未确认：尚未发出 interrupt。");
+  } finally { o.close(); }
+});
+
 test("JSON只增存在的新诊断，runPolicy与空子数组不输出，嵌套再次脱敏", () => {
   expect(diagnosticFields(runResult())).toEqual({});
   expect(upstreamResultFields(runResult({ childUpstreamErrors: [], runPolicy: { stallTimeoutMs: 600000, upstreamErrorPolicy: "observe" } }))).toEqual({});

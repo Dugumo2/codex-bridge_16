@@ -1,7 +1,7 @@
 import type { BrokerRpc, RunResult, UpstreamError, UpstreamErrorCategory } from "./contracts";
 import { resultTurn } from "./run-result";
 import { redactParams } from "./server-requests";
-import { createDiagnosticStore, diagnosticFields, isUnconfirmedRun, type DiagnosticView } from "./run-diagnostics";
+import { createDiagnosticStore, diagnosticFields, isCompleteDiagnosticNotice, isUnconfirmedRun, type DiagnosticView } from "./run-diagnostics";
 import { stopStageDescription } from "./stop-diagnostics";
 
 const labels: Record<UpstreamErrorCategory, string> = {
@@ -158,8 +158,7 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
   const acceptKnown = (view: View) => {
     const id = runId();
     if (!active || !id || view.runId !== id) return;
-    const complete = Array.isArray((view as Partial<RunResult>).turns)
-      || ["stall", "stopDiagnostics", "childUpstreamErrors", "stopOutcome", "stopCheck"].every((key) => Object.hasOwn(view, key));
+    const complete = Array.isArray((view as Partial<RunResult>).turns) || isCompleteDiagnosticNotice(view);
     const accepted = views.accept(view, complete);
     if (!accepted && view.state !== "ended" && view.state !== "lost") return;
     const merged = views.merge(view);

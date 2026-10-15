@@ -112,6 +112,17 @@ test("旧原因未确认仍继续等，旧版通知不能改写新版本诊断",
   expect(exitCodeForRun(await work)).toBe(4); expect(fake.subscriptions).toBe(0); expect(fake.notificationErrors).toEqual([]);
 });
 
+test("新诊断通知不完整时保留最近完整记录的原因并提前交付", async () => {
+  const fake = new FakeRpc(); fake.handle = () => ({ run: stopping({ diagnosticRevision: 1, stopOutcome: null }) });
+  const work = waitRun(fake.rpc, options);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  fake.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 2, state: "stopping", status: null,
+    stall: null, stopDiagnostics: stopDiagnostics(), childUpstreamErrors: [], stopOutcome: "unconfirmed", stopCheck: null });
+  const run = await bounded(work, 500);
+  expect(run.interruptReason).toBe("stallTimeout"); expect(exitCodeForRun(run)).toBe(3);
+  expect(fake.subscriptions).toBe(0); expect(fake.notificationErrors).toEqual([]);
+});
+
 function serve(args: string[], run: RunResult) {
   const c = context(dir, args);
   c.ctx.connect = async () => ({ rpc: c.fake.rpc, launched: false, close: async () => {},

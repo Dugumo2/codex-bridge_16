@@ -7,6 +7,10 @@ type DiagnosticKey = typeof keys[number];
 export type DiagnosticView = { runId?: string; diagnosticRevision?: number; state?: RunResult["state"]; status?: RunResult["status"] }
   & { [K in DiagnosticKey]?: RunResult[K] | null };
 
+export function isCompleteDiagnosticNotice(view: DiagnosticView): boolean {
+  return ["diagnosticRevision", "state", "status", ...keys].every((key) => Object.hasOwn(view, key));
+}
+
 export function isUnconfirmedRun(run: Pick<Partial<RunResult>, "interruptReason" | "stopOutcome" | "status">): boolean {
   return (run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError")
     && run.stopOutcome === "unconfirmed";

@@ -1,7 +1,7 @@
 import { CxbError, EXIT, type ExitCodeForRun, type RunResult, type TurnResult, type WaitRun } from "./contracts";
 import { readRunRecord } from "./ledger";
 import { resultPending, resultTurn } from "./run-result";
-import { createDiagnosticStore, isUnconfirmedRun, type DiagnosticView } from "./run-diagnostics";
+import { createDiagnosticStore, isCompleteDiagnosticNotice, isUnconfirmedRun, type DiagnosticView } from "./run-diagnostics";
 
 /** 即使被等待方不遵守期限，也必须拒绝等待；迟到拒绝由 race 接住。 */
 export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, signal?: AbortSignal): Promise<T> {
@@ -137,7 +137,7 @@ export const waitRun: WaitRun = async (rpc, opts) => {
       if (settled || !raw || typeof raw !== "object") return;
       const view = raw as DiagnosticView;
       if (view.runId !== opts.runId) return;
-      diagnostics.accept(view, ["stall", "stopDiagnostics", "childUpstreamErrors", "stopOutcome", "stopCheck"].every((key) => Object.hasOwn(view, key)));
+      diagnostics.accept(view, isCompleteDiagnosticNotice(view));
       check();
       if (!current && isUnconfirmedRun(diagnostics.get(opts.runId) ?? {})) recoverUnconfirmed();
     }));
