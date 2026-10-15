@@ -206,6 +206,50 @@ describe("二批 stop 展示", () => {
   });
 });
 
+describe("二批旧输出兼容", () => {
+  test("show 无新字段时正文与 JSON 逐字保持旧夹具", async () => {
+    ledger(dir);
+    const text = context(dir, ["show", "abcd"]);
+    expect(await show(text.ctx)).toBe(0);
+    expect(text.texts).toEqual(["中文结果"]);
+    expect(text.notices).toEqual(["模型：模型（线程索引）；请求强度：-"]);
+    const json = context(dir, ["show", "abcd", "--json"]);
+    await show(json.ctx);
+    expect(JSON.stringify(json.json[0])).toBe(JSON.stringify({ ok: true, command: "show", threadId: "thread-test", shortId: "abcd1234",
+      model: "模型", reasoning: null, modelSource: "index", reroute: null, mode: "result", runId: "run-test", state: "ended",
+      status: "completed", ready: "ready", result: "中文结果", outputSource: "finalAnswer", interruptReason: null,
+      stopOutcome: null, continuedFrom: null, updatedAt: 2000 }));
+  });
+  for (const mode of [[], ["--log"]]) test(`show ${mode.join(" ") || "未就绪结果"} 旧原因不扩展 interruptReason 条件`, async () => {
+    ledger(dir, [runResult({ state: "stopping", status: null, interruptReason: "stop" })]);
+    const t = context(dir, ["show", "abcd", ...mode, "--json"]);
+    await show(t.ctx);
+    const value = mode.length ? t.json[0].runs[0] : t.json[0];
+    for (const field of ["stall", "stopDiagnostics", "childUpstreamErrors", "interruptReason", "runPolicy"]) expect(value).not.toHaveProperty(field);
+  });
+  test("ls 无新字段时文本状态保持旧格式且 JSON 无新增键", async () => {
+    ledger(dir);
+    const text = context(dir, ["ls", "--local"]);
+    expect(await ls(text.ctx)).toBe(0);
+    expect(text.texts).toEqual(["SHORT_ID STATUS LAST_RUN UPDATED MODEL REASONING PREVIEW\n",
+      "abcd1234 completed run-test 1970-01-01T00:00:02.000Z 模型（线程索引） - 预览\n"]);
+    const json = context(dir, ["ls", "--local", "--json"]);
+    await ls(json.ctx);
+    for (const field of ["stall", "stopDiagnostics", "childUpstreamErrors", "interruptReason", "runPolicy"]) expect(json.json[0].items[0]).not.toHaveProperty(field);
+  });
+  for (const confirmed of [false, true]) test(`stop 无诊断时${confirmed ? "已确认" : "未确认"}输出逐字保持旧夹具`, async () => {
+    const reply = stopReply({ stopOutcome: confirmed ? "confirmed" : "unconfirmed", interruptSent: true });
+    const text = stopContext(reply);
+    expect(await stop(text.ctx)).toBe(confirmed ? 0 : 3);
+    expect(text.texts).toEqual(confirmed ? ["已停止线程 abcd1234。"] : []);
+    expect(text.notices).toEqual(confirmed ? [] : ["已发出停止，Codex 尚未确认停下；请先查看清理报告，临时故障可等待后台核实"]);
+    const json = stopContext(reply, true);
+    await stop(json.ctx);
+    expect(JSON.stringify(json.json[0])).toBe(JSON.stringify({ ok: confirmed, command: "stop", threadId: "thread-test", shortId: "abcd1234",
+      runId: "run-test", interruptSent: true, stopOutcome: confirmed ? "confirmed" : "unconfirmed", goal: "none", alreadyStopped: false }));
+  });
+});
+
 describe("二批 show --follow", () => {
   for (const json of [false, true]) test(`stall 与子代理提示只走 stderr，逐条格式保持${json ? " JSON" : "文本"}`, async () => {
     ledger(dir);
