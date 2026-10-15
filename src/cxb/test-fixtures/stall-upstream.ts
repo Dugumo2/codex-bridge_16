@@ -2,7 +2,7 @@
 import { createSa1bMock, type RpcMessage } from "../../test-support/sa1b-mock";
 
 export type InterruptMode = "interrupted" | "completed" | "failed" | "replyOnly" | "silent";
-export function createStallMock(send: (message: RpcMessage) => void) {
+export function createStallMock(send: (message: RpcMessage) => void, options: { joinedStart?: boolean } = {}) {
   const calls: Array<RpcMessage & { at: number }> = [];
   const emitted: RpcMessage[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
@@ -64,6 +64,10 @@ export function createStallMock(send: (message: RpcMessage) => void) {
       return;
     }
     if (message.method) calls.push({ ...structuredClone(message), at: Date.now() });
+    if (options.joinedStart && message.method === "turn/start" && active()) {
+      // 回包给出提交编号，但读取揭示真正活动的外部轮；不伪造本客户端的 started/input 证据。
+      output({ id: message.id, result: { turn: { id: "submitted-turn", status: "inProgress", items: [], error: null } } }); return;
+    }
     if (message.method === "turn/interrupt") {
       if (mode === "silent") return;
       output({ id: message.id, result: {} });

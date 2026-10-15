@@ -57,7 +57,7 @@ export class StallHarness {
       this.core = createStallMock((message) => {
         if (String(message.id ?? "").startsWith("stall-internal-")) return;
         for (const peer of peers) peer.send(JSON.stringify(message));
-      });
+      }, { joinedStart: true });
       // 外部轮先存在，再让 broker 的 turn/start 并入，真实走 joined 定案。
       this.core.command("turn", { threadId: "root", action: "start", turnId: "foreign-turn", announce: false });
       const core = this.core;

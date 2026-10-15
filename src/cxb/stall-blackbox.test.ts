@@ -3,9 +3,12 @@
  * 未确认用例真实等待 40 秒；状态读取始终保持 inProgress，不借假结束证据通过。
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { createStallMock, type InterruptMode } from "./test-fixtures/stall-upstream";
+import { createStallMock } from "./test-fixtures/stall-upstream";
 import { StallHarness, type StallCliResult } from "./test-fixtures/stall-harness";
 import { within, type ManagedProcess } from "../test-support/upstream-isolation";
+import { startStallModel } from "../test-support/upstream-model-server-stall";
+import { FAKE_KEY } from "../test-support/upstream-model-server";
+import { request as httpRequest } from "node:http";
 
 const MERGED = process.env.CXB_UE2_MERGED === "1";
 const lines = (text: string) => text.split(/\r?\n/u).filter(Boolean);
@@ -91,6 +94,27 @@ describe("独占模拟上游的证据真实性自测（不依赖 C1/C2/C3）", (
       expect(messages.find((message) => message.id === 3).result.thread.turns[0].status).toBe("inProgress");
     } finally { mock.close(); }
   });
+});
+
+describe("第二批本地挂起模型的传输自测（不拉起 Codex）", () => {
+  let model: Awaited<ReturnType<typeof startStallModel>>;
+  beforeAll(async () => { model = await startStallModel("hang"); }, 10_000);
+  afterAll(async () => { await model?.close(); }, 5000);
+  test("接受合法本地请求后不发响应头或首字节", async () => {
+    let responseSeen = false;
+    const req = httpRequest(`${model.baseUrl}/responses`, { method: "POST", headers: { authorization: `Bearer ${FAKE_KEY}` } }, () => { responseSeen = true; });
+    req.on("error", () => {}); req.end("{}");
+    try {
+      const end = Date.now() + 2000;
+      while (model.requests.length === 0 && Date.now() < end) await Bun.sleep(10);
+      expect(model.requests).toHaveLength(1); await Bun.sleep(200);
+      expect(responseSeen).toBe(false); expect(model.requests[0].status).toBeNull(); expect(model.violations).toEqual([]);
+    } finally { req.destroy(); }
+  }, 5000);
+  test("错误凭证立即拒绝，不能把隔离错误伪装成挂起", async () => {
+    const response = await fetch(`${model.baseUrl}/responses`, { method: "POST", headers: { authorization: "Bearer wrong-local-key" }, body: "{}", signal: AbortSignal.timeout(2000) });
+    expect(response.status).toBe(400); expect(model.violations).toHaveLength(1);
+  }, 5000);
 });
 
 scenario("S01", "重复重试报错不续命，核实后正常 interrupt", async (h) => {
