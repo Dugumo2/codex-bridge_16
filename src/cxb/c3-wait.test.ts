@@ -42,8 +42,10 @@ test("waitRun自己订阅诊断，较新通知覆盖旧完整快照，真实fail
   const run = await bounded(work, 500);
   expect(run.state).toBe("stopping"); expect(run.interruptReason).toBe("upstreamAccessError"); expect(exitCodeForRun(run)).toBe(3);
   expect(fake.notificationErrors).toEqual([]); expect(fake.subscriptions).toBe(0);
-  const failed = new FakeRpc(); failed.handle = () => ({ run: stopping({ state: "ended", status: "failed", turns: runResult().turns }) });
-  expect(exitCodeForRun(await waitRun(failed.rpc, options))).toBe(7);
+  for (const state of ["stopping", "ended"] as const) {
+    const failed = new FakeRpc(); failed.handle = () => ({ run: stopping({ state, status: "failed", turns: runResult().turns }) });
+    expect(exitCodeForRun(await bounded(waitRun(failed.rpc, options), 500))).toBe(7);
+  }
 });
 
 test("只有部分通知时按runId有界补取完整记录，不把通知强转RunResult", async () => {
@@ -74,6 +76,28 @@ test("补取失败安全降级为空结果和已知诊断；已有完整记录�
   await new Promise<void>((resolve) => setImmediate(resolve));
   known.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 2, state: "stopping", interruptReason: "stallTimeout", stopOutcome: "unconfirmed" });
   expect((await running).turns).toHaveLength(1); expect(known.calls).toHaveLength(1); expect(known.notificationErrors).toEqual([]);
+});
+
+test("补取自身挂起也在5秒内降级，初始快照继续挂起不阻止交付", async () => {
+  const fake = new FakeRpc(); fake.handle = () => new Promise(() => {});
+  const controller = new AbortController();
+  const work = waitRun(fake.rpc, { ...options, timeoutMs: 10000, signal: controller.signal });
+  try {
+    fake.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 3, state: "stopping", interruptReason: "stallTimeout", stopOutcome: "unconfirmed" });
+    expect(exitCodeForRun(await bounded(work, 6200))).toBe(3);
+    expect(fake.calls[1]!.options.timeoutMs).toBe(5000); expect(fake.subscriptions).toBe(0);
+  } finally { controller.abort(); await work.catch(() => undefined); }
+}, 7000);
+
+test("初始完整快照先恢复时取消多余补取的等待计时", async () => {
+  const fake = new FakeRpc();
+  let release!: (value: unknown) => void;
+  let calls = 0;
+  fake.handle = () => ++calls === 1 ? new Promise((resolve) => { release = resolve; }) : new Promise(() => {});
+  const work = waitRun(fake.rpc, options);
+  fake.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 3, state: "stopping", interruptReason: "stallTimeout", stopOutcome: "unconfirmed" });
+  release({ run: stopping() });
+  expect(exitCodeForRun(await bounded(work, 500))).toBe(3); expect(fake.subscriptions).toBe(0);
 });
 
 test("旧原因未确认仍继续等，旧版通知不能改写新版本诊断", async () => {
@@ -116,6 +140,33 @@ for (const name of ["run", "review", "wait"] as const) for (const state of ["sto
   expect(c.json).toHaveLength(1);
   expect(c.json[0]).toMatchObject({ ok: false, state, stopOutcome: "unconfirmed", interruptReason: "stallTimeout", stopDiagnostics: run.stopDiagnostics });
   expect(c.progress.join("\n") + c.notices.join("\n") + c.texts.join("\n")).not.toMatch(/运行(?:已)?结束/);
+  expect(c.fake.notificationErrors).toEqual([]); expect(c.fake.subscriptions).toBe(0);
+});
+
+for (const name of ["run", "review", "wait"] as const) test(`${name} stopping真实Failed未确认立即退出7且保留诊断JSON`, async () => {
+  const run = stopping({ status: "failed", turns: [{ ...runResult().turns[0]!, status: "failed", error: { message: "真实父轮失败" } }] });
+  const c = serve([name, name === "wait" ? "abcd1234" : "任务", "--json", "-v"], run);
+  expect(await bounded(command(name, c), 500)).toBe(7);
+  expect(c.json).toHaveLength(1); expect(c.json[0]).toMatchObject({ ok: false, state: "stopping", status: "failed", stopOutcome: "unconfirmed", stopDiagnostics: run.stopDiagnostics });
+  expect(c.notices).toContain("[cxb] 失败原因：真实父轮失败");
+  expect(c.progress.join("\n") + c.notices.join("\n") + c.texts.join("\n")).not.toMatch(/运行(?:已)?结束/);
+});
+
+for (const name of ["run", "review", "wait"] as const) test(`${name} runId前通知加快照失败仍交付单对象降级诊断`, async () => {
+  const c = serve([name, name === "wait" ? "abcd1234" : "任务", "--json"], stopping());
+  const original = c.fake.handle;
+  let watches = 0;
+  const emit = () => c.fake.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 3, state: "stopping", status: null, interruptReason: "stallTimeout", stopOutcome: "unconfirmed" });
+  c.fake.handle = (method, params) => {
+    if (method === "turn/start" || method === "review/start") { emit(); return original(method, params); }
+    if (method === "broker/threads/watch") {
+      if (name === "wait" && watches++ === 0) { emit(); return { thread: summary(), run: null, pending: [] }; }
+      throw new Error("快照不可用");
+    }
+    return original(method, params);
+  };
+  expect(await bounded(command(name, c), 1000)).toBe(3);
+  expect(c.json).toHaveLength(1); expect(c.json[0]).toMatchObject({ ok: false, state: "stopping", stopOutcome: "unconfirmed", interruptReason: "stallTimeout", stopDiagnostics: null });
   expect(c.fake.notificationErrors).toEqual([]); expect(c.fake.subscriptions).toBe(0);
 });
 

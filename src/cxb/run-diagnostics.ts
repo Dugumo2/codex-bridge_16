@@ -9,7 +9,7 @@ export type DiagnosticView = { runId?: string; diagnosticRevision?: number; stat
 
 export function isUnconfirmedRun(run: Pick<Partial<RunResult>, "interruptReason" | "stopOutcome" | "status">): boolean {
   return (run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError")
-    && run.stopOutcome === "unconfirmed" && run.status !== "failed";
+    && run.stopOutcome === "unconfirmed";
 }
 
 /** 缺省诊断不改变旧命令的 JSON；策略只用于开轮，不进入输出。 */

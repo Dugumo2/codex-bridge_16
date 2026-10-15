@@ -58,6 +58,7 @@ test("访问即停从父或子取结构化类别，子报错不成为父失败�
     ]);
     o.observed.failure(runResult({ status: "failed", childUpstreamErrors: [childError()], turns: [] }));
     expect(o.lines.join("\n")).not.toContain("失败原因");
+    expect(upstreamResultFields(runResult({ childUpstreamErrors: [childError()], turns: [] }))).not.toHaveProperty("error");
   } finally { o.close(); }
 });
 

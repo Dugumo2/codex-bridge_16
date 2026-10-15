@@ -129,14 +129,15 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure]);
     if ("items" in winner) return outputPending(winner.items);
     const run = upstream.apply(winner.run);
+    const code = exitCodeForRun(run);
     if (isUnconfirmedRun(run)) {
+      if (code === EXIT.CODEX_FAILED) upstream.failure(run);
       ctx.out.resultJson({ ok: false, command: "wait", waitFor: "thread", threadId: ref.threadId, shortId: ref.shortId,
         runId, state: run.state, status: run.status, stopOutcome: run.stopOutcome, interruptReason: run.interruptReason,
         stopDiagnostics: null, ...convergenceFields(run), ...selectedResultFields(run), ...upstreamResultFields(run) });
-      return EXIT.TIMEOUT;
+      return code;
     }
     showSubagents(ctx, run);
-    const code = exitCodeForRun(run);
     if (code === EXIT.CODEX_FAILED) {
       if (run.upstreamError || resultTurn(run)?.error != null) ctx.out.notice("Codex 执行失败，请用 cxb show 查看运行结果");
       upstream.failure(run);

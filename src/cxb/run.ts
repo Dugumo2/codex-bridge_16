@@ -498,12 +498,13 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     finished = true;
     const code = exitCodeForRun(result);
     if (isUnconfirmedRun(result)) {
-      const common = { ok: false, command: plan.command, thread: { id: result.threadId, shortId: result.shortId },
+      if (code === EXIT.CODEX_FAILED) upstream.failure(result);
+      const common = { ok: false, command: plan.command, thread: { id: result.threadId, shortId: result.shortId || shortId },
         runId: result.runId, state: result.state, status: result.status, stopOutcome: result.stopOutcome,
         interruptReason: result.interruptReason, stopDiagnostics: null, ...convergenceFields(result),
         ...selectedResultFields(result), ...upstreamResultFields(result) };
       out.resultJson(plan.command === "review" ? { ...common, mode: plan.review!.mode, ref: plan.review!.ref, base: plan.review!.base } : common);
-      return EXIT.TIMEOUT;
+      return code;
     }
     showSubagents(ctx, result);
     const last = resultTurn(result);

@@ -203,7 +203,15 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
     } else display(merge(run), true);
   };
   const off = rpc.on("broker/run/updated", (raw) => { if (raw && typeof raw === "object") accept(raw as View); });
-  const watchedRpc: BrokerRpc = { ...rpc, async request<T>(method: string, params?: unknown, options?: Parameters<BrokerRpc["request"]>[2]): Promise<T> {
+  const watchedRpc: BrokerRpc = { ...rpc, on(method, handler) {
+    const dispose = rpc.on(method, handler);
+    // 开轮回包之前的诊断已由观察器接住；等待器订阅后先补交这一版，再接受后续通知。
+    if (active && method === "broker/run/updated") {
+      const view = views.get(runId() ?? "");
+      if (view) handler(view);
+    }
+    return dispose;
+  }, async request<T>(method: string, params?: unknown, options?: Parameters<BrokerRpc["request"]>[2]): Promise<T> {
     const result = await rpc.request<T>(method, params, options);
     if (active && method === "broker/threads/watch" && result && typeof result === "object") {
       const snapshot = result as { run?: RunResult | null };
@@ -213,5 +221,5 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
   } };
   return { accept, refresh, apply, failure, rpc: watchedRpc,
     fields: () => { const view = views.get(runId() ?? "") ?? {}; return { ...upstreamFields(view as Partial<RunResult>), ...diagnosticFields(view as Partial<RunResult>) }; },
-    dispose: () => { active = false; off(); buffered.length = 0; views.clear(); printed.clear(); reasons.clear(); failures.clear(); } };
+    dispose: () => { active = false; off(); buffered.length = 0; views.clear(); printed.clear(); reasons.clear(); failures.clear(); stages.clear(); } };
 }

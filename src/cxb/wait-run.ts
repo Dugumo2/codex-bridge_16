@@ -41,6 +41,7 @@ export const waitRun: WaitRun = async (rpc, opts) => {
   if (opts.signal?.aborted) throw new CxbError("INTERRUPTED", "等待已取消");
   let current: RunResult | undefined;
   const diagnostics = createDiagnosticStore();
+  const recoveryController = new AbortController();
   let recovering = false;
   // 补读可能早于 ended 或 watch 回包；仅缓存目标运行最近 100 轮，与账本保留量一致。
   const results = new Map<number, TurnResult>();
@@ -74,13 +75,16 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     recovering = true;
     const timeoutMs = Math.max(1, Math.min(5000, opts.timeoutMs ?? 5000));
     void bounded(rpc.request<{ run?: RunResult | null }>("broker/threads/watch", { threadId: opts.threadId, runId: opts.runId },
-      { timeoutMs }), timeoutMs, opts.signal).then((snapshot) => {
+      { timeoutMs }), timeoutMs, opts.signal ? AbortSignal.any([opts.signal, recoveryController.signal]) : recoveryController.signal).then((snapshot) => {
       if (snapshot.run) accept(snapshot.run);
     }, () => undefined).finally(() => {
       if (settled) return;
       // 补取失败时只用最后完整记录和已接纳的诊断。没有记录时明确构造空结果，绝不把通知强转成运行记录。
       if (!current && opts.workspaceDir) {
-        try { const disk = readRunRecord(opts.workspaceDir, opts.runId); if (disk) accept(disk); } catch { /* 诊断本身仍可交付。 */ }
+        try {
+          const disk = readRunRecord(opts.workspaceDir, opts.runId);
+          if (disk && (disk.threadId === opts.threadId || disk.reviewThreadId === opts.threadId)) accept(disk);
+        } catch { /* 诊断本身仍可交付。 */ }
       }
       if (!current) current = { runId: opts.runId, threadId: opts.threadId, shortId: "", joined: false,
         state: "stopping", status: null, startedAt: 0, endedAt: null, meta: null, reviewThreadId: null,
@@ -153,6 +157,7 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     throw new CxbError("BROKER_UNAVAILABLE", "无法读取运行结果", { cause: error, retryable: true });
   } finally {
     settled = true;
+    recoveryController.abort();
     for (const dispose of disposers) dispose();
     results.clear();
     diagnostics.clear();
