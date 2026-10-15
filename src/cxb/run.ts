@@ -23,6 +23,7 @@ import { bounded, exitCodeForRun, waitRun } from "./wait-run";
 import { convergenceFields, resultPending, resultTurn, selectedResultFields } from "./run-result";
 import { convergenceLines, observeConvergence } from "./convergence";
 import { observeUpstreamErrors, upstreamResultFields } from "./upstream-errors";
+import { isUnconfirmedRun } from "./run-diagnostics";
 
 /** 不把上游消息直接输出，防止错误文本回显提示词或凭据。 */
 export function rpcDetail(error: unknown): { code?: number; message: string } {
@@ -496,6 +497,14 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     result = upstream.apply(result);
     finished = true;
     const code = exitCodeForRun(result);
+    if (isUnconfirmedRun(result)) {
+      const common = { ok: false, command: plan.command, thread: { id: result.threadId, shortId: result.shortId },
+        runId: result.runId, state: result.state, status: result.status, stopOutcome: result.stopOutcome,
+        interruptReason: result.interruptReason, stopDiagnostics: null, ...convergenceFields(result),
+        ...selectedResultFields(result), ...upstreamResultFields(result) };
+      out.resultJson(plan.command === "review" ? { ...common, mode: plan.review!.mode, ref: plan.review!.ref, base: plan.review!.base } : common);
+      return EXIT.TIMEOUT;
+    }
     showSubagents(ctx, result);
     const last = resultTurn(result);
     if (result.loopGuard) out.notice(`自动续跑刹车：${result.loopGuard.kind === "noAction" ? "连续无动作" : "轮数上限"}，${result.loopGuard.count} 轮`);
