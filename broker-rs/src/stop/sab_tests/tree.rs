@@ -16,7 +16,13 @@ fn 整树停止回包携带根停止诊断() {
         s.m.runs.runs.get_mut(R).unwrap().stop_diagnostics = diagnostics.clone();
         let (id, _) = stop(&mut s, OWNER, json!({"threadId": P}));
         let result = &s.response(&s.log, id).unwrap()["result"];
-        assert_eq!(result["stopDiagnostics"], json!(diagnostics));
+        // 回包与运行记录是同一份诊断；新停止由 C1 建立，已有诊断保留首次原因。
+        let current = s.m.runs.runs[R].stop_diagnostics.clone().unwrap();
+        assert_eq!(result["stopDiagnostics"], json!(current));
+        assert_eq!(
+            current.reason,
+            diagnostics.map_or(InterruptReason::Stop, |d| d.reason)
+        );
         assert_eq!(result["stopOutcome"], "confirmed");
     }
 }

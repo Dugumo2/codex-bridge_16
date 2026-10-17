@@ -10,6 +10,7 @@ mod review;
 mod runs;
 mod settlement;
 mod ue2_policy;
+mod ue2_stall;
 mod upstream_error;
 
 fn apply(machine: &mut Machine, event: Event) -> Vec<Action> {
