@@ -298,7 +298,21 @@ impl Machine {
                     progress.interrupt_before_stop = match reason {
                         ReconcileCancel::Stop => Some(InterruptReason::Stop),
                         ReconcileCancel::OwnerGone => Some(InterruptReason::ClientDisconnected),
-                        _ => record.interrupt_reason,
+                        // 新策略先进入 convergence_fail，根停止尚未把原因写入记录。
+                        // 只在首次冻结且没有既有中断原因时补入已锁定的新原因。
+                        _ => record.interrupt_reason.or_else(|| {
+                            record.subagent_join.as_ref().and_then(|join| {
+                                match join.terminal_reason {
+                                    Some(TerminalReason::StallTimeout) => {
+                                        Some(InterruptReason::StallTimeout)
+                                    }
+                                    Some(TerminalReason::UpstreamAccessError) => {
+                                        Some(InterruptReason::UpstreamAccessError)
+                                    }
+                                    _ => None,
+                                }
+                            })
+                        }),
                     };
                 }
             }
