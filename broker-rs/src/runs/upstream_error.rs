@@ -411,7 +411,7 @@ fn replace_spans(text: &str, spans: Vec<(usize, usize)>) -> String {
 
 impl Machine {
     /// 自报 turnId 不授予归属；已确认的 review 回放只忽略到达阶段的 ended 标记。
-    fn diagnostic_run(&self, thread: &str, turn: &str, replay: bool) -> Option<String> {
+    pub(crate) fn diagnostic_run(&self, thread: &str, turn: &str, replay: bool) -> Option<String> {
         if self.runs.phase != Phase::Open || turn.is_empty() {
             return None;
         }
@@ -465,22 +465,26 @@ impl Machine {
         };
         let record = self.runs.runs.get_mut(&run).expect("诊断归属已确认");
         let error_changed = error.is_some_and(|next| merge(&mut record.upstream_error, next));
-        let progress_changed = progress && record.last_progress_at != Some(self.clock.now_ms);
+        // 旧客户端沿用第一批进展语义；显式策略的进展由 C1 去重后统一更新。
+        let progress_changed = progress
+            && record.run_policy.is_none()
+            && record.last_progress_at != Some(self.clock.now_ms);
         if progress_changed {
             record.last_progress_at = Some(self.clock.now_ms);
         }
         if !error_changed && !progress_changed {
             return;
         }
-        record.diagnostic_revision = record
-            .diagnostic_revision
-            .checked_add(1)
-            .expect("诊断版本已耗尽");
         if error_changed {
-            self.runs.put(&run, actions);
-            self.notify_run_updated(&run, actions);
-        } else {
-            self.runs.progress_changed(&run, false, actions);
+            let error = record.upstream_error.clone().expect("报错已记录");
+            self.mark_run_diagnostic(&run, super::DiagnosticField::UpstreamError, None);
+            self.upstream_access_check(&run, &error, actions);
+        }
+        if progress_changed {
+            self.mark_run_diagnostic(&run, super::DiagnosticField::LastProgressAt, None);
+        }
+        if !self.diagnostic_batch_active {
+            self.flush_run_diagnostics(actions);
         }
     }
 
@@ -518,12 +522,10 @@ impl Machine {
         if !merge(&mut record.upstream_error, next) {
             return;
         }
-        record.diagnostic_revision = record
-            .diagnostic_revision
-            .checked_add(1)
-            .expect("诊断版本已耗尽");
-        self.runs.put(run, actions);
-        self.notify_run_updated(run, actions);
+        self.mark_run_diagnostic(run, super::DiagnosticField::UpstreamError, None);
+        if !self.diagnostic_batch_active {
+            self.flush_run_diagnostics(actions);
+        }
     }
 }
 

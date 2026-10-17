@@ -133,6 +133,180 @@ fn running() -> Machine {
     reply(&mut m, &c, Ok(json!({"turn":{"id":"本轮"}})));
     m
 }
+
+pub(super) fn stop_diagnostics_fixture() -> StopDiagnostics {
+    StopDiagnostics {
+        reason: InterruptReason::StallTimeout,
+        started_at: 1,
+        goal_started_at: Some(2),
+        goal_settled_at: Some(3),
+        interrupt_sent: true,
+        interrupt_sent_at: Some(4),
+        interrupt_reply: Some(StopRpcOutcome::Timeout),
+        interrupt_replied_at: Some(5),
+        turn_ended_at: None,
+        unconfirmed_at: Some(6),
+        confirmed_at: None,
+        rpc_issues: vec![crate::runs::StopRpcIssue {
+            method: "turn/interrupt".into(),
+            kind: StopRpcOutcome::Timeout,
+            at: 5,
+            message: "测试超时".into(),
+        }],
+    }
+}
+
+#[test]
+fn 停止回包携带空或完整的根停止诊断() {
+    for diagnostics in [None, Some(stop_diagnostics_fixture())] {
+        let mut m = running();
+        let run = m.claims["线程"].run_id.clone().unwrap();
+        m.runs.runs.get_mut(&run).unwrap().stop_diagnostics = diagnostics.clone();
+        let actions = stop(&mut m, 2, false);
+        let deadline = timer(&actions, |kind| {
+            matches!(kind, TimerKind::Stop(_, StopTimer::Waiter(_)))
+        });
+        let actions = apply(&mut m, deadline);
+        let result = outcome(&actions, 2);
+        // 回包与运行记录是同一份诊断；新停止由 C1 建立，已有诊断保留首次原因与开始时间。
+        let current = m.runs.runs[&run].stop_diagnostics.clone().unwrap();
+        assert_eq!(result["stopDiagnostics"], json!(current));
+        let (reason, started_at) =
+            diagnostics.map_or((InterruptReason::Stop, 0), |d| (d.reason, d.started_at));
+        assert_eq!((current.reason, current.started_at), (reason, started_at));
+        assert!(current.unconfirmed_at.is_some());
+        assert_eq!(result["threadId"], "线程");
+        assert_eq!(result["stopOutcome"], "unconfirmed");
+    }
+}
+
+#[test]
+fn 停止回包身份保存发送时轮次并隔离迁移后的目标() {
+    let mut m = running();
+    let actions = stop(&mut m, 2, false);
+    let context = req(&actions, "thread/goal/get");
+    let key = m.stop_diag_rpc_key(&context).unwrap();
+    let saved = m.stops.diagnostic_rpc_sends[&key].clone();
+    assert_eq!(saved.1.turn.as_deref(), Some("本轮"));
+    let id = m.stop_key("线程").unwrap();
+    m.stops.operations.get_mut(&id).unwrap().target = Some("后续轮".into());
+    let current = m.stop_diag_rpc_target(&context).unwrap();
+    assert_eq!(current.2.turn.as_deref(), Some("后续轮"));
+    assert_ne!(saved.1, current.2);
+    m.stop_diag_rpc_reply(&context, &Err(err()), false);
+    assert!(!m.stops.diagnostic_rpc_sends.contains_key(&key));
+    let mut migrated = context;
+    migrated.params = Some(json!({"threadId":"子线程"}));
+    assert!(m.stop_diag_rpc_target(&migrated).is_none());
+}
+
+#[test]
+fn 停止请求超时的诊断只由超时入口记一次() {
+    let mut m = running();
+    let actions = stop(&mut m, 2, false);
+    let context = req(&actions, "thread/goal/get");
+    let key = m.stop_diag_rpc_key(&context).unwrap();
+    m.stop_diag_rpc_reply(&context, &Err(err()), true);
+    assert!(m.stops.diagnostic_rpc_timeouts.contains(&key));
+    m.stop_diag_rpc_reply(&context, &Err(err()), false);
+    assert!(!m.stops.diagnostic_rpc_timeouts.contains(&key));
+    assert!(!m.stops.diagnostic_rpc_sends.contains_key(&key));
+}
+
+fn stop_status_diag_fixture() -> (Machine, StatusDone, StopDiagRpcKey, RequestContext) {
+    let mut m = running();
+    stop(&mut m, 2, false);
+    let id = m.stop_key("线程").unwrap();
+    let mut op = m.stops.operations.remove(&id).unwrap();
+    op.goal_busy = false;
+    let mut actions = Vec::new();
+    m.start_verification(&id, &mut op, &mut actions);
+    m.stops.operations.insert(id, op);
+    m.track_goal_requests(&mut actions);
+    let mut context = req(&actions, "thread/read");
+    let Operation::StatusRead {
+        read_id,
+        generation,
+    } = context.operation.clone()
+    else {
+        panic!("核实使用状态读取");
+    };
+    // 模拟下一页，最后实际发送的方法必须成为诊断摘要的方法。
+    m.status_reads.reads.get_mut(&read_id).unwrap().generation = generation + 1;
+    context.operation = Operation::StatusRead {
+        read_id,
+        generation: generation + 1,
+    };
+    context.method = "thread/turns/list".into();
+    m.track_goal_requests(&mut [Action::Request(context.clone())]);
+    let key = m.stop_diag_rpc_key(&context).unwrap();
+    let done = StatusDone {
+        read_id,
+        thread: "线程".into(),
+        token: context.token.clone(),
+        caller: m.status_reads.reads[&read_id].caller.clone(),
+        result: StatusResult::Unknown(StatusUnknown::Timeout),
+    };
+    (m, done, key, context)
+}
+
+#[test]
+fn 根核实本地总期限用最后实际方法记一次超时() {
+    for reason in [StatusUnknown::Timeout, StatusUnknown::Unresponsive] {
+        let (mut m, mut done, key, _) = stop_status_diag_fixture();
+        done.result = StatusResult::Unknown(reason);
+        m.status_reads.reads.remove(&done.read_id);
+        let (run, send, method) = m.take_stop_diag_status_issue(&done).unwrap();
+        assert_eq!(run, "run-1");
+        assert_eq!(send.turn.as_deref(), Some("本轮"));
+        assert_eq!(method, "thread/turns/list");
+        assert!(!m.stops.diagnostic_rpc_sends.contains_key(&key));
+        assert!(m.take_stop_diag_status_issue(&done).is_none());
+    }
+}
+
+#[test]
+fn 根核实真实请求超时或错误不被读取完成重复记账() {
+    let (mut m, mut done, _, context) = stop_status_diag_fixture();
+    m.stop_diag_rpc_reply(&context, &Err(err()), true);
+    m.status_reads.reads.remove(&done.read_id);
+    done.result = StatusResult::Unknown(StatusUnknown::Unresponsive);
+    assert!(m.take_stop_diag_status_issue(&done).is_none());
+    let (mut m, mut done, _, context) = stop_status_diag_fixture();
+    m.stop_diag_rpc_reply(&context, &Err(err()), false);
+    m.status_reads.reads.remove(&done.read_id);
+    done.result = StatusResult::Unknown(StatusUnknown::ErrorReply);
+    assert!(m.take_stop_diag_status_issue(&done).is_none());
+}
+
+#[test]
+fn 根核实期限诊断拒绝旧轮旧代际和其它调用者() {
+    for mismatch in 0..4 {
+        let (mut m, mut done, _, _) = stop_status_diag_fixture();
+        m.status_reads.reads.remove(&done.read_id);
+        match mismatch {
+            0 => m.stops.operations.get_mut("run-1").unwrap().target = Some("新轮".into()),
+            1 => m.stops.operations.get_mut("run-1").unwrap().generation += 1,
+            2 => done.thread = "旧执行线程".into(),
+            _ => done.caller = StatusCaller::ContinueCheck { round: 1 },
+        }
+        assert!(m.take_stop_diag_status_issue(&done).is_none());
+    }
+}
+
+#[test]
+fn 普通停止核实空闲只在确有目标轮时记录轮结束身份() {
+    let mut m = running();
+    stop(&mut m, 2, false);
+    let mut operation = op(&m).clone();
+    let (_, send) = m.stop_diag_idle_target(&operation).unwrap();
+    assert_eq!(send.turn.as_deref(), Some("本轮"));
+    operation.target = None;
+    assert!(m.stop_diag_idle_target(&operation).is_none());
+    operation.target = Some("本轮".into());
+    operation.already_stopped = true;
+    assert!(m.stop_diag_idle_target(&operation).is_none());
+}
 fn stop(m: &mut Machine, id: u64, clear: bool) -> Vec<Action> {
     client(
         m,
@@ -415,6 +589,68 @@ fn 暂停失败保留占用并中断目标续跑新轮次() {
     );
     let a = reply(&mut m, &req(&a, "thread/goal/set"), Err(err()));
     assert_eq!(req(&a, "turn/interrupt").params.unwrap()["turnId"], "续跑");
+}
+
+#[test]
+fn 四轮_停止目标续跑立即清除旧轮诊断并记录新结束() {
+    let mut m = running();
+    m.clock.now_ms = 100;
+    let a = stop(&mut m, 2, false);
+    let a = reply(&mut m, &req(&a, "thread/goal/get"), Ok(goal("active")));
+    let a = reply(&mut m, &req(&a, "thread/goal/set"), Err(err()));
+    assert_eq!(requests(&a, "turn/interrupt").len(), 1);
+    let run = op(&m).run_id.clone().unwrap();
+    let old_send = m.runs.stop_diag_sends[&run].clone();
+    m.clock.now_ms = 150;
+    m.stop_diag_interrupt_reply(&run, &old_send, crate::runs::StopRpcOutcome::Ok);
+    m.clock.now_ms = 200;
+    let completed = turn(&mut m, "turn/completed", "本轮");
+    let before = m.runs.runs[&run].stop_diagnostics.clone().unwrap();
+    assert_eq!(before.turn_ended_at, Some(200));
+    assert!(before.interrupt_reply.is_some());
+    m.clock.now_ms = 250;
+    turn(&mut m, "turn/started", "续跑");
+    let changed = m.runs.runs[&run].stop_diagnostics.as_ref().unwrap();
+    assert_eq!(
+        (
+            changed.turn_ended_at,
+            changed.interrupt_reply,
+            changed.interrupt_replied_at
+        ),
+        (None, None, None)
+    );
+    assert_eq!(
+        (changed.started_at, changed.reason),
+        (before.started_at, before.reason)
+    );
+    assert_eq!(changed.rpc_issues, before.rpc_issues);
+    let a = reply(
+        &mut m,
+        &req(&completed, "thread/goal/get"),
+        Ok(goal("active")),
+    );
+    let a = reply(&mut m, &req(&a, "thread/goal/set"), Err(err()));
+    assert_eq!(req(&a, "turn/interrupt").params.unwrap()["turnId"], "续跑");
+    m.stop_diag_turn_ended(&run, &old_send);
+    m.stop_diag_interrupt_reply(&run, &old_send, crate::runs::StopRpcOutcome::Ok);
+    assert_eq!(
+        m.runs.runs[&run]
+            .stop_diagnostics
+            .as_ref()
+            .unwrap()
+            .turn_ended_at,
+        None
+    );
+    m.clock.now_ms = 400;
+    turn(&mut m, "turn/completed", "续跑");
+    assert_eq!(
+        m.runs.runs[&run]
+            .stop_diagnostics
+            .as_ref()
+            .unwrap()
+            .turn_ended_at,
+        Some(400)
+    );
 }
 #[test]
 fn 暂停回包前换代只中断最新轮次() {

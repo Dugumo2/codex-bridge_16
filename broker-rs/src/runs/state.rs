@@ -54,6 +54,9 @@ pub(super) enum Phase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ActiveRun {
+    /// 每个有效活动绑定最多一个完成标记；数量不超过该运行有效绑定数。
+    /// 不独立淘汰，避免旧完成复活；随 ActiveRun 的普通释放、树提交及关闭一同回收。
+    pub child_completions: HashSet<(String, String)>,
     pub current_turn: Option<(String, String)>,
     pub snapshot: crate::results::Snapshot,
     pub progress_generation: Option<u64>,
@@ -362,7 +365,8 @@ impl Runs {
                     self.notices.iter().any(|n| match n {
                         RunNotice::TurnResult { run_id, .. }
                         | RunNotice::RunEnded { run_id, .. } => run_id == &r.run_id,
-                    }) || self.tree_retention_required(&r.run_id)
+                    }) || self.diagnostic_dirty.contains_key(&r.run_id)
+                        || self.tree_retention_required(&r.run_id)
                         || self.reconciliation.operations.values().any(|p| {
                             p.operation.token.run_id == r.run_id && p.operation.outcome_unknown
                         })

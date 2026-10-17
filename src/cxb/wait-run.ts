@@ -1,6 +1,7 @@
 import { CxbError, EXIT, type ExitCodeForRun, type RunResult, type TurnResult, type WaitRun } from "./contracts";
 import { readRunRecord } from "./ledger";
 import { resultPending, resultTurn } from "./run-result";
+import { createDiagnosticStore, isCompleteDiagnosticNotice, isUnconfirmedRun, type DiagnosticView } from "./run-diagnostics";
 
 /** 即使被等待方不遵守期限，也必须拒绝等待；迟到拒绝由 race 接住。 */
 export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, signal?: AbortSignal): Promise<T> {
@@ -20,6 +21,12 @@ export async function bounded<T>(work: Promise<T>, timeoutMs: number | null, sig
 }
 
 export const exitCodeForRun: ExitCodeForRun = (run) => {
+  if (run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError") {
+    if (run.status === "failed") return EXIT.CODEX_FAILED;
+    if (run.stopOutcome === "unconfirmed") return EXIT.TIMEOUT;
+    if (run.interruptReason === "stallTimeout") return EXIT.TIMEOUT;
+    if (run.interruptReason === "upstreamAccessError") return EXIT.INTERRUPTED;
+  }
   if (run.subagentJoin) {
     if (run.state === "lost") return EXIT.INTERRUPTED;
     if (run.status === "failed") return EXIT.CODEX_FAILED;
@@ -33,6 +40,9 @@ export const exitCodeForRun: ExitCodeForRun = (run) => {
 export const waitRun: WaitRun = async (rpc, opts) => {
   if (opts.signal?.aborted) throw new CxbError("INTERRUPTED", "等待已取消");
   let current: RunResult | undefined;
+  const diagnostics = createDiagnosticStore();
+  const recoveryController = new AbortController();
+  let recovering = false;
   // 补读可能早于 ended 或 watch 回包；仅缓存目标运行最近 100 轮，与账本保留量一致。
   const results = new Map<number, TurnResult>();
   const disposers: Array<() => void> = [];
@@ -40,11 +50,18 @@ export const waitRun: WaitRun = async (rpc, opts) => {
   let fail!: (error: unknown) => void;
   let settled = false;
   const done = new Promise<RunResult>((resolve, reject) => {
-    finish = (run) => { settled = true; resolve(run); };
-    fail = (error) => { settled = true; reject(error); };
+    finish = (run) => { if (!settled) { settled = true; resolve(run); } };
+    fail = (error) => { if (!settled) { settled = true; reject(error); } };
   });
   const check = () => {
-    if (!current || (current.state !== "ended" && current.state !== "lost")) return;
+    if (settled) return;
+    const observed = current && diagnostics.merge(current);
+    const unconfirmed = observed && isUnconfirmedRun(observed);
+    // 尚无真实失败的新原因停止可以提前退出；失败诊断不能把旧快照当成完整失败结果。
+    if (unconfirmed && observed.status !== "failed") { finish(observed); return; }
+    if (unconfirmed && current?.status !== "failed") return;
+    // 完整记录已确认失败时仍保留 stopping 的交付能力，但必须经过最终轮补读。
+    if (!current || (current.state !== "ended" && current.state !== "lost" && !unconfirmed)) return;
     const last = resultTurn(current);
     // 新记录按稳定 turnId 接补读；旧记录仍核对零基序号，兼容裁剪后的账本。
     const replacement = current.finalTurnId !== undefined
@@ -54,7 +71,30 @@ export const waitRun: WaitRun = async (rpc, opts) => {
       current = { ...current, turns: last ? current.turns.map((turn) => turn.turnId === replacement.turnId ? replacement : turn)
         : [...current.turns, replacement] };
     }
-    if (!resultPending(current)) finish(current);
+    if (!resultPending(current)) finish(diagnostics.merge(current, false));
+  };
+  const recoverUnconfirmed = () => {
+    if (settled || recovering) return;
+    recovering = true;
+    const timeoutMs = Math.max(1, Math.min(5000, opts.timeoutMs ?? 5000));
+    void bounded(rpc.request<{ run?: RunResult | null }>("broker/threads/watch", { threadId: opts.threadId, runId: opts.runId },
+      { timeoutMs }), timeoutMs, opts.signal ? AbortSignal.any([opts.signal, recoveryController.signal]) : recoveryController.signal).then((snapshot) => {
+      if (snapshot.run) accept(snapshot.run);
+    }, () => undefined).finally(() => {
+      if (settled) return;
+      // 补取失败时只用最后完整记录和已接纳的诊断。没有记录时明确构造空结果，绝不把通知强转成运行记录。
+      if (!current && opts.workspaceDir) {
+        try {
+          const disk = readRunRecord(opts.workspaceDir, opts.runId);
+          if (disk && (disk.threadId === opts.threadId || disk.reviewThreadId === opts.threadId)) accept(disk);
+        } catch { /* 诊断本身仍可交付。 */ }
+      }
+      if (!current) current = { runId: opts.runId, threadId: opts.threadId, shortId: "", joined: false,
+        state: "stopping", status: null, startedAt: 0, endedAt: null, meta: null, reviewThreadId: null,
+        input: "", continuedFrom: null, interruptReason: null, stopOutcome: null,
+        progress: { done: [], doneTotal: 0, unconfirmed: [], observedFiles: [] }, turns: [], turnsTotal: 0 };
+      check();
+    });
   };
   const watched = new Set<string>();
   const watch = (threadId: string) => {
@@ -64,6 +104,7 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     void rpc.request<{ run: RunResult | null }>("broker/threads/watch", { threadId, runId: opts.runId },
       { timeoutMs: Math.max(1, Math.min(30_000, opts.timeoutMs ?? 30_000)) }).then((snapshot) => {
       try {
+        if (settled) return;
         if (snapshot.run) { accept(snapshot.run); return; }
         // broker 内存里没有这次运行（每个线程只留最近一次、全局最多 MAX_HISTORY 次，或是 broker 重启前的运行），
         // 之后也不会再有它的通知。手上的结果（例如先到的 ended 带着 pending 的最后一轮）不可交付时，以磁盘记录补全。
@@ -74,14 +115,19 @@ export const waitRun: WaitRun = async (rpc, opts) => {
         }
         if (disk) accept(disk);
         if (settled) return;
+        if (isUnconfirmedRun(diagnostics.get(opts.runId) ?? {})) { recoverUnconfirmed(); return; }
         if (!disk && !current) { fail(new CxbError("NOT_FOUND", `找不到运行 ${opts.runId}`, { id: opts.runId })); return; }
         // broker 只淘汰已结束且结果就绪的运行，磁盘上仍是运行中或结果未就绪说明写入未落盘或记录未完整加载。
         fail(new CxbError("BROKER_UNAVAILABLE", `运行 ${opts.runId} 当前无法取得可靠的终态，请稍后重试`, { id: opts.runId, retryable: true }));
       } catch (error) { fail(error); }
-    }, fail);
+    }, (error) => {
+      if (isUnconfirmedRun(diagnostics.get(opts.runId) ?? {})) recoverUnconfirmed();
+      else fail(error);
+    });
   };
   const accept = (run: RunResult | null | undefined) => {
-    if (run?.runId !== opts.runId) return;
+    if (settled || run?.runId !== opts.runId) return;
+    diagnostics.accept(run, true);
     // 旧快照不能把已经收到的终态降回 running，也不能覆盖已就绪的结果。
     if (!current || (current.state !== "ended" && current.state !== "lost")) current = run;
     else if ((run.state === "ended" || run.state === "lost") && run.turnsTotal >= current.turnsTotal
@@ -90,6 +136,14 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     check();
   };
   try {
+    disposers.push(rpc.on("broker/run/updated", (raw) => {
+      if (settled || !raw || typeof raw !== "object") return;
+      const view = raw as DiagnosticView;
+      if (view.runId !== opts.runId) return;
+      diagnostics.accept(view, isCompleteDiagnosticNotice(view));
+      check();
+      if (!current && isUnconfirmedRun(diagnostics.get(opts.runId) ?? {})) recoverUnconfirmed();
+    }));
     disposers.push(rpc.on("broker/run/ended", (raw) => accept((raw as { run?: RunResult })?.run)));
     disposers.push(rpc.on("broker/thread/result", (raw) => {
       const event = raw as { runId?: string; turn?: number; result?: TurnResult };
@@ -105,7 +159,10 @@ export const waitRun: WaitRun = async (rpc, opts) => {
     if (error instanceof CxbError) throw error;
     throw new CxbError("BROKER_UNAVAILABLE", "无法读取运行结果", { cause: error, retryable: true });
   } finally {
+    settled = true;
+    recoveryController.abort();
     for (const dispose of disposers) dispose();
     results.clear();
+    diagnostics.clear();
   }
 };

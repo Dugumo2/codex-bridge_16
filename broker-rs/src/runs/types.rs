@@ -58,6 +58,170 @@ pub enum InterruptReason {
     BrokerLost,
     /// 自动续跑空转刹车（S1-评审第 26 节）；详情见 `RunRecord.loop_guard`。
     GoalLoop,
+    StallTimeout,
+    UpstreamAccessError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UpstreamErrorPolicy {
+    Observe,
+    StopAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunPolicy {
+    pub stall_timeout_ms: u64,
+    pub upstream_error_policy: UpstreamErrorPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StallPhase {
+    Verifying,
+    Resumed,
+    Stopping,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StallVerify {
+    Progressed,
+    TurnEnded,
+    InProgress,
+    Absent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StallReport {
+    pub timeout_ms: u64,
+    pub phase: StallPhase,
+    pub expired_at: u64,
+    pub idle_ms: u64,
+    pub last_progress_at: Option<u64>,
+    pub verify: Option<StallVerify>,
+    pub expiries: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StopRpcOutcome {
+    Ok,
+    Error,
+    Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopRpcIssue {
+    pub method: String,
+    pub kind: StopRpcOutcome,
+    pub at: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopDiagnostics {
+    pub reason: InterruptReason,
+    pub started_at: u64,
+    pub goal_started_at: Option<u64>,
+    pub goal_settled_at: Option<u64>,
+    pub interrupt_sent: bool,
+    pub interrupt_sent_at: Option<u64>,
+    pub interrupt_reply: Option<StopRpcOutcome>,
+    pub interrupt_replied_at: Option<u64>,
+    pub turn_ended_at: Option<u64>,
+    pub unconfirmed_at: Option<u64>,
+    pub confirmed_at: Option<u64>,
+    pub rpc_issues: Vec<StopRpcIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildUpstreamError {
+    pub thread_id: String,
+    pub parent_thread_id: String,
+    pub upstream_error: UpstreamError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildRunRef {
+    pub run_id: RunId,
+    pub parent_thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressTarget {
+    Own { run_id: RunId },
+    Child(ChildRunRef),
+}
+
+impl ProgressTarget {
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::Own { run_id } => run_id,
+            Self::Child(child) => &child.run_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallVerifyState {
+    pub read_id: u64,
+    pub generation: u64,
+    pub claim_id: u64,
+    pub conn_epoch: u64,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StallState {
+    pub baseline_mono: u64,
+    pub timeout_ms: u64,
+    pub generation: u64,
+    pub timer_scheduled: bool,
+    pub verify: Option<StallVerifyState>,
+    pub phase: Option<StallPhase>,
+}
+
+/// 每类最多 1024 项，由 C1 在插入时淘汰最旧项。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProgressDedup {
+    pub items: std::collections::VecDeque<(String, String, String, String)>,
+    pub hooks: std::collections::VecDeque<(String, String, String, String)>,
+    pub snapshots: std::collections::VecDeque<(String, String, String, String, u64)>,
+    pub token_high_water: std::collections::VecDeque<(String, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopDiagSend {
+    pub stop_generation: u64,
+    pub turn: Option<String>,
+    pub thread: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiagnosticField {
+    UpstreamError,
+    LastProgressAt,
+    Stall,
+    StopDiagnostics,
+    ChildUpstreamErrors,
+    StopOutcome,
+    StopCheck,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiagnosticDirty {
+    pub fields: std::collections::BTreeSet<DiagnosticField>,
+    pub child: Option<ChildUpstreamError>,
+    /// 首次标脏时捕获，释放或迁移认领后仍能发送。
+    pub recipients: Vec<crate::claim::ConnId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +367,14 @@ pub struct Progress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_policy: Option<RunPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall: Option<StallReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_diagnostics: Option<StopDiagnostics>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_upstream_errors: Vec<ChildUpstreamError>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_error: Option<UpstreamError>,
     /// 只随上游报错或最近进展变化递增，与存储和协调版本独立。

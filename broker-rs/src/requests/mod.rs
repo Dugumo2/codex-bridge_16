@@ -19,6 +19,7 @@ const DYNAMIC_TOOL: &str = "item/tool/call";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingForward {
+    pub run_id: Option<String>,
     pub request_id: Value,
     pub method: String,
     pub params: Option<Value>,
@@ -199,10 +200,12 @@ impl Machine {
             .expect("转发代号已耗尽");
         let generation = self.requests.next_generation;
         let forwarded_params = self.child_forward_params(target, &thread_id, &request.params);
+        let pending_run = self.pending_run_for(&thread_id, &request.params).or_else(|| self.relations.requests.values().find(|r| matches!(&r.stage, crate::relations::ChildRequestStage::Forwarded { forward_id, .. } if forward_id == &request.forward_id)).and_then(|r| r.run_id.clone()));
         let forward_id = request.forward_id;
         self.requests.pending.insert(
             forward_id.clone(),
             PendingForward {
+                run_id: pending_run.clone(),
                 request_id: request.id,
                 method: request.method.clone(),
                 params: request.params.clone(),
@@ -213,6 +216,9 @@ impl Machine {
                 generation,
             },
         );
+        if let Some(run) = pending_run {
+            self.stall_pending_changed(&run, true, actions);
+        }
         actions.push(Action::Send {
             conn: target,
             message: proto::request(
@@ -393,6 +399,9 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) -> Option<PendingForward> {
         let pending = self.requests.pending.remove(forward_id)?;
+        if let Some(run) = &pending.run_id {
+            self.stall_pending_changed(run, true, actions);
+        }
         actions.push(Action::CancelForwardTimer {
             forward_id: forward_id.into(),
             generation: pending.generation,

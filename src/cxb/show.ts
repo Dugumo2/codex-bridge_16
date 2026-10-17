@@ -10,7 +10,9 @@ import { resolveThreadLocal, resolveThreadViaBroker, type ThreadRef } from "./th
 import { waitRun } from "./wait-run";
 import { convergenceFields, resultPending, resultTurn, selectedResultFields } from "./run-result";
 import { observeConvergence } from "./convergence";
-import { diagnosticLine, observeUpstreamErrors, turnCodexErrorInfo, turnErrorLine, upstreamFields, upstreamShowLines } from "./upstream-errors";
+import { diagnosticLine, observeUpstreamErrors, turnCodexErrorInfo, turnErrorLine, upstreamFields, upstreamLabel, upstreamShowLines } from "./upstream-errors";
+import { diagnosticFields, isUnconfirmedRun } from "./run-diagnostics";
+import { stopStageDescription } from "./stop-diagnostics";
 import type { ConvergenceSummary } from "./sa1b-contracts";
 import { commandSession, wireMessage } from "./command-session";
 
@@ -70,14 +72,46 @@ function resultNotice(ctx: CommandContext, run: RunResult, id: string) {
       goalInactive: "目标禁止自动续轮",
       rootNoDirectInput: "根线程不能直接输入",
       abandoned: "已放弃子树清理责任",
+      stallTimeout: "无进展超时", upstreamAccessError: "上游访问报错即停",
       clientDisconnected: "客户端断开", stop: "主动停止", brokerLost: "broker 失联", goalLoop: "空转刹车", subagentsUnfinished: "子代理未完成" };
     ctx.out.notice(`已中断（${run.interruptReason ? reasons[run.interruptReason] : "服务器中断"}），可继续：cxb run --resume ${id} --continue`);
   }
 }
 
 function showUpstream(ctx: CommandContext, run: RunResult, output = "") {
-  const lines = upstreamShowLines(run);
+  const lines = [...upstreamShowLines(run), ...runDiagnosticLines(run)];
   if (lines.length) ctx.out.result(`${output && !output.endsWith("\n") ? "\n" : ""}${lines.join("\n")}\n`);
+}
+
+/** 只展示运行记录中已有的诊断，不据此推断停止结果或父轮失败。 */
+function runDiagnosticLines(run: RunResult): string[] {
+  const lines: string[] = [];
+  if (run.stall) {
+    const phase = { verifying: "核实中", resumed: "已恢复", stopping: "停止中", deferred: "等待轮次归属落定" }[run.stall.phase];
+    lines.push(`无进展：期限 ${Math.floor(run.stall.timeoutMs / 1000)} 秒；最近到期 ${new Date(run.stall.expiredAt).toISOString()}（已 ${Math.floor(run.stall.idleMs / 1000)} 秒无进展）；${phase}`);
+  }
+  if (run.stopDiagnostics && (run.state === "stopping" || run.stopOutcome === "unconfirmed")) {
+    const diagnostics = run.stopDiagnostics;
+    const reply = diagnostics.interruptReply === null ? "等待回包" : { ok: "成功", error: "失败", timeout: "超时" }[diagnostics.interruptReply];
+    const interrupt = diagnostics.interruptSent
+      ? `已发出 ${new Date(diagnostics.interruptSentAt!).toISOString()}（${reply}）` : "未发出";
+    lines.push(`停止诊断：${stopStageDescription(diagnostics, run.stopCheck)}；开始 ${new Date(diagnostics.startedAt).toISOString()}；interrupt ${interrupt}`);
+  }
+  const children = run.childUpstreamErrors ?? [];
+  for (const child of children.slice(0, 5)) {
+    const error = child.upstreamError;
+    const status = run.state === "ended" || run.state === "lost" ? "运行已结束"
+      : error.willRetry === true ? "仍在重试" : error.willRetry === false ? "已报告终止错误" : "重试状态未知";
+    lines.push(`子代理 ${clean(child.threadId.slice(0, 8))} 最近上游报错：${upstreamLabel(error)}；${error.count} 次；${status}`);
+  }
+  if (children.length > 5) lines.push(`另有 ${children.length - 5} 个子代理有报错`);
+  return lines;
+}
+
+/** 既有路径有自己的中断原因输出条件，仅给原先省略的新原因补键。 */
+function newInterruptFields(run: RunResult) {
+  return run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError"
+    ? { interruptReason: run.interruptReason } : {};
 }
 
 async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => Promise<BrokerRpc>) {
@@ -95,14 +129,14 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
     ctx.out.notice(`结果尚未就绪，请用 cxb wait ${ref.shortId ?? ref.threadId}`);
     showUpstream(ctx, run, stage?.output);
     ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: run.runId, state: run.state,
-      ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run), ...(stage ? { result: stage.output, stageResult: true } : {}),
+      ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run), ...diagnosticFields(run), ...newInterruptFields(run), ...(stage ? { result: stage.output, stageResult: true } : {}),
       stopOutcome: run.stopOutcome, childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup });
     return 5 as const;
   }
   ctx.out.result(last?.output ?? "");
   showUpstream(ctx, run, last?.output);
   ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: run.runId, state: run.state,
-    status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none", ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run),
+    status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none", ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run), ...diagnosticFields(run),
     childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup, interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
   if (!last) {
     const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)
@@ -239,7 +273,7 @@ async function showLog(ctx: CommandContext, ref: ThreadRef, connect: () => Promi
   const runs = records.map((run) => {
     const lines = linesOfRun(all, run.runId).filter((line) => ctx.parsed.options.full || SUMMARY_EVENTS.has(line.event)).map(eventLine);
     const entry = { runId: run.runId, state: run.state, status: run.status, startedAt: run.startedAt,
-      ...runModelDisplay(run), ...convergenceFields(run), ...upstreamFields(run), pendingReroute: run.pendingReroute ?? null,
+      ...runModelDisplay(run), ...convergenceFields(run), ...upstreamFields(run), ...diagnosticFields(run), ...newInterruptFields(run), pendingReroute: run.pendingReroute ?? null,
       input: clean(run.input), items: lines, turns: run.turns.map((turn) => ({ ...turn, output: clean(turn.output), error: redactParams(turn.error) })),
       ...(ctx.parsed.options.full ? { meta: redactParams(run.meta), interruptReason: run.interruptReason, stopOutcome: run.stopOutcome,
         progress: redactParams(run.progress) } : {}) };
@@ -400,10 +434,11 @@ async function follow(ctx: CommandContext, rpc: BrokerRpc, ref: ThreadRef, signa
     if (switching) await Promise.race([switching, failure]);
     const model = await Promise.race([readThreadModel(ctx, ref, async () => rpc, snapshot.thread.model), failure]);
     modelNotice(ctx, model);
-    ctx.out.result(`运行结束：${run?.status ?? "无运行"}${runId ? `（${runId}）` : ""}\n`);
+    const unconfirmed = run && isUnconfirmedRun(run);
+    if (!unconfirmed) ctx.out.result(`运行结束：${run?.status ?? "无运行"}${runId ? `（${runId}）` : ""}\n`);
     const hasConvergence = run && (run.finalTurnId !== undefined || run.subagentJoin);
     if (hasConvergence) { showSubagents(ctx, run); ctx.out.result(resultTurn(run)?.output ?? ""); }
-    ctx.out.resultJson({ terminal: true, status: run?.status ?? null, runId, ...model,
+    ctx.out.resultJson({ terminal: !unconfirmed, status: run?.status ?? null, runId, ...model,
       ...(hasConvergence ? { result: resultTurn(run)?.output ?? "", ...convergenceFields(run), ...selectedResultFields(run) } : {}) });
     return 0 as const;
   } finally { finished = true; off(); close(); convergence.dispose(); upstream.dispose(); buffered.length = 0; }

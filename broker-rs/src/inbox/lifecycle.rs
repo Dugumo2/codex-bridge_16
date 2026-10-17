@@ -54,6 +54,9 @@ impl Machine {
         entry.expiry_requested = false;
         entry.shutdown_requested = false;
         self.inbox.refresh_entry(id);
+        if let Some(run) = item.run_id.as_deref() {
+            self.stall_pending_changed(run, true, actions);
+        }
         if !self.closing {
             self.schedule_inbox(id, CLOSED_RETENTION_MS, actions);
         }

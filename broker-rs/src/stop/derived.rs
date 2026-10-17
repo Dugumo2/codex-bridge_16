@@ -14,7 +14,7 @@ use super::tree::{RootStopReport, TreePhase, TreeTrigger, TREE_VERIFY_MS};
 use crate::claim::status_read::{StatusCaller, StatusDone, StatusQuery, StatusResult};
 use crate::claim::{Action, Machine, Operation, RequestContext, State};
 use crate::relations::{AgentVersion, Authority, BindingStatus};
-use crate::runs::StopCheck;
+use crate::runs::{StopCheck, StopDiagSend};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
@@ -154,6 +154,51 @@ impl DerivedOp {
 }
 
 impl Machine {
+    pub(crate) fn derived_diagnostic_send(
+        &self,
+        key: &(u64, String),
+        turn: Option<&str>,
+    ) -> Option<(String, StopDiagSend)> {
+        let op = self.trees.aux.derived.get(key)?;
+        let tree = self.trees.operations.get(&key.0)?;
+        let work = self.trees.aux.work.get(&key.0)?;
+        if !op.root
+            || work.historical_unloaded
+            || tree.cancelled
+            || tree.generation != op.target.generation
+            || work.root_thread != op.target.thread
+        {
+            return None;
+        }
+        let run = self.runs.runs.get(&op.target.run_id)?;
+        if run.joined
+            || matches!(run.state, crate::runs::RunState::Lost)
+            || run.state == crate::runs::RunState::Ended && run.stop_diagnostics.is_none()
+        {
+            return None;
+        }
+        Some((
+            op.target.run_id.clone(),
+            StopDiagSend {
+                stop_generation: work.root_diag_generation?,
+                thread: op.target.thread.clone(),
+                turn: turn
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        self.runs
+                            .stop_diag_sends
+                            .get(&op.target.run_id)
+                            .filter(|send| {
+                                Some(send.stop_generation) == work.root_diag_generation
+                                    && send.thread == op.target.thread
+                            })
+                            .and_then(|send| send.turn.clone())
+                    })
+                    .or_else(|| tree.request.snapshot.parent_turn_id.clone()),
+            },
+        ))
+    }
+
     /// 登记并排队一个派生停止；同键已存在时只更新清除要求与已证明轮次并重新排队核实。
     pub fn begin_derived_stop(&mut self, target: DerivedTarget, actions: &mut Vec<Action>) {
         let key = (target.tree_op, target.thread.clone());
@@ -232,6 +277,12 @@ impl Machine {
         {
             return;
         }
+        if matches!(done.result, StatusResult::Idle) {
+            if let Some((run, send)) = self.derived_diagnostic_send(&key, None) {
+                self.stop_diag_turn_ended(&run, &send);
+            }
+        }
+        let op = self.trees.aux.derived.get_mut(&key).expect("派生停止存在");
         let historical = self
             .trees
             .aux
@@ -390,9 +441,24 @@ impl Machine {
         op.request_round += 1;
         let context = derived_request(op, "thread/goal/get", json!({"threadId": key.1}));
         actions.push(Action::Request(context));
+        if let Some((run, send)) = self.derived_diagnostic_send(key, None) {
+            self.stop_diag_goal_started(&run, &send);
+        }
     }
 
     fn derived_verify(&mut self, key: &(u64, String), actions: &mut Vec<Action>) {
+        if self
+            .trees
+            .aux
+            .derived
+            .get(key)
+            .is_some_and(|op| op.goal_checked)
+            && !self.stops.changes.values().any(|c| c.thread == key.1)
+        {
+            if let Some((run, send)) = self.derived_diagnostic_send(key, None) {
+                self.stop_diag_goal_settled(&run, &send);
+            }
+        }
         let op = self.trees.aux.derived.get_mut(key).expect("派生停止存在");
         op.unloaded_read = false;
         op.stage = DerivedStage::Verify;
@@ -417,6 +483,9 @@ impl Machine {
             json!({"threadId": key.1, "turnId": turn}),
         );
         actions.push(Action::Request(context));
+        if let Some((run, send)) = self.derived_diagnostic_send(key, Some(turn)) {
+            self.stop_diag_interrupt_sent(&run, &send);
+        }
     }
 
     /// 中断前核对：根线程只中断本次结束快照里证明过的轮次；子线程的轮次必须仍绑定到本次范围内的运行，

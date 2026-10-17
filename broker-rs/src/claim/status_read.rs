@@ -79,6 +79,10 @@ pub enum StatusResult {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatusCaller {
+    StallVerify {
+        run_id: String,
+        generation: u64,
+    },
     SubagentReconcile {
         token: crate::sa1b::ConvergeToken,
         op_id: crate::sa1b::ReconcileOpId,
@@ -264,9 +268,11 @@ impl Machine {
 
     /// 按调用方分派完成结果；有效性（round、generation、token 是否当前）由各处理函数自己判断。
     pub fn status_read_done(&mut self, done: StatusDone, actions: &mut Vec<Action>) {
+        self.stop_diag_status_done(&done);
         #[cfg(test)]
         self.status_reads.observed.push(done.clone());
         match &done.caller {
+            StatusCaller::StallVerify { .. } => self.stall_verify_done(done, actions),
             StatusCaller::SubagentReconcile { .. } => {
                 self.subagent_reconcile_status_done(done, actions)
             }

@@ -117,6 +117,7 @@ const INTERRUPT_TEXT: Record<NonNullable<RunResult["interruptReason"]>, string> 
   goalInactive: "目标禁止自动续轮",
   rootNoDirectInput: "根线程不能直接输入",
   abandoned: "已放弃子树清理责任",
+  stallTimeout: "无进展超时", upstreamAccessError: "上游访问报错即停",
 
 };
 

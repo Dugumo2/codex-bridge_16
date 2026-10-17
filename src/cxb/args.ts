@@ -29,6 +29,8 @@ export interface GlobalOptions {
 /** 只含当前命令的选项；未指定且没有静态默认值的字段不出现。 */
 export interface CommandOptions {
   "converge-timeout"?: number;
+  "stall-timeout"?: number;
+  "upstream-error-policy"?: "observe" | "stop-access";
   file?: string;
   resume?: string;
   continue?: boolean;
@@ -180,6 +182,12 @@ const resume = value("resume", ["--resume"], "线程ID", "恢复已有线程。"
 const convergeTimeout = value("converge-timeout", ["--converge-timeout"], "秒",
   "子代理收敛总期限，默认 3600 秒；首次收敛起算，跨汇总、detach、待答不重置，独立于 --timeout。",
   (value) => CONFIG_SCHEMA["converge-timeout"].parse(value), 3600);
+const stallTimeout = value("stall-timeout", ["--stall-timeout"], "秒",
+  "默认 600 秒内未观察到进展（输出、命令输出、token 增长等；重复的上游报错不算）会核实后停止本次运行，退出 3；等你回答／审批时不计时；静默命令、MCP 工具、深度推理等也可能长时间无可见事件，请调大或设 0。",
+  (value) => CONFIG_SCHEMA["stall-timeout"].parse(value), 600);
+const upstreamErrorPolicy = value("upstream-error-policy", ["--upstream-error-policy"], "策略",
+  "observe（默认）只提示；stop-access 只对认证、付费、权限三类结构化错误停止本次运行，不登出、不改账户，退出 4。",
+  (value) => CONFIG_SCHEMA["upstream-error-policy"].parse(value), "observe");
 const convergenceRules = ["子代理运行会等待受管后代收敛，再自动汇总到同一运行；期间上一轮输出只是阶段结果。",
   "最多新开 5 次汇总轮、50 个自动父轮；连续 3 轮无动作会刹车。达到最后一次额度仍允许当前轮完成核实。",
   "期限、预算、次数或归属核实异常会停止已确认自有范围并报告原因；未确认停止不等于已清理。",
@@ -192,7 +200,7 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
     usage: ["cxb run [提示词 ...] [选项]", "cxb run - | --file <文件> [选项]", "cxb run --resume <线程ID> --continue [补充说明 ...] [选项]"],
     globals: EXECUTION,
     options: [
-      convergeTimeout,
+      convergeTimeout, stallTimeout, upstreamErrorPolicy,
       value("file", ["-f", "--file"], "文件", "从 UTF-8 文件读取提示词。"), resume,
       flag("continue", ["--continue"], "按原运行续跑，位置参数作为本次补充。"),
       value("run", ["--run"], "运行ID", "指定续跑来源，默认最近一次运行。", id),
@@ -213,7 +221,7 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
     description: "执行一次只读代码审查",
     usage: ["cxb review [审查说明 ...] [选项]", "cxb review --mode <模式> [--ref <引用>] [--base <分支>]", "cxb review --resume <线程ID> [审查说明 ...] [选项]"],
     globals: EXECUTION,
-    options: [convergeTimeout, value("mode", ["--mode"], "模式", `审查模式：${REVIEW_MODES.join("|")}；默认 pr。`, choice(REVIEW_MODES), "pr"),
+    options: [convergeTimeout, stallTimeout, upstreamErrorPolicy, value("mode", ["--mode"], "模式", `审查模式：${REVIEW_MODES.join("|")}；默认 pr。`, choice(REVIEW_MODES), "pr"),
       value("ref", ["--ref"], "引用", "仅 commit 模式可用，默认 HEAD。", gitRef),
       value("base", ["--base"], "分支", "仅 pr 模式可用，默认自动检测，失败回退 main。", gitRef), resume],
     rules: ["未显式设置模式时，提供审查说明会选择 custom；custom 必须有说明。",

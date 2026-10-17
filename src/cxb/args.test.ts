@@ -31,7 +31,7 @@ describe("参数边界与全局选项", () => {
     expect(result.command).toBe("run");
     expect(result.globals).toEqual({ help: false, version: false, verbose: false, json: false,
       dir: resolve("."), timeout: config.defaultTimeout, sandbox: config.defaultSandbox, approval: config.defaultApprovalPolicy });
-    expect(result.options).toEqual({ "converge-timeout": 3600, continue: false, memory: false, detach: false });
+    expect(result.options).toEqual({ "converge-timeout": 3600, "stall-timeout": 600, "upstream-error-policy": "observe", continue: false, memory: false, detach: false });
     expect(result.explicit.size).toBe(0);
     parseArgv(["run", "--memory", "--json", "提示"]);
     expect(parseArgv(["run", "提示"]).options.memory).toBe(false);
@@ -333,8 +333,8 @@ describe("旧命令不作为隐藏别名", () => {
 describe("帮助与选项表", () => {
   const names: CommandName[] = ["run", "review", "show", "ls", "inbox", "reply", "wait", "stop", "rm", "config", "doctor"];
   const expectedFlags: Record<CommandName, string[]> = {
-    run: ["--converge-timeout", "--file", "--resume", "--continue", "--run", "--template", "--goal", "--budget", "--memory", "--detach"],
-    review: ["--converge-timeout", "--mode", "--ref", "--base", "--resume"], show: ["--tail", "--log", "--follow", "--server", "--limit", "--full"],
+    run: ["--converge-timeout", "--stall-timeout", "--upstream-error-policy", "--file", "--resume", "--continue", "--run", "--template", "--goal", "--budget", "--memory", "--detach"],
+    review: ["--converge-timeout", "--stall-timeout", "--upstream-error-policy", "--mode", "--ref", "--base", "--resume"], show: ["--tail", "--log", "--follow", "--server", "--limit", "--full"],
     ls: ["--all", "--limit", "--local"], inbox: ["--kind", "--all", "--limit"], reply: [], wait: [],
     stop: ["--abandon", "--clear", "--run"], rm: ["--purge"], config: ["--unset"], doctor: [],
   };
@@ -358,7 +358,7 @@ describe("帮助与选项表", () => {
     const specs = [...GLOBAL_OPTIONS.filter((o) => COMMANDS[name].globals.some((key) => key === o.key)), ...COMMANDS[name].options];
     for (const spec of specs) for (const flag of spec.flags) expect(help).toContain(flag);
     // 选项定义必须实际被解析器接受；关系校验另有独立命令用例覆盖。
-    const samples: Record<string, string> = { dir: ".", timeout: "1", "converge-timeout": "1", model: "gpt-5", reasoning: "high", sandbox: "read-only",
+    const samples: Record<string, string> = { dir: ".", timeout: "1", "converge-timeout": "1", "stall-timeout": "0", "upstream-error-policy": "observe", model: "gpt-5", reasoning: "high", sandbox: "read-only",
       approval: "auto", file: "文件.md", resume: "a1b2", run: "run_123", template: "collab", goal: "目标", budget: "1",
       mode: "pr", ref: "HEAD", base: "main", limit: "1", kind: "approval" };
     for (const spec of specs) {
