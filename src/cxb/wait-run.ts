@@ -55,9 +55,9 @@ export const waitRun: WaitRun = async (rpc, opts) => {
   });
   const check = () => {
     if (settled) return;
-    if (current) current = diagnostics.merge(current) as RunResult;
+    const observed = current && diagnostics.merge(current);
     // 新原因停止未确认可以早于 ended；此时不等最终轮补读，也不把停止未确认当成执行完成。
-    if (current && isUnconfirmedRun(current)) { finish(current); return; }
+    if (observed && isUnconfirmedRun(observed)) { finish(observed); return; }
     if (!current || (current.state !== "ended" && current.state !== "lost")) return;
     const last = resultTurn(current);
     // 新记录按稳定 turnId 接补读；旧记录仍核对零基序号，兼容裁剪后的账本。
@@ -68,7 +68,7 @@ export const waitRun: WaitRun = async (rpc, opts) => {
       current = { ...current, turns: last ? current.turns.map((turn) => turn.turnId === replacement.turnId ? replacement : turn)
         : [...current.turns, replacement] };
     }
-    if (!resultPending(current)) finish(current);
+    if (!resultPending(current)) finish(diagnostics.merge(current, false));
   };
   const recoverUnconfirmed = () => {
     if (settled || recovering) return;

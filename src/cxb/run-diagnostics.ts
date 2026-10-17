@@ -53,11 +53,13 @@ export function createDiagnosticStore() {
     views.set(id, { revision, view: fields, complete });
     return true;
   };
-  const merge = <T extends DiagnosticView>(run: T): T => {
+  const merge = <T extends DiagnosticView>(run: T, includeLifecycle = true): T => {
     const latest = run.runId ? views.get(run.runId) : undefined;
     const terminal = run.runId ? terminals.get(run.runId) : undefined;
     const fields = latest && latest.revision >= (run.diagnosticRevision ?? 0) ? latest.view : {};
     const merged = { ...run, ...fields, ...terminal };
+    // 通知的终态只描述诊断发生时的状态，不能把旧完整记录提升为可交付的终态。
+    if (!includeLifecycle) { merged.state = run.state; merged.status = run.status; }
     for (const key of keys) if (Object.hasOwn(fields, key) && fields[key] === undefined) delete merged[key];
     return merged;
   };

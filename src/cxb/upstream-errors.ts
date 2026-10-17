@@ -175,7 +175,8 @@ export function observeUpstreamErrors(rpc: BrokerRpc, runId: () => string | null
     acceptKnown(view);
   };
   const merge = (run: RunResult): RunResult => {
-    return views.merge(run) as RunResult;
+    // 完整记录的生命周期保持原值；未确认停止由 waitRun 独立合并并提前交付。
+    return views.merge(run, false);
   };
   const apply = (run: RunResult): RunResult => {
     accept(run);
