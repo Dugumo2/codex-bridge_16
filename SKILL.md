@@ -42,6 +42,8 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 
 - `--continue`：只能配 `--resume`；补充说明只能写在命令行，不能用 `-f` 或标准输入；不能与 `--goal`、`--template` 同用；**沙箱与审批不继承原运行**，需要的话重新给 `-s`、`--approval`；`--run <runId>` 指定接哪次运行。cxb 会生成续跑提示（原始要求、已完成步骤、观察到的改动、未确认操作、目标原文），让 Codex 先核验工作区再继续。
 - goal：服务器会一轮接一轮自动续跑。broker 保留连续 3 轮无动作刹车，并累计同一运行的 goal 与汇总自动父轮（上限 50，不随 goal 变化重置）；`--budget` 覆盖父轮及已归属后代，汇总继续使用原额度。额度最后一轮可完成核实，仍需新工作才异常收尾。完成条件要写成可核验的状态。
+- **无进展期限** `--stall-timeout <秒>`（run、review；`cxb config stall-timeout <秒>`；默认 600，`0` 关闭）：broker 在期限内没观察到进展（输出、命令输出、计划、文件改动、token 增长等；重复的上游报错不算）就先核实一次，仍无进展才停止本次运行，退出 3。等回答审批／提问时不计时，detach 后照常计时。**期限的边界**：静默命令、MCP 工具、压缩、hook、深度推理都可能长时间没有可见事件，`InProgress` 只证明轮没结束、不证明卡死；预计会长时间静默的任务（大编译、长测试、长 MCP 调用）调大或设 0。
+- **访问报错即停** `--upstream-error-policy stop-access`（默认 `observe`；`cxb config upstream-error-policy …`）：只对认证、付费、权限三类结构化上游错误（HTTP 401／402／403，含子代理线程上的）停止本次运行，退出 4；不登出、不改账户、不重试。无人值守、怕空转烧时间的任务可以加。
 - review 的 `-s`、`--approval` 只告警、被忽略；`--goal` 不可用。
 - 普通 `cxb review` 在新建的独立线程上审查；`--resume <线程ID>` 在该线程上追加一轮审查。
 - 模板：`cxb config templates` 列出内置和用户模板（用户模板放数据根目录下的 `templates\<名称>.md`，同名时优先于内置；数据根目录是 `CXB_HOME`，未设时为 `~\.codex-bridge`）；模板建议的沙箱只在没显式给 `-s` 时生效。
@@ -77,7 +79,8 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 - **`cxb run` 一断开，Codex 就被叫停**（后台任务被停、意外断开都一样），进度保存，之后用 `--continue` 接着干。要不受断开影响地长时间运行，用 `--detach` 交给 broker 托管，再 `cxb wait <线程ID>`。`run_in_background` 是 Claude Code 的后台，`--detach` 是 broker 托管，两回事。
 - 线程 ID 是 cxb 的线程短 ID（`cxb ls` 列出），**不是** Claude Code 的后台任务 ID。
 - 可以同时派多个线程并行；遇到 429、`Concurrency limit` 等限流，停下向用户报告，不自动重试。
-- 上游报错会即时出现在 stderr（不需要 `-v`）：`[cxb] 上游认证失败（HTTP 401），Codex 正在重试；已观察到 n 次。` 加一行原因。看到认证、付费、拒绝访问、用量上限类提示时，Codex 多半在空转重试：先向用户报告（凭证过期、额度用完、模型冷却等需要用户处理），不要干等到超时；需要时 `cxb stop <线程ID>`。`cxb ls` 的状态列（如 `running（上游 401×3）`）、`cxb show` 的「最近上游报错」与 JSON 的 `upstreamError` 可随时查。子代理线程上的报错目前不汇总到父运行。
+- 上游报错会即时出现在 stderr（不需要 `-v`）：`[cxb] 上游认证失败（HTTP 401），Codex 正在重试；已观察到 n 次。` 加一行原因。看到认证、付费、拒绝访问、用量上限类提示时，Codex 多半在空转重试：先向用户报告（凭证过期、额度用完、模型冷却等需要用户处理），不要干等到超时；需要时 `cxb stop <线程ID>`。`cxb ls` 的状态列（如 `running（上游 401×3）`）、`cxb show` 的「最近上游报错」与 JSON 的 `upstreamError` 可随时查。子代理线程上的报错以 `[cxb] 子代理 <前 8 位> …` 提示，汇总在 JSON 的 `childUpstreamErrors` 与 `show` 里，不算父运行的失败原因。
+- 无进展与停止过程也会即时提示：`[cxb] 已 n 秒未观察到进展……正在核实`、`……正在停止本次运行`、`[cxb] 停止尚未确认：<卡在哪一步>`（尚未发出 interrupt／interrupt 失败或超时／已发出但未收到轮次结束证据）。`cxb show` 的「无进展」「停止诊断」行与 JSON 的 `stall`、`stopDiagnostics` 可随时查；发生过停止（含用户 stop）的运行 JSON 都会带 `stopDiagnostics`。
 - 脚本化处理用 `--json`（stdout 只有一个 JSON 对象），按退出码和 `error.code` 分支，不解析自然语言；`-v` 把过程写到 stderr。
 
 ## 5. 待回应事项：怎么处理、谁拍板
@@ -102,8 +105,8 @@ Codex 需要人回应时，cxb 把线程交给 broker 托管、以退出码 5 �
 |---|---|---|
 | 0 | 成功 | 核对结果（第 8 节） |
 | 2 | 找不到、有歧义，或事项已过期/撤销 | `cxb ls` 找对 ID；必要时加 `-d <目录>` |
-| 3 | 超时 | `cxb show <线程ID> --tail` 看进展；长任务改 `--detach` 或加大 `--timeout`；stop 未确认按第 7 节「停止未确认时」处理，不要循环重发 |
-| 4 | 运行被中断 | 查看 `interruptReason`、`subagentJoin.terminalReason` 和停止报告；期限、归属冲突或启动不明均不算正常完成。旧记录仍可能有 `subagentsUnfinished`，是否停下须看实际停止报告；按需显式续跑 |
+| 3 | 超时；无进展停止（`interruptReason=stallTimeout`）；无进展／访问报错即停的停止未确认 | `cxb show <线程ID> --tail` 看进展；长任务改 `--detach` 或加大 `--timeout`；无进展停止先看 `stall` 判断是真卡住还是正常静默，静默任务调大 `--stall-timeout` 或设 0 后 `--continue`；stop 未确认按第 7 节「停止未确认时」处理，看「停止尚未确认：…」那行卡在哪，不要循环重发 |
+| 4 | 运行被中断；访问报错即停（`interruptReason=upstreamAccessError`） | 查看 `interruptReason`、`subagentJoin.terminalReason` 和停止报告；期限、归属冲突或启动不明均不算正常完成。旧记录仍可能有 `subagentsUnfinished`，是否停下须看实际停止报告；按需显式续跑。访问报错即停先把凭证、额度、权限问题报告用户，修好再续跑 |
 | 5 | 等待回应（不是失败） | 第 5 节 |
 | 6 | broker 不可用 | `cxb doctor`；`cxb ls --local`、`cxb show <线程ID>` 读本地记录 |
 | 7 | Codex 失败 | 读 stderr 的「失败原因」行（JSON 的 `error`、`upstreamError`）；MCP 被拒就改 `--approval auto`；认证、额度类上游错误报告用户，不要原样重派 |
