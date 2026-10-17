@@ -569,6 +569,154 @@ fn sa1b_待答交接保持来源和截止_不为收敛代答() {
     );
 }
 
+/// 真实派生启用 SA1b，扣住根 interrupt 回包，让父轮终态与停止流程交错。
+fn 新原因停止竞争(
+    reason: crate::sa1b::TerminalReason,
+    interrupt: InterruptReason,
+    status: &str,
+) {
+    use crate::sa1b::TerminalReason;
+    let mut s = Sim::new();
+    sa1b_enable(&mut s);
+    s.spawn_v1("子", "派生", "子轮");
+    assert!(s.record().subagent_join.is_some());
+    assert_eq!(s.record().interrupt_reason, None);
+    s.hold.push(("turn/interrupt".into(), P.into()));
+    let mut actions = vec![];
+    s.m.convergence_fail(R, reason, &mut actions);
+    assert_eq!(
+        s.m.convergences.progress[R].interrupt_before_stop,
+        Some(interrupt)
+    );
+    s.absorb(actions);
+    assert_eq!(s.record().state, RunState::Stopping);
+
+    // 后到的另一新策略与用户 stop 都不能覆盖首个停止原因。
+    let later = if reason == TerminalReason::StallTimeout {
+        TerminalReason::UpstreamAccessError
+    } else {
+        TerminalReason::StallTimeout
+    };
+    let mut actions = vec![];
+    s.m.convergence_fail(R, later, &mut actions);
+    s.absorb(actions);
+    s.call(
+        OWNER,
+        "broker/threads/stop",
+        json!({"threadId":P,"runId":R}),
+    );
+    assert_eq!(
+        s.m.convergences.progress[R].interrupt_before_stop,
+        Some(interrupt)
+    );
+    s.turn_completed(P, T, status);
+    s.release("turn/interrupt", P);
+    assert_eq!(s.record().state, RunState::Ended);
+    assert_eq!(
+        s.record().status,
+        Some(if status == "failed" {
+            RunStatus::Failed
+        } else {
+            RunStatus::Interrupted
+        })
+    );
+    assert_eq!(s.record().interrupt_reason, Some(interrupt));
+    assert_eq!(s.record().stop_outcome, Some(StopOutcome::Confirmed));
+    assert_eq!(
+        s.record().subagent_join.as_ref().unwrap().terminal_reason,
+        Some(if status == "failed" {
+            TerminalReason::ParentFailed
+        } else {
+            reason
+        })
+    );
+}
+
+#[test]
+fn 合并二轮_stall_timeout与父轮failed保留原因() {
+    新原因停止竞争(
+        crate::sa1b::TerminalReason::StallTimeout,
+        InterruptReason::StallTimeout,
+        "failed",
+    );
+}
+
+#[test]
+fn 合并二轮_upstream_access_error与父轮failed保留原因() {
+    新原因停止竞争(
+        crate::sa1b::TerminalReason::UpstreamAccessError,
+        InterruptReason::UpstreamAccessError,
+        "failed",
+    );
+}
+
+#[test]
+fn 合并二轮_stall_timeout与父轮interrupted保留原因() {
+    新原因停止竞争(
+        crate::sa1b::TerminalReason::StallTimeout,
+        InterruptReason::StallTimeout,
+        "interrupted",
+    );
+}
+
+#[test]
+fn 合并二轮_upstream_access_error与父轮interrupted保留原因() {
+    新原因停止竞争(
+        crate::sa1b::TerminalReason::UpstreamAccessError,
+        InterruptReason::UpstreamAccessError,
+        "interrupted",
+    );
+}
+
+#[test]
+fn 合并二轮_受管子树父轮completed仍按新原因中断() {
+    新原因停止竞争(
+        crate::sa1b::TerminalReason::StallTimeout,
+        InterruptReason::StallTimeout,
+        "completed",
+    );
+    新原因停止竞争(
+        crate::sa1b::TerminalReason::UpstreamAccessError,
+        InterruptReason::UpstreamAccessError,
+        "completed",
+    );
+}
+
+#[test]
+fn 合并二轮_用户stop先在途后无进展到期仍保持stop() {
+    let mut s = Sim::new();
+    sa1b_enable(&mut s);
+    s.spawn_v1("子", "派生", "子轮");
+    s.m.runs.runs.get_mut(R).unwrap().run_policy = Some(crate::runs::RunPolicy {
+        stall_timeout_ms: 3_000,
+        upstream_error_policy: crate::runs::UpstreamErrorPolicy::Observe,
+    });
+    let mut actions = vec![];
+    s.m.stall_arm(R, &mut actions);
+    s.absorb(actions);
+    s.hold.push(("turn/interrupt".into(), P.into()));
+    s.call(
+        OWNER,
+        "broker/threads/stop",
+        json!({"threadId":P,"runId":R}),
+    );
+    assert_eq!(s.record().state, RunState::Stopping);
+    s.advance(3_000);
+    assert_eq!(
+        s.m.convergences.progress[R].interrupt_before_stop,
+        Some(InterruptReason::Stop)
+    );
+    assert!(s.record().stall.is_none());
+    s.release("turn/interrupt", P);
+    assert_eq!(s.record().state, RunState::Ended);
+    assert_eq!(s.record().status, Some(RunStatus::Interrupted));
+    assert_eq!(s.record().interrupt_reason, Some(InterruptReason::Stop));
+    assert_eq!(
+        s.record().subagent_join.as_ref().unwrap().terminal_reason,
+        Some(crate::sa1b::TerminalReason::UserStop)
+    );
+}
+
 #[test]
 fn sa1b_运行中限制停树产生的中断不能覆盖原异常() {
     use crate::sa1b::TerminalReason;
