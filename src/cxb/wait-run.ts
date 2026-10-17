@@ -56,9 +56,12 @@ export const waitRun: WaitRun = async (rpc, opts) => {
   const check = () => {
     if (settled) return;
     const observed = current && diagnostics.merge(current);
-    // 新原因停止未确认可以早于 ended；此时不等最终轮补读，也不把停止未确认当成执行完成。
-    if (observed && isUnconfirmedRun(observed)) { finish(observed); return; }
-    if (!current || (current.state !== "ended" && current.state !== "lost")) return;
+    const unconfirmed = observed && isUnconfirmedRun(observed);
+    // 尚无真实失败的新原因停止可以提前退出；失败诊断不能把旧快照当成完整失败结果。
+    if (unconfirmed && observed.status !== "failed") { finish(observed); return; }
+    if (unconfirmed && current?.status !== "failed") return;
+    // 完整记录已确认失败时仍保留 stopping 的交付能力，但必须经过最终轮补读。
+    if (!current || (current.state !== "ended" && current.state !== "lost" && !unconfirmed)) return;
     const last = resultTurn(current);
     // 新记录按稳定 turnId 接补读；旧记录仍核对零基序号，兼容裁剪后的账本。
     const replacement = current.finalTurnId !== undefined
