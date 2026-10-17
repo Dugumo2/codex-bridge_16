@@ -26,6 +26,13 @@ const parse = (result: CliResult) => {
 };
 const exact = (result: CliResult, text: string) => assert(result.stderr.split(/\r?\n/u).includes(text), `stderr 缺少固定行：${text}`);
 
+/** 正式挂起场景必须证明请求先到达本地模型，不能把请求发出前的停滞当作模型挂起。 */
+export function assertHangRequestBeforeExpiry(requests: ReadonlyArray<{ at: number }>, expiredAt: number) {
+  assert(requests.length > 0, "挂起模型服务必须已接受请求");
+  assert(Number.isFinite(expiredAt) && Number.isFinite(requests[0].at) && requests[0].at < expiredAt,
+    "挂起请求必须在无进展到期之前到达模型服务");
+}
+
 export async function runStallE2e(scenario: StallModelScenario, mode: "smoke" | "contract" = "contract"): Promise<StallE2eResult> {
   const bin = process.env.CXB_BROKER_BIN;
   if (!bin || !existsSync(bin)) throw new Error("必须显式指定 CXB_BROKER_BIN，禁止回退到其他 broker");
@@ -79,8 +86,10 @@ export async function runStallE2e(scenario: StallModelScenario, mode: "smoke" | 
       return false;
     }, "真实运行未开始", 15_000);
     await rpc.request("broker/threads/watch", { threadId: id, runId });
-    if (mode === "smoke" && scenario !== "ok") {
+    if (scenario === "hang" || mode === "smoke" && scenario !== "ok") {
       await until(() => model!.requests.length > 0, "模型服务未接受本机请求", 15_000);
+    }
+    if (mode === "smoke" && scenario !== "ok") {
       if (scenario === "hang") {
         // 让 20 秒策略完整经过，证明骨架仍在运行；只记录当前基线，不把它当契约通过。
         const observeUntil = Date.now() + 22_000;
@@ -113,6 +122,7 @@ export async function runStallE2e(scenario: StallModelScenario, mode: "smoke" | 
       if (scenario === "hang") {
         assert.equal(record.stall.verify, "inProgress"); assert.deepEqual(final.stall, persisted.stall);
         const expired = updates.find((event) => event.params.stall?.phase === "verifying")?.params.stall; assert(expired);
+        assertHangRequestBeforeExpiry(model.requests, expired.expiredAt);
         exact(run, `[cxb] 已 ${Math.floor(expired.idleMs / 1000)} 秒未观察到进展（无进展期限 20 秒），正在核实；仍无进展将停止本次运行。`);
         exact(run, "[cxb] 无进展核实结束（轮次仍在进行），正在停止本次运行。");
         exact(run, "[cxb] 已因无进展停止本次运行（20 秒未观察到进展）。");

@@ -116,6 +116,13 @@ function stallMock(): string {
           const mode = scenario.slice("无进展:".length);
           const timers = [];
           globalThis.stallScenario = { mode, timers };
+          if (mode === "审批") {
+            globalThis.stallScenario.releaseStart = () => respond({ id: msg.id, result: { turn: { id: "turn-001", items: [], status: "inProgress", error: null } } });
+            respond({ method: "turn/started", params: { threadId, turn: { id: "turn-001", items: [], status: "inProgress", error: null } } });
+            respond({ id: "stall-approval", method: "item/commandExecution/requestApproval",
+              params: { threadId, turnId: "turn-001", itemId: "cmd-1", command: "echo hi", cwd: "/tmp" } });
+            break;
+          }
           respond({ id: msg.id, result: { turn: { id: "turn-001", items: [], status: "inProgress", error: null } } });
           respond({ method: "turn/started", params: { threadId, turn: { id: "turn-001", items: [], status: "inProgress", error: null } } });
           if (mode === "重试" || mode === "认证" || mode === "不确认") {
@@ -131,10 +138,6 @@ function stallMock(): string {
               if (count >= 6) clearInterval(timer);
             }, 500);
             timers.push(timer);
-          }
-          if (mode === "审批") {
-            setTimeout(() => respond({ id: "stall-approval", method: "item/commandExecution/requestApproval",
-              params: { threadId, turnId: "turn-001", itemId: "cmd-1", command: "echo hi", cwd: "/tmp" } }), 100);
           }
           break;
         }
@@ -152,7 +155,8 @@ function stallMock(): string {
   `;
   const pidFile = join(tempDir, "mock-pids.txt");
   writeFileSync(script, `import {appendFileSync} from "node:fs"; appendFileSync(${JSON.stringify(pidFile)}, String(process.pid) + "\\n");\n`
-    + original.replace(/^#![^\n]*\n/, "").replace(startMarker, startMarker + start).replace(interruptMarker, 'case "turn/interrupt":' + interrupt + "\n        appendFileSync("));
+    + original.replace(/^#![^\n]*\n/, "").replace(startMarker, startMarker + start).replace(interruptMarker,
+      'case "fixture/releaseStallStart": { const release = globalThis.stallScenario?.releaseStart; if (release) { delete globalThis.stallScenario.releaseStart; release(); } respond({ id: msg.id, result: { released: !!release } }); break; }\n      case "turn/interrupt":' + interrupt + "\n        appendFileSync("));
   return mock;
 }
 
@@ -178,9 +182,10 @@ async function connect(socket: string): Promise<{ client: TestClient; notices: T
 
 type Scenario = { client: TestClient; notices: Timed[]; runId: string; startedAt: number };
 
-async function startScenario(mode: string, policy: { stallTimeoutMs: number; upstreamErrorPolicy: string }): Promise<Scenario> {
+async function startScenario(mode: string, policy: { stallTimeoutMs: number; upstreamErrorPolicy: string }, beforeStart?: (client: TestClient) => void): Promise<Scenario> {
   const socket = await startBroker();
   const { client, notices } = await connect(socket);
+  beforeStart?.(client);
   const { thread } = await client.request("thread/start", {}) as { thread: { id: string } };
   const startedAt = performance.now();
   const started = await client.request("turn/start", {
@@ -249,10 +254,19 @@ test("无进展：非空输出增量延长期限，静默后才到期", async ()
 }, 40_000);
 
 test("无进展：等待审批时不计时，回答后从回答时刻重新计", async () => {
-  const s = await startScenario("审批", { stallTimeoutMs: STALL_MS, upstreamErrorPolicy: "observe" });
   let approval: Record<string, unknown> | undefined;
-  s.client.onRequest((message) => { approval = message; });
-  await waitFor(() => approval !== undefined, 10_000);
+  let released: Promise<unknown> | undefined;
+  const s = await startScenario("审批", { stallTimeoutMs: STALL_MS, upstreamErrorPolicy: "observe" }, client => {
+    // 夹具在审批被此监听收到前不回开轮；晚注册将确定性失败，不依赖 100 毫秒窗口。
+    client.onRequest(message => {
+      if (message.id !== "stall-approval" && message.method !== "item/commandExecution/requestApproval") return;
+      approval = message;
+      released = client.request("fixture/releaseStallStart", {});
+      void released.catch(() => {});
+    });
+  });
+  expect(approval).toBeDefined();
+  expect(await released).toEqual({ released: true });
   await Bun.sleep(STALL_MS * 2);
   expect(updates(s).filter((u) => u.params.stall)).toHaveLength(0);
   const answeredAt = performance.now();

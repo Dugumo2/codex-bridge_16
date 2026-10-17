@@ -9,6 +9,17 @@ import { within, type ManagedProcess } from "../test-support/upstream-isolation"
 import { startStallModel } from "../test-support/upstream-model-server-stall";
 import { FAKE_KEY } from "../test-support/upstream-model-server";
 import { request as httpRequest } from "node:http";
+import { assertHangRequestBeforeExpiry } from "../test-support/upstream-e2e-stall";
+
+test("四轮挂起证据：请求先到模型服务才认可", () => {
+  expect(() => assertHangRequestBeforeExpiry([{ at: 10 }], 20)).not.toThrow();
+});
+test("四轮挂起证据：没有模型请求时拒绝即使停止已确认", () => {
+  expect(() => assertHangRequestBeforeExpiry([], 20)).toThrow("必须已接受请求");
+});
+test("四轮挂起证据：到期时或到期后才到达的请求不能冒充挂起", () => {
+  for (const at of [20, 21]) expect(() => assertHangRequestBeforeExpiry([{ at }], 20)).toThrow("到期之前");
+});
 
 const MERGED = process.env.CXB_UE2_MERGED === "1";
 const lines = (text: string) => text.split(/\r?\n/u).filter(Boolean);

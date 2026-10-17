@@ -84,11 +84,11 @@ describe.skipIf(!RUNNABLE)("broker-ext 子线程报错归入父运行（C2）", 
     for (const client of clients.splice(0)) await client.close().catch(() => undefined);
   });
 
-  async function startBroker(options: { reviewDelay?: number } = {}) {
+  async function startBroker(options: { holdReview?: boolean } = {}) {
     const sockPath = h.testSocketPath(tempDir);
     const mockDir = h.createMockCodex(tempDir, {
       subagents: { enabled: true }, sendTurnCompleted: false,
-      ...(options.reviewDelay === undefined ? {} : { legacyReview: true, reviewDelay: options.reviewDelay }),
+      ...(options.holdReview ? { legacyReview: true, holdReview: true } : {}),
     });
     const proc = h.spawnBroker(context, h.endpointFor(sockPath), mockDir, { env: { CXB_HOME: home } });
     await h.waitForSocket(sockPath);
@@ -117,15 +117,6 @@ describe.skipIf(!RUNNABLE)("broker-ext 子线程报错归入父运行（C2）", 
     client.request("fixture/inject", { threadId: thread, kind: "notification", payload: { method: "error", params: { turnId, willRetry: true, error } } });
   const injectDelta = (client: Client, thread: string, turnId: string, index: number) =>
     client.request("fixture/inject", { threadId: thread, kind: "notification", payload: { method: "item/agentMessage/delta", params: { turnId, itemId: `子消息-${index}`, delta: `子输出 ${index}` } } });
-  /** 有界地确认一段时间内某条件始终不成立。 */
-  const staysFalse = async (cond: () => boolean, ms: number) => {
-    const until = Date.now() + ms;
-    while (Date.now() < until) {
-      if (cond()) return false;
-      await Bun.sleep(25);
-    }
-    return !cond();
-  };
   function records(): Run[] {
     const workspaces = join(home, "workspaces");
     if (!existsSync(workspaces)) return [];
@@ -198,20 +189,32 @@ describe.skipIf(!RUNNABLE)("broker-ext 子线程报错归入父运行（C2）", 
   }, 40_000);
 
   test("review 未归属期间到达的子线程报错只记账一次", async () => {
-    const { sockPath } = await startBroker({ reviewDelay: 1_500 });
+    const { sockPath } = await startBroker({ holdReview: true });
     const owner = await connect(sockPath);
     const reviewer = await connect(sockPath);
     const run = await startRun(owner);
     const childTurn = await spawnChild(owner, PARENT, run.turn.id, "child-1", "spawn-1");
-    // review 回包延迟期间 broker 处于「有未归属 review」状态，非认领线程事件会进入未归属缓冲。
-    const review = reviewer.request("review/start", { delivery: "detached", threadId: "thread-002", target: { type: "uncommittedChanges" } });
-    await Bun.sleep(200);
+    let reviewDone = false;
+    const review = reviewer.request("review/start", { delivery: "detached", threadId: "thread-002", target: { type: "uncommittedChanges" } })
+      .finally(() => { reviewDone = true; });
+    void review.catch(() => {});
+    // 上游已收到 review/start，证明 broker 已登记；回包仍由夹具扣住，不能先完成 review。
+    const gateDeadline = performance.now() + 10_000;
+    while (!(await owner.request("fixture/reviewGate", {}) as { held: boolean }).held) {
+      if (performance.now() >= gateDeadline) throw new Error("review 尚未在上游登记为扣住状态");
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    expect(reviewDone).toBe(false);
     await injectError(owner, "child-1", childTurn);
     await h.waitFor(() => updates(owner, run.runId).some((u) => u.childUpstreamError?.threadId === "child-1"), 10_000);
+    expect(reviewDone).toBe(false);
+    expect(await owner.request("fixture/reviewGate", {})).toEqual({ held: true });
+    expect(updates(owner, run.runId).filter(u => u.childUpstreamError !== null)).toHaveLength(1);
+    expect(await owner.request("fixture/releaseReview", {})).toEqual({ released: true });
     await review;
-    // 归属定下后的回放不应再把同一事件计入一次。
-    expect(await staysFalse(() => updates(owner, run.runId).filter((u) => u.childUpstreamError !== null).length > 1, 1_500)).toBe(true);
+    // review 已回包，再取快照形成服务端屏障，回放不得重复记账。
     const snapshot = await owner.request("broker/threads/watch", { threadId: PARENT }) as { run: Run };
+    expect(updates(owner, run.runId).filter(u => u.childUpstreamError !== null)).toHaveLength(1);
     expect(snapshot.run.childUpstreamErrors!.map((e) => [e.threadId, e.upstreamError.count])).toEqual([["child-1", 1]]);
   }, 40_000);
 

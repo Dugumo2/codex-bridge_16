@@ -441,6 +441,14 @@ fn 共享模式的owned运行同样计时并停止() {
         m.run_settled(RUN, false, &mut a);
         m.stall_owned_settled(RUN, &mut a);
     }
+    // 夹具显式定案为 owned 后，也要补齐真实定案路径登记的自有轮，才能核实活动目标。
+    m.claims.get_mut("线程").unwrap().pending_start = None;
+    m.remember_owned_turn("线程", "本轮");
+    m.run_turn_started(RUN, "线程", "本轮", &mut vec![]);
+    assert_eq!(
+        m.diagnostic_run("线程", "本轮", false).as_deref(),
+        Some(RUN)
+    );
     assert!(m.runs.stall_states.contains_key(RUN));
     let actions = expire_in_progress(&mut m);
     assert_eq!(interrupts(&actions), 1);

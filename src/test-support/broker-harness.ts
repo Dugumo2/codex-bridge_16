@@ -176,6 +176,8 @@ export function createMockCodex(dir: string, opts?: {
   completeBeforeResponse?: boolean;
   /** 响应 review/start 前的延迟，单位为毫秒；让客户端在请求期间断开，以测试孤立轮次的清理。 */
   reviewDelay?: number;
+  /** 扣住 review 回包，测试通过 fixture/releaseReview 显式放行。 */
+  holdReview?: boolean;
   /** 模拟目标模式线程：目标仍活跃时，首轮完成后由服务器续跑一轮，再完成目标。 */
   goalContinuation?: boolean;
   /** 模拟轮次间隙暂停目标：首轮完成时目标仍活跃，但不续跑，改为发送 goal/updated(paused)。 */
@@ -538,6 +540,16 @@ process.stdin.on("data", (chunk) => {
         break;
       }
 
+      case "fixture/reviewGate":
+        respond({ id: msg.id, result: { held: !!globalThis.heldReview } });
+        break;
+      case "fixture/releaseReview": {
+        const release = globalThis.heldReview;
+        globalThis.heldReview = null;
+        if (release) release();
+        respond({ id: msg.id, result: { released: !!release } });
+        break;
+      }
       case "review/start": {
         const threadId = msg.params?.threadId || "thread-001";
         if (msg.params?.delivery === "detached" && !${opts?.legacyReview ?? false}) {
@@ -545,7 +557,7 @@ process.stdin.on("data", (chunk) => {
           break;
         }
         const reviewThreadId = msg.params?.delivery === "detached" ? "review-thread-001" : threadId;
-        setTimeout(() => {
+        const finishReview = () => {
           if (reviewThreadId !== threadId) respond({ method: "thread/started", params: { thread: { id: reviewThreadId } } });
           respond({ id: msg.id, result: {
             turn: { id: "review-turn-001", items: [], status: "inProgress", error: null },
@@ -575,7 +587,9 @@ process.stdin.on("data", (chunk) => {
             });
           }, ${turnCompletedDelay});
           ` : ""}
-        }, ${reviewDelay});
+        };
+        if (${opts?.holdReview ?? false}) globalThis.heldReview = finishReview;
+        else setTimeout(finishReview, ${reviewDelay});
         break;
       }
 
