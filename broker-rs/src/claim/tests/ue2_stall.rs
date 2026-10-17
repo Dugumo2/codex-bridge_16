@@ -309,6 +309,33 @@ fn 核实读到新终态交既有收尾且不重复重置() {
 }
 
 #[test]
+fn 四轮_核实终态立即释放仍提交正确诊断且不重排() {
+    for status in ["completed", "failed", "interrupted"] {
+        let mut m = stall_running();
+        m.cxb_conns.insert(1);
+        advance(&mut m, TIMEOUT);
+        let read = verify_read(&fire(&mut m));
+        let actions = answer(&mut m, &read, &[("本轮", status)]);
+        assert_eq!(m.runs.runs[RUN].state, RunState::Ended);
+        assert_eq!(stall(&m).phase, StallPhase::Resumed);
+        assert_eq!(stall(&m).verify, Some(StallVerify::TurnEnded));
+        assert!(!m.runs.stall_states.contains_key(RUN));
+        // 收尾内的进展可能先排程、随后撤销；提交后最后一条计时动作必须是撤销。
+        let last_timer = actions.iter().rev().find(|a| {
+            matches!(a,
+            Action::Schedule { kind: TimerKind::Stall { run_id, .. }, .. } if run_id == RUN)
+                || matches!(a, Action::Unschedule { key: TimerKey::Stall(run) } if run == RUN)
+        });
+        assert!(matches!(last_timer, Some(Action::Unschedule { .. })));
+        assert!(actions.iter().any(|a| matches!(a, Action::Store(crate::store::StoreOp::PutRun(r))
+            if r.run_id == RUN && r.stall.as_ref().is_some_and(|s| s.phase == StallPhase::Resumed && s.verify == Some(StallVerify::TurnEnded)))));
+        assert!(actions.iter().any(|a| matches!(a, Action::Send { message, .. }
+            if message["method"] == "broker/run/updated" && message["params"]["stall"]["phase"] == "resumed"
+            && message["params"]["stall"]["verify"] == "turnEnded")));
+    }
+}
+
+#[test]
 fn 轮次仍在进行或读取失败都按无进展停止() {
     let mut m = stall_running();
     let a = expire_in_progress(&mut m);
@@ -415,6 +442,13 @@ fn 共享模式的owned运行同样计时并停止() {
         m.stall_owned_settled(RUN, &mut a);
     }
     assert!(m.runs.stall_states.contains_key(RUN));
+    let actions = expire_in_progress(&mut m);
+    assert_eq!(interrupts(&actions), 1);
+    assert_eq!(m.runs.runs[RUN].state, RunState::Stopping);
+    assert_eq!(
+        m.runs.runs[RUN].interrupt_reason,
+        Some(InterruptReason::StallTimeout)
+    );
 }
 
 #[test]
@@ -660,6 +694,69 @@ fn 未发interrupt与已发无完成两种未确认可区分() {
     let d = m.runs.runs[RUN].stop_diagnostics.clone().unwrap();
     assert!(d.interrupt_sent && d.turn_ended_at.is_none() && d.unconfirmed_at.is_some());
     assert!(d.confirmed_at.is_none());
+}
+
+#[test]
+fn 四轮_停止代际或执行线程迁移清除目标证据但保留运行历史() {
+    for migrate in [false, true] {
+        let mut m = stall_running();
+        m.clock.now_ms = 100;
+        m.begin_stop("线程", StopReason::Stop, false, &mut vec![]);
+        let old = send(&m, Some("本轮"));
+        m.stop_diag_interrupt_sent(RUN, &old);
+        m.stop_diag_interrupt_reply(RUN, &old, StopRpcOutcome::Ok);
+        m.stop_diag_rpc_issue(
+            RUN,
+            &old,
+            "thread/goal/get",
+            StopRpcOutcome::Error,
+            "旧问题",
+        );
+        m.stop_diag_turn_ended(RUN, &old);
+        let before = m.runs.runs[RUN].stop_diagnostics.clone().unwrap();
+        let mut new = old.clone();
+        if migrate {
+            new.thread = "审查执行线程".into();
+            m.runs.runs.get_mut(RUN).unwrap().review_thread_id = Some(new.thread.clone());
+        } else {
+            new.stop_generation += 1;
+        }
+        m.stop_diag_began(RUN, InterruptReason::StallTimeout, new.stop_generation);
+        let changed = m.runs.runs[RUN].stop_diagnostics.as_ref().unwrap();
+        assert_eq!(
+            (
+                changed.turn_ended_at,
+                changed.interrupt_reply,
+                changed.interrupt_replied_at
+            ),
+            (None, None, None)
+        );
+        assert_eq!(
+            (changed.started_at, changed.reason),
+            (before.started_at, before.reason)
+        );
+        assert_eq!(changed.rpc_issues, before.rpc_issues);
+        m.clock.now_ms = 200;
+        m.stop_diag_interrupt_sent(RUN, &new);
+        m.stop_diag_turn_ended(RUN, &old);
+        assert_eq!(
+            m.runs.runs[RUN]
+                .stop_diagnostics
+                .as_ref()
+                .unwrap()
+                .turn_ended_at,
+            None
+        );
+        m.stop_diag_turn_ended(RUN, &new);
+        assert_eq!(
+            m.runs.runs[RUN]
+                .stop_diagnostics
+                .as_ref()
+                .unwrap()
+                .turn_ended_at,
+            Some(200)
+        );
+    }
 }
 
 #[test]

@@ -48,6 +48,7 @@ impl Machine {
     }
 
     pub(crate) fn flush_run_diagnostics(&mut self, actions: &mut Vec<Action>) {
+        self.sync_stop_diagnostic_targets();
         for (run, dirty) in std::mem::take(&mut self.runs.diagnostic_dirty) {
             let Some(record) = self.runs.runs.get_mut(&run) else {
                 continue;
@@ -181,6 +182,9 @@ impl Machine {
         let Some(child) = self.child_activity_run(thread, turn, completion) else {
             return false;
         };
+        if completion && !self.accept_child_completion(&child, thread, turn) {
+            return true;
+        }
         #[cfg(test)]
         self.runs
             .child_event_log

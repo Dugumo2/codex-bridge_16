@@ -16,7 +16,7 @@ impl Machine {
     /// 子线程通知归属：满足契约 5.1 时返回父运行 runId 与父线程。纯查询，无副作用。
     ///
     /// `completion` 只用于 `turn/completed` 的首次终态：关系层先于诊断处理同一完成事件，
-    /// 此时观察记录已标完成仍放行；重复完成由提交层的已结束轮记录在调用前拒绝。
+    /// 此时观察记录已标完成仍放行；首次接纳由运行级绑定标记判断，不依赖线程完成缓存。
     pub(crate) fn child_activity_run(
         &self,
         thread: &str,
@@ -54,6 +54,27 @@ impl Machine {
             run_id: binding.run_id,
             parent_thread_id: binding.parent_thread_id,
         })
+    }
+
+    /// 与有效绑定同寿命的完成接纳标记；有界于现存绑定，不能用提前淘汰的 LRU 代替。
+    pub(crate) fn accept_child_completion(
+        &mut self,
+        child: &ChildRunRef,
+        thread: &str,
+        turn: &str,
+    ) -> bool {
+        let Some(active) = self.runs.active.get_mut(&child.run_id) else {
+            return false;
+        };
+        let bindings = &self.relations.bindings;
+        active.child_completions.retain(|key| {
+            bindings.get(key).is_some_and(|binding| {
+                binding.run_id == child.run_id && binding.status == BindingStatus::Bound
+            })
+        });
+        active
+            .child_completions
+            .insert((thread.into(), turn.into()))
     }
 
     /// 子线程 error／turn/completed(failed) 的诊断记账（契约 5.2）。

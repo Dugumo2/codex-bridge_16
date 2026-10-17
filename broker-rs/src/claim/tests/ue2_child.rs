@@ -1,5 +1,5 @@
 //! 上游报错第二批 C2：子线程报错与进展归入父运行（契约第 5、6 节）。
-//! 绑定由真实的 v1 派生事件建立，不用测试覆写。
+//! 首轮绑定由真实 v1 派生建立；缓存淘汰测试另构造归属层已确认的新轮绑定，不绕过诊断入口。
 use super::*;
 use crate::claim::converge::ConvergenceReadiness;
 use crate::relations::BindingStatus;
@@ -254,6 +254,53 @@ fn 子轮完成后迟到的报错与增量不归入() {
     assert_eq!(m.runs.runs[R].diagnostic_revision, revision);
     assert!(run_updates(&a).is_empty());
     assert!(m.child_activity_run(C, CT, false).is_none());
+}
+
+#[test]
+fn 四轮_完成缓存淘汰后旧子轮不覆盖新诊断且不增版() {
+    let (mut m, mut mock) = setup(false);
+    spawn(&mut m, &mut mock, C, "派生1", CT);
+    apply(&mut m, failed(C, CT));
+    assert_eq!(entry(&m, C).turn_id.as_deref(), Some(CT));
+    // 本测试聚焦诊断缓存退化；显式提供归属层已确认的新轮因果绑定。
+    let mut binding = m.binding(C, CT).unwrap();
+    binding.turn_id = "新子轮".into();
+    binding.operation.item_id = "已确认跟进".into();
+    m.relations
+        .bindings
+        .insert((C.into(), "新子轮".into()), binding);
+    apply(&mut m, mock.turn_started(C, "新子轮"));
+    apply(&mut m, unauthorized(C, "新子轮"));
+    assert_eq!(entry(&m, C).turn_id.as_deref(), Some("新子轮"));
+    let before = child_errors(&m).clone();
+    let revision = m.runs.runs[R].diagnostic_revision;
+    // 精确模拟完成去重缓存被淘汰；有效绑定与关系观察仍存在。
+    m.records.get_mut(C).unwrap().ended_turns.clear();
+    let actions = apply(&mut m, failed(C, CT));
+    assert_eq!(*child_errors(&m), before);
+    assert_eq!(m.runs.runs[R].diagnostic_revision, revision);
+    assert!(run_updates(&actions).is_empty());
+    // 数组项被淘汰后，重复完成也不能重新插入。
+    m.runs
+        .runs
+        .get_mut(R)
+        .unwrap()
+        .child_upstream_errors
+        .clear();
+    m.records.get_mut(C).unwrap().ended_turns.clear();
+    let actions = apply(&mut m, failed(C, CT));
+    assert!(child_errors(&m).is_empty());
+    assert_eq!(m.runs.runs[R].diagnostic_revision, revision);
+    assert!(run_updates(&actions).is_empty());
+    m.run_released(R, crate::runs::ReleaseKind::Natural, &mut vec![]);
+    assert!(!m.accept_child_completion(
+        &crate::runs::ChildRunRef {
+            run_id: R.into(),
+            parent_thread_id: P.into()
+        },
+        C,
+        "释放后新键"
+    ));
 }
 
 #[test]

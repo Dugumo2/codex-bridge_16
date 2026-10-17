@@ -33,6 +33,42 @@ pub(crate) fn issue_message(message: &str) -> String {
 }
 
 impl Machine {
+    /// 目标身份切换时丢弃旧目标证据；运行级首次时间、原因和最近问题列表保持不变。
+    fn stop_diag_select_target(&mut self, run: &str, send: &StopDiagSend) {
+        let changed = self
+            .runs
+            .stop_diag_sends
+            .get(run)
+            .is_some_and(|old| old != send);
+        self.runs.stop_diag_sends.insert(run.into(), send.clone());
+        if changed {
+            self.stop_diag_update(run, |d, _| {
+                let changed = d.turn_ended_at.is_some()
+                    || d.interrupt_reply.is_some()
+                    || d.interrupt_replied_at.is_some();
+                d.turn_ended_at = None;
+                d.interrupt_reply = None;
+                d.interrupt_replied_at = None;
+                changed
+            });
+        }
+    }
+
+    /// 新轮可能在旧 goal RPC 尚未回包时接管目标，事件提交前即同步，不能等下一次 interrupt。
+    pub(crate) fn sync_stop_diagnostic_targets(&mut self) {
+        let targets: Vec<_> = self
+            .stops
+            .operations
+            .values()
+            .filter_map(|op| op.diagnostic_send(op.target.as_deref()))
+            .collect();
+        for (run, send) in targets {
+            if self.stop_diag_current(&run, &send) {
+                self.stop_diag_select_target(&run, &send);
+            }
+        }
+    }
+
     /// 运行当前的执行线程（review 迁移后为 review 线程）。
     fn stop_diag_execution(&self, run: &str) -> Option<String> {
         let record = self.runs.runs.get(run)?;
@@ -100,11 +136,11 @@ impl Machine {
             .runs
             .stop_diag_sends
             .get(run)
-            .is_none_or(|send| send.stop_generation != stop_generation)
+            .is_none_or(|send| send.stop_generation != stop_generation || send.thread != thread)
         {
-            self.runs.stop_diag_sends.insert(
-                run.into(),
-                StopDiagSend {
+            self.stop_diag_select_target(
+                run,
+                &StopDiagSend {
                     stop_generation,
                     turn: None,
                     thread,
@@ -151,7 +187,7 @@ impl Machine {
         if !self.stop_diag_current(run, send) {
             return;
         }
-        self.runs.stop_diag_sends.insert(run.into(), send.clone());
+        self.stop_diag_select_target(run, send);
         self.stop_diag_update(run, |d, now| {
             d.interrupt_sent = true;
             d.interrupt_sent_at = Some(now);
@@ -183,7 +219,15 @@ impl Machine {
     }
 
     pub(crate) fn stop_diag_turn_ended(&mut self, run: &str, send: &StopDiagSend) {
-        if self.stop_diag_current(run, send) {
+        self.sync_stop_diagnostic_targets();
+        if self.stop_diag_current(run, send)
+            && self
+                .runs
+                .stop_diag_sends
+                .get(run)
+                .is_some_and(|current| current.turn.is_none() || current.turn == send.turn)
+        {
+            self.stop_diag_select_target(run, send);
             self.stop_diag_update(run, |d, now| set_once(&mut d.turn_ended_at, now));
         }
     }

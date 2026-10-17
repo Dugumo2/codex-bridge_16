@@ -530,18 +530,21 @@ impl Machine {
                 if *status != StatusTurn::InProgress
                     && shell.get("id").and_then(Value::as_str) == Some(&verify.turn_id) =>
             {
+                // 提交终态可能移除 owner；先保存本事件的诊断接收者，最终仍只统一提交一次。
+                self.mark_run_diagnostic(&run, DiagnosticField::Stall, None);
                 if !self.commit_verified_turn_end(&run, token, *status, shell, actions) {
                     // 同一结束证据已处理过或身份不符：不再次重置基准，按读取失败复核。
                     StallVerify::Unknown
                 } else {
+                    // 收尾可能已释放计时状态；核实结论仍须写入保留的运行记录。
+                    self.stall_set(
+                        &run,
+                        StallPhase::Resumed,
+                        Some(Some(StallVerify::TurnEnded)),
+                    );
                     // 新发现的终态已交既有收尾；运行仍在计时就以当时为基准重排。
                     if let Some(state) = self.runs.stall_states.get_mut(&run) {
                         state.baseline_mono = self.clock.mono_ms;
-                        self.stall_set(
-                            &run,
-                            StallPhase::Resumed,
-                            Some(Some(StallVerify::TurnEnded)),
-                        );
                         self.stall_schedule_remaining(&run, actions);
                     }
                     return;

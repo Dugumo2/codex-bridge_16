@@ -590,6 +590,68 @@ fn 暂停失败保留占用并中断目标续跑新轮次() {
     let a = reply(&mut m, &req(&a, "thread/goal/set"), Err(err()));
     assert_eq!(req(&a, "turn/interrupt").params.unwrap()["turnId"], "续跑");
 }
+
+#[test]
+fn 四轮_停止目标续跑立即清除旧轮诊断并记录新结束() {
+    let mut m = running();
+    m.clock.now_ms = 100;
+    let a = stop(&mut m, 2, false);
+    let a = reply(&mut m, &req(&a, "thread/goal/get"), Ok(goal("active")));
+    let a = reply(&mut m, &req(&a, "thread/goal/set"), Err(err()));
+    assert_eq!(requests(&a, "turn/interrupt").len(), 1);
+    let run = op(&m).run_id.clone().unwrap();
+    let old_send = m.runs.stop_diag_sends[&run].clone();
+    m.clock.now_ms = 150;
+    m.stop_diag_interrupt_reply(&run, &old_send, crate::runs::StopRpcOutcome::Ok);
+    m.clock.now_ms = 200;
+    let completed = turn(&mut m, "turn/completed", "本轮");
+    let before = m.runs.runs[&run].stop_diagnostics.clone().unwrap();
+    assert_eq!(before.turn_ended_at, Some(200));
+    assert!(before.interrupt_reply.is_some());
+    m.clock.now_ms = 250;
+    turn(&mut m, "turn/started", "续跑");
+    let changed = m.runs.runs[&run].stop_diagnostics.as_ref().unwrap();
+    assert_eq!(
+        (
+            changed.turn_ended_at,
+            changed.interrupt_reply,
+            changed.interrupt_replied_at
+        ),
+        (None, None, None)
+    );
+    assert_eq!(
+        (changed.started_at, changed.reason),
+        (before.started_at, before.reason)
+    );
+    assert_eq!(changed.rpc_issues, before.rpc_issues);
+    let a = reply(
+        &mut m,
+        &req(&completed, "thread/goal/get"),
+        Ok(goal("active")),
+    );
+    let a = reply(&mut m, &req(&a, "thread/goal/set"), Err(err()));
+    assert_eq!(req(&a, "turn/interrupt").params.unwrap()["turnId"], "续跑");
+    m.stop_diag_turn_ended(&run, &old_send);
+    m.stop_diag_interrupt_reply(&run, &old_send, crate::runs::StopRpcOutcome::Ok);
+    assert_eq!(
+        m.runs.runs[&run]
+            .stop_diagnostics
+            .as_ref()
+            .unwrap()
+            .turn_ended_at,
+        None
+    );
+    m.clock.now_ms = 400;
+    turn(&mut m, "turn/completed", "续跑");
+    assert_eq!(
+        m.runs.runs[&run]
+            .stop_diagnostics
+            .as_ref()
+            .unwrap()
+            .turn_ended_at,
+        Some(400)
+    );
+}
 #[test]
 fn 暂停回包前换代只中断最新轮次() {
     let mut m = running();

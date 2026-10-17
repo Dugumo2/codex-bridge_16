@@ -54,6 +54,9 @@ pub(super) enum Phase {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ActiveRun {
+    /// 每个有效活动绑定最多一个完成标记；数量不超过该运行有效绑定数。
+    /// 不独立淘汰，避免旧完成复活；随 ActiveRun 的普通释放、树提交及关闭一同回收。
+    pub child_completions: HashSet<(String, String)>,
     pub current_turn: Option<(String, String)>,
     pub snapshot: crate::results::Snapshot,
     pub progress_generation: Option<u64>,
