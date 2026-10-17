@@ -9,6 +9,7 @@ mod resume;
 mod review;
 mod runs;
 mod settlement;
+mod ue2_child;
 mod ue2_policy;
 mod ue2_stall;
 mod upstream_error;
