@@ -10,6 +10,7 @@ import { readRunRecord } from "./ledger";
 import { renderPending } from "./server-requests";
 import { resolveThreadViaBroker } from "./thread-ref";
 import { bounded, exitCodeForRun, waitRun } from "./wait-run";
+import { isUnconfirmedRun } from "./run-diagnostics";
 
 const MAX_WAIT_MS = 86_400_000;
 
@@ -128,8 +129,15 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure]);
     if ("items" in winner) return outputPending(winner.items);
     const run = upstream.apply(winner.run);
-    showSubagents(ctx, run);
     const code = exitCodeForRun(run);
+    if (isUnconfirmedRun(run)) {
+      if (code === EXIT.CODEX_FAILED) upstream.failure(run);
+      ctx.out.resultJson({ ok: false, command: "wait", waitFor: "thread", threadId: ref.threadId, shortId: ref.shortId,
+        runId, state: run.state, status: run.status, stopOutcome: run.stopOutcome, interruptReason: run.interruptReason,
+        stopDiagnostics: null, ...convergenceFields(run), ...selectedResultFields(run), ...upstreamResultFields(run) });
+      return code;
+    }
+    showSubagents(ctx, run);
     if (code === EXIT.CODEX_FAILED) {
       if (run.upstreamError || resultTurn(run)?.error != null) ctx.out.notice("Codex 执行失败，请用 cxb show 查看运行结果");
       upstream.failure(run);
@@ -137,7 +145,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     ctx.out.result(resultTurn(run)?.output ?? "");
     ctx.out.resultJson({ ok: code === EXIT.OK, command: "wait", waitFor: "thread", threadId: ref.threadId,
       shortId: ref.shortId, runId, status: run.status, result: resultTurn(run)?.output ?? "", alreadyDone, ...convergenceFields(run), ...selectedResultFields(run), ...upstreamResultFields(run),
-      ...(run.subagentJoin && run.interruptReason ? { interruptReason: run.interruptReason } : {}),
+      ...((run.subagentJoin || run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError") && run.interruptReason ? { interruptReason: run.interruptReason } : {}),
       ...(run.loopGuard ? { loopGuard: run.loopGuard } : {}),
       // 子代理停止报告与中断原因（subagentsUnfinished 等）原样带出；没有子代理时字段缺省，旧输出不变。
       ...(run.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}),

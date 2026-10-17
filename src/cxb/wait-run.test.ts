@@ -29,7 +29,7 @@ test("快照即终态：ended、lost、无轮次与 unavailable 都直接返回�
   for (const run of [runResult(), runResult({ state: "lost", status: "interrupted" }), runResult({ turns: [] }),
     runResult({ turns: [{ ...runResult().turns[0], ready: "unavailable" }] })]) {
     const fake = new FakeRpc();
-    fake.handle = () => { expect(fake.subscriptions).toBe(3); return { run }; };
+    fake.handle = () => { expect(fake.subscriptions).toBe(4); return { run }; };
     expect(await waitRun(fake.rpc, opts)).toEqual(run);
     expect(fake.subscriptions).toBe(0);
   }

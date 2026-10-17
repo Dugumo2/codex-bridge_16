@@ -13,6 +13,8 @@ import type { ConvergenceSummary } from "./sa1b-contracts";
 
 interface ListItem extends ModelDisplay, ConvergenceSummary {
   upstreamError?: import("./contracts").UpstreamError;
+  stall?: RunResult["stall"];
+  interruptReason?: RunResult["interruptReason"];
   threadId: string; shortId: string | null; status: string; lastRunId: string | null;
   updatedAt: number; model: string | null; preview: string | null; goal: string | null;
   /** 待核实的归档或删除（`--json` 原样带出）。 */
@@ -35,6 +37,20 @@ const preview = (text: string | null | undefined) => text == null ? null
   : [...sanitizeForTerminal(text).replace(/\s+/gu, " ")].slice(0, 120).join("");
 const sorted = (items: Iterable<ListItem>) => [...items].sort((a, b) => b.updatedAt - a.updatedAt || a.threadId.localeCompare(b.threadId));
 
+function listDiagnosticFields(run: RunResult) {
+  return { ...(run.stall ? { stall: run.stall } : {}),
+    ...(run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError" ? { interruptReason: run.interruptReason } : {}) };
+}
+
+function statusLabel(item: ListItem): string {
+  const notes: string[] = [];
+  if (item.status === "interrupted" && item.interruptReason === "stallTimeout") notes.push("无进展超时");
+  if (item.status === "interrupted" && item.interruptReason === "upstreamAccessError") notes.push("访问报错即停");
+  if (item.status === "running" && item.stall?.phase === "verifying") notes.push("无进展核实中");
+  if (item.upstreamError) notes.push(`上游 ${item.upstreamError.httpStatusCode ?? item.upstreamError.category}×${item.upstreamError.count}`);
+  return `${item.status}${notes.length ? `（${notes.join("；")}）` : ""}`;
+}
+
 type LocalThread = Pick<ThreadSummary, "threadId" | "shortId" | "lastRunId" | "updatedAt" | "model" | "preview" | "meta">
   & { state?: ThreadSummary["state"]; lifecycle?: LifecycleInfo };
 
@@ -47,7 +63,7 @@ function localItems(threads: LocalThread[], runs: RunResult[]): ListItem[] {
       : run?.state === "running" || run?.state === "stopping" || run?.state === "lost" ? run.state : run?.status ?? "idle";
     const selected = run ? resultTurn(run) : undefined;
     return { ...thread, ...threadModelDisplay(thread.threadId, thread.model, []),
-      ...(run ? { ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run) } : {}),
+      ...(run ? { ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run), ...listDiagnosticFields(run) } : {}),
       ...(run?.finalTurnId !== undefined || run?.subagentJoin ? { result: selected?.ready === "ready" ? selected.output : "", ready: resultReady(run),
         ...(run.state === "running" || run.state === "stopping" ? { stageResult: true } : {}) } : {}),
       ...(run?.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}), ...(run?.childrenStop ? { childrenStop: run.childrenStop } : {}), status, preview: preview(thread.preview), goal: thread.meta?.goal ?? null };
@@ -180,8 +196,7 @@ export const ls: CommandHandler = async (ctx) => {
     ctx.out.progress(`共发现 ${ranked.length} 条线程，显示 ${items.length} 条`);
     ctx.out.result("SHORT_ID STATUS LAST_RUN UPDATED MODEL REASONING PREVIEW\n");
     for (const item of items) {
-      const error = item.upstreamError;
-      const status = `${item.status}${error ? `（上游 ${error.httpStatusCode ?? error.category}×${error.count}）` : ""}`;
+      const status = statusLabel(item);
       ctx.out.result(sanitizeForTerminal(`${item.shortId ?? item.threadId.slice(0, 13)} ${status} ${item.lastRunId ?? "-"} ${new Date(item.updatedAt).toISOString()} ${modelLabel(item)} ${item.reasoning ?? "-"} ${item.subagents?.length ? `[子代理 ${item.subagents.length}] ` : ""}${item.preview ?? ""}\n`));
     }
     for (const item of items) if (item.childrenStop) for (const line of stopReportLines(item.childrenStop)) ctx.out.notice(`${item.shortId ?? item.threadId} ${line}`);
