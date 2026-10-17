@@ -1,31 +1,129 @@
+//! 子线程（子代理）上的上游报错与进展归入父运行（契约第 5 节）。
+//!
+//! 归属只认活动绑定：绑定上的 runId 与父线程、父运行仍在管理且在跑、子轮尚未结束。
+//! 记账按子线程各自合并，只标脏，由 `flush_run_diagnostics` 统一增版与通知。
 use crate::claim::{Action, Machine};
-use crate::runs::{upstream_error::UpstreamError, ChildRunRef};
+use crate::relations::BindingStatus;
+use crate::runs::{
+    upstream_error::{merge, UpstreamError},
+    ChildRunRef, ChildUpstreamError, DiagnosticField, RunState,
+};
 
-/// 由 C2 实现。
+/// 每个运行最多记录的子线程项；满了淘汰 `lastSeenAt` 最旧的一项。
+pub const MAX_CHILD_UPSTREAM_ERRORS: usize = 32;
+
 impl Machine {
+    /// 子线程通知归属：满足契约 5.1 时返回父运行 runId 与父线程。纯查询，无副作用。
+    ///
+    /// `completion` 只用于 `turn/completed` 的首次终态：关系层先于诊断处理同一完成事件，
+    /// 此时观察记录已标完成仍放行；重复完成由提交层的已结束轮记录在调用前拒绝。
     pub(crate) fn child_activity_run(
         &self,
-        _thread: &str,
-        _turn: &str,
-        _completion: bool,
+        thread: &str,
+        turn: &str,
+        completion: bool,
     ) -> Option<ChildRunRef> {
         #[cfg(test)]
         if let Some(child) = &self.runs.child_activity_override {
             return Some(child.clone());
         }
-        // 由 C2 实现。
-        None
+        if turn.is_empty() || self.is_execution_thread(thread) {
+            return None;
+        }
+        let binding = self.binding(thread, turn)?;
+        if binding.status != BindingStatus::Bound {
+            return None;
+        }
+        self.manage_context(&binding.run_id)?;
+        let record = self.runs.runs.get(&binding.run_id)?;
+        if !matches!(record.state, RunState::Running | RunState::Stopping) {
+            return None;
+        }
+        // 观察记录缺失（已被淘汰）时无法证明子轮仍在进行，按不归属处理。
+        let observation = self
+            .relations
+            .aux
+            .observed
+            .get(thread)?
+            .iter()
+            .find(|o| o.turn == turn)?;
+        if observation.completed && !completion {
+            return None;
+        }
+        Some(ChildRunRef {
+            run_id: binding.run_id,
+            parent_thread_id: binding.parent_thread_id,
+        })
     }
+
+    /// 子线程 error／turn/completed(failed) 的诊断记账（契约 5.2）。
+    /// 只改本运行的 `childUpstreamErrors`：父 `upstreamError`、轮次结果、SA1b 证据与预算都不碰。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn child_diagnostic_event(
         &mut self,
-        _child: &ChildRunRef,
-        _thread: &str,
+        child: &ChildRunRef,
+        thread: &str,
         _turn: &str,
-        _error: UpstreamError,
+        error: UpstreamError,
         _completion: bool,
-        _actions: &mut Vec<Action>,
+        actions: &mut Vec<Action>,
     ) {
-        // 由 C2 实现。
+        let Some(record) = self.runs.runs.get_mut(&child.run_id) else {
+            return;
+        };
+        let errors = &mut record.child_upstream_errors;
+        let item = match errors.iter_mut().find(|e| e.thread_id == thread) {
+            Some(entry) => {
+                let mut current = Some(entry.upstream_error.clone());
+                let mut changed = merge(&mut current, error);
+                entry.upstream_error = current.expect("合并后必有报错");
+                if entry.parent_thread_id != child.parent_thread_id {
+                    entry.parent_thread_id = child.parent_thread_id.clone();
+                    changed = true;
+                }
+                if !changed {
+                    return;
+                }
+                entry.clone()
+            }
+            None => {
+                if errors.len() >= MAX_CHILD_UPSTREAM_ERRORS {
+                    if let Some(oldest) = errors
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, e)| e.upstream_error.last_seen_at)
+                        .map(|(i, _)| i)
+                    {
+                        errors.remove(oldest);
+                    }
+                }
+                let entry = ChildUpstreamError {
+                    thread_id: thread.into(),
+                    parent_thread_id: child.parent_thread_id.clone(),
+                    upstream_error: error,
+                };
+                errors.push(entry.clone());
+                entry
+            }
+        };
+        self.mark_run_diagnostic(
+            &child.run_id,
+            DiagnosticField::ChildUpstreamErrors,
+            Some(item),
+        );
+        // 与 `run_diagnostic_event` 一致：批处理外的直接调用立即提交。
+        if !self.diagnostic_batch_active {
+            self.flush_run_diagnostics(actions);
+        }
+    }
+
+    /// 认领线程与活动运行的执行线程（含 review 执行线程）不是子线程。
+    fn is_execution_thread(&self, thread: &str) -> bool {
+        self.claims.contains_key(thread)
+            || self.runs.active.keys().any(|id| {
+                self.runs.runs.get(id).is_some_and(|r| {
+                    r.thread_id == thread || r.review_thread_id.as_deref() == Some(thread)
+                })
+            })
     }
 }
