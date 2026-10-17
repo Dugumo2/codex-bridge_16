@@ -226,6 +226,12 @@ scenario("detach 时已发汇总仍在核实：迁到新授权只读核实，不
 
 /** 只归一化两个独立运行必然不同的标识、工作区路径、时间；其余字节（含字段及提示）原样比较。 */
 function normalizeCli(value: string, h: H, run: any) {
+  if (run.stopDiagnostics) {
+    // 只归一化新增停止诊断内部的时间；其余字段及其位置仍逐字比较。
+    const diagnostics = Object.fromEntries(Object.entries(run.stopDiagnostics).map(([key, field]) =>
+      [key, key.endsWith("At") && typeof field === "number" ? "<时间>" : field]));
+    value = value.replace(JSON.stringify(run.stopDiagnostics), JSON.stringify(diagnostics));
+  }
   for (const [from, to] of [[h.tempDir, "<工作区>"], [h.tempDir.replaceAll("\\", "/"), "<工作区>"],
     [JSON.stringify(h.tempDir).slice(1, -1), "<工作区>"], [run.runId, "<运行>"], [run.shortId, "<短ID>"]]) {
     if (from) value = value.replaceAll(from, to);
@@ -234,6 +240,30 @@ function normalizeCli(value: string, h: H, run: any) {
     .replace(/("(?:updatedAt|startedAt|endedAt|completedAt|lastVerifiedAt)":\s*)\d+/g, '$1"<时间>"')
     .replace(/(耗时 |等待耗时 )\d+ 毫秒/g, "$1<耗时> 毫秒")
     .replace(/"alreadyDone":(true|false)/g, '"alreadyDone":"<连上时机>"');
+}
+/** 契约 4.3、7.4 唯一允许的基线增量：确有停止时，在指定位置加入完整停止诊断。 */
+function baselineStopDiagnostics(stdout: string, args: string[], run: any): string {
+  if (!args.includes("--json") || args.includes("--follow") || args.includes("--server") || args[0] === "ls") return stdout;
+  expect(run.interruptReason).toBe("stop");
+  expect(run.stopDiagnostics).toMatchObject({ reason: "stop", interruptSent: true, rpcIssues: [] });
+  expect(run.stopDiagnostics.confirmedAt).toBeNumber();
+  const anchor = args[0] === "run" || args[0] === "review" ? "interruptReason"
+    : args.includes("--log") ? "pendingReroute" : "backgroundCleanup";
+  const json = JSON.parse(stdout);
+  expect(stdout).toBe(`${JSON.stringify(json)}\n`);
+  const append = (entry: Record<string, unknown>) => {
+    expect(entry).not.toHaveProperty("stopDiagnostics");
+    expect(entry).toHaveProperty(anchor);
+    return Object.fromEntries(Object.entries(entry).flatMap(([key, value]) => key === anchor
+      ? [["stopDiagnostics", run.stopDiagnostics], [key, value]] : [[key, value]]));
+  };
+  if (args.includes("--log")) {
+    expect(json.runs).toHaveLength(1);
+    expect(json.runs[0].runId).toBe(run.runId);
+    json.runs = json.runs.map(append);
+    return `${JSON.stringify(json)}\n`;
+  }
+  return `${JSON.stringify(append(json))}\n`;
 }
 /** 仅为内联审查补上协议回包，复用原模拟器的轮次、停止及分页，不修改 R 路夹具。 */
 class BaselineHarness extends Sa1bHarness {
@@ -286,7 +316,8 @@ async function baselineSession(main: string, status: "completed" | "interrupted"
     const outputs = [{ args: [command, ...(json ? ["--json"] : [])], ...await running },
       { args: ["show", "--follow", "--json", "运行中"], ...await following },
       { args: ["wait", "--json", "运行中"], ...await waiting }];
-    expect(outputs[0]!.code).toBe(status === "completed" ? 0 : 4);
+    expect(outputs[0]!.code, outputs[0]!.stderr).toBe(status === "completed" ? 0 : 4);
+    expect(outputs[2]!.code, outputs[2]!.stderr).toBe(status === "completed" ? 0 : 4);
     // 满载下 wait 可能在运行结束后才连上（alreadyDone=true 同样正确），对照前把这一字段归一化。
     const waitedJson = JSON.parse(outputs[2]!.stdout);
     expect(waitedJson).toMatchObject({ runId: h.runId, status });
@@ -305,7 +336,13 @@ async function baselineSession(main: string, status: "completed" | "interrupted"
       ["show", P, "--server"], ["show", P, "--server", "--json"], ["show", P, "--log"], ["show", P, "--log", "--json"]]) {
       outputs.push({ args, ...await cli(h, main, args) });
     }
-    return outputs.map(row => ({ ...row, stdout: normalizeCli(row.stdout, h, run), stderr: normalizeCli(row.stderr, h, run) }));
+    const disk = readRunRecord(workspace.workspaceDir, h.runId)!;
+    return outputs.map(row => {
+      // show 读取落盘记录；run/wait 读取线上快照。新增诊断也保留各自的实际字段顺序。
+      const source = row.args[0] === "show" ? disk : run;
+      return { ...row, stdout: normalizeCli(main === BASELINE_CLI && status === "interrupted"
+        ? baselineStopDiagnostics(row.stdout, row.args, source) : row.stdout, h, source), stderr: normalizeCli(row.stderr, h, source) };
+    });
   } finally { await h.close(); }
 }
 for (const command of ["run", "review"] as const) for (const status of ["completed", "interrupted"] as const) for (const json of [false, true]) test(`未启用协调的普通${status}运行：${command}${json ? " --json" : ""}/show/ls/wait 双流与 s4-cli 逐字一致`, async () => {
