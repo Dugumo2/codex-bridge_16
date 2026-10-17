@@ -6,7 +6,7 @@ export function createStallMock(send: (message: RpcMessage) => void, options: { 
   const calls: Array<RpcMessage & { at: number }> = [];
   const emitted: RpcMessage[] = [];
   const timers = new Set<ReturnType<typeof setTimeout>>();
-  let mode: InterruptMode = "interrupted", holdReads = false;
+  let mode: InterruptMode = "interrupted", holdReads = false, approvalOnStart = false;
   const heldReads: RpcMessage[] = [];
   const output = (message: RpcMessage) => { emitted.push(structuredClone(message)); send(message); };
   const base = createSa1bMock(output);
@@ -51,6 +51,7 @@ export function createStallMock(send: (message: RpcMessage) => void, options: { 
           break;
         }
         case "approval": result = { id: approval() }; break;
+        case "approvalOnStart": approvalOnStart = true; break;
         case "holdReads": holdReads = true; break;
         case "releaseReads": {
           holdReads = false; const batch = heldReads.splice(0); for (const read of batch) base.handle(read);
@@ -80,6 +81,11 @@ export function createStallMock(send: (message: RpcMessage) => void, options: { 
       heldReads.push(structuredClone(message)); return;
     }
     base.handle(message);
+    // 与开轮在同一夹具事件中发出待答，测试进程暂停也不会漏掉停止屏障。
+    if (approvalOnStart && message.method === "turn/start") {
+      approvalOnStart = false;
+      approval();
+    }
   }
   return { handle, state, command, close() { for (const timer of timers) clearTimeout(timer); timers.clear(); } };
 }

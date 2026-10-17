@@ -48,6 +48,26 @@ test("waitRun自己订阅诊断，较新通知覆盖旧完整快照，真实fail
   }
 });
 
+for (const reason of ["stallTimeout", "upstreamAccessError"] as const) test(`完整stopping失败记录${reason}也必须等待选定最终轮补读`, async () => {
+  const fake = new FakeRpc();
+  const selected = { ...runResult().turns[0]!, status: "failed" as const, error: { message: "完整失败补读" } };
+  const snapshot = stopping({ status: "failed", interruptReason: reason, finalTurnId: selected.turnId,
+    turns: [{ ...selected, ready: "pending", error: null }] });
+  fake.handle = () => ({ run: snapshot });
+  let finished = false;
+  const controller = new AbortController();
+  const work = waitRun(fake.rpc, { ...options, signal: controller.signal }).then(run => { finished = true; return run; });
+  try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(finished).toBe(false);
+    fake.emit("broker/thread/result", { runId: "run-test", turn: 0, result: selected });
+    const run = await work;
+    expect(exitCodeForRun(run)).toBe(7); expect(run.state).toBe("stopping");
+    expect(run.turns[0]?.error).toEqual(selected.error);
+    expect(fake.notificationErrors).toEqual([]); expect(fake.subscriptions).toBe(0);
+  } finally { controller.abort(); await work.catch(() => {}); }
+});
+
 test("只有部分通知时按runId有界补取完整记录，不把通知强转RunResult", async () => {
   const fake = new FakeRpc();
   let watches = 0;
