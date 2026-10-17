@@ -91,6 +91,24 @@ test("合并回归：停止诊断先到时 loop guard 保留种类与轮数", as
   } finally { await h.cleanup(); }
 }, 90000);
 
+test("合并回归：受管子树失败保留完整终态的中断原因", async () => {
+  const h = new StallHarness();
+  try {
+    await h.open(); await h.control("mode", { mode: "failed" });
+    const proc = h.run(["--json", "--stall-timeout", "1"]);
+    await h.started();
+    const turnId = (await h.state()).threads.root.turns[0].id;
+    await h.sa1b("spawn", { parentThreadId: "root", parentTurnId: turnId, childThreadId: "child" });
+    expect(await bounded(proc.closed, 20000)).toBe(7);
+    const record = await h.persisted(), final = JSON.parse(proc.output().stdout);
+    const diagnosticState = (run: any) => ({ revision: run.diagnosticRevision, state: run.state, status: run.status, interruptReason: run.interruptReason });
+    expect(final.interruptReason, JSON.stringify({ record: diagnosticState(record), updates: h.updated().map(event => diagnosticState(event.params)),
+      ended: h.events.filter(event => event.method === "broker/run/ended").map(event => diagnosticState(event.params.run)) })).toBe("stallTimeout");
+    expect(final.error.message).toBe("测试失败");
+    expect(final.subagentJoin).toEqual(record.subagentJoin);
+  } finally { await h.close(); }
+}, 90000);
+
 for (const throughObserver of [false, true]) for (const noticeFirst of [false, true]) test(`合并回归：${throughObserver ? "观察器包装" : "直接等待"}、${noticeFirst ? "诊断先到" : "快照先到"}不能用 ended 诊断提前交付旧完整快照`, async () => {
   const fake = new FakeRpc();
   let release!: (snapshot: unknown) => void;
