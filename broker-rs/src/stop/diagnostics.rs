@@ -61,6 +61,18 @@ impl Machine {
             .operations
             .values()
             .filter_map(|op| op.diagnostic_send(op.target.as_deref()))
+            .chain(self.trees.aux.derived.iter().filter_map(|(key, op)| {
+                // 派生根的已证明轮次是集合，不能按轮号排序挑选当前轮；以运行当前轮为准。
+                // 未接管新轮时保留既有发送身份，避免普通停止转派生停止时清除结束证据。
+                let turn = self
+                    .runs
+                    .runs
+                    .get(&op.target.run_id)?
+                    .current_turn_id
+                    .as_deref()
+                    .filter(|turn| op.target.proven_turns.contains(*turn));
+                self.derived_diagnostic_send(key, turn)
+            }))
             .collect();
         for (run, send) in targets {
             if self.stop_diag_current(&run, &send) {

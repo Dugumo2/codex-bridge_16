@@ -28,6 +28,82 @@ fn 整树停止回包携带根停止诊断() {
 }
 
 #[test]
+fn 五轮_派生根换轮未中断即清除旧证据且自然结束记录新时间() {
+    let mut s = Sim::new();
+    s.spawn_v1("子甲", "派生1", "子轮甲");
+    s.hold.push(("turn/interrupt".into(), "子甲".into()));
+    stop(&mut s, OWNER, json!({"threadId": P}));
+    let key = (s.tree_op().unwrap(), P.to_owned());
+    assert!(s.finishing());
+    assert!(s.m.stops.operations.is_empty());
+    assert!(s.m.trees.aux.derived[&key].root);
+    let before = s.record().stop_diagnostics.clone().unwrap();
+    assert_eq!(before.turn_ended_at, Some(s.m.clock.now_ms));
+    assert!(before.interrupt_reply.is_some());
+    let old_send = s.m.runs.stop_diag_sends[R].clone();
+    let interrupts = s.interrupts(&s.log, P);
+
+    // 扣住 goal 与核实回包，保证换轮到自然结束之间没有任何新 interrupt。
+    s.hold.push(("thread/goal/get".into(), P.into()));
+    s.hold.push(("thread/read".into(), P.into()));
+    s.advance(100);
+    s.m.remember_owned_turn(P, "续跑根轮");
+    let changed = s.turn_started(P, "续跑根轮");
+    assert!(s
+        .held
+        .iter()
+        .any(|c| c.method == "thread/goal/get" && c.params.as_ref().unwrap()["threadId"] == P));
+    assert!(s.m.trees.aux.derived[&key]
+        .target
+        .proven_turns
+        .contains("续跑根轮"));
+    assert_eq!(s.record().current_turn_id.as_deref(), Some("续跑根轮"));
+    let mut expected = before.clone();
+    expected.turn_ended_at = None;
+    expected.interrupt_reply = None;
+    expected.interrupt_replied_at = None;
+    assert_eq!(s.record().stop_diagnostics.as_ref(), Some(&expected));
+    assert!(s
+        .run_writes(&changed)
+        .iter()
+        .any(|r| r.stop_diagnostics.as_ref() == Some(&expected)));
+    assert_eq!(s.interrupts(&s.log, P), interrupts);
+
+    // 旧轮迟到证据不能污染当前目标。
+    s.m.stop_diag_turn_ended(R, &old_send);
+    s.m.stop_diag_interrupt_reply(R, &old_send, crate::runs::StopRpcOutcome::Ok);
+    assert_eq!(s.record().stop_diagnostics.as_ref(), Some(&expected));
+    s.advance(100);
+    s.turn_completed(P, "续跑根轮", "completed");
+    s.release("thread/goal/get", P);
+    assert!(s
+        .held
+        .iter()
+        .any(|c| c.method == "thread/read" && c.params.as_ref().unwrap()["threadId"] == P));
+    assert_eq!(s.record().stop_diagnostics.as_ref(), Some(&expected));
+    s.advance(100);
+    let ended_at = s.m.clock.now_ms;
+    let verified = s.release("thread/read", P);
+    expected.turn_ended_at = Some(ended_at);
+    assert_eq!(s.record().stop_diagnostics.as_ref(), Some(&expected));
+    assert!(s
+        .run_writes(&verified)
+        .iter()
+        .any(|r| r.stop_diagnostics.as_ref() == Some(&expected)));
+    assert_eq!(s.interrupts(&s.log, P), interrupts);
+    assert_ne!(Some(ended_at), before.turn_ended_at);
+    assert_eq!(s.record().state, RunState::Stopping);
+    assert!(s.finishing(), "子树未结束，诊断更新不改变停止判定");
+    s.release("turn/interrupt", "子甲");
+    assert_eq!(s.record().state, RunState::Ended);
+    assert_eq!(s.record().stop_outcome, Some(StopOutcome::Confirmed));
+    assert_eq!(
+        s.record().stop_diagnostics.as_ref().unwrap().turn_ended_at,
+        Some(ended_at)
+    );
+}
+
+#[test]
 fn 派生根核实目标沿用最近一次同代际发送轮次() {
     let mut s = Sim::new();
     s.spawn_v1("子甲", "派生1", "子轮甲");
