@@ -44,6 +44,11 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 - goal：服务器会一轮接一轮自动续跑。broker 保留连续 3 轮无动作刹车，并累计同一运行的 goal 与汇总自动父轮（上限 50，不随 goal 变化重置）；`--budget` 覆盖父轮及已归属后代，汇总继续使用原额度。额度最后一轮可完成核实，仍需新工作才异常收尾。完成条件要写成可核验的状态。
 - **无进展期限** `--stall-timeout <秒>`（run、review；`cxb config stall-timeout <秒>`；默认 600，`0` 关闭）：broker 在期限内没观察到进展（输出、命令输出、计划、文件改动、token 增长等；重复的上游报错不算）就先核实一次，仍无进展才停止本次运行，退出 3。等回答审批／提问时不计时，detach 后照常计时。**期限的边界**：静默命令、MCP 工具、压缩、hook、深度推理都可能长时间没有可见事件，`InProgress` 只证明轮没结束、不证明卡死；预计会长时间静默的任务（大编译、长测试、长 MCP 调用）调大或设 0。
 - **访问报错即停** `--upstream-error-policy stop-access`（默认 `observe`；`cxb config upstream-error-policy …`）：只对认证、付费、权限三类结构化上游错误（HTTP 401／402／403，含子代理线程上的）停止本次运行，退出 4；不登出、不改账户、不重试。无人值守、怕空转烧时间的任务可以加。
+- **按线程关闭 MCP**（run、review）：Codex 每个线程各起一整套 MCP 服务（实测默认约 491 MB：backlog 约 253、serena 约 96、context7 约 44、sequential-thinking 约 32），子代理线程也各起一套。
+  - 持久配置：`cxb config mcp-disabled backlog,serena`（逗号分隔，默认空 = 不改动）；`cxb config mcp-when-never off` 让审批为 never 时关闭全部 MCP（never 下 MCP 工具调用本来就会被拒；默认 `keep`）。`cxb doctor` 的 MCP 一项显示当前名单。
+  - 单次运行：`--mcp <名,...>` 打开名单里的服务（优先于上面两项），`--no-mcp <名,...>` 额外关闭；同一名字不能两边都写。
+  - 只影响 cxb 开的线程和它派生的子代理，不改 Codex 的 `config.toml`；`--resume`、`--continue` 与 broker 内部恢复都会带上（冷恢复不带会重新起服务）。名单里 Codex 配置没有的名字只提示、不下发；读不到 Codex 配置时本次不关闭任何服务。Codex 自带的 computer-use 关不掉。
+  - 派单前判断任务要不要用某个 MCP（如代码检索用 serena、查文档用 context7），需要就加 `--mcp <名>`，否则保持关闭省内存。
 - review 的 `-s`、`--approval` 只告警、被忽略；`--goal` 不可用。
 - 普通 `cxb review` 在新建的独立线程上审查；`--resume <线程ID>` 在该线程上追加一轮审查。
 - 模板：`cxb config templates` 列出内置和用户模板（用户模板放数据根目录下的 `templates\<名称>.md`，同名时优先于内置；数据根目录是 `CXB_HOME`，未设时为 `~\.codex-bridge`）；模板建议的沙箱只在没显式给 `-s` 时生效。

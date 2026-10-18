@@ -1,7 +1,7 @@
 import { getDefaultBranch } from "../git";
 import { CxbError, type ServerRequestDeps } from "./contracts";
 import type { CommandContext, CommandHandler } from "./main";
-import { executeRun, type ExecutionPlan } from "./run";
+import { executeRun, preflightMcp, type ExecutionPlan } from "./run";
 
 export function reviewPlan(ctx: CommandContext): ExecutionPlan {
   const { options, positional, explicit } = ctx.parsed;
@@ -23,5 +23,9 @@ export function reviewPlan(ctx: CommandContext): ExecutionPlan {
 }
 
 export function createReviewHandler(deps: ServerRequestDeps): CommandHandler {
-  return (ctx) => executeRun(ctx, deps, reviewPlan(ctx));
+  return async (ctx) => {
+    const plan = reviewPlan(ctx);
+    // 审查固定 never：按 mcp-when-never 与名单关闭 MCP，但不报告审批风险，保持审查原有输出。
+    return executeRun(ctx, deps, { ...plan, mcpOff: await preflightMcp(ctx, "never", false) });
+  };
 }

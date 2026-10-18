@@ -311,8 +311,14 @@ export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): Comman
       });
       await check("mcpApprovalRisk", "warn", async (limit) => {
         const result = await deps.preflight(ctx.parsed.globals.approval, process.env, limit);
-        return { status: result.status === "ok" ? "pass" : "warn", detail: result.status === "unavailable" ? "未能检查 MCP 审批风险" : `有效审批 ${ctx.parsed.globals.approval}；${result.status === "warn" ? "MCP 工具可能被拒绝" : "未发现审批风险"}`,
-          servers: result.servers.map((server) => ({ name: server.name, source: server.source, mode: server.effectiveMode, risk: server.risk, recommendation: server.suggestion })) };
+        // 按线程关闭的 MCP 来自持久配置（mcp-select.ts）；只展示名单，是否生效取决于 Codex 配置里有没有该服务。
+        const stored = ctx.userConfig?.values ?? {};
+        const mcpDisabled = typeof stored["mcp-disabled"] === "string" ? stored["mcp-disabled"].split(",") : [];
+        const mcpWhenNever = stored["mcp-when-never"] === "off" ? "off" : "keep";
+        const closing = `cxb 开线程关闭 MCP：${mcpDisabled.length ? mcpDisabled.join("、") : "无"}${mcpWhenNever === "off" ? "；审批 never 时全关" : ""}`;
+        return { status: result.status === "ok" ? "pass" : "warn", detail: `${result.status === "unavailable" ? "未能检查 MCP 审批风险" : `有效审批 ${ctx.parsed.globals.approval}；${result.status === "warn" ? "MCP 工具可能被拒绝" : "未发现审批风险"}`}；${closing}`,
+          servers: result.servers.map((server) => ({ name: server.name, source: server.source, mode: server.effectiveMode, risk: server.risk, recommendation: server.suggestion })),
+          mcpDisabled, mcpWhenNever };
       });
       await check("askUserInput", "warn", async (limit) => {
         if (!codex || !diagBroker) return { status: "warn", detail: "未检查（codex 不可用）" };

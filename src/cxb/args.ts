@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import { config, validateId, type ApprovalMode, type ReasoningEffort, type SandboxMode } from "../config";
 import { CONFIG_SCHEMA, isConfigKey } from "./config-schema";
 import { CxbError } from "./contracts";
+import { parseMcpNames } from "./mcp-select";
 
 export type CommandName = "run" | "review" | "show" | "ls" | "inbox" | "reply" | "wait" | "stop" | "rm" | "config" | "doctor";
 export type OptionValue = string | number | boolean;
@@ -31,6 +32,12 @@ export interface CommandOptions {
   "converge-timeout"?: number;
   "stall-timeout"?: number;
   "upstream-error-policy"?: "observe" | "stop-access";
+  /** 本次打开 / 额外关闭的 MCP 服务（规范化逗号串）。 */
+  mcp?: string;
+  "no-mcp"?: string;
+  /** 只来自持久配置（applyUserConfig），没有同名命令行参数。 */
+  "mcp-disabled"?: string;
+  "mcp-when-never"?: "keep" | "off";
   file?: string;
   resume?: string;
   continue?: boolean;
@@ -112,6 +119,13 @@ function choice(values: readonly string[]): ValueParser {
   };
 }
 
+/** 逗号分隔的 MCP 服务名单，规范化为去重后的逗号串。 */
+function mcpList(value: string, label: string): string {
+  const names = parseMcpNames(value);
+  if (!names) usage(`${label} 需要逗号分隔的 MCP 服务名（字母、数字及 _ . -）。`);
+  return names!.join(",");
+}
+
 function integer(max = Number.MAX_SAFE_INTEGER): ValueParser {
   return (value, label) => {
     const number = Number(value);
@@ -188,6 +202,18 @@ const stallTimeout = value("stall-timeout", ["--stall-timeout"], "秒",
 const upstreamErrorPolicy = value("upstream-error-policy", ["--upstream-error-policy"], "策略",
   "observe（默认）只提示；stop-access 只对认证、付费、权限三类结构化错误停止本次运行，不登出、不改账户，退出 4。",
   (value) => CONFIG_SCHEMA["upstream-error-policy"].parse(value), "observe");
+const mcpOn = value("mcp", ["--mcp"], "名单",
+  "本次打开的 MCP 服务（逗号分隔）；优先于 config 的 mcp-disabled 与 mcp-when-never。", mcpList);
+const mcpOff = value("no-mcp", ["--no-mcp"], "名单",
+  "本次额外关闭的 MCP 服务（逗号分隔）；只影响 cxb 开的线程与其子代理，不改 Codex 配置。", mcpList);
+const mcpRules = ["--mcp 与 --no-mcp 不能列出同一服务；名单只对 Codex 配置里启用的服务生效，其余名字只提示。"];
+
+/** --mcp 与 --no-mcp 互相矛盾时报用法错误。 */
+function validateMcp(p: ParsedCommand): void {
+  const on = p.options.mcp?.split(",") ?? [];
+  const both = (p.options["no-mcp"]?.split(",") ?? []).filter((name) => on.includes(name));
+  if (both.length) usage(`--mcp 与 --no-mcp 不能同时列出：${both.join("、")}。`);
+}
 const convergenceRules = ["子代理运行会等待受管后代收敛，再自动汇总到同一运行；期间上一轮输出只是阶段结果。",
   "最多新开 5 次汇总轮、50 个自动父轮；连续 3 轮无动作会刹车。达到最后一次额度仍允许当前轮完成核实。",
   "期限、预算、次数或归属核实异常会停止已确认自有范围并报告原因；未确认停止不等于已清理。",
@@ -200,7 +226,7 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
     usage: ["cxb run [提示词 ...] [选项]", "cxb run - | --file <文件> [选项]", "cxb run --resume <线程ID> --continue [补充说明 ...] [选项]"],
     globals: EXECUTION,
     options: [
-      convergeTimeout, stallTimeout, upstreamErrorPolicy,
+      convergeTimeout, stallTimeout, upstreamErrorPolicy, mcpOn, mcpOff,
       value("file", ["-f", "--file"], "文件", "从 UTF-8 文件读取提示词。"), resume,
       flag("continue", ["--continue"], "按原运行续跑，位置参数作为本次补充。"),
       value("run", ["--run"], "运行ID", "指定续跑来源，默认最近一次运行。", id),
@@ -214,21 +240,21 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
       "--resume 需要新提示词或 --continue；--continue 必须配合 --resume。",
       "--continue 仅接受位置补充，不接受标准输入或文件；补充不替换原始要求；不能与 --goal、--template 同用。",
       "--run 必须配合 --continue；--budget 必须配合 --goal。",
-      "空白提示词无效；文件与标准输入的内容由执行层读取并校验。", ...convergenceRules],
-    validate: validateRun,
+      "空白提示词无效；文件与标准输入的内容由执行层读取并校验。", ...mcpRules, ...convergenceRules],
+    validate: (p) => { validateRun(p); validateMcp(p); },
   },
   review: {
     description: "执行一次只读代码审查",
     usage: ["cxb review [审查说明 ...] [选项]", "cxb review --mode <模式> [--ref <引用>] [--base <分支>]", "cxb review --resume <线程ID> [审查说明 ...] [选项]"],
     globals: EXECUTION,
-    options: [convergeTimeout, stallTimeout, upstreamErrorPolicy, value("mode", ["--mode"], "模式", `审查模式：${REVIEW_MODES.join("|")}；默认 pr。`, choice(REVIEW_MODES), "pr"),
+    options: [convergeTimeout, stallTimeout, upstreamErrorPolicy, mcpOn, mcpOff, value("mode", ["--mode"], "模式", `审查模式：${REVIEW_MODES.join("|")}；默认 pr。`, choice(REVIEW_MODES), "pr"),
       value("ref", ["--ref"], "引用", "仅 commit 模式可用，默认 HEAD。", gitRef),
       value("base", ["--base"], "分支", "仅 pr 模式可用，默认自动检测，失败回退 main。", gitRef), resume],
     rules: ["未显式设置模式时，提供审查说明会选择 custom；custom 必须有说明。",
       "显式 pr、uncommitted、commit 均不接受位置说明。",
       "显式 sandbox 或 approval 先校验，再始终告警并忽略；固定 read-only 和 never。",
-      "不接受 --goal 或 --budget；引用不能包含 shell 元字符。", ...convergenceRules],
-    validate: validateReview,
+      "不接受 --goal 或 --budget；引用不能包含 shell 元字符。", ...mcpRules, ...convergenceRules],
+    validate: (p) => { validateReview(p); validateMcp(p); },
   },
   show: {
     description: "查看最近结果、日志或进展",

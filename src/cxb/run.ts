@@ -10,8 +10,9 @@ import { sanitizeForTerminal } from "../questions";
 import { NO_RESPONSE, type AnyServerRequestHandler } from "../rpc";
 import { askOverrides } from "./ask-instructions";
 import { absorbedRefusal, buildContinuePrompt, continueRefusal, localContinueRefusal, resolveRunChain } from "./continue-prompt";
-import { ASK_FEATURE_KEY, CxbError, EXIT, rpcFailure, type BrokerConnection, type BrokerRpc, type ExitCode,
+import { ASK_FEATURE_KEY, CxbError, EXIT, rpcFailure, type ApprovalPolicyName, type BrokerConnection, type BrokerRpc, type ExitCode,
   type ResumeOverrides, type RunPolicy, type RunResult, type ServerRequestDeps } from "./contracts";
+import { mcpOffConfig, selectMcp } from "./mcp-select";
 import { readRunRecord } from "./ledger";
 import { lifecyclePendingError } from "./lifecycle";
 import { resolveThreadViaBroker } from "./thread-ref";
@@ -108,6 +109,8 @@ export interface ExecutionPlan {
   review?: { mode: string; ref: string | null; base: string | null; target: object };
   /** `run --resume <id> --continue`：supplement 来自位置参数（拍板 J），fromRunId 来自 `--run`。 */
   continue?: { supplement: string | null; fromRunId?: string };
+  /** 本次按线程关闭的 MCP 服务（preflightMcp），随开线程、恢复与覆盖登记下发。 */
+  mcpOff?: string[];
 }
 
 interface ContinueSource { from: RunResult; prompt: string; goal: unknown }
@@ -198,6 +201,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     const rpc = connection.rpc;
     if (controller.signal.aborted) throw new CxbError("INTERRUPTED", "命令已取消");
     let overrides = askOverrides();
+    // 关闭键与提问开关同在覆盖里：冷恢复不带会把服务重新起（E7 实测），登记后 broker 内部恢复与续跑也补传。
+    if (plan.mcpOff?.length) overrides = { ...overrides, config: { ...overrides.config, ...mcpOffConfig(plan.mcpOff) } };
     // 版本握手已保证 broker 支持登记；失败说明参数、线程或连接有问题，照常上抛。
     const registerOverrides = (id: string, value: ResumeOverrides | null) =>
       request("broker/threads/resumeOverrides", { threadId: id, overrides: value });
@@ -560,8 +565,8 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
     if (options.continue) {
       // 解析层已拒绝标准输入、文件、--goal、--template；位置参数是本次补充，不替换原始要求。
       const supplement = positional.join(" ").trim() ? positional.join(" ") : null;
-      reportApprovalPreflight(await cancellablePreflight(ctx), ctx.out);
-      return executeRun(ctx, deps, { command: "run", sandbox: globals.sandbox,
+      const mcpOff = await preflightMcp(ctx, globals.approval, true);
+      return executeRun(ctx, deps, { command: "run", sandbox: globals.sandbox, mcpOff,
         continue: { supplement, ...(options.run ? { fromRunId: options.run } : {}) } });
     }
     let prompt = await readPrompt(ctx);
@@ -583,18 +588,38 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
       }
     }
     if (!prompt.trim()) throw new CxbError("USAGE", "模板生成的提示词不能为空");
-    reportApprovalPreflight(await cancellablePreflight(ctx), ctx.out);
-    return executeRun(ctx, deps, { command: "run", sandbox, prompt });
+    const mcpOff = await preflightMcp(ctx, globals.approval, true);
+    return executeRun(ctx, deps, { command: "run", sandbox, prompt, mcpOff });
   };
 }
 
+/**
+ * 开跑前读一次 Codex 的 MCP 配置：按持久配置与本次参数算出要关闭的服务（mcp-select.ts），
+ * 提示无效名字；`report` 为真时再报告审批风险，已关闭的服务不再列入。review 不报告审批风险，保持原输出。
+ */
+export async function preflightMcp(ctx: CommandContext, policy: ApprovalPolicyName, report: boolean): Promise<string[]> {
+  const result = await cancellablePreflight(ctx, policy);
+  const o = ctx.parsed.options;
+  const list = (value: string | undefined) => value ? value.split(",") : [];
+  const selection = selectMcp({
+    configured: result.status === "unavailable" ? null : result.servers.map((server) => server.name),
+    disabled: list(o["mcp-disabled"]), extraOff: list(o["no-mcp"]), on: list(o.mcp),
+    policy, whenNever: o["mcp-when-never"] ?? "keep",
+  });
+  if (selection.unknown.length) ctx.out.notice(`[cxb] 提醒：MCP 服务 ${selection.unknown.join("、")} 不在 Codex 已启用的配置里，已忽略。`);
+  if (selection.unverified) ctx.out.notice("[cxb] 提醒：读不到 Codex 的 MCP 配置，本次未关闭任何 MCP 服务。");
+  if (selection.off.length) ctx.out.progress(`本次关闭 MCP：${selection.off.join("、")}`);
+  if (report) reportApprovalPreflight({ ...result, servers: result.servers.filter((server) => !selection.off.includes(server.name)) }, ctx.out);
+  return selection.off;
+}
+
 /** 开跑前的审批预检：Ctrl-C 取消（INTERRUPTED），读配置的期限不超过本命令的 --timeout。 */
-async function cancellablePreflight(ctx: CommandContext) {
+async function cancellablePreflight(ctx: CommandContext, policy: ApprovalPolicyName) {
   const { globals } = ctx.parsed;
   const controller = new AbortController();
   const unregister = ctx.registerCleanup(() => { controller.abort(); });
   try {
-    return await approvalPreflight(globals.approval, process.env,
+    return await approvalPreflight(policy, process.env,
       { signal: controller.signal, ...(globals.timeout > 0 ? { deadline: performance.now() + globals.timeout * 1000 } : {}) });
   } finally { unregister(); }
 }

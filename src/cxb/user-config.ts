@@ -15,7 +15,7 @@ export interface UserConfig {
 export const CONFIG_DEFAULTS: Readonly<Record<ConfigKey, string | number | boolean | null>> = Object.freeze({
   model: null, reasoning: null, sandbox: config.defaultSandbox, approval: config.defaultApprovalPolicy,
   timeout: config.defaultTimeout, "converge-timeout": 3600, "stall-timeout": 600, "upstream-error-policy": "observe",
-  memory: false, server: "auto", "broker-idle-timeout": 300,
+  memory: false, server: "auto", "broker-idle-timeout": 300, "mcp-disabled": null, "mcp-when-never": "keep",
 });
 
 function invalid(path: string): CxbError {
@@ -90,6 +90,8 @@ export function applyUserConfig(parsed: ParsedCommand, stored: UserConfig): void
       case "stall-timeout": if (parsed.command === "run" || parsed.command === "review") parsed.options["stall-timeout"] = value as number; break;
       case "upstream-error-policy": if (parsed.command === "run" || parsed.command === "review") parsed.options["upstream-error-policy"] = value as typeof parsed.options["upstream-error-policy"]; break;
       case "memory": if (parsed.command === "run") parsed.options.memory = value as boolean; break;
+      case "mcp-disabled": if (parsed.command === "run" || parsed.command === "review") parsed.options["mcp-disabled"] = value as string; break;
+      case "mcp-when-never": if (parsed.command === "run" || parsed.command === "review") parsed.options["mcp-when-never"] = value as "keep" | "off"; break;
     }
   }
 }

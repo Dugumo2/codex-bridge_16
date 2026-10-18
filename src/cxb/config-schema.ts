@@ -3,6 +3,7 @@
 
 import { config } from "../config";
 import { CxbError } from "./contracts";
+import { parseMcpNames } from "./mcp-select";
 
 export type ConfigValue = string | number | boolean;
 
@@ -69,6 +70,12 @@ export const CONFIG_SCHEMA = Object.freeze({
   server: enumeration(SERVER_PREFERENCES),
   // 秒转毫秒后也必须能精确表示，不能把大整数静默舍入后传给 broker。
   "broker-idle-timeout": seconds(Math.floor(Number.MAX_SAFE_INTEGER / 1000)),
+  // 存储为去重后的逗号分隔串；只影响 cxb 开的线程，不改 Codex 的 config.toml。
+  "mcp-disabled": spec("逗号分隔的 MCP 服务名（字母、数字及 _ . -），cxb 开线程时关闭",
+    (value) => typeof value === "string" && parseMcpNames(value)?.join(",") === value,
+    (value) => parseMcpNames(value)?.join(",") ?? value, (value) => parseMcpNames(value) !== null),
+  "mcp-when-never": spec("以下值之一：keep、off（审批为 never 时 off 关闭全部 MCP）",
+    (value) => value === "keep" || value === "off"),
 });
 
 export type ConfigKey = keyof typeof CONFIG_SCHEMA;
