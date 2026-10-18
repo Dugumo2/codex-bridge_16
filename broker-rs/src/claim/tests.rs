@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod child_unsub;
 mod ext;
 mod loop_guard;
 mod model_inherit;

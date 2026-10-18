@@ -297,6 +297,8 @@ impl Machine {
                 .remove(&conn)
         });
         let run_id = open.run_id.clone();
+        // 父代理可能给退订过的旧子线程派活：开工前先把它们挂回（relations/release.rs）。
+        self.reattach_released_children(&open.thread_id, actions);
         if open.kind == ReqKind::ReviewStart {
             self.convergences.review_runs.insert(run_id.clone());
         }

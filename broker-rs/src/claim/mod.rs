@@ -307,6 +307,10 @@ pub enum Operation {
         generation: u64,
         thread: String,
     },
+    /// 重新订阅曾被本连接退订、仍加载的子线程（`relations/release.rs`）；回包只恢复附着证据，不学习订阅事实。
+    ChildReattach {
+        thread: String,
+    },
 
     Lifecycle {
         thread: String,
@@ -1753,7 +1757,8 @@ impl Machine {
             } => self.status_read_reply(*read_id, *generation, result, actions),
             Operation::RelationLookup { .. }
             | Operation::Discovery { .. }
-            | Operation::AttachThread { .. } => self.relation_reply(&context, result, actions),
+            | Operation::AttachThread { .. }
+            | Operation::ChildReattach { .. } => self.relation_reply(&context, result, actions),
             Operation::DerivedStop { .. } => self.tree_reply(&context, result, actions),
             Operation::BudgetVerify { .. }
             | Operation::StartReconciliation { .. }
@@ -3082,10 +3087,13 @@ impl Machine {
                     self.record(thread_id).subscribed = true;
                 }
             }
+            // 子线程重新附着只恢复附着证据（relation_reply），不记订阅事实、不学线程索引：
+            // 否则子线程会被当作 broker 自己订阅的线程，运行结束后再也不随根退订。
             if let Some(thread_id) = value
                 .get("thread")
                 .and_then(|t| t.get("id"))
                 .and_then(Value::as_str)
+                .filter(|_| !matches!(context.operation, Operation::ChildReattach { .. }))
             {
                 if context.method != "thread/fork" {
                     self.record(thread_id).subscribed = true;
@@ -3374,6 +3382,8 @@ impl Machine {
                         operation: Operation::Unsubscribe,
                         method: "thread/unsubscribe".into(),
                     }));
+                    // 子线程由 app-server 自动挂到本连接，随根一起退订，否则一直不卸载。
+                    self.release_idle_children(None, actions);
                 }
             }
             TimerKind::SettlementRetry { attempt } => {

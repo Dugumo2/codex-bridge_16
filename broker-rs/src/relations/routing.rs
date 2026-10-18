@@ -615,6 +615,8 @@ impl Machine {
         }
         self.routing_revoke_run(run, actions);
         self.refresh_members(run, MemberChange::Request, actions);
+        // 清理范围内的子线程此前被留住订阅；根已释放时随清理结束一并退订。
+        self.release_idle_children(None, actions);
     }
 
     /// 撤回运行名下已转发的子请求，按当前授权与策略重新判定；旧 forwardId 失效，旧 CLI 迟到回答被忽略。

@@ -130,7 +130,15 @@ impl Machine {
         };
         let claimed = self.claims.contains_key(thread);
         if !claimed {
-            self.attach(thread, AttachmentSource::ThreadEvent);
+            // 状态变化对所有连接广播（0.160.0 实测退订后仍会收到），对本连接退订过的子线程不算附着证据；
+            // 其余线程事件只发给订阅者，thread/closed 表示已卸载，都把它从待重新订阅名单划掉。
+            let broadcast = event.method == "thread/status/changed";
+            if !(broadcast && self.relations.aux.released_children.contains(thread)) {
+                self.attach(thread, AttachmentSource::ThreadEvent);
+            }
+            if !broadcast {
+                self.relations.aux.released_children.remove(thread);
+            }
         }
         let thread = thread.to_owned();
         let turn = notification_turn(params).map(str::to_owned);
@@ -168,8 +176,20 @@ impl Machine {
                             .and_then(|t| t.get("status"))
                             .and_then(Value::as_str)
                             .unwrap_or("unknown");
+                        let first_completion = !self
+                            .relations
+                            .aux
+                            .observed
+                            .get(&thread)
+                            .is_some_and(|turns| {
+                                turns.iter().any(|t| t.turn == *turn && t.completed)
+                            });
                         self.convergence_observe_activity(&thread, turn, status, false);
                         self.observe_turn(&thread, turn, true, true, actions);
+                        // 根已释放后才结束的子线程：此刻补退订；重复的完成通知不再重发。
+                        if first_completion {
+                            self.release_idle_children(Some(&thread), actions);
+                        }
                     }
                     self.parent_turn_ended(&thread, turn, actions);
                 }
@@ -204,6 +224,7 @@ impl Machine {
                 {
                     self.convergence_observation_gap(&thread, actions);
                     self.detach_evidence(&thread);
+                    self.relations.aux.released_children.remove(&thread);
                 }
                 false
             }
@@ -220,6 +241,10 @@ impl Machine {
 
     /// 本连接确实收到了该线程的事件或请求：只证明当前 epoch 下被观察，不证明此前历史完整。
     pub(crate) fn attach(&mut self, thread: &str, source: AttachmentSource) {
+        // 线程事件由调用方按方法决定是否划掉（状态变化是广播）；其余来源都证明已重新挂上。
+        if source != AttachmentSource::ThreadEvent {
+            self.relations.aux.released_children.remove(thread);
+        }
         let (epoch, now, revision) = (
             self.relations.conn_epoch,
             self.clock.mono_ms,
