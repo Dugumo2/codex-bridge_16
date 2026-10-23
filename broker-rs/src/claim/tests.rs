@@ -14,6 +14,7 @@ mod ue2_child;
 mod ue2_policy;
 mod ue2_stall;
 mod upstream_error;
+mod wait_superseded;
 
 fn apply(machine: &mut Machine, event: Event) -> Vec<Action> {
     let (next, mut actions) = step(std::mem::take(machine), event);

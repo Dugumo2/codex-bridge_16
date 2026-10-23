@@ -388,6 +388,14 @@ impl Machine {
                 );
             }
             "broker/threads/watch" => {
+                let exclusive_waiter = match params.get("exclusiveWaiter") {
+                    None => false,
+                    Some(Value::Bool(value)) => *value,
+                    Some(_) => {
+                        invalid(&request, actions);
+                        return;
+                    }
+                };
                 // runId 可选：指定时快照给这次运行（须属于该线程或其 review 子线程），否则给最近一次运行。
                 let run_id = match params.get("runId") {
                     None => None,
@@ -419,6 +427,22 @@ impl Machine {
                         return;
                     }
                     self.record(thread).watchers.push(request.conn);
+                }
+                // 先通过观察者预算；重复订阅也可升级为独占等待，普通补读不改变登记。
+                if exclusive_waiter {
+                    if let Some(previous) = self.record(thread).exclusive_waiter {
+                        if previous != request.conn {
+                            self.send_ext(
+                                previous,
+                                proto::notification(
+                                    "broker/wait/superseded",
+                                    Some(json!({"threadId":thread})),
+                                ),
+                                actions,
+                            );
+                        }
+                    }
+                    self.record(thread).exclusive_waiter = Some(request.conn);
                 }
                 self.watcher_activity(thread, actions);
                 ok(

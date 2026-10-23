@@ -57,6 +57,23 @@ async function waitInbox(ctx: CommandContext, rpc: BrokerRpc, deadline: number, 
 async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSignal, deadline: number, id: string) {
   const ref = await resolveThreadViaBroker(rpc, id);
   const label = ref.shortId ?? ref.threadId.slice(0, 8);
+  let superseded = false;
+  let decided = false;
+  let replace!: () => void;
+  const replacement = new Promise<{ superseded: true }>((resolve) => { replace = () => resolve({ superseded: true }); });
+  // RPC 同批派发先于 await 续体；标志负责终结裁决，Promise 负责唤醒正在等待的 race。
+  const offSuperseded = rpc.on("broker/wait/superseded", (raw) => {
+    if (decided || (raw as { threadId?: string } | null)?.threadId !== ref.threadId) return;
+    superseded = true;
+    replace();
+  });
+  const outputSuperseded = () => {
+    decided = true;
+    ctx.out.notice("[cxb] 本次等待已被同一线程的新等待接替，已退出。");
+    ctx.out.resultJson({ ok: false, command: "wait", waitFor: "thread", threadId: ref.threadId,
+      shortId: ref.shortId, event: "superseded", superseded: true });
+    return EXIT.IDLE;
+  };
   let snapshot: { thread: ThreadSummary; run: RunResult | null; pending: InboxItem[]; revision?: number } & import("./sa1b-contracts").ConvergenceSummary | undefined;
   let runId: string | null = null;
   const convergence = observeConvergence(rpc, () => runId, (line) => ctx.out.notice(line));
@@ -100,6 +117,8 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   if (signal.aborted) abort();
   let running: Promise<RunResult> | undefined;
   const outputPending = (items: InboxItem[]) => {
+    if (superseded) return outputSuperseded();
+    decided = true;
     const rendered = renderPending(items, { threadId: ref.threadId, shortId: label });
     ctx.out.result(rendered.text);
     for (const line of convergenceLines(convergence.fields(), items.length)) ctx.out.notice(line);
@@ -107,7 +126,8 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     return EXIT.WAITING_RESPONSE;
   };
   try {
-    snapshot = await rpc.request("broker/threads/watch", { threadId: ref.threadId });
+    snapshot = await rpc.request("broker/threads/watch", { threadId: ref.threadId, exclusiveWaiter: true });
+    if (superseded) return outputSuperseded();
     runId = snapshot!.run?.runId ?? snapshot!.thread.lastRunId;
     convergence.accept({ ...snapshot!.run, ...snapshot, runId: runId ?? undefined });
     if (snapshot!.run) snapshot!.run = upstream.apply(snapshot!.run);
@@ -126,8 +146,11 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     running = waitRun(upstream.rpc, { threadId: ref.threadId, runId, workspaceDir: ctx.workspace.workspaceDir,
       timeoutMs: Math.max(0, deadline - performance.now()), signal: controller.signal,
       log: (text) => ctx.out.progress(text) });
-    const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure]);
+    const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure, replacement]);
+    if (superseded || "superseded" in winner) return outputSuperseded();
     if ("items" in winner) return outputPending(winner.items);
+    // 从这里开始已选定结果出口；输出期间及 finally 收束期间的迟到通知不再改变结果。
+    decided = true;
     const run = upstream.apply(winner.run);
     const code = exitCodeForRun(run);
     if (isUnconfirmedRun(run)) {
@@ -151,8 +174,13 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
       ...(run.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}),
       ...(run.childrenStop ? { interruptReason: run.interruptReason, childrenStop: run.childrenStop } : {}) });
     return code;
+  } catch (error) {
+    if (!decided && superseded) return outputSuperseded();
+    decided = true;
+    throw error;
   } finally {
-    off(); offMoved(); convergence.dispose(); upstream.dispose(); signal.removeEventListener("abort", abort); controller.abort();
+    decided = true;
+    offSuperseded(); off(); offMoved(); convergence.dispose(); upstream.dispose(); signal.removeEventListener("abort", abort); controller.abort();
     // 交接胜出时仍等取消收束，避免遗留 waitRun 的订阅和计时器。
     await running?.catch(() => undefined);
   }

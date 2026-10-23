@@ -236,6 +236,8 @@ pub struct ThreadRecord {
     pub subscribed: bool,
     pub last_run: Option<RunId>,
     pub watchers: Vec<ConnId>,
+    /// 按线程等待的独占观察者；非空时该连接一定在 watchers 中。
+    pub exclusive_waiter: Option<ConnId>,
     pub pending_meta: HashMap<ConnId, Value>,
     pub result_pending: bool,
     /// 释放后保留代号，旧退订检查不能作用于已再次释放的认领。
@@ -3249,6 +3251,9 @@ impl Machine {
             .collect();
         for record in self.records.values_mut() {
             record.watchers.retain(|id| *id != conn);
+            if record.exclusive_waiter == Some(conn) {
+                record.exclusive_waiter = None;
+            }
             record.pending_meta.remove(&conn);
         }
         for thread in watched {

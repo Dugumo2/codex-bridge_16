@@ -1,14 +1,214 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { COMMANDS, parseArgv } from "./args";
 import { wait } from "./wait";
-import { bounded } from "./wait-run";
+import { bounded, waitRun } from "./wait-run";
 import { cleanupContexts, context, errorCode, failure, gate, item, thread } from "./test-fixtures/n4b-support";
 import { runResult } from "./test-fixtures/run-fakes";
 import { removeTemp } from "./test-fixtures/main-test-support";
 import { upstreamError } from "./test-fixtures/upstream-errors";
+import { Writable } from "node:stream";
+import { createOutput } from "./output";
+
+/** 使用真实输出层检查完整字节，覆盖补换行与 JSON 序列化。 */
+function wireOutput(c: ReturnType<typeof context>) {
+  let stdout = "", stderr = "";
+  c.ctx.out = createOutput({ command: "wait", json: c.ctx.parsed.globals.json, verbose: false,
+    stdout: new Writable({ write(chunk, _encoding, done) { stdout += chunk.toString(); done(); } }),
+    stderr: new Writable({ write(chunk, _encoding, done) { stderr += chunk.toString(); done(); } }),
+  });
+  return { get stdout() { return stdout; }, get stderr() { return stderr; } };
+}
+
+describe("单等待逐字基线 6619d6d", () => {
+  for (const scenario of ["正常完成", "待答事项", "目标受阻"] as const) {
+    for (const json of [false, true]) test(`${scenario}：${json ? "JSON" : "文本"}及标准错误与退出码`, async () => {
+      const c = context(["wait", "abcd1234", ...(json ? ["--json"] : [])]);
+      const output = wireOutput(c);
+      const status = scenario === "目标受阻" ? "goalBlocked" : "completed";
+      c.fake.handle = (method) => method === "broker/threads/list" ? { threads: [thread()] }
+        : { thread: thread(), run: runResult({ status }), pending: scenario === "待答事项" ? [item()] : [] };
+      expect(await bounded(wait(c.ctx), 2000)).toBe(scenario === "待答事项" ? 5 : scenario === "目标受阻" ? 9 : 0);
+      await c.ctx.out.flush();
+      const expected = scenario === "待答事项"
+        ? { ok: false, status: "waiting", threadId: "thread-test", pending: [{ ...item(), params: {
+          questions: [{ id: "q1", question: "请选择文件", isSecret: "***", options: [{ label: "甲", description: "甲文件" }] }],
+        } }] }
+        : { ok: scenario === "正常完成", command: "wait", waitFor: "thread", threadId: "thread-test", shortId: "abcd1234",
+          runId: "run-test", status, result: "中文结果", alreadyDone: true };
+      expect(output.stdout).toEqual(json ? JSON.stringify(expected) + "\n" : scenario === "待答事项"
+        ? 'qu_test1234 提问：请选择文件（选项：甲）；回答：cxb reply qu_test1234 "你的回答"\ncxb wait abcd1234' : "中文结果");
+      if (json) expect(JSON.parse(output.stdout)).toEqual(expected);
+      expect(output.stderr).toEqual("");
+      c.checkClean();
+    });
+  }
+});
+
+const supersededNotice = "[cxb] 本次等待已被同一线程的新等待接替，已退出。\n";
+const supersededJson = { ok: false, command: "wait", waitFor: "thread", threadId: "thread-test", shortId: "abcd1234",
+  event: "superseded", superseded: true };
+const replaceWait = (c: ReturnType<typeof context>, threadId = "thread-test") =>
+  c.fake.emit("broker/wait/superseded", { threadId });
+
+describe("独占线程等待", () => {
+  test("仅首次线程快照带标记，运行补读与 review 子线程观察不带标记", async () => {
+    const c = context(["wait", "abcd1234"]);
+    c.fake.handle = (method, params) => method === "broker/threads/list" ? { threads: [thread()] }
+      : { thread: thread(), run: runResult({ reviewThreadId: "review-child" }), pending: [] };
+    expect(await bounded(wait(c.ctx), 2000)).toBe(0);
+    expect(c.fake.calls.filter(call => call.method === "broker/threads/watch").map(call => call.params)).toEqual([
+      { threadId: "thread-test", exclusiveWaiter: true }, { threadId: "review-child" }, { threadId: "thread-test", runId: "run-test" },
+    ]);
+    c.checkClean();
+  });
+
+  test("waitRun 初始 watch 与未确认诊断补读均不带独占标记", async () => {
+    const c = context(["wait", "abcd1234"]);
+    c.fake.handle = () => new Promise(() => {});
+    const controller = new AbortController();
+    const work = waitRun(c.fake.rpc, { threadId: "thread-test", runId: "run-test", timeoutMs: 2000, signal: controller.signal });
+    try {
+      c.fake.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 3, state: "stopping", status: null,
+        interruptReason: "stallTimeout", stopOutcome: "unconfirmed" });
+      expect(c.fake.calls.map(call => call.params)).toEqual([
+        { threadId: "thread-test", runId: "run-test" }, { threadId: "thread-test", runId: "run-test" },
+      ]);
+    } finally { controller.abort(); await work.catch(() => undefined); }
+    c.checkClean();
+  });
+
+  for (const id of [undefined, "ap_test1234", "qu_test1234", "mc_test1234", "gd_test1234"]) test(`事项或工作区等待不登记独占：${id ?? "工作区"}`, async () => {
+    const c = context(["wait", ...(id ? [id] : [])]);
+    c.fake.handle = () => ({ event: id ? "resolved" : "idle", item: item() });
+    expect(await bounded(wait(c.ctx), 2000)).toBe(id ? 0 : 10);
+    expect(c.fake.calls.map(call => call.method)).toEqual(["broker/inbox/wait"]);
+    c.checkClean();
+  });
+
+  for (const scenario of ["待答事项", "没有运行", "快照失败"] as const) {
+    for (const json of [false, true]) test(`首次快照同批接替优先于${scenario}：${json ? "JSON" : "文本"}`, async () => {
+      const c = context(["wait", "abcd1234", ...(json ? ["--json"] : [])]);
+      const output = wireOutput(c);
+      const watching = gate<void>();
+      let resolve!: (value: unknown) => void, reject!: (error: Error) => void;
+      const reply = new Promise((yes, no) => { resolve = yes; reject = no; });
+      c.fake.handle = () => ({ threads: [thread()] });
+      const request = c.fake.rpc.request;
+      // 直接返回可控传输 Promise，避免 FakeRpc 的 async 适配额外插入一次微任务，遮住真实竞态。
+      c.fake.rpc.request = ((method, params, options) => {
+        if (method !== "broker/threads/watch") return request(method, params, options);
+        c.fake.calls.push({ method, params, options });
+        expect(c.fake.handlers.get("broker/wait/superseded")?.size).toBe(1);
+        watching.resolve();
+        return reply;
+      }) as typeof request;
+      const work = wait(c.ctx);
+      await watching.wait();
+      // 先完成回包，再在同批同步派发通知；await 续体必须检查标志。
+      if (scenario === "快照失败") reject(new Error("首次快照失败"));
+      else resolve({ thread: thread({ lastRunId: null }), run: scenario === "没有运行" ? null : runResult(), pending: [item()] });
+      replaceWait(c);
+      expect(await bounded(work, 2000)).toBe(10);
+      await c.ctx.out.flush();
+      expect(output.stdout).toEqual(json ? JSON.stringify(supersededJson) + "\n" : "");
+      expect(output.stderr).toEqual(supersededNotice);
+      c.checkClean();
+    });
+  }
+
+  for (const competitor of ["待答事项", "正常结果", "失败结果", "请求失败", "子线程订阅失败", "无竞争"] as const) {
+    for (const first of [true, false]) test(`等待中接替与${competitor}竞争，接替${first ? "先" : "后"}派发，资源收束`, async () => {
+      const c = context(["wait", "abcd1234", "--json"]);
+      const output = wireOutput(c);
+      const watching = gate<void>();
+      let rejectWatch!: (error: Error) => void;
+      c.fake.handle = (method, params) => {
+        if (method === "broker/threads/list") return { threads: [thread()] };
+        if (params.threadId === "review-child") return new Promise((_, reject) => { rejectWatch = reject; });
+        if (!params.exclusiveWaiter) {
+          watching.resolve();
+          if (competitor === "请求失败") return new Promise((_, reject) => { rejectWatch = reject; });
+        }
+        return { thread: thread(), run: runResult({ state: "running", status: null,
+          reviewThreadId: competitor === "子线程订阅失败" ? "review-child" : null }), pending: [] };
+      };
+      // 记录命令实际申请的计时器；必须取消或已触发，不以等待一段时间推测清理。
+      const active = new Set<ReturnType<typeof setTimeout>>();
+      const originalSet = globalThis.setTimeout, originalClear = globalThis.clearTimeout;
+      const set = spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+        const timer = originalSet(() => { active.delete(timer); callback(...args); }, ms);
+        active.add(timer); return timer;
+      }) as typeof setTimeout);
+      const clear = spyOn(globalThis, "clearTimeout").mockImplementation(((timer: ReturnType<typeof setTimeout>) => {
+        active.delete(timer); originalClear(timer);
+      }) as typeof clearTimeout);
+      const work = wait(c.ctx);
+      try {
+        await watching.wait();
+        if (first) replaceWait(c);
+        if (competitor === "待答事项") c.fake.emit("broker/inbox/added", { item: item() });
+        if (competitor === "正常结果" || competitor === "失败结果") c.fake.emit("broker/run/ended", {
+          run: runResult({ status: competitor === "正常结果" ? "completed" : "failed" }),
+        });
+        if (competitor === "请求失败" || competitor === "子线程订阅失败") rejectWatch(new Error("补读失败"));
+        if (!first) replaceWait(c);
+        replaceWait(c);
+        expect(await bounded(work, 2000)).toBe(10);
+        await c.ctx.out.flush();
+        expect(output.stdout).toEqual(JSON.stringify(supersededJson) + "\n");
+        expect(output.stderr).toEqual(supersededNotice);
+        c.checkClean();
+        expect(active.size).toBe(0);
+      } finally {
+        await c.cancel(); await work.catch(() => undefined);
+        set.mockRestore(); clear.mockRestore();
+        for (const timer of active) originalClear(timer);
+      }
+    });
+  }
+
+  test("其他线程通知被忽略；开始输出及输出后的接替不改变已选定结果", async () => {
+    const c = context(["wait", "abcd1234", "--json"]);
+    c.fake.handle = (method) => {
+      if (method === "broker/threads/list") return { threads: [thread()] };
+      replaceWait(c, "其他线程");
+      return { thread: thread(), run: runResult(), pending: [] };
+    };
+    const original = c.ctx.out.resultJson;
+    c.ctx.out.resultJson = (value) => { replaceWait(c); original(value); replaceWait(c); };
+    expect(await bounded(wait(c.ctx), 2000)).toBe(0);
+    replaceWait(c);
+    expect(c.json).toEqual([{ ok: true, command: "wait", waitFor: "thread", threadId: "thread-test", shortId: "abcd1234",
+      runId: "run-test", status: "completed", result: "中文结果", alreadyDone: true }]);
+    expect(c.notices).toEqual([]);
+    c.checkClean();
+  });
+
+  test("接替保留已输出上游诊断并只追加一行提示", async () => {
+    const c = context(["wait", "abcd1234"]);
+    const output = wireOutput(c), watching = gate<void>();
+    c.fake.handle = (method, params) => {
+      if (method === "broker/threads/list") return { threads: [thread()] };
+      if (!params.exclusiveWaiter) watching.resolve();
+      return { thread: thread(), run: runResult({ state: "running", status: null }), pending: [] };
+    };
+    const work = wait(c.ctx);
+    await watching.wait();
+    c.fake.emit("broker/run/updated", { runId: "run-test", diagnosticRevision: 1, upstreamError: upstreamError() });
+    await c.ctx.out.flush();
+    const prior = output.stderr;
+    expect(prior.length).toBeGreaterThan(0);
+    replaceWait(c);
+    expect(await bounded(work, 2000)).toBe(10);
+    await c.ctx.out.flush();
+    expect(output.stdout).toEqual("");
+    expect(output.stderr).toEqual(prior + supersededNotice);
+    c.checkClean();
+  });
+});
 
 const dirs: string[] = [];
 beforeEach(() => { dirs.push(mkdtempSync(join(tmpdir(), "cxb-n4b-disk-"))); });
