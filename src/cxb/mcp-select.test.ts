@@ -1,15 +1,19 @@
 // 按线程关闭 MCP（命令面规格 3.1.4 节）：名单解析与选择的纯函数，以及 run、review 实际下发与登记的覆盖。
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgv } from "./args";
+import { brokerVersionOf, connectBroker } from "./broker-conn";
+import { BROKER_BIN } from "../test-support/broker-harness";
+import { readThreadIndex } from "./ledger";
+import { resolveWorkspace } from "./workspace";
 import { CONFIG_SCHEMA } from "./config-schema";
 import { ASK_FEATURE_KEY, CxbError } from "./contracts";
 import type { CommandHandler } from "./main";
 import { enabledMcpServers, mcpOffConfig, parseMcpNames, selectMcp } from "./mcp-select";
 import { createReviewHandler } from "./review";
 import { createRunHandler } from "./run";
-import { CLEANUP_BUDGET, TEST_BUDGET, RunHarness, fakeServerRequests } from "./test-fixtures/run-harness";
+import { CLEANUP_BUDGET, TEST_BUDGET, RunHarness, fakeServerRequests, until } from "./test-fixtures/run-harness";
 import { applyUserConfig } from "./user-config";
 
 const off = (name: string) => `mcp_servers.${name}.enabled`;
@@ -237,6 +241,37 @@ describe("run、review 下发与登记", () => {
       .toEqual([[off("backlog")], [], [off("serena")]]);
     expect(all.filter((c) => c.method === "fixture/resumeOverrides").slice(1).map((c) => keys(c.params.overrides.config)))
       .toEqual([[off("backlog")], [], [off("serena")]]);
+  }, TEST_BUDGET);
+
+  for (const command of ["run", "review"] as const) test(`${command} 对比真实旧登记：清空名单提醒，保持不变不提醒，再关闭提醒`, async () => {
+    h.workspace.workspaceDir = resolveWorkspace(h.workspace.root, h.env).workspaceDir;
+    await h.start({ mcpServers });
+    const invoke = async (disabled: string, id?: string) => {
+      // 此处走真实恢复登记，避免 RunHarness 的登记记录桩掩盖持久化行为。
+      const connection = await connectBroker({ workspace: h.workspace, brokerBin: BROKER_BIN,
+        expectedBrokerVersion: await brokerVersionOf(BROKER_BIN), probe: true, timeoutMs: 5000 });
+      h.connections.push(connection);
+      const inner = command === "run" ? run() : createReviewHandler(fakeServerRequests());
+      const args = command === "run" ? ["run", "配置切换", "--json"] : ["review", "--mode", "uncommitted", "--json"];
+      if (id) args.push("--resume", id);
+      const result = await h.invoke(withConfig(inner, disabled ? { "mcp-disabled": disabled } : {}), args, connection);
+      expect(result.code).toBe(0);
+      const threadId = JSON.parse(result.stdout).thread.id;
+      const expected = mcpOffConfig(disabled ? disabled.split(",") : []);
+      await until(() => {
+        const stored = readThreadIndex(h.workspace.workspaceDir).find((entry) => entry.threadId === threadId)?.resumeOverrides as any;
+        return stored?.config && JSON.stringify(Object.fromEntries(Object.entries(stored.config).filter(([key]) => key.startsWith("mcp_servers.")))) === JSON.stringify(expected);
+      });
+      return { ...result, id: threadId };
+    };
+    const first = await invoke("backlog");
+    expect(first.stderr).not.toContain("本次 MCP 开关未确认生效");
+    const raw = JSON.parse(readFileSync(join(h.workspace.workspaceDir, "threads.json"), "utf8"));
+    expect(Object.values(raw.payload.threads).find((entry: any) => entry.threadId === first.id))
+      .toMatchObject({ resumeOverrides: { config: { [off("backlog")]: false } } });
+    expect((await invoke("backlog", first.id)).stderr).not.toContain("本次 MCP 开关未确认生效");
+    expect((await invoke("", first.id)).stderr.match(/本次 MCP 开关未确认生效/g)).toHaveLength(1);
+    expect((await invoke("backlog", first.id)).stderr.match(/本次 MCP 开关未确认生效/g)).toHaveLength(1);
   }, TEST_BUDGET);
 
   test("带点服务名在名单与 never 全关时提示并跳过，恢复只提示一次未确认生效", async () => {

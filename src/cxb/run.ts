@@ -13,7 +13,7 @@ import { absorbedRefusal, buildContinuePrompt, continueRefusal, localContinueRef
 import { ASK_FEATURE_KEY, CxbError, EXIT, rpcFailure, type BrokerConnection, type BrokerRpc, type ExitCode,
   type ResumeOverrides, type RunPolicy, type RunResult, type ServerRequestDeps } from "./contracts";
 import { enabledMcpServers, mcpOffConfig, selectMcp } from "./mcp-select";
-import { readRunRecord } from "./ledger";
+import { readRunRecord, readThreadIndex } from "./ledger";
 import { lifecyclePendingError } from "./lifecycle";
 import { resolveThreadViaBroker } from "./thread-ref";
 import type { CommandContext, CommandHandler } from "./main";
@@ -227,7 +227,9 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       const ref = await resolveThreadViaBroker({ request }, options.resume, { passThrough: true });
       threadId = ref.threadId;
       label = ref.shortId ?? options.resume;
-      const child = childEntry(ctx.workspace.workspaceDir, threadId);
+      let child: ReturnType<typeof childEntry> = null;
+      // 本地索引不可读时仍向上游核实线程能力，MCP 提醒另按未知登记降级。
+      try { child = childEntry(ctx.workspace.workspaceDir, threadId); } catch { /* 继续只读上游元数据。 */ }
       let capability = child?.canAcceptDirectInput;
       let parent = child?.parentThreadId;
       if (capability == null) {
@@ -259,7 +261,11 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     if (selection.unverified) out.notice("[cxb] 提醒：读不到 Codex 的 MCP 配置，本次未关闭任何 MCP 服务。");
     if (selection.dotted.length) out.notice(`[cxb] 提醒：MCP 服务 ${selection.dotted.map(safe).join("、")} 名字含「.」，Codex 的配置覆盖按点切分，无法按线程关闭，已跳过。`);
     if (selection.off.length) out.progress(`已请求关闭 MCP：${selection.off.map(safe).join("、")}`);
-    if (options.resume && (selection.off.length || selection.dotted.length || o.mcp)) {
+    const previousMcp = threadId ? registeredMcpOff(ctx.workspace.workspaceDir, threadId) : null;
+    const currentMcp = Object.keys(mcpOffConfig(selection.off));
+    const mcpChanged = previousMcp === null ? !!(selection.off.length || selection.dotted.length || o.mcp)
+      : previousMcp.length !== currentMcp.length || currentMcp.some((key) => !previousMcp.includes(key));
+    if (options.resume && mcpChanged) {
       out.notice("[cxb] 提醒：本次 MCP 开关未确认生效——线程若仍被其他连接使用或正在运行，Codex 会忽略本次覆盖，下次冷恢复时才按登记生效；要确保立即生效请不带 --resume 新开线程。");
     }
     // 审批风险仍按既有范围计算；恢复覆盖可能被忽略，因此已有线程保留全部风险提醒。
@@ -616,3 +622,22 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
 }
 
 function listMcp(value: string | undefined): string[] { return value ? value.split(",") : []; }
+
+/** 只比较登记中的 MCP 关闭键；索引不可读或形状异常时退回原提示条件。 */
+function registeredMcpOff(workspaceDir: string, threadId: string): string[] | null {
+  const object = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  try {
+    const entry = readThreadIndex(workspaceDir).find((entry) => entry.threadId === threadId);
+    if (!entry) return null;
+    // Rust 的 Option 为空时省略字段；已知线程没有登记即空集合。
+    const overrides = entry.resumeOverrides;
+    if (overrides === undefined || overrides === null) return [];
+    if (!object(overrides) || Object.keys(overrides).some((key) => key !== "config" && key !== "developerInstructions")
+      || ("developerInstructions" in overrides && typeof overrides.developerInstructions !== "string")) return null;
+    if (!("config" in overrides)) return [];
+    if (!object(overrides.config)) return null;
+    return Object.entries(overrides.config).filter(([key, value]) => /^mcp_servers\..+\.enabled$/.test(key) && value === false)
+      .map(([key]) => key);
+  } catch { return null; }
+}

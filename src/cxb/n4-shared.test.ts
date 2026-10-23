@@ -59,6 +59,14 @@ function writeRun(run: ReturnType<typeof runResult>) {
 }
 
 describe("ledger：只读 broker 账本", () => {
+  test("线程索引保留恢复登记原值，旧索引不添加该字段", () => {
+    const resumeOverrides = { config: { "mcp_servers.backlog.enabled": false }, developerInstructions: "测试指令" };
+    writeIndex({ aaaa1111: { ...entry("t-1", "aaaa1111", 1), resumeOverrides }, bbbb2222: entry("t-2", "bbbb2222", 2) });
+    expect(readThreadIndex(dir).find((item) => item.threadId === "t-1")?.resumeOverrides).toEqual(resumeOverrides);
+    expect(readThreadIndex(dir).find((item) => item.threadId === "t-2")).not.toHaveProperty("resumeOverrides");
+    writeIndex({ aaaa1111: { ...entry("t-1", "aaaa1111", 1), resumeOverrides: { config: null } } });
+    expect(readThreadIndex(dir)[0]?.resumeOverrides).toEqual({ config: null });
+  });
   test("线程索引：不存在为空、按 updatedAt 倒序、损坏抛 LOCAL_ERROR", () => {
     expect(readThreadIndex(dir)).toEqual([]);
     writeIndex({ aaaa1111: entry("t-1", "aaaa1111", 1), bbbb2222: entry("t-2", "bbbb2222", 5) });

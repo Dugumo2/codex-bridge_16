@@ -564,6 +564,57 @@ const turnText = (unit: { fake: FakeRpc }) => unit.fake.calls.find((call) => cal
 
 const realRequests: ServerRequestDeps = { attachServerRequests, handover, renderPending };
 
+for (const scenario of ["清空名单", "名单相同", "仅顺序与其他字段变化", "索引缺失", "线程缺失", "索引损坏", "登记形状异常", "配置形状异常", "只计 false", "全关改回 keep"] as const)
+  test(`MCP 恢复登记对比：${scenario}`, async () => {
+    const unchanged = scenario === "名单相同" || scenario === "仅顺序与其他字段变化";
+    const args = scenario === "清空名单" || scenario === "全关改回 keep" ? [] : ["--no-mcp", unchanged ? "backlog,serena" : "backlog"];
+    const unit = unitExecution(["run", "恢复", "--resume", "thread-test", ...args]);
+    if (scenario === "全关改回 keep") unit.ctx.parsed.options["mcp-when-never"] = "keep";
+    const original = unit.fake.handle;
+    unit.fake.handle = (method, params) => {
+      if (method === "broker/threads/list") return { threads: [{ threadId: "thread-test", shortId: "abcd1234" }] };
+      if (method === "thread/resume") return { thread: { id: "thread-test" } };
+      if (method === "config/read") return { config: { mcp_servers: { backlog: {}, serena: {} } } };
+      return original(method, params);
+    };
+    const stored = scenario === "登记形状异常" ? [] : { config: scenario === "配置形状异常" ? null : {
+      "mcp_servers.serena.enabled": unchanged ? false : true,
+      "mcp_servers.backlog.enabled": scenario === "只计 false" ? true : false,
+      "mcp_servers.backlog.timeout": false, model_reasoning_effort: "low",
+    } };
+    if (scenario !== "索引缺失") writeFileSync(join(h.workspace.workspaceDir, "threads.json"), scenario === "索引损坏" ? "{坏"
+      : JSON.stringify({ epoch: 1, revision: 1, payload: { threads: { abcd1234: {
+        threadId: scenario === "线程缺失" ? "other-thread" : "thread-test", shortId: "abcd1234", updatedAt: 1, resumeOverrides: stored,
+      } } } }));
+    expect(await handler()(unit.ctx)).toBe(0);
+    await unit.out.flush();
+    expect(unit.output().stderr.includes("本次 MCP 开关未确认生效")).toBe(!unchanged);
+  });
+
+test("续跑清空旧 MCP 关闭登记时提醒未确认生效", async () => {
+  const unit = continueUnit([]);
+  writeFileSync(join(h.workspace.workspaceDir, "threads.json"), JSON.stringify({ payload: { threads: { abcd1234: {
+    threadId: "thread-test", shortId: "abcd1234", updatedAt: 1,
+    resumeOverrides: { config: { "mcp_servers.backlog.enabled": false } },
+  } } } }));
+  expect(await handler()(unit.ctx)).toBe(0);
+  await unit.out.flush();
+  expect(unit.output().stderr.match(/本次 MCP 开关未确认生效/g)).toHaveLength(1);
+  expect(unit.fake.calls.find((call) => call.method === "broker/threads/resumeOverrides")!.params.overrides.config)
+    .not.toHaveProperty("mcp_servers.backlog.enabled");
+});
+
+for (const [label, resumeOverrides] of [["省略字段", undefined], ["空值", null], ["省略配置", {}]] as const)
+  test(`已有线程${label}表示没有旧覆盖，仅豁免时关闭集合不变不提醒`, async () => {
+    const unit = continueUnit(["--mcp", "backlog"]);
+    writeFileSync(join(h.workspace.workspaceDir, "threads.json"), JSON.stringify({ payload: { threads: { abcd1234: {
+      threadId: "thread-test", shortId: "abcd1234", updatedAt: 1, resumeOverrides,
+    } } } }));
+    expect(await handler()(unit.ctx)).toBe(0);
+    await unit.out.flush();
+    expect(unit.output().stderr).not.toContain("本次 MCP 开关未确认生效");
+  });
+
 test("续跑按线程保存的目录读取有效配置，关闭键登记但不主动恢复线程", async () => {
   const unit = continueUnit(["--no-mcp", "project_only"]);
   const cwd = join(h.dir, "线程原目录");

@@ -11,6 +11,8 @@ import { CxbError, type LifecycleInfo, type RunMeta, type RunResult, type RunMod
 
 /** threads.json 里的一项（Rust runs::types::ThreadIndexEntry，只取 CLI 用到的字段）。 */
 export interface ThreadIndexEntry {
+  /** 原样读取恢复登记；使用方核实形状，兼容旧索引缺少此字段。 */
+  resumeOverrides?: unknown;
   parentThreadId?: string;
   relationKind?: import("./contracts").RelationKind;
   sourceSummary?: unknown;
@@ -132,6 +134,7 @@ export function readThreadIndex(workspaceDir: string): ThreadIndexEntry[] {
       threadId: entry.threadId, shortId: entry.shortId, lastRunId: entry.lastRunId ?? null,
       updatedAt: Number(entry.updatedAt) || 0, model: entry.model ?? null, preview: entry.preview ?? null,
       cwd: entry.cwd ?? null, meta: entry.meta ?? null,
+      ...(entry.resumeOverrides !== undefined ? { resumeOverrides: entry.resumeOverrides } : {}),
       // SA1：子线程的血缘字段只在索引里有时带出（旧索引没有这些键）。
       ...(typeof entry.parentThreadId === "string" ? { parentThreadId: entry.parentThreadId } : {}),
       ...(typeof entry.relationKind === "string" ? { relationKind: entry.relationKind } : {}),

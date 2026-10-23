@@ -88,6 +88,27 @@ test("MCP 配置名单、有效关闭名单与无效名字分开显示，关闭�
   for (const text of ["配置名单", "预计有效关闭名单", "无法核实或无效的名字", "with.dot"]) expect(plain.stdout).toContain(text);
 });
 
+for (const scenario of ["broker 未运行", "方法不可用", "形状异常", "auto 不触发全关"] as const)
+  test(`无关闭请求且${scenario}时，配置未核实仍通过`, async () => {
+    writeUserConfig(h.home, scenario === "auto 不触发全关" ? { approval: "auto", "mcp-when-never": "off" } : {});
+    const original = rpc.handle;
+    if (scenario === "broker 未运行") deps.connectBroker = async () => { throw new BrokerNotRunning(); };
+    rpc.handle = (method, params) => {
+      if (method !== "config/read") return original(method, params);
+      if (scenario === "方法不可用") throw Object.assign(new Error("方法不存在"), { code: -32601 });
+      return {};
+    };
+    const check = checkOf(await invoke(), "mcpApprovalRisk");
+    expect(check).toMatchObject({ status: "pass", mcpConfigVerified: false, mcpEffectiveDisabled: [] });
+    expect(check.detail).toContain("预计有效关闭名单：无");
+    expect(check.detail).not.toContain("未能核实");
+  });
+
+test("无关闭请求时保留审批预检的风险状态", async () => {
+  deps.preflight = async () => ({ check: "mcpApprovalRisk", status: "warn", servers: [] });
+  expect(checkOf(await invoke(), "mcpApprovalRisk").status).toBe("warn");
+});
+
 test("唯一风险服务预计关闭后，MCP 诊断恢复通过", async () => {
   writeUserConfig(h.home, { approval: "never", "mcp-disabled": "project" });
   const original = rpc.handle;

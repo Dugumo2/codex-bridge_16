@@ -316,6 +316,7 @@ export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): Comman
         const stored = ctx.userConfig?.values ?? {};
         const mcpDisabled = typeof stored["mcp-disabled"] === "string" ? stored["mcp-disabled"].split(",") : [];
         const mcpWhenNever = stored["mcp-when-never"] === "off" ? "off" : "keep";
+        const hasClosingRequest = mcpDisabled.length > 0 || (ctx.parsed.globals.approval === "never" && mcpWhenNever === "off");
         let configured: string[] | null = null;
         if (brokerUsable) {
           try {
@@ -331,16 +332,17 @@ export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): Comman
           policy: ctx.parsed.globals.approval, whenNever: mcpWhenNever });
         const mcpUnverified = configured === null ? mcpDisabled : [];
         const servers = result.servers.filter((server) => !selection.off.includes(server.name));
-        const riskStatus = result.status === "unavailable" ? "unavailable" : servers.some((server) => server.risk) ? "warn" : "ok";
+        const riskStatus = !hasClosingRequest ? result.status : result.status === "unavailable" ? "unavailable" : servers.some((server) => server.risk) ? "warn" : "ok";
+        const closingUnverified = hasClosingRequest && configured === null;
         const names = [
           ...(mcpUnverified.length ? [`未能核实：${mcpUnverified.join("、")}`] : []),
           ...(selection.unknown.length ? [`不存在或已停用：${selection.unknown.join("、")}`] : []),
           ...(selection.dotted.length ? [`名字含「.」，无法按线程关闭：${selection.dotted.join("、")}`] : []),
         ];
         const closing = `配置名单：mcp-disabled=${mcpDisabled.join(",") || "无"}，mcp-when-never=${mcpWhenNever}`
-          + `；预计有效关闭名单：${configured === null ? "未能核实" : selection.off.join("、") || "无"}`
-          + `；无法核实或无效的名字：${names.join("；") || (configured === null ? "未能核实" : "无")}`;
-        return { status: riskStatus === "ok" && configured !== null && !names.length ? "pass" : "warn", detail: `${riskStatus === "unavailable" ? "未能检查 MCP 审批风险" : `有效审批 ${ctx.parsed.globals.approval}；${riskStatus === "warn" ? "MCP 工具可能被拒绝" : "未发现审批风险"}`}；${closing}`,
+          + `；预计有效关闭名单：${closingUnverified ? "未能核实" : selection.off.join("、") || "无"}`
+          + `；无法核实或无效的名字：${names.join("；") || (closingUnverified ? "未能核实" : "无")}`;
+        return { status: riskStatus === "ok" && !closingUnverified && !names.length ? "pass" : "warn", detail: `${riskStatus === "unavailable" ? "未能检查 MCP 审批风险" : `有效审批 ${ctx.parsed.globals.approval}；${riskStatus === "warn" ? "MCP 工具可能被拒绝" : "未发现审批风险"}`}；${closing}`,
           servers: servers.map((server) => ({ name: server.name, source: server.source, mode: server.effectiveMode, risk: server.risk, recommendation: server.suggestion })),
           mcpDisabled, mcpWhenNever, mcpEffectiveDisabled: selection.off, mcpUnknown: selection.unknown,
           mcpDotted: selection.dotted, mcpUnverified, mcpConfigVerified: configured !== null };
