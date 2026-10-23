@@ -4,7 +4,7 @@
 //! 未归档与已归档各分页一遍，不加 cwd 过滤）、已加载线程（`thread/loaded/list` 加定向 `thread/read`）。
 //! 完整的条件：各来源都遍历完；期间关系版本没变（变了重查一次，再变判不完整）；没有未落定的派生；
 //! 已加载成员都有当前 epoch 的有效附着证据。否则 Incomplete，保留已发现成员。
-//! SA1a 不用 thread/resume 补附着，Operation::AttachThread 不发请求。
+//! 仅恢复本连接主动释放过的线程；同步登记发现，挂回屏障通过后再发送来源查询。
 use super::*;
 use serde_json::json;
 
@@ -89,11 +89,23 @@ impl Machine {
             kind: TimerKind::DiscoveryDeadline { op_id, generation },
             delay_ms: timeout,
         });
-        self.discovery_start_sources(op_id, actions);
+        self.begin_child_barrier(root, ChildWaiter::Discovery(op_id), actions);
+        if !self
+            .relations
+            .aux
+            .child_barriers
+            .contains_key(&ChildWaiter::Discovery(op_id))
+            && self.relations.aux.work[&op_id].sources.is_empty()
+        {
+            self.discovery_start_sources(op_id, actions);
+        }
         op_id
     }
 
-    fn discovery_start_sources(&mut self, op_id: u64, actions: &mut Vec<Action>) {
+    pub(super) fn discovery_start_sources(&mut self, op_id: u64, actions: &mut Vec<Action>) {
+        if !self.relations.aux.work.contains_key(&op_id) {
+            return;
+        }
         let version = self.relations.aux.version;
         let work = self
             .relations
@@ -372,6 +384,14 @@ impl Machine {
     }
 
     fn discovery_maybe_finish(&mut self, op_id: u64, actions: &mut Vec<Action>) {
+        if self
+            .relations
+            .aux
+            .child_barriers
+            .contains_key(&ChildWaiter::Discovery(op_id))
+        {
+            return;
+        }
         let Some(work) = self.relations.aux.work.get(&op_id) else {
             return;
         };

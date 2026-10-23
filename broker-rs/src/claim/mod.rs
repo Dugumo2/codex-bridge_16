@@ -307,9 +307,10 @@ pub enum Operation {
         generation: u64,
         thread: String,
     },
-    /// 重新订阅曾被本连接退订、仍加载的子线程（`relations/release.rs`）；回包只恢复附着证据，不学习订阅事实。
-    ChildReattach {
+    /// 子线程责任操作（恢复、退订及只读核实），由唯一操作编号隔离迟到回包。
+    ChildSubscription {
         thread: String,
+        op: u64,
     },
 
     Lifecycle {
@@ -383,6 +384,17 @@ pub struct RequestContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimerKind {
+    ChildBarrier {
+        waiter: crate::relations::ChildWaiter,
+    },
+    ChildSubscription {
+        thread: String,
+        op: u64,
+    },
+    ChildRetry {
+        thread: String,
+        op: u64,
+    },
     Stall {
         run_id: String,
         generation: u64,
@@ -469,6 +481,9 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    ChildBarrier(crate::relations::ChildWaiter),
+    ChildSubscription(String),
+    ChildRetry(String),
     Stall(String),
     BudgetVerifyDeadline(String, u64),
     ConvergeDeadline(String, u64),
@@ -499,6 +514,11 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::ChildBarrier { waiter } => Some(TimerKey::ChildBarrier(waiter.clone())),
+            TimerKind::ChildSubscription { thread, .. } => {
+                Some(TimerKey::ChildSubscription(thread.clone()))
+            }
+            TimerKind::ChildRetry { thread, .. } => Some(TimerKey::ChildRetry(thread.clone())),
             TimerKind::Stall { run_id, .. } => Some(TimerKey::Stall(run_id.clone())),
             TimerKind::BudgetVerifyDeadline { token } => Some(TimerKey::BudgetVerifyDeadline(
                 token.run_id.clone(),
@@ -811,6 +831,7 @@ pub struct Machine {
 pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.diagnostic_batch_active = true;
     let mut actions = Vec::new();
+    state.child_subscription_event(&event, &mut actions);
     // 先保留身份，事件完全处理后才撤销线上保护，避免回包处理中的释放触发淘汰。
     let finished_start = match &event {
         Event::Reply { context, .. }
@@ -1016,6 +1037,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.schedule_next_verifications(&mut actions);
     state.ensure_breaker_probe(&mut actions);
     state.track_review_requests(&mut actions);
+    state.child_subscriptions_after_step(&mut actions);
     state.flush_run_diagnostics(&mut actions);
     state.flush_run_notices(&mut actions);
     state.evict_records();
@@ -1368,6 +1390,7 @@ impl Machine {
                     pending_detach: None,
                 },
             );
+            self.begin_child_run_barrier(&thread_id, actions);
             if let Some(open) = open {
                 let run = open.run_id.clone();
                 self.run_opened(open, actions);
@@ -1392,6 +1415,22 @@ impl Machine {
             return;
         }
         // thread/goal/clear 只在回包成功后学习（learn_traffic，上游 891–904 行）：清除失败时 goal 仍是 active。
+        if request.method == "thread/unsubscribe" {
+            if let Some(thread) = thread_id
+                .as_deref()
+                .filter(|t| self.thread_relation(t).is_some())
+            {
+                if !self.child_release_capacity(thread, actions) {
+                    send_error(
+                        &request,
+                        code::GENERAL_ERROR,
+                        "子线程释放责任表已满，请稍后重试",
+                        actions,
+                    );
+                    return;
+                }
+            }
+        }
         let stream_id = ReqKind::from_method(&request.method).map(|_| self.reserve_stream_slot());
         actions.push(Action::Request(RequestContext {
             resume_retried: false,
@@ -1406,7 +1445,10 @@ impl Machine {
     }
 
     /// #2 的屏障：只有 resume 回包进入邮箱后才取出流式请求。
-    fn submit_stream(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
+    pub(crate) fn submit_stream(&mut self, thread_id: &str, actions: &mut Vec<Action>) {
+        if self.child_start_waiting(thread_id) {
+            return;
+        }
         if let Some(value) = self
             .claims
             .get(thread_id)
@@ -1758,7 +1800,7 @@ impl Machine {
             Operation::RelationLookup { .. }
             | Operation::Discovery { .. }
             | Operation::AttachThread { .. }
-            | Operation::ChildReattach { .. } => self.relation_reply(&context, result, actions),
+            | Operation::ChildSubscription { .. } => self.relation_reply(&context, result, actions),
             Operation::DerivedStop { .. } => self.tree_reply(&context, result, actions),
             Operation::BudgetVerify { .. }
             | Operation::StartReconciliation { .. }
@@ -3061,6 +3103,14 @@ impl Machine {
         result: &Result<Value, Value>,
         actions: &mut Vec<Action>,
     ) {
+        if self.relations.aux.ignored_subscription_reply
+            && matches!(
+                context.method.as_str(),
+                "thread/resume" | "thread/unsubscribe"
+            )
+        {
+            return;
+        }
         if self.closing {
             return;
         }
@@ -3093,7 +3143,7 @@ impl Machine {
                 .get("thread")
                 .and_then(|t| t.get("id"))
                 .and_then(Value::as_str)
-                .filter(|_| !matches!(context.operation, Operation::ChildReattach { .. }))
+                .filter(|_| !matches!(context.operation, Operation::ChildSubscription { .. }))
             {
                 if context.method != "thread/fork" {
                     self.record(thread_id).subscribed = true;
@@ -3322,6 +3372,13 @@ impl Machine {
             return;
         }
         match kind {
+            TimerKind::ChildBarrier { waiter } => self.child_barrier_timeout(waiter, actions),
+            TimerKind::ChildSubscription { thread, op } => {
+                self.child_subscription_timeout(&thread, op, actions)
+            }
+            TimerKind::ChildRetry { thread, op } => {
+                self.child_subscription_retry(&thread, op, actions)
+            }
             TimerKind::Stall { run_id, generation } => {
                 self.stall_timer(&run_id, generation, actions)
             }
@@ -3356,6 +3413,11 @@ impl Machine {
                 self.detach_deadline(token, generation, actions)
             }
             TimerKind::Unsubscribe => {
+                if self.thread_relation(&token.thread_id).is_some()
+                    && !self.child_release_capacity(&token.thread_id, actions)
+                {
+                    return;
+                }
                 if self.closing
                     || self.claims.contains_key(&token.thread_id)
                     || self.tree_busy(Some(&token.thread_id))
@@ -3591,7 +3653,12 @@ impl Machine {
     }
 }
 
-fn send_error(request: &ClientRequest, code: i64, message: &str, actions: &mut Vec<Action>) {
+pub(crate) fn send_error(
+    request: &ClientRequest,
+    code: i64,
+    message: &str,
+    actions: &mut Vec<Action>,
+) {
     actions.push(Action::Send {
         conn: request.conn,
         message: proto::response_err(request.id.clone(), proto::error_object(code, message, None)),

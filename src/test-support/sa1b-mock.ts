@@ -7,14 +7,14 @@ export interface RpcMessage { id?: any; method?: string; params?: any; result?: 
 export interface MockTurn { id: string; status: string; items: any[]; error: any }
 export interface MockThread {
   id: string; parentThreadId: string | null; version: ProtocolVersion; turns: MockTurn[];
-  loaded: boolean; archived: boolean; pendingInit: boolean; canAcceptDirectInput?: boolean;
+  loaded: boolean; archived: boolean; pendingInit: boolean; stored: boolean; closing: boolean; canAcceptDirectInput?: boolean;
   goal: any; usage: any; delivery: DeliveryMode; startMode: StartMode;
   interrupts: any[]; goalWrites: any[]; inputs: any[]; answers: any[]; pendingRequests: RpcMessage[];
 }
 export interface Sa1bOptions { version?: ProtocolVersion; pageSize?: number }
 
 /** 命令皆为 fixture/sa1b/<名称>，避免与旧夹具控制面相互消费。 */
-export function createSa1bMock(send: (message: RpcMessage) => unknown, options: Sa1bOptions = {}) {
+export function createSa1bMock(send: (message: RpcMessage, connectionId?: string) => unknown, options: Sa1bOptions = {}) {
   const threads = new Map<string, MockThread>();
   const calls: RpcMessage[] = [];
   const events: RpcMessage[] = [];
@@ -22,25 +22,51 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
   const fences = new Map<string, { method: string; threadId?: string }>();
   const requestFences = new Map<string, { method: string; threadId?: string }>();
   const requestHeld = new Map<string, RpcMessage[]>();
+  const snapshotFences = new Map<string, { method: string; threadId?: string }>();
+  const responseFences = new Map<string, { method: string; threadId?: string }>();
+  const subscriptions = new Map<string, Set<string>>([["broker", new Set()]]);
+  const deliveries: { connectionId: string; message: RpcMessage }[] = [];
+  const heldDeliveries = new Map<string, { message: RpcMessage; recipients?: string[]; connectionId: string }[]>();
+  const requestConnections = new Map<RpcMessage, string>();
+  const busy = new Set<string>();
+  const queued = new Map<string, { message: RpcMessage; connectionId: string }[]>();
+  const responseContexts = new Map<string, { method: string; threadId?: string; connectionId: string }>();
+  let currentConnection = "broker";
+  const broadcasts = new Set(["thread/started", "thread/status/changed", "thread/goal/updated", "thread/goal/cleared", "thread/closed",
+    "thread/name/updated", "thread/archived", "thread/unarchived", "thread/deleted", "thread/reverted", "thread/attachment/updated", "thread/project/updated"]);
   const faults = new Map<string, { mode: string; remaining: number }>();
-  const background = createBackgroundTerminalsMock(message => send(message as RpcMessage), { enabled: true });
+  const background = createBackgroundTerminalsMock(message => emit(message as RpcMessage), { enabled: true });
   let serial = 0;
   const clone = <T>(value: T): T => structuredClone(value);
   const thread = (id: string): MockThread => {
     let t = threads.get(id);
     if (!t) {
-      t = { id, parentThreadId: null, version: options.version ?? "v1", turns: [], loaded: true, archived: false,
+      t = { id, parentThreadId: null, version: options.version ?? "v1", turns: [], loaded: true, archived: false, stored: true, closing: false,
         pendingInit: false, canAcceptDirectInput: true, goal: null, usage: null, delivery: "normal", startMode: "started",
         interrupts: [], goalWrites: [], inputs: [], answers: [], pendingRequests: [] };
       threads.set(id, t);
+      for (const subscribed of subscriptions.values()) subscribed.add(id);
     }
     return t;
   };
-  const emit = (message: RpcMessage, hold?: string) => {
+  const emit = (message: RpcMessage, hold?: string, captured?: string[], connectionId = currentConnection) => {
     const target = message.params?.threadId ?? message.params?.thread?.id;
-    const fence = hold ?? [...fences].find(([, f]) => f.method === message.method && (!f.threadId || f.threadId === target))?.[0];
-    if (fence) { held.set(fence, [...held.get(fence) ?? [], clone(message)]); return; }
-    events.push(clone(message)); send(clone(message));
+    const context = message.method ? undefined : responseContexts.get(JSON.stringify([connectionId, message.id]));
+    // 快照栅栏在读取订阅集合前停住，送达栅栏保存当时的接收者；二者不能互相替代。
+    const beforeSnapshot = !captured && [...snapshotFences].find(([, f]) => f.method === message.method && (!f.threadId || f.threadId === target))?.[0];
+    const recipients = beforeSnapshot ? undefined : captured ?? (!message.method ? [context?.connectionId ?? connectionId]
+      : [...subscriptions].filter(([, subscribed]) => !target || broadcasts.has(message.method!) || subscribed.has(target)).map(([id]) => id));
+    const fence = beforeSnapshot || hold || (context && [...responseFences].find(([, f]) => f.method === context.method && (!f.threadId || f.threadId === context.threadId))?.[0])
+      || [...fences].find(([, f]) => f.method === message.method && (!f.threadId || f.threadId === target))?.[0];
+    if (fence) {
+      held.set(fence, [...held.get(fence) ?? [], clone(message)]);
+      heldDeliveries.set(fence, [...heldDeliveries.get(fence) ?? [], { message: clone(message), recipients, connectionId }]); return;
+    }
+    for (const recipient of recipients ?? []) {
+      deliveries.push({ connectionId: recipient, message: clone(message) });
+      if (recipient === "broker") events.push(clone(message));
+      send(clone(message), recipient);
+    }
   };
   const reply = (id: any, result: any, hold?: string) => emit({ id, result }, hold);
   const error = (id: any, message: string, code = -32600) => emit({ id, error: { code, message } });
@@ -78,7 +104,11 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
     turn.status = status === "errored" ? "failed" : status === "shutdown" ? "interrupted" : status;
     if (status === "failed" || status === "errored") turn.error = { message: "测试失败", codexErrorInfo: null, additionalDetails: null };
     if (announce) notify("turn/completed", { threadId: t.id, turn });
-    if (status === "shutdown") { t.loaded = false; notify("thread/closed", { threadId: t.id }); }
+    if (status === "shutdown") {
+      t.loaded = false;
+      for (const subscribed of subscriptions.values()) subscribed.delete(t.id);
+      notify("thread/closed", { threadId: t.id });
+    }
     if (t.parentThreadId && (status === "errored" || status === "shutdown")) {
       const parent = thread(t.parentThreadId), parentTurn = parent.turns.at(-1);
       if (parentTurn) item(parent, parentTurn, { type: "collabAgentToolCall", id: `status-${turn.id}`,
@@ -116,14 +146,25 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
     const t = p.threadId ? thread(p.threadId) : undefined;
     switch (msg.method?.slice("fixture/sa1b/".length)) {
       // 观测响应不能再次进入事件日志，否则连续 state 会递归复制之前的整份快照。
-      case "state": send({ id: msg.id, result: clone({ threads: Object.fromEntries(threads), calls, events, held: Object.fromEntries(held), requestHeld: Object.fromEntries(requestHeld) }) }); break;
-      case "fence": (p.direction === "request" ? requestFences : fences).set(p.name, { method: p.method, threadId: p.threadId }); reply(msg.id, {}); break;
+      case "state": send({ id: msg.id, result: state() }, currentConnection); break;
+      case "connection": subscriptions.set(p.connectionId, new Set(p.threadIds ?? [])); reply(msg.id, {}); break;
+      case "fence": (p.direction === "request" ? requestFences : p.direction === "snapshot" ? snapshotFences : p.direction === "response" ? responseFences : fences).set(p.name, { method: p.method, threadId: p.threadId }); reply(msg.id, {}); break;
       case "release": {
-        fences.delete(p.name); const batch = held.get(p.name) ?? []; held.delete(p.name);
-        for (const message of batch) emit(message);
+        fences.delete(p.name); snapshotFences.delete(p.name); responseFences.delete(p.name);
+        const batch = held.get(p.name) ?? []; held.delete(p.name);
+        const captured = heldDeliveries.get(p.name); heldDeliveries.delete(p.name);
+        if (captured) for (const event of captured) emit(event.message, undefined, event.recipients, event.connectionId);
+        else for (const message of batch) emit(message);
         requestFences.delete(p.name); const requests = requestHeld.get(p.name) ?? []; requestHeld.delete(p.name);
-        for (const request of requests) handle(request, false);
+        for (const request of requests) execute(request, requestConnections.get(request) ?? "broker");
         reply(msg.id, { released: batch.length + requests.length }); break;
+      }
+      case "unload": {
+        t!.loaded = false; t!.closing = false;
+        if (p.stored === false) t!.stored = false;
+        for (const subscribed of subscriptions.values()) subscribed.delete(t!.id);
+        if (p.closed !== false) notify("thread/closed", { threadId: t!.id });
+        reply(msg.id, {}); break;
       }
       case "barrier": reply(msg.id, { eventCount: events.length, callCount: calls.length }); break;
       case "spawn": {
@@ -168,7 +209,7 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
       case "delivery": thread(p.childThreadId).delivery = p.mode; reply(msg.id, {}); break;
       case "startBehavior": t!.startMode = p.mode; reply(msg.id, {}); break;
       case "metadata": {
-        for (const key of ["loaded", "archived", "canAcceptDirectInput", "pendingInit"] as const) if (key in p) (t as any)[key] = p[key] === null ? undefined : p[key];
+        for (const key of ["loaded", "archived", "canAcceptDirectInput", "pendingInit", "stored", "closing"] as const) if (key in p) (t as any)[key] = p[key] === null ? undefined : p[key];
         reply(msg.id, {}); break;
       }
       case "fault": faults.set(`${p.method}:${p.threadId ?? "*"}`, { mode: p.mode, remaining: p.count ?? -1 }); reply(msg.id, {}); break;
@@ -200,7 +241,7 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
       default: error(msg.id, "未知 SA1b 控制方法", -32601);
     }
   }
-  function handle(msg: RpcMessage, recordCall = true): boolean {
+  function processMessage(msg: RpcMessage): boolean {
     if (msg.method?.startsWith("fixture/sa1b/")) { control(msg); return true; }
     if (!msg.method) {
       for (const t of threads.values()) {
@@ -209,17 +250,26 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
       }
       return true;
     }
-    if (recordCall) calls.push(clone(msg));
     const p = msg.params ?? {};
-    const requestFence = [...requestFences].find(([, f]) => f.method === msg.method && (!f.threadId || f.threadId === p.threadId))?.[0];
-    if (requestFence) { requestHeld.set(requestFence, [...requestHeld.get(requestFence) ?? [], clone(msg)]); return true; }
     const fault = faults.get(`${msg.method}:${p.threadId ?? "*"}`) ?? faults.get(`${msg.method}:*`);
     if (fault && fault.remaining !== 0) {
       if (fault.remaining > 0) fault.remaining--;
-      if (fault.mode === "error" || fault.mode === "notFound") { error(msg.id, fault.mode === "notFound" ? "thread not found" : "模拟读取失败"); return true; }
+      if (fault.mode === "error" || fault.mode === "notFound" || fault.mode === "closing" || fault.mode === "attachedError") {
+        if (fault.mode === "attachedError") { thread(p.threadId).loaded = true; subscriptions.get(currentConnection)!.add(p.threadId); }
+        error(msg.id, fault.mode === "notFound" ? (msg.method === "thread/read" ? `thread not loaded: ${p.threadId}` : `no rollout found for thread id ${p.threadId}`)
+          : fault.mode === "closing" ? `thread ${p.threadId} is closing; retry thread/resume after the thread is closed`
+          : fault.mode === "attachedError" ? "模拟已订阅后构造响应失败" : "模拟读取失败"); return true;
+      }
       if (fault.mode === "dropped") return true;
       if (fault.mode === "duplicateCursor") { reply(msg.id, { data: [], nextCursor: "duplicate" }); return true; }
-      if (fault.mode === "notLoaded") { reply(msg.id, { thread: { ...meta(thread(p.threadId)), status: { type: "notLoaded" } } }); return true; }
+      if (fault.mode === "notLoaded") {
+        if (msg.method === "thread/unsubscribe") {
+          thread(p.threadId).loaded = false;
+          for (const subscribed of subscriptions.values()) subscribed.delete(p.threadId);
+          reply(msg.id, { status: "notLoaded" });
+        } else reply(msg.id, { thread: { ...meta(thread(p.threadId)), status: { type: "notLoaded" } } });
+        return true;
+      }
     }
     if (background.handle(msg)) return true;
     const t = p.threadId ? thread(p.threadId) : undefined;
@@ -229,8 +279,20 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
       case "model/list": reply(msg.id, { data: [{ id: "original-model", model: "original-model", displayName: "测试模型", description: "", isDefault: true,
         supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }], defaultReasoningEffort: "high", inputModalities: ["text"] }], nextCursor: null }); break;
       case "thread/start": { const root = thread(p.id ?? "root"); notify("thread/started", { thread: meta(root) }); reply(msg.id, { thread: meta(root), model: p.model ?? "mock-model", cwd: p.cwd, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }); break; }
-      case "thread/resume": reply(msg.id, { thread: meta(t!), model: p.model ?? "mock-model", cwd: process.env.TEMP!, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }); break;
-      case "thread/read": reply(msg.id, { thread: meta(t!, p.includeTurns === true) }); break;
+      case "thread/resume": {
+        if (!t!.stored) { error(msg.id, `no rollout found for thread id ${t!.id}`); break; }
+        if (t!.closing) { error(msg.id, `thread ${t!.id} is closing; retry thread/resume after the thread is closed`); break; }
+        if (!t!.loaded) {
+          t!.loaded = true;
+          for (const subscribed of subscriptions.values()) subscribed.add(t!.id);
+          notify("thread/started", { thread: meta(t!) });
+        }
+        subscriptions.get(currentConnection)!.add(t!.id);
+        reply(msg.id, { thread: meta(t!), model: p.model ?? "mock-model", cwd: process.env.TEMP!, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }); break;
+      }
+      case "thread/read":
+        if (!t!.stored && !t!.loaded) error(msg.id, `thread not loaded: ${t!.id}`);
+        else reply(msg.id, { thread: meta(t!, p.includeTurns === true) }); break;
       case "thread/list": page(msg.id, [...threads.values()].filter(x => (!p.ancestorThreadId || ancestors(x).includes(p.ancestorThreadId)) && x.archived === (p.archived === true)).map(x => meta(x)), p); break;
       case "thread/loaded/list": page(msg.id, [...threads.values()].filter(x => x.loaded && !x.archived).map(x => x.id), p); break;
       case "thread/turns/list": {
@@ -264,11 +326,50 @@ export function createSa1bMock(send: (message: RpcMessage) => unknown, options: 
         reply(msg.id, { goal: t!.goal, cleared: t!.goal === null }); notify("thread/goal/updated", { threadId: t!.id, goal: t!.goal }); break;
       }
       case "thread/backgroundTerminals/list": reply(msg.id, { data: [], nextCursor: null }); break;
-      case "thread/unsubscribe": reply(msg.id, {}); break;
+      case "thread/unsubscribe": {
+        const subscribed = subscriptions.get(currentConnection)!;
+        const status = !t!.loaded ? "notLoaded" : subscribed.has(t!.id) ? "unsubscribed" : "notSubscribed";
+        subscribed.delete(t!.id); reply(msg.id, { status }); break;
+      }
       case "thread/memoryMode/set": reply(msg.id, { threadId: p.threadId, mode: p.mode }); break;
       default: if (msg.id !== undefined) error(msg.id, `未实现方法 ${msg.method}`, -32601);
     }
     return true;
   }
-  return { handle, state: () => clone({ threads: Object.fromEntries(threads), calls, events, held: Object.fromEntries(held), requestHeld: Object.fromEntries(requestHeld) }) };
+  function execute(message: RpcMessage, connectionId: string) {
+    const previous = currentConnection; currentConnection = connectionId;
+    try { processMessage(message); } finally { currentConnection = previous; }
+    const id = message.params?.threadId;
+    if (id) {
+      busy.delete(id);
+      const next = queued.get(id)?.shift();
+      if (next) dispatch(next.message, next.connectionId);
+    }
+  }
+  function dispatch(message: RpcMessage, connectionId: string) {
+    const id = message.params?.threadId;
+    if (id && busy.has(id)) { queued.set(id, [...queued.get(id) ?? [], { message, connectionId }]); return; }
+    if (id) busy.add(id);
+    const fence = [...requestFences].find(([, f]) => f.method === message.method && (!f.threadId || f.threadId === id))?.[0];
+    if (fence) {
+      requestHeld.set(fence, [...requestHeld.get(fence) ?? [], message]); requestConnections.set(message, connectionId); return;
+    }
+    execute(message, connectionId);
+  }
+  function handle(message: RpcMessage, recordCall = true, connectionId = "broker"): boolean {
+    if (!subscriptions.has(connectionId)) subscriptions.set(connectionId, new Set());
+    if (message.id !== undefined && message.method) responseContexts.set(JSON.stringify([connectionId, message.id]), { method: message.method, threadId: message.params?.threadId, connectionId });
+    if (!message.method || message.method.startsWith("fixture/sa1b/")) {
+      const previous = currentConnection; currentConnection = connectionId;
+      try { return processMessage(message); } finally { currentConnection = previous; }
+    }
+    if (recordCall) calls.push(clone(message));
+    dispatch(clone(message), connectionId); return true;
+  }
+  function state() {
+    return clone({ threads: Object.fromEntries(threads), calls, events, held: Object.fromEntries(held), requestHeld: Object.fromEntries(requestHeld),
+      subscriptions: Object.fromEntries([...subscriptions].map(([id, subscribed]) => [id, [...subscribed]])), deliveries,
+      queued: Object.fromEntries([...queued].map(([id, requests]) => [id, requests.map(x => x.message)])) });
+  }
+  return { handle, state };
 }

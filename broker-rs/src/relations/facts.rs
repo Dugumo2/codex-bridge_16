@@ -130,15 +130,8 @@ impl Machine {
         };
         let claimed = self.claims.contains_key(thread);
         if !claimed {
-            // 状态变化对所有连接广播（0.160.0 实测退订后仍会收到），对本连接退订过的子线程不算附着证据；
-            // 其余线程事件只发给订阅者，thread/closed 表示已卸载，都把它从待重新订阅名单划掉。
-            let broadcast = event.method == "thread/status/changed";
-            if !(broadcast && self.relations.aux.released_children.contains(thread)) {
-                self.attach(thread, AttachmentSource::ThreadEvent);
-            }
-            if !broadcast {
-                self.relations.aux.released_children.remove(thread);
-            }
+            // 统一入口检查订阅责任：广播与旧订阅者快照中的事件都不能覆盖最后发出的操作。
+            self.attach(thread, AttachmentSource::ThreadEvent);
         }
         let thread = thread.to_owned();
         let turn = notification_turn(params).map(str::to_owned);
@@ -210,6 +203,7 @@ impl Machine {
                 true
             }
             "thread/closed" => {
+                self.child_closed(&thread, actions);
                 self.convergences.closed_threads.insert(thread.clone());
                 self.convergence_observation_gap(&thread, actions);
                 self.detach_evidence(&thread);
@@ -224,11 +218,12 @@ impl Machine {
                 {
                     self.convergence_observation_gap(&thread, actions);
                     self.detach_evidence(&thread);
-                    self.relations.aux.released_children.remove(&thread);
+                    // 广播可能迟到，不能结束本连接的订阅责任。
                 }
                 false
             }
             "thread/deleted" | "thread/archived" | "thread/unarchived" => {
+                self.child_probe(&thread, actions);
                 if event.method == "thread/deleted" {
                     self.detach_evidence(&thread);
                 }
@@ -241,9 +236,12 @@ impl Machine {
 
     /// 本连接确实收到了该线程的事件或请求：只证明当前 epoch 下被观察，不证明此前历史完整。
     pub(crate) fn attach(&mut self, thread: &str, source: AttachmentSource) {
-        // 线程事件由调用方按方法决定是否划掉（状态变化是广播）；其余来源都证明已重新挂上。
-        if source != AttachmentSource::ThreadEvent {
-            self.relations.aux.released_children.remove(thread);
+        // 有释放责任时，只有匹配最后一个恢复操作的成功回包能建立附着证据。
+        if self.relations.aux.released.get(thread).is_some_and(|r| {
+            source != AttachmentSource::ExplicitResume
+                || r.result != super::release::SubscriptionResult::Attached
+        }) {
+            return;
         }
         let (epoch, now, revision) = (
             self.relations.conn_epoch,

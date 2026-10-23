@@ -13,6 +13,7 @@ mod discovery;
 mod facts;
 mod notify;
 mod release;
+pub(crate) use release::{ChildBarrier, ChildWaiter, Released};
 pub mod results;
 mod routing;
 #[cfg(test)]
@@ -153,7 +154,11 @@ pub struct RelationsAux {
     /// 最近一次发现中已加载但没有附着证据的线程：活动状态未知。
     pub unobserved_loaded: BTreeSet<String>,
     /// 本连接主动退订、尚未见到卸载的子线程（`release.rs`）：根线程再开运行时要重新订阅回来。
-    pub released_children: BTreeSet<String>,
+    pub released: BTreeMap<String, Released>,
+    pub child_barriers: BTreeMap<ChildWaiter, ChildBarrier>,
+    pub release_capacity_warned: bool,
+    /// 仅在当前事件内使用：旧订阅回包不得绕过责任表更新普通认领事实。
+    pub ignored_subscription_reply: bool,
 }
 
 impl RelationsAux {
@@ -361,7 +366,6 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) -> u64 {
         // 退订过、仍加载的子线程没有附着证据，发现会判 attachmentMissing：先挂回（relations/release.rs）。
-        self.reattach_released_children(root, actions);
         self.discovery_begin(root, scope, caller, actions)
     }
     pub fn discovery_done(
@@ -459,10 +463,8 @@ impl Machine {
             Operation::AttachThread { .. } => {
                 actions.push(Action::Debug("忽略未启用的附着回包".into()))
             }
-            Operation::ChildReattach { thread } => {
-                let thread = thread.clone();
-                self.child_reattach_reply(&thread, result.is_ok(), actions)
-            }
+            // 订阅操作在统一事件入口记账，普通与迟到回包共用同一顺序判据。
+            Operation::ChildSubscription { .. } => {}
             _ => {}
         }
         self.ensure_sweep(actions);

@@ -21,7 +21,7 @@ export class Sa1bHarness {
   async open(options: { pageSize?: number } = {}) {
     const module = pathToFileURL(join(import.meta.dir, "sa1b-mock.ts")).href;
     writeMockCodexScript(this.tempDir, `import { createSa1bMock } from ${JSON.stringify(module)};
-const mock = createSa1bMock(message => process.stdout.write(JSON.stringify(message) + "\\n"), ${JSON.stringify(options)});
+const mock = createSa1bMock((message, connectionId) => { if (connectionId === undefined || connectionId === "broker") process.stdout.write(JSON.stringify(message) + "\\n"); }, ${JSON.stringify(options)});
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", chunk => { buffer += chunk; let end; while ((end = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0,end); buffer = buffer.slice(end+1); if (line.trim()) mock.handle(JSON.parse(line)); } });
