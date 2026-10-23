@@ -7,6 +7,7 @@ import type { AccountRead } from "../types";
 import { BrokerNotRunning, connectBroker, resolveBrokerBin, safeSummary } from "./broker-conn";
 import { CXB_PROTOCOL_VERSION, CxbError, EXIT, type BrokerConnection } from "./contracts";
 import type { CommandHandler } from "./main";
+import { enabledMcpServers, selectMcp } from "./mcp-select";
 import { approvalPreflight } from "./preflight";
 import { bounded } from "./wait-run";
 
@@ -310,15 +311,39 @@ export function createDoctorHandler(overrides: Partial<DoctorDeps> = {}): Comman
         throw new CxbError("LOCAL_ERROR", "模型分页超过 20 页，未能完整检查");
       });
       await check("mcpApprovalRisk", "warn", async (limit) => {
+        const mcpDeadline = deps.now() + limit.timeoutMs;
         const result = await deps.preflight(ctx.parsed.globals.approval, process.env, limit);
-        // 按线程关闭的 MCP 来自持久配置（mcp-select.ts）；只展示名单，是否生效取决于 Codex 配置里有没有该服务。
         const stored = ctx.userConfig?.values ?? {};
         const mcpDisabled = typeof stored["mcp-disabled"] === "string" ? stored["mcp-disabled"].split(",") : [];
         const mcpWhenNever = stored["mcp-when-never"] === "off" ? "off" : "keep";
-        const closing = `cxb 开线程关闭 MCP：${mcpDisabled.length ? mcpDisabled.join("、") : "无"}${mcpWhenNever === "off" ? "；审批 never 时全关" : ""}`;
-        return { status: result.status === "ok" ? "pass" : "warn", detail: `${result.status === "unavailable" ? "未能检查 MCP 审批风险" : `有效审批 ${ctx.parsed.globals.approval}；${result.status === "warn" ? "MCP 工具可能被拒绝" : "未发现审批风险"}`}；${closing}`,
-          servers: result.servers.map((server) => ({ name: server.name, source: server.source, mode: server.effectiveMode, risk: server.risk, recommendation: server.suggestion })),
-          mcpDisabled, mcpWhenNever };
+        let configured: string[] | null = null;
+        if (brokerUsable) {
+          try {
+            // 给降级展示留出时间；有效服务名含受信任的项目层配置。
+            configured = enabledMcpServers(await request("config/read", { cwd: ctx.workspace.root },
+              { ...limit, timeoutMs: Math.max(1, Math.min(5000, (mcpDeadline - deps.now()) / 2)) }));
+          } catch (error) {
+            if (controller.signal.aborted) throw error;
+            // broker 不支持、读取失败或超时均不推断关闭名单。
+          }
+        }
+        const selection = selectMcp({ configured, disabled: mcpDisabled, extraOff: [], on: [],
+          policy: ctx.parsed.globals.approval, whenNever: mcpWhenNever });
+        const mcpUnverified = configured === null ? mcpDisabled : [];
+        const servers = result.servers.filter((server) => !selection.off.includes(server.name));
+        const riskStatus = result.status === "unavailable" ? "unavailable" : servers.some((server) => server.risk) ? "warn" : "ok";
+        const names = [
+          ...(mcpUnverified.length ? [`未能核实：${mcpUnverified.join("、")}`] : []),
+          ...(selection.unknown.length ? [`不存在或已停用：${selection.unknown.join("、")}`] : []),
+          ...(selection.dotted.length ? [`名字含「.」，无法按线程关闭：${selection.dotted.join("、")}`] : []),
+        ];
+        const closing = `配置名单：mcp-disabled=${mcpDisabled.join(",") || "无"}，mcp-when-never=${mcpWhenNever}`
+          + `；预计有效关闭名单：${configured === null ? "未能核实" : selection.off.join("、") || "无"}`
+          + `；无法核实或无效的名字：${names.join("；") || (configured === null ? "未能核实" : "无")}`;
+        return { status: riskStatus === "ok" && configured !== null && !names.length ? "pass" : "warn", detail: `${riskStatus === "unavailable" ? "未能检查 MCP 审批风险" : `有效审批 ${ctx.parsed.globals.approval}；${riskStatus === "warn" ? "MCP 工具可能被拒绝" : "未发现审批风险"}`}；${closing}`,
+          servers: servers.map((server) => ({ name: server.name, source: server.source, mode: server.effectiveMode, risk: server.risk, recommendation: server.suggestion })),
+          mcpDisabled, mcpWhenNever, mcpEffectiveDisabled: selection.off, mcpUnknown: selection.unknown,
+          mcpDotted: selection.dotted, mcpUnverified, mcpConfigVerified: configured !== null };
       });
       await check("askUserInput", "warn", async (limit) => {
         if (!codex || !diagBroker) return { status: "warn", detail: "未检查（codex 不可用）" };

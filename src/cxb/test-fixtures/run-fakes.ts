@@ -15,7 +15,8 @@ export class FakeRpc {
   /** 监听器异常与真实 RPC 一样逐个隔离；用例收尾必须检查此列表，不能把异常当成功。 */
   notificationErrors: Array<{ method: string; listener: "通配" | "具体"; error: unknown }> = [];
   calls: Array<{ method: string; params: any; options: any }> = [];
-  handle: (method: string, params: any) => unknown = () => ({});
+  /** 默认有效配置没有 MCP 服务；用例可通过 handle 配置回包或读取失败。 */
+  handle: (method: string, params: any) => unknown = (method) => method === "config/read" ? { config: { mcp_servers: {} } } : {};
   rpc: BrokerRpc = {
     request: async <T>(method: string, params?: unknown, options?: unknown): Promise<T> => {
       this.calls.push({ method, params, options });

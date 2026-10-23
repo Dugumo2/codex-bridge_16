@@ -10,9 +10,9 @@ import { sanitizeForTerminal } from "../questions";
 import { NO_RESPONSE, type AnyServerRequestHandler } from "../rpc";
 import { askOverrides } from "./ask-instructions";
 import { absorbedRefusal, buildContinuePrompt, continueRefusal, localContinueRefusal, resolveRunChain } from "./continue-prompt";
-import { ASK_FEATURE_KEY, CxbError, EXIT, rpcFailure, type ApprovalPolicyName, type BrokerConnection, type BrokerRpc, type ExitCode,
+import { ASK_FEATURE_KEY, CxbError, EXIT, rpcFailure, type BrokerConnection, type BrokerRpc, type ExitCode,
   type ResumeOverrides, type RunPolicy, type RunResult, type ServerRequestDeps } from "./contracts";
-import { mcpOffConfig, selectMcp } from "./mcp-select";
+import { enabledMcpServers, mcpOffConfig, selectMcp } from "./mcp-select";
 import { readRunRecord } from "./ledger";
 import { lifecyclePendingError } from "./lifecycle";
 import { resolveThreadViaBroker } from "./thread-ref";
@@ -109,8 +109,6 @@ export interface ExecutionPlan {
   review?: { mode: string; ref: string | null; base: string | null; target: object };
   /** `run --resume <id> --continue`：supplement 来自位置参数（拍板 J），fromRunId 来自 `--run`。 */
   continue?: { supplement: string | null; fromRunId?: string };
-  /** 本次按线程关闭的 MCP 服务（preflightMcp），随开线程、恢复与覆盖登记下发。 */
-  mcpOff?: string[];
 }
 
 interface ContinueSource { from: RunResult; prompt: string; goal: unknown }
@@ -201,8 +199,6 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     const rpc = connection.rpc;
     if (controller.signal.aborted) throw new CxbError("INTERRUPTED", "命令已取消");
     let overrides = askOverrides();
-    // 关闭键与提问开关同在覆盖里：冷恢复不带会把服务重新起（E7 实测），登记后 broker 内部恢复与续跑也补传。
-    if (plan.mcpOff?.length) overrides = { ...overrides, config: { ...overrides.config, ...mcpOffConfig(plan.mcpOff) } };
     // 版本握手已保证 broker 支持登记；失败说明参数、线程或连接有问题，照常上抛。
     const registerOverrides = (id: string, value: ResumeOverrides | null) =>
       request("broker/threads/resumeOverrides", { threadId: id, overrides: value });
@@ -221,7 +217,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     const rethrow = (error: unknown) => {
       if (controller.signal.aborted || (error instanceof CxbError && error.code === "TIMEOUT")) throw error;
     };
-    type ThreadMetadata = ThreadModel & { canAcceptDirectInput?: boolean; parentThreadId?: string;
+    type ThreadMetadata = ThreadModel & { cwd?: string; canAcceptDirectInput?: boolean; parentThreadId?: string;
       source?: { subAgent?: { thread_spawn?: { parent_thread_id?: string } } } };
     // 能力预检和模型核对共用一次只读请求；失败也保留给解析器发出可见提示。
     let metadataRead: Promise<ThreadMetadata | undefined> | undefined;
@@ -247,6 +243,34 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
       if (capability === false) throw new CxbError("LOCAL_ERROR", `子代理线程 ${safe(label)} 不接受直接输入，请从父线程继续`
         + (parent ? `：cxb run --resume ${safe(parent)} <要求>。` : "。"), { id: label });
     }
+    const o = ctx.parsed.options;
+    const needsMcpConfig = !!(o["mcp-disabled"] || o["no-mcp"] || o.mcp || (policy === "never" && o["mcp-when-never"] === "off"));
+    let configured: string[] | null = null;
+    if (needsMcpConfig) {
+      try {
+        // --continue 不发 resume；broker 内部恢复沿用线程保存的目录，不可误用当前工作区。
+        const cwd = plan.continue ? (await readThread())?.cwd : ctx.workspace.root;
+        if (typeof cwd === "string" && cwd.trim()) configured = enabledMcpServers(await request("config/read", { cwd }));
+      } catch (error) { rethrow(error); }
+    }
+    const selection = selectMcp({ configured, disabled: listMcp(o["mcp-disabled"]), extraOff: listMcp(o["no-mcp"]),
+      on: listMcp(o.mcp), policy, whenNever: o["mcp-when-never"] ?? "keep" });
+    if (selection.unknown.length) out.notice(`[cxb] 提醒：MCP 服务 ${selection.unknown.map(safe).join("、")} 不在 Codex 已启用的配置里，已忽略。`);
+    if (selection.unverified) out.notice("[cxb] 提醒：读不到 Codex 的 MCP 配置，本次未关闭任何 MCP 服务。");
+    if (selection.dotted.length) out.notice(`[cxb] 提醒：MCP 服务 ${selection.dotted.map(safe).join("、")} 名字含「.」，Codex 的配置覆盖按点切分，无法按线程关闭，已跳过。`);
+    if (selection.off.length) out.progress(`已请求关闭 MCP：${selection.off.map(safe).join("、")}`);
+    if (options.resume && (selection.off.length || selection.dotted.length || o.mcp)) {
+      out.notice("[cxb] 提醒：本次 MCP 开关未确认生效——线程若仍被其他连接使用或正在运行，Codex 会忽略本次覆盖，下次冷恢复时才按登记生效；要确保立即生效请不带 --resume 新开线程。");
+    }
+    // 审批风险仍按既有范围计算；恢复覆盖可能被忽略，因此已有线程保留全部风险提醒。
+    if (plan.command === "run") {
+      const report = await approvalPreflight(policy, process.env,
+        { signal: controller.signal, ...(Number.isFinite(deadline) ? { deadline } : {}) });
+      reportApprovalPreflight({ ...report, servers: options.resume ? report.servers
+        : report.servers.filter((server) => !selection.off.includes(server.name)) }, out);
+    }
+    // 冷恢复不带关闭键会重新起服务；登记后 broker 内部恢复与续跑也补传。
+    if (selection.off.length) overrides = { ...overrides, config: { ...overrides.config, ...mcpOffConfig(selection.off) } };
     let modelSource: string | undefined;
     let reasoningSource: string | undefined;
     if (plan.command === "run") {
@@ -283,8 +307,8 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
         const { [ASK_FEATURE_KEY]: _, ...rest } = overrides.config!;
         overrides = { ...overrides, config: rest };
         warnAsk();
-        // 恢复已有线程时先清除旧登记，避免重试失败后 broker 继续补传已失效的键。
-        if (threadId) await registerOverrides(threadId, null);
+        // 重试前替换为去键后的有效覆盖；重试失败也保留 MCP 关闭键与其他字段。
+        if (threadId) await registerOverrides(threadId, overrides);
         response = await request<ThreadResponse>(method, { ...params, ...overrides });
       }
       if (method === "thread/resume" && plan.command === "review") {
@@ -565,8 +589,7 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
     if (options.continue) {
       // 解析层已拒绝标准输入、文件、--goal、--template；位置参数是本次补充，不替换原始要求。
       const supplement = positional.join(" ").trim() ? positional.join(" ") : null;
-      const mcpOff = await preflightMcp(ctx, globals.approval, true);
-      return executeRun(ctx, deps, { command: "run", sandbox: globals.sandbox, mcpOff,
+      return executeRun(ctx, deps, { command: "run", sandbox: globals.sandbox,
         continue: { supplement, ...(options.run ? { fromRunId: options.run } : {}) } });
     }
     let prompt = await readPrompt(ctx);
@@ -588,38 +611,8 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
       }
     }
     if (!prompt.trim()) throw new CxbError("USAGE", "模板生成的提示词不能为空");
-    const mcpOff = await preflightMcp(ctx, globals.approval, true);
-    return executeRun(ctx, deps, { command: "run", sandbox, prompt, mcpOff });
+    return executeRun(ctx, deps, { command: "run", sandbox, prompt });
   };
 }
 
-/**
- * 开跑前读一次 Codex 的 MCP 配置：按持久配置与本次参数算出要关闭的服务（mcp-select.ts），
- * 提示无效名字；`report` 为真时再报告审批风险，已关闭的服务不再列入。review 不报告审批风险，保持原输出。
- */
-export async function preflightMcp(ctx: CommandContext, policy: ApprovalPolicyName, report: boolean): Promise<string[]> {
-  const result = await cancellablePreflight(ctx, policy);
-  const o = ctx.parsed.options;
-  const list = (value: string | undefined) => value ? value.split(",") : [];
-  const selection = selectMcp({
-    configured: result.status === "unavailable" ? null : result.servers.map((server) => server.name),
-    disabled: list(o["mcp-disabled"]), extraOff: list(o["no-mcp"]), on: list(o.mcp),
-    policy, whenNever: o["mcp-when-never"] ?? "keep",
-  });
-  if (selection.unknown.length) ctx.out.notice(`[cxb] 提醒：MCP 服务 ${selection.unknown.join("、")} 不在 Codex 已启用的配置里，已忽略。`);
-  if (selection.unverified) ctx.out.notice("[cxb] 提醒：读不到 Codex 的 MCP 配置，本次未关闭任何 MCP 服务。");
-  if (selection.off.length) ctx.out.progress(`本次关闭 MCP：${selection.off.join("、")}`);
-  if (report) reportApprovalPreflight({ ...result, servers: result.servers.filter((server) => !selection.off.includes(server.name)) }, ctx.out);
-  return selection.off;
-}
-
-/** 开跑前的审批预检：Ctrl-C 取消（INTERRUPTED），读配置的期限不超过本命令的 --timeout。 */
-async function cancellablePreflight(ctx: CommandContext, policy: ApprovalPolicyName) {
-  const { globals } = ctx.parsed;
-  const controller = new AbortController();
-  const unregister = ctx.registerCleanup(() => { controller.abort(); });
-  try {
-    return await approvalPreflight(policy, process.env,
-      { signal: controller.signal, ...(globals.timeout > 0 ? { deadline: performance.now() + globals.timeout * 1000 } : {}) });
-  } finally { unregister(); }
-}
+function listMcp(value: string | undefined): string[] { return value ? value.split(",") : []; }

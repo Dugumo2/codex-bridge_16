@@ -275,6 +275,9 @@ process.stdin.on("data", (chunk: string) => {
       case "initialize":
         send({ id: msg.id, result: { userAgent: "mock-codex-e2e/0.160.0" } });
         break;
+      case "config/read":
+        send({ id: msg.id, result: { config: { mcp_servers: JSON.parse(process.env.MOCK_E2E_MCP_SERVERS ?? "{}") } } });
+        break;
       case "thread/start":
       case "thread/resume":
         send({ id: msg.id, result: { thread: { ...thread(msg.method === "thread/start" ? "thread-e2e" : threadId),

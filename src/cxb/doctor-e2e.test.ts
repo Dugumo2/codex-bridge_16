@@ -54,7 +54,10 @@ test("真实 broker：未拉起诊断正常；普通命令拉起后只读诊断�
   expect(warmOutput.checks.find((c: any) => c.name === "broker")).toMatchObject({ status: "pass", launched: false, epoch: conn.handshake.epoch });
   expect(warmOutput.checks.find((c: any) => c.name === "models")).toMatchObject({ status: "pass", count: 1, defaults: ["n5-model"] });
   expect(warmOutput.checks.find((c: any) => c.name === "account").detail).toContain("n5@example.test");
-  expect(warmOutput.summary).toEqual({ pass: 11, warn: 0, fail: 0 });
+  // 旧模拟服务器尚未提供 config/read 形状，MCP 有效配置应明确降级，其他诊断照常通过。
+  expect(warmOutput.checks.find((c: any) => c.name === "mcpApprovalRisk")).toMatchObject({ status: "warn", mcpConfigVerified: false, mcpEffectiveDisabled: [] });
+  expect(warmOutput.checks.find((c: any) => c.name === "mcpApprovalRisk").detail).toContain("预计有效关闭名单：未能核实");
+  expect(warmOutput.summary).toEqual({ pass: 10, warn: 1, fail: 0 });
   expect(warm.stderr).not.toContain("候选进程已拉起");
 }, 55_000);
 

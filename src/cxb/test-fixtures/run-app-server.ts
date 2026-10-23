@@ -29,7 +29,7 @@ function state(id: string) {
   return value;
 }
 function thread(id: string) {
-  return { id, cwd: process.cwd(), turns: state(id).turns, status: { type: state(id).turns.at(-1)?.status === "inProgress" ? "active" : "idle" } };
+  return { id, cwd: scenario.threadCwd === null ? undefined : scenario.threadCwd ?? process.cwd(), turns: state(id).turns, status: { type: state(id).turns.at(-1)?.status === "inProgress" ? "active" : "idle" } };
 }
 /** 结果补读的条目分页一页给完；找不到轮次时回错误。 */
 function sendItems(id: unknown, threadId: string, turnId: string) {
@@ -70,12 +70,20 @@ process.stdin.on("data", (chunk) => {
     switch (msg.method) {
       case "initialize": reply(msg.id, { userAgent: "甲路模拟 Codex" }); break;
       case "initialized": break;
+      case "config/read":
+        if (scenario.configReadError) send({ id: msg.id, error: { code: scenario.configReadError, message: "模拟读取配置失败" } });
+        else reply(msg.id, "configRead" in scenario ? scenario.configRead : { config: { mcp_servers: scenario.mcpServers ?? {} } });
+        break;
       case "model/list": reply(msg.id, { data: [{ id: "mock-model", isDefault: true, upgrade: null, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null }); break;
       case "thread/start":
       case "thread/resume": {
         const key = "features.default_mode_request_user_input";
         if (scenario.rejectAsk && p.config?.[key]) {
           send({ id: msg.id, error: { code: -32600, message: `unknown configuration field ${key} 秘密不应回显` } });
+          break;
+        }
+        if (scenario.failResumeRetry && msg.method === "thread/resume" && !p.config?.[key]) {
+          send({ id: msg.id, error: { code: -32000, message: "模拟恢复重试失败" } });
           break;
         }
         if (scenario.warnAsk) notify("configWarning", { summary: `忽略 ${key}`, details: "秘密不应回显" });

@@ -10,8 +10,13 @@ import { bounded } from "./wait-run";
 import { RunHarness, fakeServerRequests, CLEANUP_BUDGET, TEST_BUDGET, alive, until } from "./test-fixtures/run-harness";
 
 let h: RunHarness;
-beforeEach(() => { h = new RunHarness(); });
-afterEach(async () => { await h.cleanup(); }, CLEANUP_BUDGET);
+let oldHome: string | undefined;
+beforeEach(() => { h = new RunHarness(); oldHome = process.env.CODEX_HOME; process.env.CODEX_HOME = h.env.CODEX_HOME; });
+afterEach(async () => {
+  try { await h.cleanup(); } finally {
+    if (oldHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldHome;
+  }
+}, CLEANUP_BUDGET);
 
 /** 仅在测试连接边界改写请求；服务器仍按实际 delivery 校验。 */
 function detachedRequest(connection: BrokerConnection): BrokerConnection {
@@ -104,6 +109,23 @@ test("review resume 在原线程追加新运行并保留前次历史结果", asy
   expect(runs.find((run) => run.runId === before.runId)?.turns[0]?.output).toBe("完整中文结果");
   const { run } = await observer.rpc.request<any>("broker/threads/watch", { threadId: before.thread.id });
   expect(run.reviewThreadId).toBeNull();
+}, TEST_BUDGET);
+
+test("审查恢复下发并登记 MCP 关闭键，提示覆盖未确认且不报告审批风险", async () => {
+  const observer = await h.start({ mcpServers: { project_only: { enabled: true } } });
+  const handler = createReviewHandler(fakeServerRequests());
+  const first = await h.invoke(handler, ["review", "--mode", "uncommitted", "--json"]);
+  expect(first.code).toBe(0);
+  const id = JSON.parse(first.stdout).thread.id;
+  const result = await h.invoke(handler, ["review", "--mode", "uncommitted", "--resume", id, "--no-mcp", "project_only"]);
+  expect(result.code).toBe(0);
+  expect(result.stderr.match(/本次 MCP 开关未确认生效/g)).toHaveLength(1);
+  expect(result.stderr).not.toContain("当前审批为 never");
+  const { calls } = await observer.rpc.request<any>("fixture/state");
+  expect(calls.find((call: any) => call.method === "config/read").params).toEqual({ cwd: h.workspace.root });
+  expect(calls.find((call: any) => call.method === "thread/resume").params.config).toMatchObject({ "mcp_servers.project_only.enabled": false });
+  expect(calls.filter((call: any) => call.method === "fixture/resumeOverrides").at(-1).params.overrides.config)
+    .toMatchObject({ "mcp_servers.project_only.enabled": false });
 }, TEST_BUDGET);
 
 test("四种审查目标、默认 main/HEAD、强制只读与 never、运行留在审查线程", async () => {

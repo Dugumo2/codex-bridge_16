@@ -39,6 +39,8 @@ export interface McpSelectionInput {
 export interface McpSelection {
   /** 本次下发关闭的服务，按 Codex 配置中的顺序。 */
   off: string[];
+  /** 本应关闭但含点的名字；覆盖键按点切分，不能安全下发。 */
+  dotted: string[];
   /** 名单或参数里出现、但 Codex 配置里没有（或已停用）的名字。 */
   unknown: string[];
   /** 读不到 Codex 配置而无法下发的关闭请求（名单非空时才有意义）。 */
@@ -49,14 +51,28 @@ export function selectMcp(input: McpSelectionInput): McpSelection {
   const requested = [...input.disabled, ...input.extraOff];
   const allOff = input.policy === "never" && input.whenNever === "off";
   if (input.configured === null) {
-    return { off: [], unknown: [], unverified: requested.length > 0 || allOff };
+    return { off: [], dotted: [], unknown: [], unverified: requested.length > 0 || allOff };
   }
   const configured = input.configured;
   const named = new Set(requested);
-  const off = configured.filter((name) => (allOff || named.has(name)) && !input.on.includes(name));
+  const selected = configured.filter((name) => (allOff || named.has(name)) && !input.on.includes(name));
+  const off = selected.filter((name) => !name.includes("."));
+  const dotted = selected.filter((name) => name.includes("."));
   const mentioned = [...requested, ...input.on];
   const unknown = mentioned.filter((name, index) => !configured.includes(name) && mentioned.indexOf(name) === index);
-  return { off, unknown, unverified: false };
+  return { off, dotted, unknown, unverified: false };
+}
+
+/** config/read 返回的有效服务表直接位于 config.mcp_servers，没有 additional 包装。 */
+export function enabledMcpServers(configRead: unknown): string[] | null {
+  const object = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!object(configRead) || !object(configRead.config)) return null;
+  const servers = configRead.config.mcp_servers;
+  // 有效配置未定义服务时，字段可以省略。
+  if (servers === undefined) return [];
+  if (!object(servers) || Object.values(servers).some((server) => !object(server))) return null;
+  return Object.entries(servers).filter(([, server]) => (server as Record<string, unknown>).enabled !== false).map(([name]) => name);
 }
 
 /** 写进 thread/start、thread/resume 与恢复覆盖登记的配置键。 */

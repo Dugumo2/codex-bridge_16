@@ -203,10 +203,10 @@ const upstreamErrorPolicy = value("upstream-error-policy", ["--upstream-error-po
   "observe（默认）只提示；stop-access 只对认证、付费、权限三类结构化错误停止本次运行，不登出、不改账户，退出 4。",
   (value) => CONFIG_SCHEMA["upstream-error-policy"].parse(value), "observe");
 const mcpOn = value("mcp", ["--mcp"], "名单",
-  "本次打开的 MCP 服务（逗号分隔）；优先于 config 的 mcp-disabled 与 mcp-when-never。", mcpList);
+  "豁免本次 cxb 关闭策略的 MCP 服务（逗号分隔）；仍按 Codex 有效配置，不会启用 Codex 里已停用的服务。", mcpList);
 const mcpOff = value("no-mcp", ["--no-mcp"], "名单",
   "本次额外关闭的 MCP 服务（逗号分隔）；只影响 cxb 开的线程与其子代理，不改 Codex 配置。", mcpList);
-const mcpRules = ["--mcp 与 --no-mcp 不能列出同一服务；名单只对 Codex 配置里启用的服务生效，其余名字只提示。"];
+const mcpRules = ["--mcp 与 --no-mcp 不能列出同一服务；名单只对 Codex 配置里启用的服务生效，其余名字只提示。恢复已有线程时，线程若仍在使用中，本次开关可能不生效。"];
 
 /** --mcp 与 --no-mcp 互相矛盾时报用法错误。 */
 function validateMcp(p: ParsedCommand): void {

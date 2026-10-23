@@ -127,11 +127,11 @@ for (const scenario of ["warnAsk", "rejectAsk"] as const) test(`未知配置键�
   expect(registered.developerInstructions).toBe(ASK_INSTRUCTIONS);
 }, TEST_BUDGET);
 
-test("resume 未知键重试先清除旧登记，成功后只登记有效覆盖", async () => {
-  const observer = await h.start({ rejectAsk: true });
+test("恢复未知键重试先登记去键后的有效覆盖，成功后保留 MCP 关闭键", async () => {
+  const observer = await h.start({ rejectAsk: true, mcpServers: { backlog: {} } });
   const first = await h.invoke(handler(), ["run", "中文", "--json"]);
   const id = JSON.parse(first.stdout).thread.id;
-  const second = await h.invoke(handler(), ["run", "继续新要求", "--resume", id]);
+  const second = await h.invoke(handler(), ["run", "继续新要求", "--resume", id, "--no-mcp", "backlog"]);
   expect(second.code).toBe(0);
   const { calls } = await observer.rpc.request<any>("fixture/state");
   const resumes = calls.filter((call: any) => call.method === "thread/resume");
@@ -139,8 +139,24 @@ test("resume 未知键重试先清除旧登记，成功后只登记有效覆盖"
   expect(resumes[0].params.config[ASK_FEATURE_KEY]).toBe(true);
   expect(resumes[1].params.config).not.toHaveProperty(ASK_FEATURE_KEY);
   const registrations = calls.filter((call: any) => call.method === "fixture/resumeOverrides");
-  expect(registrations.at(-2).params.overrides).toBeNull();
+  expect(registrations.at(-2).params.overrides).toEqual({
+    config: resumes[1].params.config, developerInstructions: ASK_INSTRUCTIONS,
+  });
+  expect(registrations.at(-2).params.overrides.config["mcp_servers.backlog.enabled"]).toBe(false);
+  expect(registrations.at(-2).params.overrides.config).not.toHaveProperty(ASK_FEATURE_KEY);
   expect(registrations.at(-1).params.overrides.config).not.toHaveProperty(ASK_FEATURE_KEY);
+}, TEST_BUDGET);
+
+test("恢复提问开关去键重试失败后，最后登记仍保留 MCP 关闭键与其他覆盖", async () => {
+  const observer = await h.start({ rejectAsk: true, failResumeRetry: true, mcpServers: { backlog: {} } });
+  const first = await h.invoke(handler(), ["run", "创建", "--json"]);
+  expect(first.code).toBe(0);
+  const result = await h.invoke(handler(), ["run", "恢复", "--resume", JSON.parse(first.stdout).thread.id, "--no-mcp", "backlog"]);
+  expect(result.code).toBe(7);
+  const { calls } = await observer.rpc.request<any>("fixture/state");
+  const last = calls.filter((call: any) => call.method === "fixture/resumeOverrides").at(-1).params.overrides;
+  expect(last).toMatchObject({ config: { "mcp_servers.backlog.enabled": false, model_reasoning_effort: "high" }, developerInstructions: ASK_INSTRUCTIONS });
+  expect(last.config).not.toHaveProperty(ASK_FEATURE_KEY);
 }, TEST_BUDGET);
 
 test("审批预检失败不阻止 run；风险提醒恰好一条", async () => {
@@ -271,6 +287,7 @@ function unitExecution(args: string[], server: "private" | "shared" = "private")
   const ctx: CommandContext = { parsed, out, workspace: h.workspace, connect: async () => connection,
     registerCleanup(callback) { callbacks.add(callback); return () => { callbacks.delete(callback); }; } };
   fake.handle = (method) => {
+    if (method === "config/read") return { config: { mcp_servers: {} } };
     if (method === "broker/runs/modelSummaries") return { runs: [] };
     if (method === "model/list") return { data: [{ id: "mock-model", isDefault: true, upgrade: null,
       supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
@@ -546,6 +563,80 @@ const methods = (unit: { fake: FakeRpc }) => unit.fake.calls.map((call) => call.
 const turnText = (unit: { fake: FakeRpc }) => unit.fake.calls.find((call) => call.method === "turn/start")?.params.input[0].text as string;
 
 const realRequests: ServerRequestDeps = { attachServerRequests, handover, renderPending };
+
+test("续跑按线程保存的目录读取有效配置，关闭键登记但不主动恢复线程", async () => {
+  const unit = continueUnit(["--no-mcp", "project_only"]);
+  const cwd = join(h.dir, "线程原目录");
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => {
+    if (method === "thread/read") return { thread: { cwd } };
+    if (method === "config/read") return { config: { mcp_servers: { project_only: {} } } };
+    return original(method, params);
+  };
+  expect(await createRunHandler(fakeServerRequests())(unit.ctx)).toBe(0);
+  expect(unit.fake.calls.find((call) => call.method === "config/read")!.params).toEqual({ cwd });
+  expect(unit.fake.calls.filter((call) => call.method === "thread/read")).toHaveLength(1);
+  expect(unit.fake.calls.find((call) => call.method === "broker/threads/resumeOverrides")!.params.overrides.config)
+    .toMatchObject({ "mcp_servers.project_only.enabled": false });
+  expect(methods(unit)).not.toContain("thread/resume");
+  await unit.out.flush();
+  expect(unit.output().stderr).toContain("本次 MCP 开关未确认生效");
+});
+
+for (const unreadable of [false, true]) test(`续跑${unreadable ? "读不到线程" : "缺少线程目录"}时不猜测配置目录、不下发关闭键`, async () => {
+  const unit = continueUnit(["--no-mcp", "backlog"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => {
+    if (method === "thread/read") {
+      if (unreadable) throw wireError(-32601, "无法读取线程");
+      return { thread: {} };
+    }
+    return original(method, params);
+  };
+  expect(await createRunHandler(fakeServerRequests())(unit.ctx)).toBe(0);
+  expect(methods(unit)).not.toContain("config/read");
+  const config = unit.fake.calls.find((call) => call.method === "broker/threads/resumeOverrides")!.params.overrides.config;
+  expect(Object.keys(config).some((key) => key.startsWith("mcp_servers."))).toBe(false);
+  await unit.out.flush();
+  expect(unit.output().stderr).toContain("读不到 Codex 的 MCP 配置，本次未关闭任何 MCP 服务");
+});
+
+for (const failure of ["方法不存在", "读取失败", "请求超时"] as const) test(`有效配置${failure}时降级运行且不登记关闭键`, async () => {
+  const unit = unitExecution(["run", "中文", "--no-mcp", "backlog"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => {
+    if (method === "config/read") throw failure === "请求超时" ? new CxbError("BROKER_UNAVAILABLE", "模拟 RPC 超时")
+      : wireError(failure === "方法不存在" ? -32601 : -32000, "模拟配置读取失败");
+    return original(method, params);
+  };
+  expect(await createRunHandler(fakeServerRequests())(unit.ctx)).toBe(0);
+  const config = unit.fake.calls.find((call) => call.method === "broker/threads/resumeOverrides")!.params.overrides.config;
+  expect(Object.keys(config).some((key) => key.startsWith("mcp_servers."))).toBe(false);
+  await unit.out.flush();
+  expect(unit.output().stderr).toContain("读不到 Codex 的 MCP 配置，本次未关闭任何 MCP 服务");
+});
+
+test("读取有效配置期间取消仍上抛中断，不继续开线程", async () => {
+  const unit = unitExecution(["run", "中文", "--no-mcp", "backlog"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => method === "config/read" ? new Promise(() => {}) : original(method, params);
+  const work = createRunHandler(fakeServerRequests())(unit.ctx);
+  void work.catch(() => {});
+  await until(() => methods(unit).includes("config/read"));
+  await Promise.all([...unit.callbacks].map((callback) => callback()));
+  await expect(work).rejects.toMatchObject({ code: "INTERRUPTED" });
+  expect(methods(unit)).not.toContain("thread/start");
+  expect(unit.closed()).toBe(true);
+});
+
+test("读取有效配置触及命令期限时上抛超时，不降级成成功运行", async () => {
+  const unit = unitExecution(["run", "中文", "--no-mcp", "backlog", "--timeout", "1"]);
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => method === "config/read" ? new Promise(() => {}) : original(method, params);
+  await expect(createRunHandler(fakeServerRequests())(unit.ctx)).rejects.toMatchObject({ code: "TIMEOUT" });
+  expect(methods(unit)).not.toContain("thread/start");
+  expect(unit.closed()).toBe(true);
+});
 
 test("续跑：启动回包等待审批，真实处理器先回包再完成运行", async () => {
   const unit = continueUnit(["--json", "--approval", "never"]);

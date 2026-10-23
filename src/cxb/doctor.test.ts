@@ -25,6 +25,7 @@ beforeEach(() => {
     if (method === "broker/health") return { brokerVersion: "1.2.3", protocolVersion: CXB_PROTOCOL_VERSION, epoch: 1, uptimeMs: 100, claims: 0, pending: 0, storage: "ok", survivesParentJob: true, parentJob: false };
     if (method === "account/read") return { account: { type: "chatgpt", email: "a@b.com", planType: "pro" } };
     if (method === "model/list") return { data: [{ id: "模型甲", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high" }] }], nextCursor: null };
+    if (method === "config/read") return { config: { mcp_servers: {} } };
     return {};
   };
   deps = { findExecutable: () => "模拟-codex", resolveBrokerBin: () => "模拟-broker",
@@ -62,8 +63,78 @@ test("所有诊断通过、完整健康信息、有效审批和只读方法", as
   expect(checkOf(result, "askUserInput").detail).toContain("false");
   expect(approval).toBe("auto");
   expect(closes).toBe(1);
-  expect(rpc.calls.map((call) => call.method)).toEqual(["broker/health", "account/read", "model/list"]);
+  expect(rpc.calls.map((call) => call.method).sort()).toEqual(["account/read", "broker/health", "config/read", "model/list"]);
   expect(rpc.calls.find((call) => call.method === "account/read")!.params).toEqual({ refreshToken: false });
+  expect(rpc.calls.find((call) => call.method === "config/read")!.params).toEqual({ cwd: h.root });
+});
+
+test("MCP 配置名单、有效关闭名单与无效名字分开显示，关闭后不报该服务审批风险", async () => {
+  writeUserConfig(h.home, { approval: "never", "mcp-disabled": "project,reenabled,disabled,ghost,with.dot" });
+  const original = rpc.handle;
+  rpc.handle = (method, params) => method === "config/read" ? { config: { mcp_servers: {
+    project: { command: "项目服务" }, reenabled: { enabled: true }, disabled: { enabled: false }, "with.dot": {}, kept: {},
+  } } } : original(method, params);
+  deps.preflight = async () => ({ check: "mcpApprovalRisk", status: "warn", servers: [
+    { name: "project", source: "config.toml", effectiveMode: "未配置", risk: true, suggestion: "请加 --approval auto" },
+    { name: "with.dot", source: "config.toml", effectiveMode: "未配置", risk: true, suggestion: "请加 --approval auto" },
+  ] });
+  const result = await invoke();
+  const check = checkOf(result, "mcpApprovalRisk");
+  expect(check).toMatchObject({ status: "warn", mcpDisabled: ["project", "reenabled", "disabled", "ghost", "with.dot"], mcpWhenNever: "keep",
+    mcpEffectiveDisabled: ["project", "reenabled"], mcpUnknown: ["disabled", "ghost"], mcpDotted: ["with.dot"], mcpUnverified: [], mcpConfigVerified: true });
+  expect(check.servers.map((server: any) => server.name)).toEqual(["with.dot"]);
+  for (const text of ["配置名单", "预计有效关闭名单：project、reenabled", "不存在或已停用：disabled、ghost", "名字含「.」，无法按线程关闭：with.dot", "MCP 工具可能被拒绝"]) expect(check.detail).toContain(text);
+  const plain = await invoke([]);
+  for (const text of ["配置名单", "预计有效关闭名单", "无法核实或无效的名字", "with.dot"]) expect(plain.stdout).toContain(text);
+});
+
+test("唯一风险服务预计关闭后，MCP 诊断恢复通过", async () => {
+  writeUserConfig(h.home, { approval: "never", "mcp-disabled": "project" });
+  const original = rpc.handle;
+  rpc.handle = (method, params) => method === "config/read" ? { config: { mcp_servers: { project: {} } } } : original(method, params);
+  deps.preflight = async () => ({ check: "mcpApprovalRisk", status: "warn", servers: [
+    { name: "project", source: "config.toml", effectiveMode: "未配置", risk: true, suggestion: "请加 --approval auto" },
+  ] });
+  const check = checkOf(await invoke(), "mcpApprovalRisk");
+  expect(check).toMatchObject({ status: "pass", mcpEffectiveDisabled: ["project"], servers: [] });
+  expect(check.detail).toContain("未发现审批风险");
+});
+
+for (const policy of ["never", "auto"] as const) test(`MCP never 全关按本次有效审批 ${policy} 选择，带点名字不计入关闭`, async () => {
+  writeUserConfig(h.home, { approval: policy, "mcp-when-never": "off" });
+  const original = rpc.handle;
+  rpc.handle = (method, params) => method === "config/read" ? { config: { mcp_servers: {
+    project: {}, "with.dot": {}, disabled: { enabled: false },
+  } } } : original(method, params);
+  const check = checkOf(await invoke(), "mcpApprovalRisk");
+  expect(check).toMatchObject({ mcpDisabled: [], mcpWhenNever: "off", mcpEffectiveDisabled: policy === "never" ? ["project"] : [],
+    mcpDotted: policy === "never" ? ["with.dot"] : [], mcpUnknown: [], mcpUnverified: [], mcpConfigVerified: true });
+  expect(check.detail).toContain(`有效审批 ${policy}`);
+});
+
+for (const scenario of ["broker 未运行", "读取失败", "不支持方法", "形状异常", "请求超时"]) test(`MCP ${scenario} 时明确未能核实且不漏报风险`, async () => {
+  writeUserConfig(h.home, { approval: "never", "mcp-disabled": "project", "mcp-when-never": "off" });
+  const original = rpc.handle;
+  if (scenario === "broker 未运行") deps.connectBroker = async () => { throw new BrokerNotRunning(); };
+  rpc.handle = (method, params) => {
+    if (method !== "config/read") return original(method, params);
+    if (scenario === "请求超时") return new Promise<never>(() => {});
+    if (scenario === "读取失败") throw new Error("模拟读取失败");
+    if (scenario === "不支持方法") throw Object.assign(new Error("方法不存在"), { code: -32601 });
+    return { config: { mcp_servers: [] } };
+  };
+  if (scenario === "请求超时") { deps.itemMs = 300; deps.probeWritable = () => {}; }
+  deps.preflight = async () => ({ check: "mcpApprovalRisk", status: "warn", servers: [
+    { name: "project", source: "config.toml", effectiveMode: "未配置", risk: true, suggestion: "请加 --approval auto" },
+  ] });
+  const result = await invoke();
+  expect(result.code).toBe(0);
+  const check = checkOf(result, "mcpApprovalRisk");
+  expect(check).toMatchObject({ status: "warn", mcpEffectiveDisabled: [], mcpUnknown: [], mcpDotted: [], mcpUnverified: ["project"], mcpConfigVerified: false });
+  expect(check.servers.map((server: any) => server.name)).toEqual(["project"]);
+  expect(check.detail).toContain("预计有效关闭名单：未能核实");
+  expect(check.detail).toContain("未能核实：project");
+  expect(check.detail).toContain("MCP 工具可能被拒绝");
 });
 
 test("未运行正常退出且依赖项未检查，缺省空闲期限三百秒", async () => {
