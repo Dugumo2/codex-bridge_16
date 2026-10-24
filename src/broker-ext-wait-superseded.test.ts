@@ -111,7 +111,9 @@ describe.skipIf(!RUNNABLE)("broker-ext 独占线程等待", () => {
     } finally { await bounded(s.close(), 12_000); }
   }, 45_000);
 
-  test("强行结束旧等待后新等待正常完成且无接替通知", async () => {
+  // 已结束的 A 收不到任何消息，「不向断开连接发通知」无法从进程外观察；断开即清字段由 Rust
+  // wait_superseded 用例 3 直接断言。这里只证明可观察部分：B 不被误通知、独占登记确实转到 B（C 能接替 B）。
+  test("强行结束旧等待后新等待接手独占登记并正常完成", async () => {
     const s = fixture();
     try {
       await s.open(); await s.start();
@@ -119,12 +121,21 @@ describe.skipIf(!RUNNABLE)("broker-ext 独占线程等待", () => {
       await a.registered(); a.proc.kill(); await bounded(a.result, 5000);
       const b = cli(s, ["wait", sa1b!.SA1B_ROOT, "--json"]);
       await b.registered();
+      expect(b.records().filter(record => record.event === "superseded")).toEqual([]);
+      expect(b.proc.exitCode).toBeNull();
+      const c = cli(s, ["wait", sa1b!.SA1B_ROOT, "--json"]);
+      const registered = await c.registered();
+      const old = await bounded(b.result, Math.max(1, 1000 - (Date.now() - registered.at)));
+      expect(old.at - registered.at).toBeLessThanOrEqual(1000);
+      expect(old.code).toBe(10);
+      expect(JSON.parse(old.stdout)).toMatchObject({ ok: false, event: "superseded", superseded: true });
+      expect(b.records().filter(record => record.event === "superseded")).toHaveLength(1);
       await s.finish(sa1b!.SA1B_ROOT, "强制结束后正常结果");
-      const next = await bounded(b.result, 10_000);
+      const next = await bounded(c.result, 10_000);
       expect(next.code).toBe(0);
       expect(JSON.parse(next.stdout)).toMatchObject({ ok: true, result: "强制结束后正常结果" });
       expect(next.stderr).toEqual("");
-      expect([...a.records(), ...b.records()].filter(record => record.event === "superseded")).toEqual([]);
+      expect(c.records().filter(record => record.event === "superseded")).toEqual([]);
     } finally { await bounded(s.close(), 12_000); }
   }, 45_000);
 
