@@ -74,7 +74,11 @@ async function start(mode: string) {
 }
 
 function cli(...args: string[]) {
-  return processes.run(process.execPath, [join(import.meta.dir, "..", "main.ts"), ...args, "-d", join(sandbox, "ws")],
+  return cliEntry(join(import.meta.dir, "..", "main.ts"), ...args);
+}
+
+function cliEntry(entry: string, ...args: string[]) {
+  return processes.run(process.execPath, [entry, ...args, "-d", join(sandbox, "ws")],
     { cwd: sandbox, env: env(), limitMs: 50000, onStderr: (chunk) => processes.log(chunk) });
 }
 
@@ -101,16 +105,38 @@ describe("乙组真 broker", () => {
     expect(delivered[0].result).toEqual({ answers: { q1: { answers: ["b.txt"] } } });
   }, 90000);
 
-  test("detach 后 wait 读取结果，主入口四命令接线有效", async () => {
+  async function detachedWait(entry = join(import.meta.dir, "..", "main.ts"), endedBeforeDetach = false) {
     await start("complete");
-    const running = await cli("run", "测试后台结果", "--detach", "--json");
+    const running = await cliEntry(entry, "run", "测试后台结果", "--detach", "--json");
     expect(running.code).toBe(0);
-    const handle = JSON.parse(running.stdout);
+    const output = JSON.parse(running.stdout);
+    if (endedBeforeDetach) {
+      expect(running.stderr).toContain("真实 broker 返回 runEnded");
+      expect(output.status).toBe("completed");
+    }
+    // 详细设计 #26a'''：交接恰逢运行结束时直接输出终态，线程字段嵌在 thread 内。
+    // 两种输出都必须提供真实短 ID；wait 仍核对同一线程、同一运行及完整结果。
+    if (output.status === "running") {
+      expect(output).toMatchObject({ threadId: "thread-e2e" });
+    } else {
+      expect(output).toMatchObject({ ok: true, command: "run", status: "completed", result: "续跑完成",
+        thread: { id: "thread-e2e" } });
+    }
+    const handle = output.status === "running" ? output
+      : { threadId: output.thread.id, shortId: output.thread.shortId, runId: output.runId };
+    expect(handle.shortId).toMatch(/^[0-9a-f]{8}$/);
+    expect(handle.runId).toBeString();
+    expect(handle.runId.length).toBeGreaterThan(0);
     const waited = await cli("wait", handle.shortId, "--timeout", "20", "--json");
     expect(waited.code).toBe(0);
     expect(JSON.parse(waited.stdout)).toMatchObject({ command: "wait", waitFor: "thread", threadId: handle.threadId,
       runId: handle.runId, status: "completed", result: "续跑完成" });
-  }, 90000);
+  }
+
+  test("detach 后 wait 读取结果，主入口四命令接线有效", () => detachedWait(), 90000);
+
+  test("detach 交接前已完成：仍以真实短 ID wait 读取同一结果", () =>
+    detachedWait(join(import.meta.dir, "n4b-ended-cli.ts"), true), 90000);
 
   test("stop 停止托管线程并返回确认，不直接持有上游运行", async () => {
     await start("hold");
