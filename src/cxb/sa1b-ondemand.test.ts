@@ -60,16 +60,31 @@ async function nextRun(h: H) {
     return turns.length >= 2 && (await h.watch()).thread?.state === "running";
   }, 8000, "第二次运行未开始");
 }
-async function cli(h: H, main: string, args: string[], timeout = 10000) {
+async function cli(h: H, main: string, args: string[], timeout = 10000, onStdout?: (stdout: string) => void) {
   const proc = Bun.spawn([process.execPath, main, ...args, "--dir", h.tempDir], {
     cwd: h.tempDir, stdin: "ignore", stdout: "pipe", stderr: "pipe",
     env: { ...envWithPathPrefix(h.tempDir), CXB_HOME: h.home, CODEX_HOME: join(h.tempDir, "cli-codex-home"), USERPROFILE: h.tempDir, HOME: h.tempDir },
   });
   h.spawnedProcesses.push(proc);
   const timer = setTimeout(() => proc.kill(), timeout);
+  // 保留完整双流，同时让调用方用已读到的输出建立启动栅栏，不以固定睡眠猜测进程就绪。
+  const stdout = (async () => {
+    const reader = proc.stdout.getReader();
+    const decoder = new TextDecoder();
+    let value = "";
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        value += decoder.decode(chunk.value, { stream: true });
+        onStdout?.(value);
+      }
+      return value + decoder.decode();
+    } finally { reader.releaseLock(); }
+  })();
   try {
-    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-    return { code, stdout, stderr };
+    const [output, stderr, code] = await Promise.all([stdout, new Response(proc.stderr).text(), proc.exited]);
+    return { code, stdout: output, stderr };
   } finally { clearTimeout(timer); }
 }
 
@@ -302,9 +317,15 @@ async function baselineSession(main: string, status: "completed" | "interrupted"
       const run = await h.record();
       return !!readRunLog(workspace.workspaceDir, run.shortId)?.some(line => line.runId === h.runId && line.event === "轮次开始");
     }, 5000, "开始日志未落盘，不能比较跟随输出");
-    const following = cli(h, main, ["show", P, "--follow", "--json"], 20000);
+    let followed = "";
+    const following = cli(h, main, ["show", P, "--follow", "--json"], 20000, value => { followed = value; });
+    void following.catch(() => {});
     const waiting = cli(h, main, ["wait", P, "--json"], 20000);
-    await h.observe(350);
+    void waiting.catch(() => {});
+    // follow 先输出本地 tail，再接实时通知；必须让两次会话跨过相同的初始日志边界。
+    await h.until(async () => followed.split("\n").slice(0, -1).some(line => {
+      try { return JSON.parse(line).kind === "轮次开始"; } catch { return false; }
+    }), 10000, "跟随尚未输出轮次开始，不能触发轮次结束");
     expect(h.ended()).toHaveLength(0);
     if (status === "interrupted") await h.owner.request("broker/threads/stop", { threadId: P, runId: h.runId }, 15000);
     else await h.finish(P, "普通运行结果");
