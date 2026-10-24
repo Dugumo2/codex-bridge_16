@@ -748,7 +748,7 @@ fn 三种退订成功状态_not_loaded才清除责任() {
 }
 
 #[test]
-fn closed在旧退订和已撒手时放行_在途恢复后仍记账冷恢复() {
+fn closed只在已确认时放行_未确认订阅操作先保留责任() {
     for phase in 0..3 {
         let (mut m, _, unsub) = pending_release();
         if phase > 0 {
@@ -760,8 +760,17 @@ fn closed在旧退订和已撒手时放行_在途恢复后仍记账冷恢复() {
         } else {
             None
         };
-        apply(&mut m, notify("thread/closed", json!({"threadId":C})));
-        assert_eq!(m.relations.aux.released.contains_key(C), phase == 2);
+        let closed = apply(&mut m, notify("thread/closed", json!({"threadId":C})));
+        assert_eq!(m.relations.aux.released.contains_key(C), phase != 1);
+        if phase == 0 {
+            let probe = rpc(&closed, "thread/read", C);
+            reply(
+                &mut m,
+                &probe,
+                Ok(json!({"thread":{"id":C,"status":{"type":"notLoaded"}}})),
+            );
+            assert!(!m.relations.aux.released.contains_key(C));
+        }
         if let Some(child) = child {
             assert!(!m.relations.aux.child_barriers.is_empty());
             resume_ok(&mut m, &child);
@@ -1315,4 +1324,507 @@ fn 连续挂回失败三次后按五十二十秒退避_成功清零() {
     resume_ok(&mut m, &child);
     assert_eq!(m.relations.aux.released[C].failures, 0);
     assert_eq!(m.relations.aux.released[C].retry_at, 0);
+}
+
+/// 子线程独立运行结束，但其普通退订计时器尚未进入邮箱。
+fn independent_child_before_unsubscribe() -> (Machine, SubagentMock, ClaimToken) {
+    let (mut m, mock) = released();
+    let a = apply(
+        &mut m,
+        Event::ClientRequest {
+            request: request(1, 20, "turn/start", json!({"threadId":C,"input":[]})),
+            run_id: Some("子线程独立运行".into()),
+        },
+    );
+    let resumed = resume_ok(&mut m, &rpc(&a, "thread/resume", C));
+    let start = rpc(&resumed, "turn/start", C);
+    reply(&mut m, &start, Ok(json!({"turn":{"id":"独立轮"}})));
+    let token = m.token(C).unwrap();
+    let a = apply(
+        &mut m,
+        notify(
+            "turn/completed",
+            json!({"threadId":C,"turn":{"id":"独立轮","status":"completed"}}),
+        ),
+    );
+    assert!(a.iter().any(|a|matches!(a,Action::Schedule {token:scheduled,kind:TimerKind::Unsubscribe,..} if *scheduled == token)));
+    assert!(!m.claims.contains_key(C));
+    assert!(m.records[C].subscribed);
+    (m, mock, token)
+}
+
+#[test]
+fn 审查一_父运行先登记后旧子退订计时器不得摘订_复用事件可达且结束后补退() {
+    let (mut m, mut mock, old) = independent_child_before_unsubscribe();
+    let a = start_again(&mut m, "父复用运行", 21);
+    assert!(
+        m.relations.aux.child_barriers.is_empty(),
+        "子线程尚未撒手，无需挂回屏障"
+    );
+    let parent = rpc(&a, "thread/resume", P);
+    let a = reply(&mut m, &parent, Ok(json!({"thread":{"id":P}})));
+    let start = rpc(&a, "turn/start", P);
+    reply(&mut m, &start, Ok(json!({"turn":{"id":"复用父轮"}})));
+    apply(&mut m, mock.turn_started(P, "复用父轮"));
+    assert!(
+        !m.relation_needs_subscription(C),
+        "尚未建立新运行对子线程的成员需求"
+    );
+    let a = apply(
+        &mut m,
+        Event::Timer {
+            token: old,
+            kind: TimerKind::Unsubscribe,
+        },
+    );
+    assert!(
+        !has_rpc(&a, "thread/unsubscribe", C),
+        "祖先运行必须保护普通退订入口"
+    );
+    assert!(m.records[C].subscribed);
+    assert!(m.relations.attachments[C].valid);
+
+    // 模拟订阅传输边界：一旦发出退订，后续子事件就不再投递给 broker。
+    let subscribed = !has_rpc(&a, "thread/unsubscribe", C);
+    let (started, completed) =
+        SubagentMock::v1_message("sendInput", P, "复用父轮", "复用", C, false);
+    apply(&mut m, started);
+    apply(&mut m, completed);
+    if subscribed {
+        apply(&mut m, mock.turn_started(C, "复用子轮"));
+    }
+    assert!(m.relations.aux.observed[C]
+        .iter()
+        .any(|t| t.turn == "复用子轮" && t.started));
+    // v1 跟进不单凭线程血缘授予新轮归属；这里核对子事件确实到达 broker 的观察层。
+    apply(&mut m, mock.turn_completed(C, "复用子轮", "completed"));
+    let a = apply(&mut m, mock.turn_completed(P, "复用父轮", "completed"));
+    assert!(
+        has_rpc(&a, "thread/unsubscribe", C),
+        "祖先运行结束后自动补退，不依赖子线程再来事件"
+    );
+    assert!(!m.records[C].subscribed);
+    assert!(m.relations.aux.deferred_child_unsubscribes.is_empty());
+    reply(
+        &mut m,
+        &rpc(&a, "thread/unsubscribe", C),
+        Ok(json!({"status":"unsubscribed"})),
+    );
+}
+
+#[test]
+fn 审查一_未完成发现保护普通子退订_发现结束后补退() {
+    let (mut m, _, old) = independent_child_before_unsubscribe();
+    let (discovery, _) = discover(&mut m);
+    let generation = m.relations.discoveries[&discovery].generation;
+    let a = apply(
+        &mut m,
+        Event::Timer {
+            token: old,
+            kind: TimerKind::Unsubscribe,
+        },
+    );
+    assert!(!has_rpc(&a, "thread/unsubscribe", C));
+    assert!(m.records[C].subscribed);
+    let a = apply(
+        &mut m,
+        Event::Timer {
+            token: ClaimToken {
+                thread_id: P.into(),
+                claim_id: 0,
+            },
+            kind: TimerKind::DiscoveryDeadline {
+                op_id: discovery,
+                generation,
+            },
+        },
+    );
+    assert!(!m.relations.discoveries.contains_key(&discovery));
+    assert!(has_rpc(&a, "thread/unsubscribe", C));
+    assert!(m.relations.aux.deferred_child_unsubscribes.is_empty());
+}
+
+#[test]
+fn 审查一_延后退订遇到新认领或关闭不遗留也不作用于新运行() {
+    for shutdown in [false, true] {
+        let (mut m, _, old) = independent_child_before_unsubscribe();
+        start_again(&mut m, "父复用运行", 21);
+        apply(
+            &mut m,
+            Event::Timer {
+                token: old,
+                kind: TimerKind::Unsubscribe,
+            },
+        );
+        assert!(m.relations.aux.deferred_child_unsubscribes.contains_key(C));
+        let a = if shutdown {
+            apply(&mut m, Event::Shutdown)
+        } else {
+            apply(
+                &mut m,
+                Event::ClientRequest {
+                    request: request(1, 22, "turn/start", json!({"threadId":C,"input":[]})),
+                    run_id: Some("新的子独立运行".into()),
+                },
+            )
+        };
+        assert!(!has_rpc(&a, "thread/unsubscribe", C));
+        assert!(m.relations.aux.deferred_child_unsubscribes.is_empty());
+        if !shutdown {
+            assert!(m.claims.contains_key(C));
+        }
+    }
+}
+
+/// 恢复尚未确认时撤销等待者，得到排在恢复之后的补偿退订。
+fn cancelled_resume_with_compensation() -> (Machine, RequestContext, RequestContext) {
+    let (mut m, _) = released();
+    let a = start_again(&mut m, "取消的运行", 30);
+    let a = loaded(&mut m, &a);
+    let resume = rpc(&a, "thread/resume", C);
+    let a = apply(&mut m, Event::Disconnected { conn: 1 });
+    let unsubscribe = rpc(&a, "thread/unsubscribe", C);
+    assert!(!m.claims.contains_key(P));
+    assert!(m.relations.aux.child_barriers.is_empty());
+    (m, resume, unsubscribe)
+}
+
+#[test]
+fn 审查二_补偿退订未确认时closed保留责任_冷恢复后再次开工仍等屏障() {
+    for unknown in [false, true] {
+        let (mut m, resume, unsubscribe) = cancelled_resume_with_compensation();
+        if unknown {
+            apply(
+                &mut m,
+                Event::TransportFailed {
+                    context: unsubscribe.clone(),
+                    error: json!({"message":"补偿结果未知"}),
+                },
+            );
+        }
+        let op = m.relations.aux.released[C].op;
+        let a = apply(&mut m, notify("thread/closed", json!({"threadId":C})));
+        assert!(
+            m.relations.aux.released.contains_key(C),
+            "最后操作为补偿退订也不能提前结束责任"
+        );
+        assert_eq!(m.relations.aux.released[C].op, op);
+        let probe = rpc(&a, "thread/read", C);
+        apply(&mut m, Event::Connected { conn: 1 });
+        apply(&mut m, Event::Initialized { conn: 1, cxb: true });
+        let a = start_again(&mut m, "再次开工", 31);
+        let parent = rpc(&a, "thread/resume", P);
+        let a = reply(&mut m, &parent, Ok(json!({"thread":{"id":P}})));
+        assert!(!has_rpc(&a, "turn/start", P));
+        assert!(!m.relations.aux.child_barriers.is_empty());
+
+        // 旧运行时关闭后，先前排队的恢复冷加载成功；它仍早于补偿退订，不能越过屏障。
+        let a = apply(
+            &mut m,
+            Event::LateReply {
+                context: resume,
+                result: Ok(json!({"thread":{"id":C}})),
+            },
+        );
+        assert!(!has_rpc(&a, "turn/start", P));
+        assert_eq!(m.relations.aux.released[C].op, op);
+        let a = reply(&mut m, &unsubscribe, Ok(json!({"status":"unsubscribed"})));
+        assert!(!has_rpc(&a, "turn/start", P));
+        let a = reply(
+            &mut m,
+            &probe,
+            Ok(json!({"thread":{"id":C,"status":{"type":"idle"}}})),
+        );
+        let current_resume = rpc(&a, "thread/resume", C);
+        assert!(!has_rpc(&a, "turn/start", P));
+        let a = resume_ok(&mut m, &current_resume);
+        let start = rpc(&a, "turn/start", P);
+        assert!(m.relations.attachments[C].valid);
+        assert!(m.relations.aux.child_barriers.is_empty());
+        reply(&mut m, &start, Ok(json!({"turn":{"id":"再次父轮"}})));
+        let a = apply(
+            &mut m,
+            notify(
+                "turn/completed",
+                json!({"threadId":P,"turn":{"id":"再次父轮","status":"completed"}}),
+            ),
+        );
+        let final_unsubscribe = rpc(&a, "thread/unsubscribe", C);
+        reply(
+            &mut m,
+            &final_unsubscribe,
+            Ok(json!({"status":"notLoaded"})),
+        );
+        assert!(!m.relations.aux.released.contains_key(C));
+        assert!(!m.relations.attachments[C].valid);
+    }
+}
+
+#[test]
+fn 审查二_closed后的有序只读可确认未加载_旧读不能越过新恢复() {
+    for loaded_after_close in [false, true] {
+        let (mut m, resume, _) = cancelled_resume_with_compensation();
+        let a = apply(&mut m, notify("thread/closed", json!({"threadId":C})));
+        assert!(m.relations.aux.released.contains_key(C));
+        let probe = rpc(&a, "thread/read", C);
+        if !loaded_after_close {
+            // 即使补偿的回包未送达，排在它之后的读取也能核实实际卸载，安全退役。
+            reply(
+                &mut m,
+                &probe,
+                Ok(json!({"thread":{"id":C,"status":{"type":"notLoaded"}}})),
+            );
+            assert!(!m.relations.aux.released.contains_key(C));
+            apply(
+                &mut m,
+                Event::LateReply {
+                    context: resume,
+                    result: Ok(json!({"thread":{"id":C}})),
+                },
+            );
+            assert!(!m.relations.attachments[C].valid);
+        } else {
+            // 新恢复发出会作废更早的读取身份，迟到读取不能清除新操作责任。
+            apply(&mut m, Event::Connected { conn: 1 });
+            let a = apply(
+                &mut m,
+                Event::ClientRequest {
+                    request: request(1, 40, "turn/start", json!({"threadId":C,"input":[]})),
+                    run_id: Some("独立冷恢复".into()),
+                },
+            );
+            let current_resume = rpc(&a, "thread/resume", C);
+            let current_op = m.relations.aux.released[C].op;
+            let a = reply(
+                &mut m,
+                &probe,
+                Ok(json!({"thread":{"id":C,"status":{"type":"notLoaded"}}})),
+            );
+            assert_eq!(m.relations.aux.released[C].op, current_op);
+            assert!(!has_rpc(&a, "turn/start", C));
+            assert!(has_rpc(
+                &resume_ok(&mut m, &current_resume),
+                "turn/start",
+                C
+            ));
+        }
+    }
+}
+
+/// 父运行已经实际开轮，子线程仍沿用独立运行留下的订阅。
+fn reuse_parent(m: &mut Machine, mock: &mut SubagentMock) {
+    let a = start_again(m, "父复用运行", 51);
+    let a = resume_ok(m, &rpc(&a, "thread/resume", P));
+    reply(
+        m,
+        &rpc(&a, "turn/start", P),
+        Ok(json!({"turn":{"id":"复用父轮"}})),
+    );
+    apply(m, mock.turn_started(P, "复用父轮"));
+}
+
+#[test]
+fn 验收1b_父先结束而无绑定子轮仍活动_初次退订与补退都等子轮完成() {
+    for already_deferred in [true, false] {
+        let (mut m, mut mock, old) = independent_child_before_unsubscribe();
+        reuse_parent(&mut m, &mut mock);
+        if already_deferred {
+            let a = apply(
+                &mut m,
+                Event::Timer {
+                    token: old.clone(),
+                    kind: TimerKind::Unsubscribe,
+                },
+            );
+            assert!(!has_rpc(&a, "thread/unsubscribe", C));
+            assert!(m.relations.aux.deferred_child_unsubscribes.contains_key(C));
+        }
+        // 不给新子轮授予运行绑定，关系层成员需求不能替代观察轮次保护。
+        apply(&mut m, mock.turn_started(C, "无绑定复用子轮"));
+        assert!(!m.relation_needs_subscription(C));
+        let a = apply(&mut m, mock.turn_completed(P, "复用父轮", "completed"));
+        assert!(!m.claims.contains_key(P));
+        assert!(
+            !has_rpc(&a, "thread/unsubscribe", C),
+            "父先结束不能摘掉仍活动的无绑定子轮"
+        );
+        if !already_deferred {
+            let a = apply(
+                &mut m,
+                Event::Timer {
+                    token: old,
+                    kind: TimerKind::Unsubscribe,
+                },
+            );
+            assert!(
+                !has_rpc(&a, "thread/unsubscribe", C),
+                "仅剩观察轮次也要保护初次退订"
+            );
+        }
+        assert!(m.records[C].subscribed);
+        assert!(m.relations.attachments[C].valid);
+        assert!(m.relations.aux.deferred_child_unsubscribes.contains_key(C));
+        let a = apply(&mut m, Event::Connected { conn: 99 });
+        assert!(
+            !has_rpc(&a, "thread/unsubscribe", C),
+            "无关事件复查不能重复或提前退订"
+        );
+        let a = apply(
+            &mut m,
+            mock.turn_completed(C, "无绑定复用子轮", "completed"),
+        );
+        assert_eq!(
+            unsubscribed(&a),
+            vec![C.to_owned()],
+            "子轮完成后恰好补退一次"
+        );
+        assert!(!m.records[C].subscribed);
+        assert!(m.relations.aux.deferred_child_unsubscribes.is_empty());
+    }
+}
+
+#[test]
+fn 验收2b_两个延后项同一步解除保护_仅剩一个名额时逐个补退并保留责任() {
+    let (mut m, mut mock, old) = independent_child_before_unsubscribe();
+    reuse_parent(&mut m, &mut mock);
+    let other = "另一个子线程";
+    let mut edge = m.thread_relation(C).unwrap();
+    edge.child_thread_id = other.into();
+    m.relations.edges.insert(other.into(), edge);
+    let record = m.records[C].clone();
+    *m.record(other) = record;
+    m.attach(other, crate::relations::AttachmentSource::ThreadStarted);
+    for child in [C, other] {
+        let a = apply(
+            &mut m,
+            Event::Timer {
+                token: ClaimToken {
+                    thread_id: child.into(),
+                    claim_id: old.claim_id,
+                },
+                kind: TimerKind::Unsubscribe,
+            },
+        );
+        assert!(!has_rpc(&a, "thread/unsubscribe", child));
+    }
+    assert_eq!(m.relations.aux.deferred_child_unsubscribes.len(), 2);
+    // 两个候选都还没有退订责任，构造已有责任占用 1023 个名额的边界。
+    m.relations.aux.released.remove(C).unwrap();
+    let (seed, _) = released();
+    let entry = seed.relations.aux.released[C].clone();
+    for i in 0..crate::relations::MAX_ATTACHMENTS - 1 {
+        m.relations
+            .aux
+            .released
+            .insert(format!("保留{i}"), entry.clone());
+    }
+    let a = apply(&mut m, mock.turn_completed(P, "复用父轮", "completed"));
+    let sent = unsubscribed(&a);
+    assert_eq!(sent.len(), 1, "仅剩一个名额，同一步只能发一个退订");
+    let first = &sent[0];
+    let second = if first == C { other } else { C };
+    assert!(m.relations.aux.released.contains_key(first));
+    assert_eq!(
+        m.relations.aux.released.len(),
+        crate::relations::MAX_ATTACHMENTS
+    );
+    assert_eq!(m.relations.aux.deferred_child_unsubscribes.len(), 1);
+    assert!(m
+        .relations
+        .aux
+        .deferred_child_unsubscribes
+        .contains_key(second));
+    assert!(m.records[second].subscribed);
+    let first_request = rpc(&a, "thread/unsubscribe", first);
+    let a = apply(&mut m, Event::Connected { conn: 99 });
+    assert!(
+        unsubscribed(&a).is_empty(),
+        "满表时重复复查不能先发请求再丢责任"
+    );
+    assert_eq!(
+        m.relations.aux.released.len(),
+        crate::relations::MAX_ATTACHMENTS
+    );
+    let a = reply(&mut m, &first_request, Ok(json!({"status":"notLoaded"})));
+    assert_eq!(
+        unsubscribed(&a),
+        vec![second.to_owned()],
+        "确认卸载释放名额后自动补退剩余项"
+    );
+    assert_eq!(
+        m.relations.aux.released.len(),
+        crate::relations::MAX_ATTACHMENTS
+    );
+    assert!(m.relations.aux.released.contains_key(second));
+    assert!(m.relations.aux.deferred_child_unsubscribes.is_empty());
+    for i in 0..crate::relations::MAX_ATTACHMENTS - 1 {
+        assert_eq!(m.relations.aux.released[&format!("保留{i}")], entry);
+    }
+}
+
+#[test]
+fn 延后退订在失去订阅记录缺失或记录淘汰时立即清理() {
+    for cause in 0..3 {
+        let (mut m, _, old) = independent_child_before_unsubscribe();
+        start_again(&mut m, "父保护运行", 60);
+        apply(
+            &mut m,
+            Event::Timer {
+                token: old,
+                kind: TimerKind::Unsubscribe,
+            },
+        );
+        assert!(m.relations.aux.deferred_child_unsubscribes.contains_key(C));
+        match cause {
+            0 => m.records.get_mut(C).unwrap().subscribed = false,
+            1 => {
+                m.records.remove(C);
+            }
+            _ => {
+                for i in 0..MAX_HISTORY {
+                    m.record(&format!("待淘汰历史{i}"));
+                }
+            }
+        }
+        let a = apply(&mut m, Event::Connected { conn: 99 });
+        assert!(!has_rpc(&a, "thread/unsubscribe", C));
+        assert!(
+            m.relations.aux.deferred_child_unsubscribes.is_empty(),
+            "清理不等待下一步事件"
+        );
+        if cause == 2 {
+            assert!(!m.records.contains_key(C));
+        }
+    }
+}
+
+#[test]
+fn 延后退订的旧代号不能退掉已结束的新认领订阅() {
+    let (mut m, _, old) = independent_child_before_unsubscribe();
+    start_again(&mut m, "父保护运行", 61);
+    apply(
+        &mut m,
+        Event::Timer {
+            token: old.clone(),
+            kind: TimerKind::Unsubscribe,
+        },
+    );
+    // 模拟新认领已经结束：此时没有活动认领可兜底，必须核对记录中的代号。
+    m.records.get_mut(C).unwrap().last_claim_id = old.claim_id + 1;
+    let a = apply(&mut m, Event::Connected { conn: 99 });
+    assert!(!has_rpc(&a, "thread/unsubscribe", C));
+    assert!(m.relations.aux.deferred_child_unsubscribes.is_empty());
+    let a = apply(
+        &mut m,
+        Event::Timer {
+            token: old,
+            kind: TimerKind::Unsubscribe,
+        },
+    );
+    assert!(!has_rpc(&a, "thread/unsubscribe", C));
+    assert!(m.records[C].subscribed);
+    assert!(
+        m.relations.aux.deferred_child_unsubscribes.is_empty(),
+        "迟到旧计时器不能重新登记延后项"
+    );
 }

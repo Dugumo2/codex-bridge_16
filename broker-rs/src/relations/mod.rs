@@ -156,6 +156,8 @@ pub struct RelationsAux {
     /// 本连接主动退订、尚未见到卸载的子线程（`release.rs`）：根线程再开运行时要重新订阅回来。
     pub released: BTreeMap<String, Released>,
     pub child_barriers: BTreeMap<ChildWaiter, ChildBarrier>,
+    /// 普通退订因活动保护或容量不足延后，保留原认领代号，每步复查并随记录淘汰。
+    pub deferred_child_unsubscribes: BTreeMap<String, ClaimToken>,
     pub release_capacity_warned: bool,
     /// 仅在当前事件内使用：旧订阅回包不得绕过责任表更新普通认领事实。
     pub ignored_subscription_reply: bool,

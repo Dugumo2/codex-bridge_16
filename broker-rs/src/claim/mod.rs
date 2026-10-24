@@ -3372,6 +3372,47 @@ impl Machine {
             });
         }
     }
+    /// 沿用普通退订的代号及全部活动保护；直接复查，不反复安排零延迟计时器。
+    pub(crate) fn retry_deferred_child_unsubscribes(&mut self, actions: &mut Vec<Action>) {
+        if self.closing {
+            self.relations.aux.deferred_child_unsubscribes.clear();
+        }
+        if self.relations.aux.deferred_child_unsubscribes.is_empty() {
+            return;
+        }
+        let pending: Vec<_> = self
+            .relations
+            .aux
+            .deferred_child_unsubscribes
+            .values()
+            .cloned()
+            .collect();
+        for token in pending {
+            let current = self
+                .records
+                .get(&token.thread_id)
+                .is_some_and(|record| record.subscribed && record.last_claim_id == token.claim_id);
+            if !current {
+                self.relations
+                    .aux
+                    .deferred_child_unsubscribes
+                    .remove(&token.thread_id);
+                continue;
+            }
+            // 只复用计时器处理，不递归进入 step；活动保护与容量检查均由同一入口执行。
+            self.timer(token.clone(), TimerKind::Unsubscribe, actions);
+            if self
+                .records
+                .get(&token.thread_id)
+                .is_none_or(|record| !record.subscribed)
+            {
+                self.relations
+                    .aux
+                    .deferred_child_unsubscribes
+                    .remove(&token.thread_id);
+            }
+        }
+    }
     fn timer(&mut self, token: ClaimToken, kind: TimerKind, actions: &mut Vec<Action>) {
         if self.closing {
             return;
@@ -3418,9 +3459,20 @@ impl Machine {
                 self.detach_deadline(token, generation, actions)
             }
             TimerKind::Unsubscribe => {
-                if self.thread_relation(&token.thread_id).is_some()
-                    && !self.child_release_capacity(&token.thread_id, actions)
+                if self.records.get(&token.thread_id).is_none_or(|record| {
+                    !record.subscribed || record.last_claim_id != token.claim_id
+                }) {
+                    return;
+                }
+                let child = self.thread_relation(&token.thread_id).is_some();
+                if child
+                    && (self.child_activity_protected(&token.thread_id)
+                        || !self.child_release_capacity(&token.thread_id, actions))
                 {
+                    self.relations
+                        .aux
+                        .deferred_child_unsubscribes
+                        .insert(token.thread_id.clone(), token);
                     return;
                 }
                 if self.closing
@@ -3439,7 +3491,7 @@ impl Machine {
                     }
                     record.subscribed = false;
                     self.detach_evidence(&token.thread_id);
-                    actions.push(Action::Request(RequestContext {
+                    let context = RequestContext {
                         resume_retried: false,
                         stream_id: None,
                         review_id: None,
@@ -3448,7 +3500,12 @@ impl Machine {
                         token: Some(token),
                         operation: Operation::Unsubscribe,
                         method: "thread/unsubscribe".into(),
-                    }));
+                    };
+                    // 必须在请求入队及扫描其他子线程之前占位，不能让同一步共用剩余名额。
+                    if child {
+                        self.child_register_subscription(&context, actions);
+                    }
+                    actions.push(Action::Request(context));
                     // 子线程由 app-server 自动挂到本连接，随根一起退订，否则一直不卸载。
                     self.release_idle_children(None, actions);
                 }
@@ -3524,6 +3581,7 @@ impl Machine {
         }
         for id in evicted {
             self.records.remove(&id);
+            self.relations.aux.deferred_child_unsubscribes.remove(&id);
             self.record_order.retain(|t| t != &id);
             self.ended_order.retain(|t| t != &id);
         }

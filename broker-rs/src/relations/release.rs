@@ -104,7 +104,11 @@ impl Machine {
         }
     }
 
-    fn child_register_subscription(&mut self, context: &RequestContext, actions: &mut Vec<Action>) {
+    pub(crate) fn child_register_subscription(
+        &mut self,
+        context: &RequestContext,
+        actions: &mut Vec<Action>,
+    ) {
         let Some(thread) = context.params.as_ref().and_then(|p| p["threadId"].as_str()) else {
             return;
         };
@@ -267,6 +271,17 @@ impl Machine {
                 .discoveries
                 .values()
                 .any(|d| !d.completed && (d.root == thread || self.descends_from(thread, &d.root)))
+    }
+
+    /// 普通退订与子线程释放共用活动保护，未取得运行绑定的观察轮次也必须收完。
+    pub(crate) fn child_activity_protected(&self, thread: &str) -> bool {
+        self.child_observer_needs(thread)
+            || self
+                .relations
+                .aux
+                .observed
+                .get(thread)
+                .is_some_and(|turns| turns.iter().any(|t| t.started && !t.completed))
     }
 
     fn child_resolved(&mut self, thread: &str, success: bool, actions: &mut Vec<Action>) {
@@ -505,14 +520,15 @@ impl Machine {
     }
 
     pub(super) fn child_closed(&mut self, thread: &str, actions: &mut Vec<Action>) {
-        // closed 可以属于旧运行时：已发出但尚未确认的 resume 仍可能在它之后冷恢复。
+        // closed 可以属于旧运行时。最后操作即使是补偿退订，其前面的恢复仍可能冷加载。
+        // 同线程操作串行：只有后继操作确认，或排在其后的只读核实，才能排除此前操作的副作用。
         if self.relations.aux.released.get(thread).is_some_and(|r| {
-            r.resume
-                && matches!(
-                    r.result,
-                    SubscriptionResult::Pending | SubscriptionResult::Unknown
-                )
+            matches!(
+                r.result,
+                SubscriptionResult::Pending | SubscriptionResult::Unknown
+            )
         }) {
+            self.child_probe(thread, actions);
             return;
         }
         self.child_confirm_unloaded(thread, actions);
@@ -626,6 +642,8 @@ impl Machine {
                 self.child_register_subscription(&context, actions);
             }
         }
+        // 先计入本步已有请求，再补退；普通退订在发出前登记，逐项占用容量。
+        self.retry_deferred_child_unsubscribes(actions);
         let backoff: Vec<_> = self
             .relations
             .aux
@@ -693,7 +711,7 @@ impl Machine {
 
     /// 子线程本身已无活动：未被认领、不在停止树里、关系层不再需要、没有活跃 goal、没有未完成的轮次。
     fn child_subscription_idle(&self, thread: &str) -> bool {
-        !self.child_observer_needs(thread)
+        !self.child_activity_protected(thread)
             && !self.claims.contains_key(thread)
             && !self.tree_busy(Some(thread))
             && !self.relation_needs_subscription(thread)
@@ -701,12 +719,6 @@ impl Machine {
                 .records
                 .get(thread)
                 .is_some_and(|r| r.goal_active || r.subscribed)
-            && !self
-                .relations
-                .aux
-                .observed
-                .get(thread)
-                .is_some_and(|turns| turns.iter().any(|t| t.started && !t.completed))
     }
 
     /// 沿血缘向上：必须是子线程（有父边），祖先里有 broker 跑过运行的线程，且没有任何祖先仍被认领或订阅。
