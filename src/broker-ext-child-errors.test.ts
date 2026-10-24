@@ -5,7 +5,7 @@
  *   watch 快照、落盘记录与重启后快照一致，父运行自己的 upstreamError 不变；
  * - 另一运行的子线程报错只记到那个运行；
  * - review 未归属期间到达的子线程事件只记账一次；
- * - 子线程持续进展时父运行不判无进展（依赖 C1 计时，待合并后运行：CXB_UE2_MERGED=1）。
+ * - 子线程持续进展时父运行不判无进展（依赖 C1 计时）。
  * broker 只支持 Windows：其他平台整组跳过（不加载夹具）。
  */
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
@@ -16,7 +16,6 @@ import type { Subprocess } from "bun";
 import type { TestClient as Client } from "./test-support/broker-harness";
 
 const RUNNABLE = process.platform === "win32";
-const MERGED = process.env.CXB_UE2_MERGED === "1";
 const harness = RUNNABLE ? await import("./test-support/broker-harness") : null;
 
 type Diagnostic = { count: number; willRetry: boolean | null; category: string; httpStatusCode: number | null; turnId: string | null };
@@ -218,8 +217,8 @@ describe.skipIf(!RUNNABLE)("broker-ext 子线程报错归入父运行（C2）", 
     expect(snapshot.run.childUpstreamErrors!.map((e) => [e.threadId, e.upstreamError.count])).toEqual([["child-1", 1]]);
   }, 40_000);
 
-  // 进展归入后由 C1 的计时重排；本路 broker 的计时是空钩子，合并后运行。
-  test.skipIf(!MERGED)("子线程持续进展时父运行不判无进展；进展停止后才到期（待合并后运行）", async () => {
+  // 进展归入后由 C1 的计时重排。
+  test("子线程持续进展时父运行不判无进展；进展停止后才到期", async () => {
     const { sockPath } = await startBroker();
     const owner = await connect(sockPath);
     const run = await startRun(owner, PARENT, { cxbRunPolicy: { stallTimeoutMs: 1_500, upstreamErrorPolicy: "observe" } });

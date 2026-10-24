@@ -1,5 +1,5 @@
 /**
- * 契约第 8 节黑盒 A。骨架没有 C1/C2/C3，完整行为仅 CXB_UE2_MERGED=1 时启用。
+ * 契约第 8 节黑盒 A。
  * 未确认用例真实等待 40 秒；状态读取始终保持 inProgress，不借假结束证据通过。
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -21,7 +21,6 @@ test("四轮挂起证据：到期时或到期后才到达的请求不能冒充�
   for (const at of [20, 21]) expect(() => assertHangRequestBeforeExpiry([{ at }], 20)).toThrow("到期之前");
 });
 
-const MERGED = process.env.CXB_UE2_MERGED === "1";
 const lines = (text: string) => text.split(/\r?\n/u).filter(Boolean);
 const json = (result: StallCliResult) => {
   expect(result.stdout.trim().startsWith("{")).toBe(true);
@@ -33,12 +32,12 @@ const exact = (result: StallCliResult, line: string) => expect(lines(result.stde
 async function done(proc: ManagedProcess, timeout = 20_000) {
   const code = await within(proc.closed, timeout, "黑盒 CLI 总期限"); return { code, ...proc.output() };
 }
-function scenario(id: string, title: string, body: (h: StallHarness) => Promise<void>, timeout = 35_000, merged = true, shared = false) {
-  describe(`${id} ${title}${merged && !MERGED ? "（待合并 C1/C2/C3；设置 CXB_UE2_MERGED=1）" : ""}`, () => {
+function scenario(id: string, title: string, body: (h: StallHarness) => Promise<void>, timeout = 35_000, shared = false) {
+  describe(`${id} ${title}`, () => {
     let h: StallHarness;
-    beforeAll(async () => { if (merged && !MERGED) return; h = new StallHarness(); await h.open(shared); }, 20_000);
+    beforeAll(async () => { h = new StallHarness(); await h.open(shared); }, 20_000);
     afterAll(async () => { if (h) await h.close(); }, 15_000);
-    test.skipIf(merged && !MERGED)("屏幕、退出码、独立 watcher 与落盘契约", async () => body(h), timeout);
+    test("屏幕、退出码、独立 watcher 与落盘契约", async () => body(h), timeout);
   });
 }
 function snapshots(h: StallHarness) {
@@ -184,7 +183,7 @@ scenario("S08", "显式 0 关闭，无输出八秒后正常完成", async (h) =>
   expect(result.stderr).not.toContain("未观察到进展"); const record = await h.persisted();
   expect(record.runPolicy).toEqual({ stallTimeoutMs: 0, upstreamErrorPolicy: "observe" }); expect(record.stall).toBeUndefined();
   expect(record.stopDiagnostics).toBeUndefined(); expect((await h.state()).calls.some((call: any) => call.method === "turn/interrupt")).toBe(false);
-}, 25_000, false);
+}, 25_000);
 scenario("S09", "detach 后 broker 继续计时，wait 返回 3", async (h) => {
   const detached = await done(h.run(["--detach", "--json"])); expect(detached.code).toBe(0); const initial = json(detached); await h.started();
   const waited = await h.cli(["wait", "root", "--json", "--timeout", "20"], 25_000); expect(waited.code).toBe(3);
@@ -205,7 +204,7 @@ scenario("S10b", "observe 加期限 0 的对照持续重试后仍可完成", asy
   const result = await done(proc); expect(result.code).toBe(0); expect(json(result).result).toBe("本地脚本结果");
   const record = await h.persisted(); expect(record.interruptReason).toBeNull(); expect(record.stall).toBeUndefined();
   expect(result.stderr).not.toContain("已按 --upstream-error-policy"); snapshots(h);
-}, 25_000, false);
+}, 25_000);
 
 for (const [mode, code] of [["failed", 7], ["completed", 0], ["interrupted", 3]] as const) scenario("S11", `SA1b 未启用，停止竞态 ${mode} → ${code}`, async (h) => {
   await h.control("mode", { mode }); const proc = h.run(["--json"]); await h.started();
@@ -244,4 +243,4 @@ scenario("S13", "共享服务器 joined 运行不取得停止权", async (h) => 
   expect(record.stall).toBeUndefined(); expect(record.stopDiagnostics).toBeUndefined();
   expect((await h.state()).calls.some((call: any) => call.method === "turn/interrupt")).toBe(false);
   await h.control("finish"); const result = await done(proc); expect(result.code).toBe(0); expect(json(result).status).toBe("completed"); await h.persisted();
-}, 35_000, true, true);
+}, 35_000, true);
