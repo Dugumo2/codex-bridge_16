@@ -1102,14 +1102,16 @@ fn 修复3_guardian处理后保留受管订阅_真实退订使附着失效() {
     m.relations.bindings.clear();
     m.relations.contexts.get_mut(R).unwrap().members.clear();
     assert!(app_requests(&mock.inject(&mut m, timer.clone()), "thread/unsubscribe").is_empty());
-    m.relations.contexts.get_mut(R).unwrap().cleanup = None;
-    // 清理范围消失后，父认领和未完成子轮仍需订阅；等活动保护全部结束才补退。
-    assert!(app_requests(&mock.inject(&mut m, timer.clone()), "thread/unsubscribe").is_empty());
+    // 先结束父认领与子轮，让活动保护全部消失，只剩清理范围：仍不得退订（单独证明清理范围保护）。
     let completed = mock.turn_completed(C, "子轮1", "completed");
     assert!(app_requests(&mock.inject(&mut m, completed), "thread/unsubscribe").is_empty());
     let completed = mock.turn_completed(P, T, "completed");
-    let mut actions = mock.inject(&mut m, completed);
-    actions.extend(mock.inject(&mut m, timer));
+    assert!(app_requests(&mock.inject(&mut m, completed), "thread/unsubscribe").is_empty());
+    assert!(!m.child_activity_protected(C));
+    assert!(app_requests(&mock.inject(&mut m, timer.clone()), "thread/unsubscribe").is_empty());
+    assert!(m.records[C].subscribed);
+    m.relations.contexts.get_mut(R).unwrap().cleanup = None;
+    let actions = mock.inject(&mut m, timer);
     assert_eq!(app_requests(&actions, "thread/unsubscribe").len(), 1);
     assert!(!m.relations.attachments[C].valid);
     assert!(!m.records[C].subscribed);
