@@ -66,8 +66,10 @@ impl BrokerJob {
 mod tests {
     use super::*;
     use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
     #[test]
     fn 释放_job_时其中的进程被结束() {
@@ -77,6 +79,8 @@ mod tests {
             .args(["-n", "30", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            // 测试进程没有控制台时（如 Codex 运行环境），不隐藏就会给 ping 新开可见控制台窗口。
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .expect("启动 ping");
         job.assign(child.as_raw_handle() as isize)
