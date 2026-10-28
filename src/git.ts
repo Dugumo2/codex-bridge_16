@@ -4,7 +4,7 @@ import { spawnSync } from "child_process";
 
 /** Run a git command synchronously with a 5-second timeout. */
 function git(args: string[], cwd: string): { stdout: string; status: number | null } {
-  const result = spawnSync("git", args, { cwd, encoding: "utf-8", timeout: 5000 });
+  const result = spawnSync("git", args, { cwd, encoding: "utf-8", timeout: 5000, windowsHide: true });
   return { stdout: (result.stdout ?? "").trim(), status: result.status };
 }
 

@@ -534,7 +534,7 @@ setInterval(() => {}, 1000);
   ): Promise<Subprocess> => {
     const ownerPath = join(dir, "owner.ts");
     writeFileSync(ownerPath, ownerScript);
-    const owner = Bun.spawn(["bun", "run", ownerPath, sockPath, threadId, mode], { stdout: "pipe", stderr: "pipe" });
+    const owner = Bun.spawn(["bun", "run", ownerPath, sockPath, threadId, mode], { stdout: "pipe", stderr: "pipe", windowsHide: true });
     spawnedProcesses.push(owner);
     const decoder = new TextDecoder();
     const readyOrEnd = (async () => {

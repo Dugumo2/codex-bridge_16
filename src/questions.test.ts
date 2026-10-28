@@ -195,7 +195,7 @@ describe("orphaned questions (review round 2)", () => {
 
   /** A PID guaranteed dead: spawn a no-op process and wait for it to exit. */
   function deadPid(): number {
-    const result = spawnSync(process.execPath, ["--version"], { stdio: "ignore" });
+    const result = spawnSync(process.execPath, ["--version"], { stdio: "ignore", windowsHide: true });
     if (typeof result.pid !== "number" || result.pid <= 0) throw new Error("could not obtain dead pid");
     return result.pid;
   }

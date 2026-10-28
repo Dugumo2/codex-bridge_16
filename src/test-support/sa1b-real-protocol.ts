@@ -68,7 +68,7 @@ async function run(name: string, options: ScriptedOptions, resume?: "cold" | "lo
     // turn/completed（最多5秒），确保本场景能观察随机子结果；不伪造任何回包或core事件。
     // 这不是core完成消息投递延迟测试，后者仍单列未覆盖。
     writeMockCodexScript(tempDir, `import { appendFileSync } from "node:fs";
-const child = Bun.spawn(${JSON.stringify(command)}, { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: process.env });
+const child = Bun.spawn(${JSON.stringify(command)}, { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: process.env, windowsHide: true });
 const completed = new Set(), holds = new Map(); let input = "", observed = "";
 function release(thread) { const pending = holds.get(thread); if (!pending) return; holds.delete(thread); for (const entry of pending) { clearTimeout(entry.timer); child.stdin.write(entry.line + "\\n"); } }
 process.stdin.setEncoding("utf8");
@@ -174,7 +174,7 @@ const cases: Array<[string, ScriptedOptions, ("cold" | "loaded")?]> = [
 if (!existsSync(binary)) {
   for (const [name] of cases) results.push({ name, status: "未覆盖", blocker: `指定0.160.0 app-server产物不存在：${binary}` });
 } else {
-  const proc = Bun.spawn([binary, "--version"], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn([binary, "--version"], { stdout: "pipe", stderr: "pipe", windowsHide: true });
   const timer = setTimeout(() => proc.kill(), 5000);
   const version = await new Response(proc.stdout).text(); await proc.exited; clearTimeout(timer);
   if (!version.includes("0.160.0")) for (const [name] of cases) results.push({ name, status: "未覆盖", blocker: `版本核实失败：${version.trim()}` });

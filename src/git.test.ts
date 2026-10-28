@@ -24,7 +24,7 @@ describe("getDefaultBranch", () => {
     const tmp = join(process.env.TMPDIR ?? "/tmp", `git-test-slashy-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
     mkdirSync(tmp, { recursive: true });
     try {
-      spawnSync("git", ["init", "-q", tmp]);
+      spawnSync("git", ["init", "-q", tmp], { windowsHide: true });
       // Stage a symbolic-ref file directly so we don't need a populated
       // remote tracking branch — getDefaultBranch only inspects the ref.
       const refDir = join(tmp, ".git", "refs", "remotes", "origin");

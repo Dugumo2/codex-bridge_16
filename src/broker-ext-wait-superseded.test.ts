@@ -50,7 +50,7 @@ function cli(s: Harness, args: string[]) {
   const preload = join(s.tempDir, `旁读-${index}.mjs`), events = join(s.tempDir, `管道-${index}.jsonl`);
   writeFileSync(preload, observer);
   const proc = Bun.spawn([process.execPath, "--preload", preload, join(import.meta.dir, "cxb/main.ts"), ...args, "--dir", s.tempDir], {
-    cwd: s.tempDir, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    cwd: s.tempDir, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
     env: { ...brokerHarness!.envWithPathPrefix(s.tempDir), CXB_HOME: s.home, CODEX_HOME: join(s.tempDir, "cli-codex-home"),
       USERPROFILE: s.tempDir, HOME: s.tempDir, CXB_WAIT_TEST_EVENTS: events },
   });

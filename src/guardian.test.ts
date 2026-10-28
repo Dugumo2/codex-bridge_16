@@ -69,7 +69,7 @@ describe("saveGuardianDenial / listGuardianDenials", () => {
 
   test("skips corrupt files", () => {
     saveGuardianDenial(dir, deniedNotification());
-    Bun.spawnSync(["sh", "-c", `echo garbage > "${join(dir, "broken.json")}"`]);
+    Bun.spawnSync(["sh", "-c", `echo garbage > "${join(dir, "broken.json")}"`], { windowsHide: true });
     expect(listGuardianDenials(dir)).toHaveLength(1);
   });
 });

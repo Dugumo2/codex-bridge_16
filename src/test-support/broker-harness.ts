@@ -688,7 +688,7 @@ export function serveMockOverSocket(context: BrokerHarnessContext, mockCodexDir:
     websocket: {
       open(ws) {
         const child = Bun.spawn(mockCommand, {
-          stdin: "pipe", stdout: "pipe", stderr: "inherit", env: envWithPathPrefix(mockCodexDir),
+          stdin: "pipe", stdout: "pipe", stderr: "inherit", env: envWithPathPrefix(mockCodexDir), windowsHide: true,
         });
         childOf.set(ws, child);
         context.spawnedProcesses.push(child);
@@ -777,6 +777,8 @@ export function spawnBroker(
     stdout: "pipe",
     stderr: "pipe",
     cwd: opts?.cwd ?? context.tempDir,
+    // 测试进程没有控制台时（分片子进程、Codex 运行环境），不隐藏就会给 broker 新开可见控制台窗口。
+    windowsHide: true,
   });
 
   context.spawnedProcesses.push(proc);

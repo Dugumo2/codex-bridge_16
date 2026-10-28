@@ -143,7 +143,7 @@ async function runChild(
   try {
     if (launcher === "bun") {
       const child = Bun.spawn([process.execPath, fixture, mode], {
-        stdin: "ignore", stdout: fd ?? "pipe", stderr: "pipe", env: childEnv(),
+        stdin: "ignore", stdout: fd ?? "pipe", stderr: "pipe", env: childEnv(), windowsHide: true,
       });
       track(child.pid, child.exited, () => { child.kill("SIGKILL"); });
       const stdout = child.stdout && typeof child.stdout !== "number"

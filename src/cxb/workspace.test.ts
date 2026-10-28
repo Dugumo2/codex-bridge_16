@@ -83,7 +83,7 @@ async function compareRust(dir: string): Promise<string> {
   const child = processes.add(Bun.spawn([BROKER_BIN, "serve", "--endpoint", `pipe:${path}`, "--cwd", workspace.root, "--idle-timeout", "30000"], {
     cwd: temporary,
     env: { ...childEnv, CXB_HOME: data, CODEX_HOME: directory(`codex-${randomUUID()}`), CXB_SERVER: "private" },
-    stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
   }));
   const stdout = new Response(child.stdout).text();
   const stderr = new Response(child.stderr).text();
@@ -277,7 +277,7 @@ test("TS/Rust 对照：Windows 短文件名", async () => {
     join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
     "-NoProfile", "-NonInteractive", "-Command",
     '[Console]::OutputEncoding = [Text.UTF8Encoding]::new(); $fs = New-Object -ComObject Scripting.FileSystemObject; $fs.GetFolder($env:CXB_N1B_PROBE_PATH).ShortPath',
-  ], { env: { ...privateTestEnv(), CXB_N1B_PROBE_PATH: target }, stdin: "ignore", stdout: "pipe", stderr: "pipe" }));
+  ], { env: { ...privateTestEnv(), CXB_N1B_PROBE_PATH: target }, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true }));
   const stdout = new Response(child.stdout).text();
   const stderr = new Response(child.stderr).text();
   expect(await processes.exited(child)).toBe(0);
@@ -296,7 +296,7 @@ test("TS/Rust 对照：本机可访问的 UNC 共享", async () => {
   const unc = `\\\\localhost\\${target[0]}$${target.slice(2)}`;
   const child = processes.add(Bun.spawn([process.execPath, "-e",
     'import { statSync } from "node:fs"; try { if (!statSync(process.argv[1]).isDirectory()) process.exitCode = 2; } catch { process.exitCode = 2; }', unc,
-  ], { env: privateTestEnv(), stdin: "ignore", stdout: "ignore", stderr: "ignore" }));
+  ], { env: privateTestEnv(), stdin: "ignore", stdout: "ignore", stderr: "ignore", windowsHide: true }));
   const code = await processes.exited(child);
   if (code === 2) {
     console.warn("跳过真实 UNC 对照：当前用户无法访问本机测试卷的管理共享；纯字符串前缀用例仍会执行。");

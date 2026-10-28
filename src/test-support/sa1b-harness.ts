@@ -96,7 +96,7 @@ process.stdin.on("end", () => process.exit(0));`);
   }
   async cli(args: string[], timeout = 10000) {
     const proc = Bun.spawn([process.execPath, join(import.meta.dir, "../cxb/main.ts"), ...args, "--dir", this.tempDir], {
-      cwd: this.tempDir, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      cwd: this.tempDir, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
       env: { ...envWithPathPrefix(this.tempDir), CXB_HOME: this.home, CODEX_HOME: join(this.tempDir, "cli-codex-home"), USERPROFILE: this.tempDir, HOME: this.tempDir },
     });
     this.spawnedProcesses.push(proc);

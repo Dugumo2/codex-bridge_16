@@ -62,7 +62,7 @@ async function nextRun(h: H) {
 }
 async function cli(h: H, main: string, args: string[], timeout = 10000, onStdout?: (stdout: string) => void) {
   const proc = Bun.spawn([process.execPath, main, ...args, "--dir", h.tempDir], {
-    cwd: h.tempDir, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    cwd: h.tempDir, stdin: "ignore", stdout: "pipe", stderr: "pipe", windowsHide: true,
     env: { ...envWithPathPrefix(h.tempDir), CXB_HOME: h.home, CODEX_HOME: join(h.tempDir, "cli-codex-home"), USERPROFILE: h.tempDir, HOME: h.tempDir },
   });
   h.spawnedProcesses.push(proc);

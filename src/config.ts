@@ -178,6 +178,7 @@ export function resolveWorkspaceDir(cwd: string): string {
     cwd,
     encoding: "utf-8",
     timeout: 5000,
+    windowsHide: true,
   });
   let wsRoot: string;
   if (result.status === 0 && result.stdout) {

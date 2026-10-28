@@ -24,7 +24,7 @@ const mutations = [
   { name: "中间子代理抢先完成", file: "sa1b-scripted-model.ts", from: "await parentFinal.wait();\n      return sse(answer(\"子线程", to: "return sse(answer(\"子线程", test: "中间子代理也须等父final" },
 ];
 async function run(pattern?: string) {
-  const proc = Bun.spawn([process.execPath, "test", tests, ...(pattern ? ["-t", pattern] : [])], { stdout: "pipe", stderr: "pipe", cwd: base });
+  const proc = Bun.spawn([process.execPath, "test", tests, ...(pattern ? ["-t", pattern] : [])], { stdout: "pipe", stderr: "pipe", cwd: base, windowsHide: true });
   const timer = setTimeout(() => proc.kill(), 15000);
   try {
     const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);

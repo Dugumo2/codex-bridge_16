@@ -36,7 +36,7 @@ function startTemplateChild(mode: string) {
   const proc = processes.add(Bun.spawn([
     process.execPath, join(import.meta.dir, "test-fixtures", "ws-template-child.ts"),
     mode, dataRoot, legacyRoot, ready, release,
-  ], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: privateTestEnv() }));
+  ], { stdin: "ignore", stdout: "pipe", stderr: "pipe", env: privateTestEnv(), windowsHide: true }));
   return { proc, ready, release, stdout: new Response(proc.stdout).text(), stderr: new Response(proc.stderr).text() };
 }
 
@@ -334,7 +334,7 @@ test.each(["已有新配置", "没有新配置"])("两个独立 CLI 并发迁移
   const children = [0, 1].map((i) => {
     const ready = join(temporary, `ready-${i}`);
     const proc = processes.add(Bun.spawn([process.execPath, join(import.meta.dir, "test-fixtures", "ws-migrate-child.ts"), dataRoot, legacyRoot, ready, start], {
-      stdin: "ignore", stdout: "pipe", stderr: "pipe", env: privateTestEnv(),
+      stdin: "ignore", stdout: "pipe", stderr: "pipe", env: privateTestEnv(), windowsHide: true,
     }));
     return { proc, ready, stdout: new Response(proc.stdout).text(), stderr: new Response(proc.stderr).text() };
   });
