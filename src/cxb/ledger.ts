@@ -4,10 +4,11 @@
 // 从不写。文件布局（详细设计 7.1 节）：`threads.json`、`runs/<runId>.json`（外壳 {epoch, revision, payload}）、
 // `runs/<shortId>.log`（broker 追加写，轮转到 `.log.1`）。
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { modelTurn } from "./run-result";
 import { CxbError, type LifecycleInfo, type RunMeta, type RunResult, type RunModelSummary, type ModelRun } from "./contracts";
+import type { LogCoverageIssue, TreeLogPayload } from "./tree-log-types";
 
 /** threads.json 里的一项（Rust runs::types::ThreadIndexEntry，只取 CLI 用到的字段）。 */
 export interface ThreadIndexEntry {
@@ -34,6 +35,8 @@ export interface ThreadIndexEntry {
  * 按前三个空格切分；不属于任何运行的行（丢行标记）runId 写 `-`。事件名不含空格，内容截到 240 个字符、控制字符换成空格。
  */
 export interface LogLine {
+  /** 新格式身份；旧行保持没有此字段，正文已还原为 summary。 */
+  source?: TreeLogPayload;
   /** ISO 8601 毫秒精度 UTC 时间戳，如 `2026-10-06T08:00:00.000Z`。 */
   ts: string;
   /** 所属运行；丢行标记等不属于任何运行的行为 null。 */
@@ -244,24 +247,94 @@ function parseLog(text: string, label: string): LogLine[] {
     const line = raw.replace(/\r$/, "");
     if (!line) continue;
     const [ts, run, event, ...rest] = line.split(" ");
-    const content = rest.join(" ");
+    let content = rest.join(" ");
     if (!TIMESTAMP.test(ts!) || run === undefined || (run !== "-" && !RUN_ID.test(run)) || !event) {
       throw new CxbError("LOCAL_ERROR", `${label}有损坏的行`);
     }
-    parsed.push({ ts: ts!, runId: run === "-" ? null : run, event, content, text: content ? `${event} ${content}` : event });
+    let source: TreeLogPayload | undefined;
+    if (/^@cxb2(?:\s|$)/.test(content)) {
+      try {
+        const value: unknown = JSON.parse(content.slice(6));
+        const nullable = (v: unknown) => v === null || typeof v === "string";
+        if (!isObject(value) || !["eventId", "rootThreadId", "threadId"].every((key) => typeof value[key] === "string" && value[key] !== "")
+          || !["parentThreadId", "shortId", "turnId", "itemId"].every((key) => nullable(value[key]))
+          || !["run", "execution", "subagent"].includes(value.sourceRole as string)
+          || typeof value.summary !== "string" || typeof value.truncated !== "boolean"
+          || (value.late !== undefined && typeof value.late !== "boolean")
+          || (value.coverageIssue !== undefined && !["beforeBindingUnknown", "discoveryIncomplete"].includes(value.coverageIssue as string))) {
+          throw new Error("结构化日志字段损坏");
+        }
+        source = value as unknown as TreeLogPayload;
+        content = source.summary;
+      } catch (cause) { throw new CxbError("LOCAL_ERROR", `${label}有损坏的 @cxb2 行`, { cause }); }
+    }
+    parsed.push({ ts: ts!, runId: run === "-" ? null : run, event, content, text: content ? `${event} ${content}` : event,
+      ...(source ? { source } : {}) });
   }
   return parsed;
 }
 
 /** 读线程日志（先 `.log.1` 再 `.log`，按写入顺序）；两者都不存在返回 null。 */
 export function readRunLog(workspaceDir: string, shortId: string): LogLine[] | null {
+  return readRunLogSnapshot(workspaceDir, shortId).lines;
+}
+
+/** 文件身份与长度一起核验，避免轮转时把旧活动文件与新备份拼错。接口允许确定性模拟轮转。 */
+export interface LogReadIO {
+  fingerprint(path: string): string | null;
+  read(path: string): string;
+}
+const logIO: LogReadIO = {
+  fingerprint(path) {
+    try {
+      const stat = statSync(path, { bigint: true });
+      return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  },
+  read: (path) => readFileSync(path, "utf8"),
+};
+
+/** 静态保留窗口：最多三次整批读取，不做增量读取或终态水位推断。 */
+export function readRunLogSnapshot(workspaceDir: string, shortId: string, io: LogReadIO = logIO): {
+  lines: LogLine[] | null; issues: LogCoverageIssue[];
+} {
   const base = join(workspaceDir, "runs", `${shortId}.log`);
-  const parts = [`${base}.1`, base].filter((path) => existsSync(path));
-  if (!parts.length) return null;
+  const parts = [`${base}.1`, base];
   const label = `线程 ${shortId} 的日志`;
-  return parts.flatMap((path) => {
-    let text: string;
-    try { text = readFileSync(path, "utf8"); } catch (cause) { throw new CxbError("LOCAL_ERROR", `${label}无法读取`, { cause }); }
-    return parseLog(text, label);
-  });
+  let changed = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const before = parts.map((path) => io.fingerprint(path));
+      const texts = parts.map((path, i) => before[i] === null ? "" : io.read(path));
+      const after = parts.map((path) => io.fingerprint(path));
+      if (before.some((stamp, i) => stamp !== after[i])) { changed = true; continue; }
+      if (before.every((stamp) => stamp === null)) return { lines: null, issues: [{ code: "missingLog" }] };
+      const issues: LogCoverageIssue[] = [];
+      if (changed || before[0] !== null) issues.push({ code: "rotationWindow" });
+      if (texts.some((text) => text.length > 0 && !text.endsWith("\n"))) issues.push({ code: "trailingPartialLine" });
+      const seen = new Set<string>();
+      const lines = texts.flatMap((text) => parseLog(text, label)).filter((line) => {
+        const id = line.source?.eventId;
+        if (!id) return true;
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+      return { lines, issues };
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ENOENT") { changed = true; continue; }
+      if (cause instanceof CxbError) throw cause;
+      throw new CxbError("LOCAL_ERROR", `${label}无法读取`, { cause });
+    }
+  }
+  throw new CxbError("LOCAL_ERROR", `${label}持续变化，无法取得稳定快照，请重试`);
+}
+
+/** 旧 show 的事件范围：必须在 limit、摘要筛选和补发去重之前调用。 */
+export function ownLogLines(lines: LogLine[]): LogLine[] {
+  // 树发现缺口可挂在根身份上，它也是本期新增的树范围诊断，不能挤占旧视图。
+  return lines.filter((line) => line.source?.sourceRole !== "subagent" && !line.source?.coverageIssue);
 }

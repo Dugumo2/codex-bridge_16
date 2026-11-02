@@ -235,63 +235,69 @@ impl Snapshot {
 
 /// 摘要稳定取前 80 个 Unicode 字符；换行折为空格，日志始终一事件一行。
 pub fn summarize_item(item: &Value) -> Option<ProgressItem> {
+    summarize_item_with_truncation(item).map(|(item, _)| item)
+}
+
+/// 截断信息在摘要生成时累计；不能从最终摘要长度推断是否丢失内容。
+pub fn summarize_item_with_truncation(item: &Value) -> Option<(ProgressItem, bool)> {
     let item_type = item.get("type")?.as_str()?;
     let item_id = item.get("id")?.as_str()?;
+    let mut truncated = false;
+    let mut take = |text: &str, max: usize| {
+        truncated |= text.chars().count() > max;
+        text.chars().take(max).collect::<String>()
+    };
     let summary = match item_type {
-        "commandExecution" => item.get("command")?.as_str()?.chars().take(80).collect(),
-        "agentMessage" | "plan" => item.get("text")?.as_str()?.chars().take(80).collect(),
-        "fileChange" => item
-            .get("changes")?
-            .as_array()?
-            .iter()
-            .filter_map(|change| change.get("path").and_then(Value::as_str))
-            .take(8)
-            .map(|path| path.chars().take(80).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("、"),
+        "commandExecution" => take(item.get("command")?.as_str()?, 80),
+        "agentMessage" | "plan" => take(item.get("text")?.as_str()?, 80),
+        "fileChange" => {
+            let paths: Vec<_> = item
+                .get("changes")?
+                .as_array()?
+                .iter()
+                .filter_map(|change| change.get("path").and_then(Value::as_str))
+                .collect();
+            let summary = paths
+                .iter()
+                .take(8)
+                .map(|path| take(path, 80))
+                .collect::<Vec<_>>()
+                .join("、");
+            truncated |= paths.len() > 8;
+            summary
+        }
         "mcpToolCall" => format!(
             "{} / {}",
-            item.get("server")?
-                .as_str()?
-                .chars()
-                .take(40)
-                .collect::<String>(),
-            item.get("tool")?
-                .as_str()?
-                .chars()
-                .take(40)
-                .collect::<String>()
+            take(item.get("server")?.as_str()?, 40),
+            take(item.get("tool")?.as_str()?, 40)
         ),
-        "dynamicToolCall" => item
-            .get("tool")
-            .or_else(|| item.get("name"))?
-            .as_str()?
-            .chars()
-            .take(80)
-            .collect(),
-        "webSearch" => item.get("query")?.as_str()?.chars().take(80).collect(),
-        "imageView" => item.get("path")?.as_str()?.chars().take(80).collect(),
+        "dynamicToolCall" => take(item.get("tool").or_else(|| item.get("name"))?.as_str()?, 80),
+        "webSearch" => take(item.get("query")?.as_str()?, 80),
+        "imageView" => take(item.get("path")?.as_str()?, 80),
         "enteredReviewMode" => "开始审查".into(),
         "exitedReviewMode" => "审查完成".into(),
         "contextCompaction" => "压缩上下文".into(),
-        _ if item_type.ends_with("ToolCall") => item
-            .get("tool")
-            .and_then(Value::as_str)
-            .unwrap_or("工具调用")
-            .chars()
-            .take(80)
-            .collect(),
+        _ if item_type.ends_with("ToolCall") => take(
+            item.get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("工具调用"),
+            80,
+        ),
         _ => return None,
     };
-    Some(ProgressItem {
-        item_id: item_id.into(),
-        item_type: item_type.into(),
-        summary: summary
-            .chars()
-            .take(80)
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect(),
-    })
+    truncated |= summary.chars().count() > 80;
+    Some((
+        ProgressItem {
+            item_id: item_id.into(),
+            item_type: item_type.into(),
+            summary: summary
+                .chars()
+                .take(80)
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        },
+        truncated,
+    ))
 }
 
 #[cfg(test)]

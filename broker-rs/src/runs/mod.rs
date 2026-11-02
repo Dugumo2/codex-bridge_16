@@ -39,6 +39,7 @@ use std::collections::HashMap;
 pub mod budget;
 pub mod child_diag;
 mod diagnostics;
+mod event_log;
 pub mod stall;
 #[cfg(test)]
 mod tests;
@@ -84,6 +85,7 @@ pub enum RunTimer {
     ResultRetry(ResultRead),
     ProgressFlush { run_id: RunId, generation: u64 },
     DailyCleanup,
+    EventLogSweep { generation: u64 },
 }
 
 /// 建运行所需的信息，由丙路在 #2 处填写。
@@ -168,6 +170,7 @@ pub struct Runs {
     pub(crate) child_results: crate::relations::results::ChildReads,
     pub(crate) epoch: u64,
     next_creation_sequence: u64,
+    event_log: event_log::EventLog,
     pub(crate) verifying_history: std::collections::HashSet<RunId>,
     /// 从开轮发出保留至回包或线上迟到等待结束；不依赖认领生命周期。
     pub(crate) inflight_starts: std::collections::HashSet<RunId>,
@@ -204,9 +207,7 @@ pub struct Runs {
 mod purge;
 mod reads;
 mod state;
-use crate::results::{
-    full_items, limit_text, output_from_items, summarize_item, Activity, Snapshot,
-};
+use crate::results::{full_items, limit_text, output_from_items, Activity, Snapshot};
 pub(crate) use state::utc_timestamp;
 use state::{schedule, ActiveRun, Phase};
 pub use state::{MAX_RESULT_QUEUE, MAX_RESULT_READS, MAX_TURNS};
@@ -552,8 +553,17 @@ impl Machine {
             let active = self.runs.active.get_mut(run).expect("活动运行存在");
             active.current_turn = Some(key);
             active.snapshot = Snapshot::default();
-            self.runs
-                .log(run, self.clock.now_ms, "轮次开始", turn, actions);
+            self.runs.log_owned(
+                run,
+                thread,
+                Some(turn),
+                None,
+                self.clock.now_ms,
+                "轮次开始",
+                turn,
+                false,
+                actions,
+            );
         }
     }
 
@@ -630,7 +640,7 @@ impl Machine {
         }
         self.runs.link_turn(&run, thread, turn, false);
         let completed = method == "item/completed";
-        let summary = summarize_item(item);
+        let summary = crate::results::summarize_item_with_truncation(item);
         let active = self.runs.active.get_mut(&run).expect("活动运行存在");
         let key = (thread.to_owned(), turn.to_owned());
         if active.current_turn.is_none() {
@@ -651,7 +661,7 @@ impl Machine {
                 changed = progress.unconfirmed.len() != count;
             }
         }
-        if let Some(summary) = summary {
+        if let Some((summary, truncated)) = summary {
             if completed {
                 // 有界的重复通知去重窗口与 done 保留窗口相同。
                 if progress
@@ -693,8 +703,17 @@ impl Machine {
             } else {
                 "条目开始"
             };
-            self.runs
-                .log(&run, self.clock.now_ms, event, &summary.summary, actions);
+            self.runs.log_owned(
+                &run,
+                thread,
+                Some(turn),
+                Some(&summary.item_id),
+                self.clock.now_ms,
+                event,
+                &summary.summary,
+                truncated,
+                actions,
+            );
         }
         if completed
             && item.get("type").and_then(Value::as_str) == Some("fileChange")
@@ -868,8 +887,17 @@ impl Machine {
         self.reconcile_parent_completed(&run, id, actions);
         self.runs.put(&run, actions);
         self.runs.touch(&run, self.clock.now_ms, actions);
-        self.runs
-            .log(&run, self.clock.now_ms, "轮次完成", id, actions);
+        self.runs.log_owned(
+            &run,
+            thread,
+            Some(id),
+            None,
+            self.clock.now_ms,
+            "轮次完成",
+            id,
+            false,
+            actions,
+        );
         self.runs.evict();
     }
 
@@ -1413,6 +1441,7 @@ impl Machine {
                 schedule("", RunTimer::DailyCleanup, CLEANUP_INTERVAL_MS, actions);
             }
             RunTimer::DailyCleanup => {}
+            RunTimer::EventLogSweep { generation } => self.sweep_event_log(generation, actions),
         }
     }
 
@@ -1573,6 +1602,7 @@ impl Machine {
         if self.runs.phase != Phase::Open {
             return;
         }
+        self.clear_pending_event_log(actions);
         self.runs.phase = Phase::Draining;
         self.runs.active.clear();
         self.runs.cleanup_scheduled = false;
@@ -1598,6 +1628,7 @@ impl Machine {
             return;
         }
         self.runs.finalize_pending(actions);
+        self.clear_pending_event_log(actions);
         self.runs.phase = Phase::Finalized;
         self.runs.active.clear();
         self.runs.turn_runs.clear();

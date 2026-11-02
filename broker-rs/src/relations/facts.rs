@@ -1046,6 +1046,21 @@ impl Machine {
             }
         };
         if let Some(reason) = conflict {
+            self.runs.log_source(
+                run,
+                child,
+                Some(&key.parent_thread_id),
+                "subagent",
+                Some(turn),
+                None,
+                self.clock.now_ms,
+                "归属冲突",
+                &reason,
+                false,
+                false,
+                Some("discoveryIncomplete"),
+                actions,
+            );
             if let Some(member) = self
                 .relations
                 .contexts
@@ -1082,6 +1097,22 @@ impl Machine {
                 status: BindingStatus::Bound,
             },
         );
+        self.runs.log_source(
+            run,
+            child,
+            Some(&key.parent_thread_id),
+            "subagent",
+            Some(turn),
+            None,
+            self.clock.now_ms,
+            "纳入运行",
+            "已确认活动绑定",
+            false,
+            false,
+            None,
+            actions,
+        );
+        self.flush_bound_event_log(run, child, turn, &key.parent_thread_id, actions);
         // 继承：等这一轮结论的孙线程派生现在可以确认。
         let waiting: Vec<EvidenceKey> = self
             .relations
@@ -1588,6 +1619,7 @@ impl Machine {
                 join.work_epoch = epoch;
             }
         }
+        self.log_member_change(run, thread, change, actions);
         self.persist_children(run, actions);
         self.notify_child_changed(run, thread, actions);
         self.on_member_changed(run, revision, change, actions);
@@ -1954,5 +1986,120 @@ impl Machine {
         self.claims.values().any(|c| {
             c.run_id.as_deref() == Some(run) && matches!(c.state, State::FinishingTree { .. })
         })
+    }
+}
+
+#[cfg(test)]
+mod tree_log_tests {
+    use super::*;
+    use crate::claim::{Claim, ReqKind, State};
+    use crate::runs::RunOpen;
+    use crate::store::StoreOp;
+    use serde_json::json;
+
+    #[test]
+    fn tree_log_独立认领与其他运行绑定冲突只写候选运行() {
+        for independent in [true, false] {
+            let mut m = Machine::new(false);
+            let mut a = vec![];
+            for (run, root) in [("candidate", "root"), ("existing", "other")] {
+                m.run_opened(
+                    RunOpen {
+                        run_id: run.into(),
+                        thread_id: root.into(),
+                        conn: None,
+                        kind: ReqKind::TurnStart,
+                        joined: false,
+                        input: String::new(),
+                        continued_from: None,
+                    },
+                    &mut a,
+                );
+            }
+            let key = EvidenceKey {
+                parent_thread_id: "root".into(),
+                parent_turn_id: "pt".into(),
+                item_id: "spawn".into(),
+            };
+            if independent {
+                m.claims.insert(
+                    "child".into(),
+                    Claim {
+                        stream_id: None,
+                        owned_ended: Default::default(),
+                        owned_turns: ["ct".into()].into_iter().collect(),
+                        claim_id: 7,
+                        state: State::Running {
+                            owner: crate::claim::Owner::Client(1),
+                            turn_id: "ct".into(),
+                            joined: false,
+                        },
+                        run_id: Some("existing".into()),
+                        resume_goal: false,
+                        request_pending: false,
+                        owner_gone: false,
+                        pending_start: None,
+                        submitted_input: vec![],
+                        held_requests: vec![],
+                        held_deltas: 0,
+                        held_bytes: 0,
+                        held_dropped_items: 0,
+                        overflowed: false,
+                        settlement_reply: None,
+                        pending_detach: None,
+                    },
+                );
+            } else {
+                m.relations.bindings.insert(
+                    ("child".into(), "ct".into()),
+                    ActivityBinding {
+                        thread_id: "child".into(),
+                        turn_id: "ct".into(),
+                        run_id: "existing".into(),
+                        parent_thread_id: "other".into(),
+                        evidence: BindingEvidence::V1Spawn,
+                        operation: key.clone(),
+                        status: BindingStatus::Bound,
+                    },
+                );
+            }
+            a.clear();
+            m.bind(
+                "child",
+                "ct",
+                "candidate",
+                BindingEvidence::V1Spawn,
+                &key,
+                &mut a,
+            );
+            let lines: Vec<_> = a
+                .iter()
+                .filter_map(|a| match a {
+                    Action::Store(StoreOp::AppendLog { short_id, lines }) => {
+                        Some((short_id, lines))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(*lines[0].0, m.runs.runs["candidate"].short_id);
+            assert!(lines[0].1[0].contains(" candidate 归属冲突 @cxb2 "));
+            let payload: Value =
+                serde_json::from_str(lines[0].1[0].split("@cxb2 ").nth(1).unwrap()).unwrap();
+            assert_eq!(payload["threadId"], "child");
+            assert_eq!(payload["parentThreadId"], "root");
+            assert_eq!(payload["coverageIssue"], "discoveryIncomplete");
+            let binding = m.binding("child", "ct").unwrap();
+            if independent {
+                assert!(matches!(binding.status, BindingStatus::Conflict(_)));
+            } else {
+                assert_eq!(binding.run_id, "existing");
+            }
+            a.clear();
+            m.log_bound_child_event("candidate", "child", "ct", "item/completed", &Some(json!({"turnId":"ct","item":{"id":"i","type":"agentMessage","text":"不可串账"}})), &mut a);
+            assert!(!a
+                .iter()
+                .any(|a| matches!(a, Action::Store(StoreOp::AppendLog { .. }))));
+        }
     }
 }

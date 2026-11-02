@@ -238,30 +238,6 @@ impl Runs {
         }
     }
 
-    pub(crate) fn log(
-        &self,
-        run: &str,
-        now: u64,
-        event: &str,
-        content: &str,
-        actions: &mut Vec<Action>,
-    ) {
-        if self.phase != Phase::Open {
-            return;
-        }
-        if let Some(record) = self.runs.get(run) {
-            let content: String = content
-                .chars()
-                .take(240)
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect();
-            actions.push(Action::Store(StoreOp::AppendLog {
-                short_id: record.short_id.clone(),
-                lines: vec![format!("{} {run} {event} {content}", utc_timestamp(now))],
-            }));
-        }
-    }
-
     pub(super) fn progress_changed(
         &mut self,
         run: &str,

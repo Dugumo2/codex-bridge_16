@@ -894,11 +894,15 @@ impl Machine {
         }
         if self.take_detach(thread, actions).is_some() {
             if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.as_ref()) {
-                self.runs.log(
+                self.runs.log_owned(
                     run,
+                    thread,
+                    None,
+                    None,
                     self.clock.now_ms,
                     "交接撤销",
                     "发起连接已断开",
+                    false,
                     actions,
                 );
             }

@@ -483,6 +483,7 @@ pub enum TimerKind {
 /// 没有键的计时（M2–M5 的各类）行为不变。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerKey {
+    EventLogSweep,
     ChildBarrier(crate::relations::ChildWaiter),
     ChildSubscription(String),
     ChildRetry(String),
@@ -516,6 +517,9 @@ pub enum TimerKey {
 impl TimerKind {
     pub fn key(&self, token: &ClaimToken) -> Option<TimerKey> {
         match self {
+            TimerKind::Run(crate::runs::RunTimer::EventLogSweep { .. }) => {
+                Some(TimerKey::EventLogSweep)
+            }
             TimerKind::ChildBarrier { waiter } => Some(TimerKey::ChildBarrier(waiter.clone())),
             TimerKind::ChildSubscription { thread, .. } => {
                 Some(TimerKey::ChildSubscription(thread.clone()))
@@ -2449,6 +2453,13 @@ impl Machine {
         mut event: HeldNotification,
         actions: &mut Vec<Action>,
     ) {
+        self.buffer_child_event_log(
+            thread_id,
+            &event.method,
+            &event.params,
+            event.committed,
+            actions,
+        );
         let child_handled = self.dispatch_child_diagnostic(
             thread_id,
             &event.method,

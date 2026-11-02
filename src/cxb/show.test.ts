@@ -11,10 +11,56 @@ import { N4Broker } from "./test-fixtures/n4a-broker";
 import { readRunLog } from "./ledger";
 import { until } from "./test-fixtures/main-test-support";
 import { upstreamError } from "./test-fixtures/upstream-errors";
+import type { TreeLogPayload } from "./tree-log-types";
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-n4a-show-")); });
 afterEach(async () => { await removeTemp(dir); }, 10_000);
+
+describe("show 旧跟随对结构化树日志的兼容", () => {
+  const ts = "2026-11-02T00:00:00.000Z";
+  function structured(eventId: string, role: TreeLogPayload["sourceRole"], text: string) {
+    const source: TreeLogPayload = { eventId, rootThreadId: "thread-test", threadId: role === "run" ? "thread-test" : role === "execution" ? "review-child" : "ordinary-child",
+      parentThreadId: role === "run" ? null : "thread-test", shortId: null, sourceRole: role,
+      turnId: null, itemId: null, summary: text, truncated: false };
+    return `${ts} run-test 条目完成 @cxb2 ${JSON.stringify(source)}\n`;
+  }
+  test("初始 tail 在 limit 之前过滤普通子来源，终态与资源清理不变", async () => {
+    ledger(dir);
+    writeFileSync(join(dir, "runs", "abcd1234.log"), structured("1:1", "run", "根一")
+      + structured("1:2", "execution", "review二") + structured("1:3", "subagent", "不可泄漏"));
+    const t = context(dir, ["show", "abcd", "--follow", "--limit", "2", "--json"]);
+    t.fake.handle = (method) => method === "broker/threads/list" ? { threads: [summary()] }
+      : method === "broker/runs/modelSummaries" ? { runs: [] } : { thread: summary(), run: runResult() };
+    try {
+      expect(await bounded(show(t.ctx), 2000, "初始跟随没有结束")).toBe(0);
+      expect(t.json.slice(0, -1)).toEqual([{ ts, kind: "条目完成", text: "条目完成 根一" }, { ts, kind: "条目完成", text: "条目完成 review二" }]);
+      expect(t.json.at(-1)).toMatchObject({ terminal: true, status: "completed" });
+      expect(t.fake.subscriptions + t.any.size + t.cleanup.size).toBe(0);
+    } finally { for (const cleanup of [...t.cleanup]) await cleanup(); }
+  });
+  test("review 补发先过滤再按出现次数去重，同正文普通子行不能挤掉或复制执行行", async () => {
+    ledger(dir);
+    const path = join(dir, "runs", "abcd1234.log");
+    writeFileSync(path, structured("1:1", "run", "共同摘要") + structured("1:2", "subagent", "共同摘要"));
+    const t = context(dir, ["show", "abcd", "--follow", "--limit", "1", "--json"]);
+    const ended = runResult({ reviewThreadId: "review-child" });
+    t.fake.handle = (method, params) => {
+      if (method === "broker/threads/list") return { threads: [summary()] };
+      if (method === "broker/runs/modelSummaries") return { runs: [] };
+      if (params.threadId === "review-child") {
+        appendFileSync(path, structured("1:3", "subagent", "共同摘要") + structured("1:4", "execution", "共同摘要")
+          + structured("1:5", "subagent", "不可泄漏"));
+      }
+      return { thread: summary({ threadId: params.threadId }), run: ended };
+    };
+    try {
+      expect(await bounded(show(t.ctx), 2000, "review 补发没有结束")).toBe(0);
+      expect(t.json.slice(0, -1)).toEqual([{ ts, kind: "条目完成", text: "条目完成 共同摘要" }, { ts, kind: "条目完成", text: "条目完成 共同摘要" }]);
+      expect(t.fake.subscriptions + t.any.size + t.cleanup.size).toBe(0);
+    } finally { for (const cleanup of [...t.cleanup]) await cleanup(); }
+  });
+});
 
 describe("show 本地读取", () => {
   test("就绪结果与完整 JSON 字段，模型查询连接 broker", async () => {
