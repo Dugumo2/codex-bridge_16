@@ -124,7 +124,9 @@ Codex 需要人回应时，cxb 把线程交给 broker 托管、以退出码 5 �
 ## 7. 等待、查看与线程管理
 
 - `cxb wait`：不带 ID 等本工作区出现新事项（没有活动也没有待答事项时返回 10）；带**线程 ID** 等整次运行结束（跨 goal 多轮）；带**事项 ID**（`ap_`/`qu_`/`mc_`/`gd_`）等它被回复、过期或撤销。同一线程只留一个线程等待：重挂 `cxb wait <线程>` 时旧等待自动退出 10（stderr「本次等待已被同一线程的新等待接替」），不必先手动结束旧等待。
+- `cxb wait <线程ID> --tree`：等整次运行时同时显示子代理树（stderr：首次整棵树，之后只报变化的节点），结束时在父结果后附「子代理结果（本次运行最近受管轮）」，每个子代理一行状态加最多 300 字摘要；`--json` 多一个 `tree` 字段。只能带线程 ID。退出码与不带 `--tree` 相同；某个子代理结果读不到只标该项不可用。运行中偶尔出现「树信息可能陈旧」表示快照还没追上通知，不影响结果。「活动已落定」不等于任务成功，以结果摘要为准。
 - `cxb show <线程ID>`：默认最近一轮结果；`--tail` 最近进展；`--log` 完整本地日志（权威记录）；`--follow` 实时跟随（尽力而为，`--json` 时每行一个 JSON）；`--server` 从服务器读。
+- `cxb show <根线程ID> --log --tree`（或 `--tail --tree [--limit n]`）：把父线程与各子代理的事件按时间合成一条时间线，行首 `[根 …]`、`[子 … ← 父]`；`--full` 才显示条目（命令、回答摘要）。完全离线读本地日志；拿子线程 ID 查会提示改用根线程（退出 1）；有缺口时 stderr 提示「日志仅覆盖保留窗口」。看子代理在干什么、卡在哪，优先用它。
 - `cxb ls`：列线程（合并服务器信息）；`--local` 只读本地。
 - 续聊还是新开：同一件事、同一项目接着做 → `--resume`；被停下或刹车 → `--resume --continue`；不相关的事或换项目 → 新线程；线程卡住 → 先 `cxb stop` 再决定。
 - `cxb stop <线程ID>`：等 Codex 确认停下（最多约 40 秒）；有子代理时连带停整棵子树；确认还要求该线程（及子线程）由 Codex 管理的后台命令已清理。未确认退出 3，见下面「停止未确认时」。默认只暂停目标，`--clear` 放弃目标；`--run <runId>` 核实某次历史失联运行。
@@ -153,10 +155,11 @@ Codex 需要人回应时，cxb 把线程交给 broker 托管、以退出码 5 �
 cxb run [提示词] | - | -f <文件>   [--resume <ID> [--continue [--run <runId>]]] [--template <名称>] [--goal <完成条件> [--budget <token>]] [--detach] [--memory]
 cxb review [说明] [--mode pr|uncommitted|commit|custom] [--ref <提交>] [--base <分支>] [--resume <ID>]
 cxb show <ID> [--tail|--log|--follow] [--server] [--limit <行>] [--full]
+cxb show <根线程ID> --log|--tail --tree [--full] [--limit <行>]
 cxb ls [--all|--limit <数量>] [--local]
 cxb inbox [--kind <类型>] [--limit <数量>]
 cxb reply <事项ID> <内容>|-
-cxb wait [线程ID|事项ID] [--timeout <秒>]
+cxb wait [线程ID|事项ID] [--timeout <秒>] | cxb wait <线程ID> --tree
 cxb stop <ID> [--clear] [--run <runId> [--abandon]]
 cxb rm <ID> [--purge]
 cxb config [<键> [值]] [--unset] | cxb config templates
