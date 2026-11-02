@@ -221,6 +221,15 @@ impl Machine {
                 false
             }
             "thread/status/changed" => {
+                let status = params
+                    .and_then(|p| p.get("status"))
+                    .and_then(|s| s.get("type"))
+                    .and_then(Value::as_str);
+                if matches!(status, Some("active" | "pendingInit")) {
+                    // 状态反证立即撤销旧快照；不能等下一轮发现才失效。
+                    self.relations.aux.candidate_observations.remove(&thread);
+                    self.refresh_thread_classifications(&thread, MemberChange::Activity, actions);
+                }
                 if params
                     .and_then(|p| p.get("status"))
                     .and_then(|s| s.get("type"))
@@ -891,6 +900,7 @@ impl Machine {
             && now < op.expires_at_ms
             && op.conn_epoch == self.relations.conn_epoch
             && op.outcome == EvidenceOutcome::Pending
+            && (!self.op_confirmed(&op.key) || self.operation_generation_current(op))
     }
 
     /// 运行确认后把配对落实为绑定，并把接收方纳入成员。
@@ -899,6 +909,9 @@ impl Machine {
             return;
         };
         if op.run_id.is_empty() || !self.ensure_context(&op.run_id) {
+            return;
+        }
+        if !self.operation_generation_current(&op) {
             return;
         }
         if self

@@ -503,6 +503,25 @@ impl Machine {
         actions.push(Action::Unschedule {
             key: crate::claim::TimerKey::DiscoveryDeadline(op_id),
         });
+        // 某候选核实完成后，其他回包仍可在途；发布前再检查其版本。
+        for (thread, version) in &work.candidate_versions {
+            if thread != &root
+                && self
+                    .relations
+                    .aux
+                    .candidate_versions
+                    .get(thread)
+                    .copied()
+                    .unwrap_or(0)
+                    != *version
+            {
+                work.reasons.insert("candidateChanged".into());
+                work.missing
+                    .entry(thread.clone())
+                    .or_default()
+                    .push("candidateChanged".into());
+            }
+        }
         let mut all: BTreeMap<String, RelationEdge> = self.relations.edges.clone();
         for (thread, edge) in work.read_edges.iter().chain(work.found.iter()) {
             all.insert(thread.clone(), edge.clone());

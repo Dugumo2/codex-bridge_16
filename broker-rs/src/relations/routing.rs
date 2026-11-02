@@ -149,7 +149,7 @@ impl Machine {
                 upstream_request_id: request.id.clone(),
                 method: request.method.clone(),
                 params: request.params.clone(),
-                source_thread_id: thread,
+                source_thread_id: thread.clone(),
                 source_turn_id: turn,
                 run_id: None,
                 received_at_ms: now,
@@ -168,6 +168,8 @@ impl Machine {
                 revoke_requested: false,
             },
         );
+        self.candidate_changed(&thread);
+        self.refresh_thread_classifications(&thread, MemberChange::Request, actions);
         self.route_record(&key, actions);
         true
     }
@@ -193,6 +195,12 @@ impl Machine {
             // 请求仍然存活，RPC 去重登记随接手方结算，不进入关系墓碑。
             self.relations.aux.request_meta.remove(key);
             self.relations.requests.remove(key);
+            self.candidate_changed(&record.source_thread_id);
+            self.refresh_thread_classifications(
+                &record.source_thread_id,
+                MemberChange::Request,
+                actions,
+            );
             let from_held = meta.is_some_and(|m| m.from_held);
             self.server_request(held(&record, forward_id), from_held, actions);
             return;
@@ -200,7 +208,7 @@ impl Machine {
         let resolution = self.resolve(&record.source_thread_id, record.source_turn_id.as_deref());
         let run = match resolution {
             Resolution::Unknown => {
-                self.set_stage(key, ChildRequestStage::Lookup);
+                self.set_stage(key, ChildRequestStage::Lookup, actions);
                 self.lookup_ensure(&record.source_thread_id, actions);
                 return;
             }
@@ -241,7 +249,7 @@ impl Machine {
             .filter(|c| c.run_id.as_deref() == Some(run.as_str()))
         {
             if claim.settling() || claim.precheck() {
-                self.set_stage(key, ChildRequestStage::Held);
+                self.set_stage(key, ChildRequestStage::Held, actions);
                 self.refresh_member(
                     &run,
                     &record.source_thread_id,
@@ -288,10 +296,22 @@ impl Machine {
         }
     }
 
-    fn set_stage(&mut self, key: &(u64, String), stage: ChildRequestStage) {
-        if let Some(r) = self.relations.requests.get_mut(key) {
-            r.stage = stage;
+    fn set_stage(
+        &mut self,
+        key: &(u64, String),
+        stage: ChildRequestStage,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(record) = self.relations.requests.get_mut(key) else {
+            return;
+        };
+        if record.stage == stage {
+            return;
         }
+        record.stage = stage;
+        let thread = record.source_thread_id.clone();
+        self.candidate_changed(&thread);
+        self.refresh_thread_classifications(&thread, MemberChange::Request, actions);
     }
 
     fn forget_request(
@@ -301,7 +321,14 @@ impl Machine {
     ) -> Option<ChildRequest> {
         self.write_tombstone(key.clone(), actions);
         self.relations.aux.request_meta.remove(key);
-        self.relations.requests.remove(key)
+        let record = self.relations.requests.remove(key)?;
+        self.candidate_changed(&record.source_thread_id);
+        self.refresh_thread_classifications(
+            &record.source_thread_id,
+            MemberChange::Request,
+            actions,
+        );
+        Some(record)
     }
 
     /// 确定不答：静默丢弃并记诊断，不发 Dismiss。
@@ -350,6 +377,7 @@ impl Machine {
                 conn,
                 gen,
             },
+            actions,
         );
         self.forward_child(
             held(&record, forward_id),
@@ -444,6 +472,7 @@ impl Machine {
             ChildRequestStage::Inbox {
                 item_id: String::new(),
             },
+            actions,
         );
         match self.inbox_register_child_request(
             origin,
@@ -459,6 +488,7 @@ impl Machine {
                     ChildRequestStage::Inbox {
                         item_id: item_id.clone(),
                     },
+                    actions,
                 );
                 if let Some(meta) = self.relations.aux.request_meta.get_mut(key) {
                     meta.inbox_item = Some(item_id);
@@ -635,7 +665,7 @@ impl Machine {
             .collect();
         for (key, forward_id) in keys {
             // 先改阶段，撤转发的回调不会把它当成已回答。
-            self.set_stage(&key, ChildRequestStage::Held);
+            self.set_stage(&key, ChildRequestStage::Held, actions);
             self.take_forward(&forward_id, actions);
             if let Some(meta) = self.relations.aux.request_meta.get_mut(&key) {
                 meta.from_held = true;
@@ -664,7 +694,28 @@ impl Machine {
                 _ => None,
             });
         let context = self.relations.contexts.get_mut(run).expect("上下文存在");
+        let previous_gen = context.gen;
         context.gen = context.gen.saturating_add(1);
+        if matches!(kind, HandoffKind::Detach | HandoffKind::OwnerGone)
+            && matches!(
+                context.authority,
+                Authority::Owner(_) | Authority::Broker { .. }
+            )
+        {
+            // 合法交接保留尚未配对的派生/复用资格；只迁移原本有效的本代证据。
+            for op in self.relations.operations.values_mut() {
+                if op.run_id == run
+                    && op.authority_gen == previous_gen
+                    && op.conn_epoch == self.relations.conn_epoch
+                    && matches!(
+                        op.outcome,
+                        EvidenceOutcome::Pending | EvidenceOutcome::Proven
+                    )
+                {
+                    op.authority_gen = context.gen;
+                }
+            }
+        }
         match kind {
             HandoffKind::Detach => {
                 let policy = claim_policy.unwrap_or(context.policy);
@@ -710,11 +761,11 @@ impl Machine {
                     continue;
                 }
                 ChildRequestStage::Forwarded { forward_id, .. } => {
-                    self.set_stage(&key, ChildRequestStage::Revoked);
+                    self.set_stage(&key, ChildRequestStage::Revoked, actions);
                     self.take_forward(&forward_id, actions);
                 }
                 ChildRequestStage::Inbox { item_id } => {
-                    self.set_stage(&key, ChildRequestStage::Revoked);
+                    self.set_stage(&key, ChildRequestStage::Revoked, actions);
                     self.inbox_revoke_child(&item_id, actions);
                 }
                 _ => {}
@@ -826,7 +877,7 @@ impl Machine {
         let key = request_key(self.relations.conn_epoch, id);
         if let Some(record) = self.relations.requests.get(&key).cloned() {
             if let ChildRequestStage::Forwarded { forward_id, .. } = &record.stage {
-                self.set_stage(&key, ChildRequestStage::Revoked);
+                self.set_stage(&key, ChildRequestStage::Revoked, actions);
                 self.take_forward(forward_id, actions);
             }
             // 收件箱阶段的事项由 resolve_held_request → inbox_server_resolved 按来源线程关闭。
@@ -973,7 +1024,9 @@ impl Machine {
             });
         if let Some(key) = key {
             let gen = gen_of(&self.relations.requests[&key].run_id, self);
-            self.set_stage(&key, ChildRequestStage::Writing { op, gen });
+            // Inbox → Writing 保持同一个待答事实，不改变候选分类。
+            self.relations.requests.get_mut(&key).unwrap().stage =
+                ChildRequestStage::Writing { op, gen };
         }
     }
 
@@ -1013,7 +1066,7 @@ impl Machine {
                 // 写入结果已到达：清掉旧 op 后按普通撤销出口关闭，不能回到可重试状态。
                 self.inbox_cancel_child_reply(&item_id, actions);
             } else {
-                self.set_stage(&key, ChildRequestStage::Inbox { item_id });
+                self.set_stage(&key, ChildRequestStage::Inbox { item_id }, actions);
             }
         }
     }

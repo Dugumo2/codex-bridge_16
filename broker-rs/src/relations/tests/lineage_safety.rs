@@ -54,7 +54,7 @@ fn history(m: &mut Machine, thread: &str) {
 
 /// 用生产发现请求及回包核实快照；不写成员表、不强设 complete。
 fn discover(m: &mut Machine, mock: &mut SubagentMock, snapshots: &[(&str, &str, Value, bool)]) {
-    let (op, held) = discover_with_hold(m, mock, snapshots, false);
+    let (op, held) = discover_with_hold(m, mock, snapshots, None);
     assert!(held.is_empty());
     assert!(m.discovery_outcome(op).is_some(), "生产发现回调已完成");
 }
@@ -63,7 +63,7 @@ fn discover_with_hold(
     m: &mut Machine,
     mock: &mut SubagentMock,
     snapshots: &[(&str, &str, Value, bool)],
-    hold_child_checks: bool,
+    held_thread: Option<&str>,
 ) -> (u64, Vec<RequestContext>) {
     let token = m.convergences.runs[R].token.clone();
     let epoch = m.convergences.ledgers[R].work_epoch;
@@ -91,8 +91,7 @@ fn discover_with_hold(
         assert!(calls < 256, "发现请求必须有界完成");
         let params = context.params.clone().unwrap_or(Value::Null);
         let thread = params["threadId"].as_str().unwrap_or_default();
-        if hold_child_checks
-            && thread == C
+        if held_thread == Some(thread)
             && matches!(context.method.as_str(), "thread/read" | "thread/goal/get")
         {
             held.push(context);
@@ -324,7 +323,10 @@ fn stale_check_reply(mock: &SubagentMock, context: &RequestContext) -> Value {
     if context.method == "thread/goal/get" {
         json!({"goal": null})
     } else {
-        let mut info = mock.thread_info(C).unwrap();
+        let thread = context.params.as_ref().unwrap()["threadId"]
+            .as_str()
+            .unwrap();
+        let mut info = mock.thread_info(thread).unwrap();
         info["status"] = json!({"type": "notLoaded"});
         info["turns"] = json!([{ "id": "历史轮", "status": "completed" }]);
         json!({"thread": info})
@@ -341,9 +343,16 @@ fn lineage_safety_发现旧工作回包不能覆盖本次启动复用与活动�
             &mut m,
             &mut mock,
             &[(C, "notLoaded", json!([]), false)],
-            true,
+            Some(C),
         );
-        assert_eq!(held.len(), 2, "扣住真实发出的子线程 read 与 goal 请求");
+        assert!(
+            held.iter().any(|c| c.method == "thread/read"),
+            "扣住实际核实读取"
+        );
+        assert!(
+            held.iter().any(|c| c.method == "thread/goal/get"),
+            "扣住实际 goal 核实"
+        );
         let old_version = m.relations.aux.work[&op].candidate_versions[C];
         match change {
             "spawn" => {
@@ -439,8 +448,9 @@ fn lineage_safety_旧连接及旧发现操作回包不得写候选事实() {
         let (mut m, mut mock) = machine();
         candidate(&mut m, &mut mock, C);
         let (op, held) =
-            discover_with_hold(&mut m, &mut mock, &[(C, "idle", json!([]), false)], true);
-        assert_eq!(held.len(), 2);
+            discover_with_hold(&mut m, &mut mock, &[(C, "idle", json!([]), false)], Some(C));
+        assert!(held.iter().any(|c| c.method == "thread/read"));
+        assert!(held.iter().any(|c| c.method == "thread/goal/get"));
         if stale == "connection" {
             m.relations.conn_epoch += 1;
         } else {
@@ -806,4 +816,191 @@ fn lineage_safety_独立认领候选产生归属冲突而不获取管理权() {
     assert!(facts.activities.is_empty());
     assert!(m.binding(C, "独立轮").is_none());
     assert!(!m.current_management_evidence(R, C));
+}
+
+#[test]
+fn lineage_safety_历史核实完成后活动通知立即撤证且发布前复核() {
+    for status in ["active", "pendingInit"] {
+        const OTHER: &str = "扣包的另一历史子";
+        let (mut m, mut mock) = machine();
+        for thread in [C, OTHER] {
+            history(&mut m, thread);
+            candidate(&mut m, &mut mock, thread);
+        }
+        let (op, held) = discover_with_hold(
+            &mut m,
+            &mut mock,
+            &[
+                (
+                    C,
+                    "notLoaded",
+                    json!([{"id":"历史轮","status":"completed"}]),
+                    false,
+                ),
+                (OTHER, "notLoaded", json!([]), false),
+            ],
+            Some(OTHER),
+        );
+        assert!(!held.is_empty(), "其他候选核实回包实际在途");
+        assert_eq!(m.classify_candidate(R, C), Membership::Historical);
+        assert!(m.relations.aux.work[&op]
+            .checks_done
+            .contains(&(C.into(), "thread/read".into())));
+        assert!(m.relations.aux.work[&op]
+            .checks_done
+            .contains(&(C.into(), "thread/goal/get".into())));
+        assert!(m.discovery_outcome(op).is_none());
+        mock.inject(
+            &mut m,
+            Event::Notification {
+                method: "thread/status/changed".into(),
+                params: Some(json!({"threadId":C,"status":{"type":status}})),
+            },
+        );
+        assert!(
+            m.run_has_candidate(R, C),
+            "活动通知必须立即撤销历史排除：{status}"
+        );
+        assert!(
+            !m.relations
+                .aux
+                .candidate_observations
+                .get(C)
+                .is_some_and(|o| o.inactive),
+            "活动通知不能保留旧静止证明：{status}"
+        );
+        assert!(m.convergences.ledgers[R].covered_epoch.is_none());
+        for context in held {
+            let response = stale_check_reply(&mock, &context);
+            mock.inject(
+                &mut m,
+                Event::Reply {
+                    context,
+                    result: Ok(response),
+                },
+            );
+        }
+        let result = m.discovery_outcome(op).expect("其他回包放行后发现已结束");
+        assert!(
+            result
+                .state
+                .incomplete_reasons
+                .iter()
+                .any(|r| r == "candidateChanged"),
+            "发布必须复核已完成候选版本：{status}"
+        );
+        assert!(
+            m.run_has_candidate(R, C),
+            "活动候选不能被最后发布排除：{status}"
+        );
+        assert!(!settled(&m.convergence_facts(R).unwrap()));
+        let done = mock.turn_completed(P, T, "completed");
+        mock.inject(&mut m, done);
+        assert!(
+            m.claims.contains_key(P),
+            "候选重新活动后父轮完成也不得释放：{status}"
+        );
+    }
+}
+
+#[test]
+fn lineage_safety_历史无轮次请求插入及结束立即刷新分类() {
+    let (mut m, mut mock) = machine();
+    history(&mut m, C);
+    candidate(&mut m, &mut mock, C);
+    discover(&mut m, &mut mock, &[(C, "notLoaded", json!([]), false)]);
+    assert_eq!(m.classify_candidate(R, C), Membership::Historical);
+    let (_, request) = mock.request(C, None, Some(json!(906)), APPROVAL);
+    let routed = mock.inject(&mut m, request);
+    assert!(
+        m.run_has_candidate(R, C),
+        "无轮次 Lookup 插入必须立即刷新历史分类"
+    );
+    assert!(m.convergences.ledgers[R].covered_epoch.is_none());
+    assert!(
+        m.relations.aux.lookups.is_empty(),
+        "已知血缘不需要额外回查任务"
+    );
+    let pending = m
+        .relations
+        .requests
+        .values()
+        .find(|r| r.upstream_request_id == json!(906))
+        .unwrap();
+    assert_eq!(pending.stage, ChildRequestStage::Lookup);
+    assert!(pending.run_id.is_none());
+    assert!(
+        m.convergence_facts(R).unwrap().pending_requests > 0,
+        "收敛事实直接考虑可能属于本运行的 Lookup 请求"
+    );
+    assert!(forwarded(&routed, 1).is_empty());
+    assert!(
+        !routed
+            .iter()
+            .any(|a| matches!(a, Action::ServerResult { .. } | Action::ServerError { .. })),
+        "候选无管理权，不越权作答"
+    );
+    mock.inject(
+        &mut m,
+        Event::Notification {
+            method: "serverRequest/resolved".into(),
+            params: Some(json!({"threadId": C, "requestId":906})),
+        },
+    );
+    assert!(
+        !m.run_has_candidate(R, C),
+        "无轮次请求结束必须撤销待答候选分类"
+    );
+    assert_eq!(m.convergence_facts(R).unwrap().pending_requests, 0);
+}
+
+#[test]
+fn lineage_safety_合法交接保留未绑定资格且首轮晚到仍正确绑定() {
+    for kind in [HandoffKind::Detach, HandoffKind::OwnerGone] {
+        let (mut m, mut mock) = machine();
+        history(&mut m, C);
+        mock.register(C, Some(P), "v1", false, true);
+        let (started, completed) = SubagentMock::v1_spawn(P, T, "交接前派生", C, false);
+        run(&mut m, &mut mock, vec![started, completed]);
+        assert!(m.relations.bindings.is_empty());
+        let before = m.manage_context(R).unwrap().gen;
+        if kind == HandoffKind::Detach {
+            // 经真实 detach 入口同步管理代际与协调器令牌。
+            mock.inject(
+                &mut m,
+                Event::ClientRequest {
+                    request: crate::claim::ClientRequest {
+                        conn: 1,
+                        id: json!(908),
+                        method: "broker/threads/detach".into(),
+                        params: Some(json!({"threadId":P,"runId":R,"policy":"on-request"})),
+                    },
+                    run_id: None,
+                },
+            );
+        } else {
+            // OwnerGone 的生产后续进入停止；这里仅核实关系交接仍保留首轮资格。
+            m.on_handoff(R, kind, &mut vec![]);
+        }
+        assert_eq!(m.manage_context(R).unwrap().gen, before + 1);
+        assert!(
+            m.current_management_evidence(R, C),
+            "合法交接不得丢失未绑定资格：{kind:?}"
+        );
+        assert!(m.manage_context(R).unwrap().members.contains_key(C));
+        assert!(!m.run_has_candidate(R, C));
+        if kind == HandoffKind::Detach {
+            assert!(!settled(&m.convergence_facts(R).unwrap()));
+        }
+        let late = mock.turn_started(C, "交接后晚到首轮");
+        mock.inject(&mut m, late);
+        assert_eq!(bound(&m, C, "交接后晚到首轮").as_deref(), Some(R));
+        assert!(m.current_management_evidence(R, C));
+        let done = mock.turn_completed(C, "交接后晚到首轮", "completed");
+        mock.inject(&mut m, done);
+        assert!(m.convergences.ledgers[R]
+            .results
+            .iter()
+            .any(|r| r.locator.turn_id.as_deref() == Some("交接后晚到首轮")));
+    }
 }

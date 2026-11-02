@@ -458,7 +458,10 @@ impl Machine {
             .requests
             .iter()
             .filter(|(key, r)| {
-                r.run_id.as_deref() == Some(run_id)
+                (r.run_id.as_deref() == Some(run_id)
+                    || (r.run_id.is_none()
+                        && r.stage == ChildRequestStage::Lookup
+                        && self.lookup_may_belong(run_id, &r.source_thread_id)))
                     && routing::live_stage(&r.stage)
                     && !self
                         .relations

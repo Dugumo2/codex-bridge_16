@@ -40,6 +40,38 @@ impl Machine {
             .candidate_versions
             .insert(thread.into(), version);
     }
+    /// 通知与请求会改变候选事实；刷新已知血缘和已有分类，不授予管理权。
+    pub(crate) fn refresh_thread_classifications(
+        &mut self,
+        thread: &str,
+        change: MemberChange,
+        actions: &mut Vec<Action>,
+    ) {
+        let runs: Vec<String> = self
+            .relations
+            .contexts
+            .keys()
+            .filter(|run| {
+                self.run_tracks_thread(run, thread)
+                    || self.run_lineage_threads(run).contains(thread)
+            })
+            .cloned()
+            .collect();
+        for run in runs {
+            self.refresh_member(&run, thread, change, actions);
+            self.convergence_sync_facts(&run);
+        }
+    }
+
+    /// 合法交接迁移有效操作的管理代际；所有归属入口共享这一判定。
+    /// 当前授权撤销不抹掉已经成立的活动归属；实际绑定与路由另行检查授权。
+    pub(crate) fn operation_generation_current(&self, op: &EvidenceOperation) -> bool {
+        op.conn_epoch == self.relations.conn_epoch
+            && self
+                .manage_context(&op.run_id)
+                .is_some_and(|c| c.gen == op.authority_gen)
+    }
+
     /// 共同资格判定：成员表与发现分类均不能反过来证明归属。
     pub(crate) fn current_management_evidence(&self, run: &str, thread: &str) -> bool {
         if self
@@ -59,10 +91,7 @@ impl Machine {
                     op.outcome,
                     EvidenceOutcome::Pending | EvidenceOutcome::Proven
                 )
-                && op.conn_epoch == self.relations.conn_epoch
-                && self
-                    .manage_context(run)
-                    .is_some_and(|c| c.gen == op.authority_gen)
+                && self.operation_generation_current(op)
                 && matches!(
                     op.kind,
                     EvidenceKind::V1Spawn

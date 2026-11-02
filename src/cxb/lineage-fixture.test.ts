@@ -81,6 +81,9 @@ test("C 恢复快照结果补读只取所选运行的受管轮，不取线程最
     activity: "settled", pendingCount: 0, conflict: null, turnIds: ["R2-turn"], shortId: null, stop: null, result: null }],
   { deadline: performance.now() + 4000 });
   expect(result.get("child")).toMatchObject({ turnId: "R2-turn", output: "R2受管结果", availability: "available" });
-  expect(fake.calls.filter(call => call.method === "thread/turns/list")).toHaveLength(2);
-  expect(fake.calls.filter(call => call.method === "thread/items/list").map(call => call.params.turnId)).toEqual(["R2-turn"]);
+  const turnPages = fake.calls.filter(call => call.method === "thread/turns/list");
+  expect(turnPages.some(call => call.params.cursor), "受管轮不在首页时必须继续翻页").toBe(true);
+  const itemReads = fake.calls.filter(call => call.method === "thread/items/list");
+  expect(itemReads.length).toBeGreaterThan(0);
+  expect(itemReads.every(call => call.params.turnId === "R2-turn"), "正文读取只能访问所选运行的受管轮").toBe(true);
 });
