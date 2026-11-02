@@ -157,7 +157,8 @@ impl Runs {
         actions.push(Action::Store(StoreOp::AppendLog {
             short_id: record.short_id.clone(),
             lines: vec![format!(
-                "{} {run} {event} @cxb2 {payload}",
+                // 旧 writer 将正文控制字符替换为空格；实际 TAB 是不与旧正文碰撞的格式边界。
+                "{} {run} {event} \t@cxb2 {payload}",
                 super::utc_timestamp(now)
             )],
         }));

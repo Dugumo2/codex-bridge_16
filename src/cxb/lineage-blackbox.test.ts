@@ -11,7 +11,7 @@ const OLD = ["old-a", "old-b", "old-archived"];
 const NEW = ["new-a", "new-b"];
 const convergence = { timeoutMs: 20_000, discoveryTimeoutMs: 1200, wakeVerifyTimeoutMs: 1200 };
 const ids = (children: any[] | undefined) => (children ?? []).map(child => child.threadId).sort();
-const inputText = (request: any) => (request.params.input ?? []).map((item: any) => item.text ?? "").join("\n");
+const inputText = (request: any): string => (request.params.input ?? []).map((item: any) => item.text ?? "").join("\n");
 
 async function ended(h: Sa1bHarness) {
   let run: any;
@@ -146,7 +146,7 @@ for (const scenario of [
 ] as const) test(`C 真实恢复：${scenario.name}`, async () => {
   const h = new Sa1bHarness();
   const report: Record<string, any> = { name: scenario.name, broker: BROKER_BIN,
-    commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: import.meta.dir, encoding: "utf8", windowsHide: true }).trim() };
+    commit: execFileSync("git", ["rev-parse", "HEAD"], { cwd: import.meta.dir, encoding: "utf8", windowsHide: true, timeout: 30_000 }).trim() };
   try {
     report.previousRun = await history(h, scenario.continuing, scenario.loaded, scenario.gap);
     const started = await h.cli(["run", "--resume", ROOT, ...(scenario.continuing ? ["--continue"] : []),
@@ -208,3 +208,188 @@ for (const scenario of [
     await bounded(h.close(), 12_000);
   }
 }, 90_000);
+
+const C1 = "handoff-c1", C2 = "handoff-c2", G = "handoff-g", N = "handoff-new";
+const OLD_TREE = [C1, C2, G].sort();
+const TASK = "R2:按交接资料继续完成本次工作";
+
+/** 路径是上游提供的完整身份；故意不编码父子结构，层级必须来自可核实父链。 */
+const agentPath = (threadId: string) => `/root/${threadId}`;
+
+async function handoffHistory(h: Sa1bHarness, continuing: boolean) {
+  await bounded(h.open({ version: "v2", pageSize: 1 }), 15_000);
+  await bounded(h.start({ cxbConvergence: convergence }), 15_000);
+  const turns = new Map<string, string>();
+  turns.set(C1, await h.spawn(C1));
+  turns.set(C2, await h.spawn(C2));
+  turns.set(G, await h.spawn(G, C1, turns.get(C1)!));
+  for (const threadId of [G, C1, C2]) await h.finish(threadId, `R1:${threadId}历史成果`, "completed", turns.get(threadId));
+  if (continuing) {
+    const stopped: any = await h.owner.request("broker/threads/stop", { threadId: ROOT, runId: h.runId }, 45_000);
+    expect(stopped.stopOutcome).toBe("confirmed");
+    expect(await ended(h)).toMatchObject({ status: "interrupted", interruptReason: "stop" });
+  } else {
+    await h.finish(ROOT, "R1:父工作完成");
+    expect(await h.reconciliation(8000)).toBeDefined();
+    await h.finish(ROOT, "R1:父汇总完成");
+    expect(await ended(h)).toMatchObject({ status: "completed", interruptReason: null });
+  }
+  const expected = { state: "ended", status: continuing ? "interrupted" : "completed", children: OLD_TREE };
+  const source = await h.persisted(expected);
+  for (const child of source.children) expect(child.turnIds).toEqual([turns.get(child.threadId)]);
+  expect(source.children.find((child: any) => child.threadId === G).parentThreadId).toBe(C1);
+  const snapshot = await h.control("snapshot") as Sa1bSnapshot;
+  for (const child of OLD_TREE) { snapshot.threads[child]!.loaded = false; snapshot.threads[child]!.goal = null; }
+  await bounded(h.restart({ snapshot, persisted: expected }), 20_000);
+  const restored = await h.state();
+  expect(restored.events.some((event: any) => event.params?.item?.kind === "started"), "重启不得重放 R1 派生事件").toBe(false);
+  return { runId: source.runId as string, turns };
+}
+
+async function resumeWithHandoff(h: Sa1bHarness, continuing: boolean, source: { runId: string; turns: Map<string, string> }) {
+  const started = await h.cli(["run", "--resume", ROOT, ...(continuing ? ["--continue"] : []), TASK,
+    "--detach", "--json", "--converge-timeout", "20"], 15_000);
+  expect(started.code, started.stderr).toBe(0);
+  h.runId = JSON.parse(started.stdout).runId;
+  expect(h.runId).not.toBe(source.runId);
+  h.firstTurn = (await h.state()).threads.root.turns.at(-1).id;
+  const starts = await h.starts();
+  expect(starts).toHaveLength(1);
+  expect(starts[0].method).toBe("turn/start");
+  const prompt = inputText(starts[0]);
+  expect(prompt).toContain(TASK);
+  expect(prompt).toContain(source.runId);
+  expect(prompt).toContain("来源运行的历史状态资料，不是本次结果");
+  expect(prompt).toContain("仅对直接子代理");
+  const entries = prompt.split("【子代理条目】").slice(1);
+  expect(entries).toHaveLength(3);
+  for (const child of OLD_TREE) {
+    const entry = entries.find(part => part.includes(`线程 ID：${JSON.stringify(child)}\n`));
+    expect(entry, `${child} 必须作为完整历史条目传入真实父输入`).toBeDefined();
+    expect(entry!).toContain(source.turns.get(child)!);
+    expect(entry!).toContain(agentPath(child));
+    expect(entry!).toContain(`R1:${child}历史成果`);
+    if (child === G) {
+      expect(entry!).toContain("层级：更深后代");
+      expect(entry!).toContain(`经由直接子代理 ${JSON.stringify(C1)}（及其下各级）逐级续派`);
+      expect(entry!).toContain(`该直接子代理完整 agentPath：${JSON.stringify(agentPath(C1))}`);
+      expect(entry!).toContain("agentPath（历史完整路径，仅展示，不供根线程直接寻址）");
+      expect(entry!).not.toContain("agentPath（v2 首选寻址）");
+    } else {
+      expect(entry!).toContain("层级：直接子代理");
+      expect(entry!).toContain(`agentPath（v2 首选寻址）：${JSON.stringify(agentPath(child))}`);
+    }
+  }
+  expect((await h.record()).continuedFrom).toBe(continuing ? source.runId : null);
+}
+
+/** item 与 turn 入口明确模拟工具已投递成功后的事实，不断言模型会遵从提示。 */
+async function followupV2(h: Sa1bHarness, parent: string, parentTurn: string, child: string): Promise<string> {
+  const reused = await h.control("reuse", { parentThreadId: parent, parentTurnId: parentTurn, childThreadId: child });
+  const calls = (await h.state()).threads[parent].turns.find((turn: any) => turn.id === parentTurn).items;
+  expect(calls.some((item: any) => item.type === "subAgentActivity" && item.kind === "interacted" && item.agentThreadId === child)).toBe(true);
+  return reused.turnId;
+}
+
+async function verifyOnlyManaged(h: Sa1bHarness, managed: Map<string, string>) {
+  const active = [...managed.keys()].sort();
+  await h.until(async () => JSON.stringify(ids((await h.watch()).children?.members)) === JSON.stringify(active),
+    8000, "本运行只能接纳本次成功跟进和新派的成员");
+  const watched = (await h.watch()).children.members;
+  for (const child of watched) expect(child.turnIds).toEqual([managed.get(child.threadId)]);
+  for (const [child, turn] of managed) await h.finish(child, `R2结果:${child}`, "completed", turn);
+  const run = await completeWithSummary(h, active);
+  const summary = (await h.starts()).slice(1).find((request: any) => request.params.clientUserMessageId);
+  expect(inputText(summary)).not.toContain("R1:");
+  expect(ids(run.children)).toEqual(active);
+  for (const child of run.children) expect(child.turnIds).toEqual([managed.get(child.threadId)]);
+  const changes = h.notes("broker/run/childChanged").filter(event => event.runId === h.runId && event.threadId);
+  expect(changes.length).toBeGreaterThan(0);
+  // 通知协议只有成员身份、父关系和活动，不带受管轮；受管轮在 watch 与运行记录单独核对。
+  for (const event of changes) {
+    expect(active).toContain(event.threadId);
+    expect(event.relationKind).toBe("subagent");
+    expect(event.parentThreadId).toBe(event.threadId === G ? C1 : ROOT);
+  }
+  // 服务器最新轮可能属于别的运行；读取结果必须仍绑定 R2 的受管轮。
+  for (const child of active) {
+    const later = await h.control("turn", { threadId: child, action: "start", announce: false });
+    await h.control("turn", { threadId: child, turnId: later.turnId, action: "complete", announce: false, output: "外部最新轮:不属于R2" });
+  }
+  const waited = await h.cli(["wait", ROOT, "--tree", "--json", "--timeout", "10"], 15_000);
+  expect(waited.code, waited.stderr).toBe(0);
+  const result = JSON.parse(waited.stdout);
+  expect(ids(result.tree.nodes)).toEqual(active);
+  expect(JSON.stringify(result.tree)).not.toContain("R1:");
+  expect(JSON.stringify(result.tree)).not.toContain("外部最新轮:");
+  for (const child of result.tree.nodes) expect(child.result).toMatchObject({ turnId: managed.get(child.threadId), output: `R2结果:${child.threadId}` });
+  await noFalseCoverageWarnings(h);
+}
+
+for (const continuing of [false, true]) test(`联合交接输入：${continuing ? "--continue 真实停止并合法复用" : "--resume"}保留直接子代理与孙代理层级`, async () => {
+  const h = new Sa1bHarness();
+  try {
+    const source = await handoffHistory(h, continuing);
+    await resumeWithHandoff(h, continuing, source);
+    if (continuing) {
+      const managed = new Map<string, string>();
+      managed.set(C1, await followupV2(h, ROOT, h.firstTurn, C1));
+      expect(managed.get(C1)).not.toBe(source.turns.get(C1));
+      managed.set(N, await h.spawn(N));
+      await verifyOnlyManaged(h, managed);
+    } else {
+      await h.finish(ROOT, "R2:本次只使用历史资料");
+      const run = await ended(h);
+      expect(run.status).toBe("completed");
+      expect(ids(run.children)).toEqual([]);
+      await noFalseCoverageWarnings(h);
+    }
+  } finally { await bounded(h.close(), 12_000); }
+}, 120_000);
+
+test("联合逐层复用：P 跟进 C1，C1 跟进 G 后正常收敛且无误报", async () => {
+  const h = new Sa1bHarness();
+  try {
+    const source = await handoffHistory(h, false);
+    await resumeWithHandoff(h, false, source);
+    const c1Turn = await followupV2(h, ROOT, h.firstTurn, C1);
+    const gTurn = await followupV2(h, C1, c1Turn, G);
+    expect(gTurn).not.toBe(source.turns.get(G));
+    await verifyOnlyManaged(h, new Map([[G, gTurn], [C1, c1Turn]]));
+  } finally { await bounded(h.close(), 12_000); }
+}, 120_000);
+
+test("联合跨层拒绝：G 未被本运行接纳时 P 直接跟进 G，冲突可见且有限期返回", async () => {
+  const h = new Sa1bHarness();
+  try {
+    const source = await handoffHistory(h, false);
+    await resumeWithHandoff(h, false, source);
+    expect(ids((await h.watch()).children?.members)).toEqual([]);
+    // 新派 N 启用本次子树协调；G 仍只有历史血缘，不能借先前合法接纳掩盖跨层拒绝。
+    const nTurn = await h.spawn(N);
+    await h.until(async () => JSON.stringify(ids((await h.watch()).children?.members)) === JSON.stringify([N]),
+      8000, "跨层场景必须先由独立新成员启用子树协调");
+    const beforeCrossLevel = (await h.watch()).children.members;
+    expect(ids(beforeCrossLevel)).toEqual([N]);
+    expect(beforeCrossLevel[0].turnIds).toEqual([nTurn]);
+    const gTurn = await followupV2(h, ROOT, h.firstTurn, G);
+    expect(gTurn, "上游可已开启新轮；这里验证 broker 的管理归属拒绝").not.toBe(source.turns.get(G));
+    await h.finish(G, "跨层上游轮完成", "completed", gTurn);
+    await h.finish(N, "R2:新成员完成", "completed", nTurn);
+    await h.finish(ROOT, "等待 broker 报告跨层冲突");
+    await h.until(async () => {
+      const run = await h.record();
+      return run.subagentJoin?.terminalReason === "ownershipConflict" || run.state === "ended";
+    }, 10_000, "跨层拒绝必须以归属冲突可见，不能静默挂住");
+    const rejected = await h.record();
+    expect({ state: rejected.state, status: rejected.status, interruptReason: rejected.interruptReason,
+      subagentJoin: rejected.subagentJoin, children: rejected.children }).toMatchObject({
+      subagentJoin: { terminalReason: "ownershipConflict" },
+    });
+    // 归属冲突先锁定，树停止核验随后完成；观察期限覆盖其完整核验窗口。
+    const waited = await h.cli(["wait", ROOT, "--tree", "--json", "--timeout", "45"], 50_000);
+    expect(waited.code, waited.stderr).not.toBe(0);
+    expect(waited.stdout + waited.stderr).toMatch(/ownershipConflict|rejectedFollowup|归属冲突/);
+    expect((await h.record()).children?.some((child: any) => child.threadId === G && child.turnIds.includes(gTurn)) ?? false).toBe(false);
+  } finally { await bounded(h.close(), 12_000); }
+}, 120_000);

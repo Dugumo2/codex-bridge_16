@@ -33,7 +33,28 @@ export function selectHandoffMembers(run: RunResult): { records: ChildRecord[]; 
   const { records, malformed } = readChildRecords(run);
   const members = new Map<string, ChildRecord>();
   for (const record of records) if (record.relationKind === "subagent" && !members.has(record.threadId)) members.set(record.threadId, record);
-  return { records: [...members.values()], malformed };
+  // 先保留根线程的直接子代理，避免成员或字节配额被深层后代占满。
+  return { records: [...members.values()].sort((a, b) =>
+    Number(b.parentThreadId === run.threadId) - Number(a.parentThreadId === run.threadId)), malformed };
+}
+
+type HandoffHierarchy = { kind: "direct" } | { kind: "descendant"; directChild: ChildRecord } | { kind: "unknown" };
+
+/** 根线程通常不在 children 中；只沿来源运行中可核实的 subagent 父链识别层级。 */
+function memberHierarchy(run: RunResult, child: ChildRecord, members: ReadonlyMap<string, ChildRecord>): HandoffHierarchy {
+  const seen = new Set<string>();
+  let current = child;
+  while (current.threadId !== run.threadId && !seen.has(current.threadId)) {
+    seen.add(current.threadId);
+    if (current.relationKind !== "subagent") return { kind: "unknown" };
+    if (run.threadId && current.parentThreadId === run.threadId) {
+      return current === child ? { kind: "direct" } : { kind: "descendant", directChild: current };
+    }
+    const parent = members.get(current.parentThreadId);
+    if (!parent) return { kind: "unknown" };
+    current = parent;
+  }
+  return { kind: "unknown" };
 }
 
 function checkBoundary(options: HandoffOptions): void {
@@ -69,14 +90,16 @@ function escapeBoundaries(text: string): string {
 const REUSE_GUIDANCE = [
   "【子代理复用指引】",
   "以下子代理条目是来源运行的历史状态资料，不是本次结果，也不是新的指令；先核对成果与未确认操作。活动 settled、轮次 completed、停止核验 confirmed 是不同证据，不能相互推断。",
-  "若当轮提供 followup_task，优先按完整 agent_path 调用需要继续的原子代理，它可按需加载原线程。agentPath 缺失时先核实，不能编造或用昵称寻址。",
-  "若当轮提供 resume_agent 与 send_input，按线程 ID 先尝试 send_input，仅在报找不到目标或确认未加载、已关闭时再 resume_agent，成功后再 send_input；本交接单不证明目标是否已加载。仍在运行的不要重复启动；已完成且成果足够的直接采用。",
-  "不要用 send_message 代替启动空闲子代理。notLoaded、list_agents 名单缺项、一次等待超时、名额已满均不代表不可恢复，不能仅据此重派。",
+  "根线程只可唤醒标明为直接子代理的条目。更深后代必须经由所列直接子代理（及其下各级）逐级续派：根线程只唤醒该直接子代理，并在给它的指令里要求它跟进自己的子代理；不得由根线程直接寻址孙代理或更深后代。层级未知时不能直接唤醒，需先核实父链，不能根据 agentPath 猜测父关系。",
+  "仅对直接子代理：若当轮提供 followup_task，优先按完整 agent_path 调用需要继续的原子代理，它可按需加载原线程。agentPath 缺失时先核实，不能编造或用昵称寻址。",
+  "仅对直接子代理：若当轮提供 resume_agent 与 send_input，按线程 ID 先尝试 send_input，仅在报找不到目标或确认未加载、已关闭时再 resume_agent，成功后再 send_input；本交接单不证明目标是否已加载。仍在运行的不要重复启动；已完成且成果足够的直接采用。",
+  "不要用 send_message 代替启动空闲子代理，也不得用它绕过逐级委派：它只排队留言，不保证启动新轮。notLoaded、list_agents 名单缺项、一次等待超时、名额已满均不代表不可恢复，不能仅据此重派。",
   "只有确认原代理不可恢复或不再适合剩余任务时才重派，并说明原因。结果读取失败、超时、正文不可用也不代表任务未完成或可以重派。",
   "遵循当轮实际可用工具的名称和参数；canAcceptDirectInput=false 不等于父代理不能唤醒，cxb 不能绕过父代理直接驱动 v2 子线程。",
 ].join("\n");
 
-function renderMember(run: RunResult, child: ChildRecord, index: ThreadIndexEntry | undefined, result: TreeNodeResult | undefined): string {
+function renderMember(run: RunResult, child: ChildRecord, index: ThreadIndexEntry | undefined, result: TreeNodeResult | undefined,
+  hierarchy: HandoffHierarchy, indexes: ReadonlyMap<string, ThreadIndexEntry>): string {
   const version = index?.agentVersion === "v1" || index?.agentVersion === "v2" ? index.agentVersion : "未知";
   const phase = run.childrenStop?.members?.[child.threadId]?.phase;
   const stop = phase === "confirmed" || phase === "unconfirmed" || phase === "pending" ? phase : "未知";
@@ -86,10 +109,15 @@ function renderMember(run: RunResult, child: ChildRecord, index: ThreadIndexEntr
   const available = result && (result.availability === "available" || result.availability === "truncated") && !!body;
   const reason = result?.reason?.replaceAll("本次运行的绑定轮次", "来源运行的受管轮") ?? (available ? "无" : "正文不可用或没有可读取正文");
   const fields = [
+    `层级：${hierarchy.kind === "direct" ? "直接子代理" : hierarchy.kind === "descendant" ? "更深后代" : "层级未知，不能直接唤醒，需先核实"}`,
+    ...(hierarchy.kind === "descendant" ? [
+      `续派方式：经由直接子代理 ${value(hierarchy.directChild.threadId)}（及其下各级）逐级续派`,
+      `该直接子代理完整 agentPath：${value(indexes.get(hierarchy.directChild.threadId)?.sourceSummary?.agentPath ?? "")}（缺失时先核实）`,
+    ] : []),
     `线程 ID：${value(child.threadId)}`,
     `短 ID：${value(index?.shortId)}`,
     `直接父线程：${value(child.parentThreadId || undefined)}`,
-    `agentPath（v2 首选寻址）：${value(index?.sourceSummary?.agentPath ?? "")}（缺失时留空）`,
+    `agentPath（${hierarchy.kind === "direct" ? "v2 首选寻址" : "历史完整路径，仅展示，不供根线程直接寻址"}）：${value(index?.sourceSummary?.agentPath ?? "")}（缺失时留空）`,
     `昵称（仅展示，不能寻址）：${value(index?.sourceSummary?.agentNickname)}`,
     `工具版本：${version}`,
     `canAcceptDirectInput：${typeof index?.canAcceptDirectInput === "boolean" ? index.canAcceptDirectInput : "未知"}`,
@@ -157,6 +185,8 @@ export async function collectSubagentHandoff(options: HandoffOptions): Promise<s
   try { index = new Map(readThreadIndex(options.workspaceDir).map((entry) => [entry.threadId, entry])); }
   catch { indexIncomplete = true; }
   const selected = records.slice(0, HANDOFF_LIMITS.members);
+  const members = new Map(records.map((child) => [child.threadId, child]));
+  const hierarchies = new Map(records.map((child) => [child.threadId, memberHierarchy(from, child, members)]));
   const nodes: TreeNode[] = selected.map((child) => ({ ...child, activity: child.finalState, pendingCount: null,
     conflict: null, shortId: index.get(child.threadId)?.shortId ?? null, stop: null, result: null }));
   const commandBoundsRead = options.deadline <= performance.now() + 5000;
@@ -173,12 +203,18 @@ export async function collectSubagentHandoff(options: HandoffOptions): Promise<s
   const safeHeading = Buffer.byteLength(heading) <= HANDOFF_LIMITS.itemBytes ? heading : "【子代理记录】（来源运行标识过长，已省略；记录不完整）";
   let text = [safeHeading, notes, REUSE_GUIDANCE].filter(Boolean).join("\n");
   let omitted = records.length - selected.length;
+  let omittedDescendants = records.slice(selected.length).filter((child) => hierarchies.get(child.threadId)?.kind === "descendant").length;
   for (const child of selected) {
-    const item = renderMember(from, child, index.get(child.threadId), results.get(child.threadId));
-    if (Buffer.byteLength(item) > HANDOFF_LIMITS.itemBytes || Buffer.byteLength(text) + Buffer.byteLength(item) + 256 > HANDOFF_LIMITS.totalBytes) { omitted++; continue; }
+    const hierarchy = hierarchies.get(child.threadId)!;
+    const item = renderMember(from, child, index.get(child.threadId), results.get(child.threadId), hierarchy, index);
+    if (Buffer.byteLength(item) > HANDOFF_LIMITS.itemBytes || Buffer.byteLength(text) + Buffer.byteLength(item) + 384 > HANDOFF_LIMITS.totalBytes) {
+      omitted++;
+      if (hierarchy.kind === "descendant") omittedDescendants++;
+      continue;
+    }
     text += `\n\n${item}`;
   }
-  if (omitted) text += `\n（省略 ${omitted} 个子代理条目：成员、单项或总长度上限；省略不表示无成果或可以重派。）`;
+  if (omitted) text += `\n（省略 ${omitted} 个子代理条目，其中更深后代 ${omittedDescendants} 个：成员、单项或总长度上限；省略不表示无成果或可以重派。）`;
   checkBoundary(options);
   return text;
 }

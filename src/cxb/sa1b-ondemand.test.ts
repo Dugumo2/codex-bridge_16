@@ -285,7 +285,7 @@ function baselineStopDiagnostics(stdout: string, args: string[], run: any): stri
  * 按新 CLI 的展示规则还原为「事件 摘要」，摘要为空时只留事件名；其余字节仍逐字比较。
  */
 function baselineStructuredLog(stdout: string): string {
-  const restore = (text: string) => text.replace(/ @cxb2 (\{.*\})$/gm, (_, payload: string) => {
+  const restore = (text: string) => text.replace(/ \t@cxb2 (\{.*\})$/gm, (_, payload: string) => {
     const { summary } = JSON.parse(payload);
     expect(summary).toBeString();
     return summary ? ` ${summary}` : "";
