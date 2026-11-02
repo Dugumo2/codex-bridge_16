@@ -171,4 +171,15 @@ describe("buildContinuePrompt：「丁＋」（S1-评审第 25 节）", () => {
     expect(text).toContain("run_gone");
     expect(text).toContain("可能不是最初的要求");
   });
+
+  test("交接单保留全部原节并置于进度之后；空交接单与旧调用完全一致", () => {
+    const input = { from, chain: { original, broken: false, missingRunId: null }, goal: null, supplement: null };
+    const plain = buildContinuePrompt(input);
+    const handoff = "【来源运行 run_z 的子代理记录】\n子线程资料";
+    const text = buildContinuePrompt({ ...input, subagentHandoff: handoff });
+    expect(text.replace(`\n\n${handoff}`, "")).toBe(plain);
+    expect(text.indexOf(handoff)).toBeGreaterThan(text.indexOf("【已有进度】"));
+    expect(text.indexOf(handoff)).toBeLessThan(text.indexOf("【怎么继续】"));
+    expect(buildContinuePrompt({ ...input, subagentHandoff: "" })).toBe(plain);
+  });
 });
