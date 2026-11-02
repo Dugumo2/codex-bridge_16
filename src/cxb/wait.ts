@@ -6,11 +6,15 @@ import { CxbError, EXIT, rpcFailure, type BrokerRpc, type InboxItem, type InboxW
 import { presentItem, safeLine } from "./inbox";
 import { commandSession } from "./command-session";
 import type { CommandContext, CommandHandler } from "./main";
-import { readRunRecord } from "./ledger";
+import { readRunRecord, readThreadIndex } from "./ledger";
 import { renderPending } from "./server-requests";
 import { resolveThreadViaBroker } from "./thread-ref";
 import { bounded, exitCodeForRun, waitRun } from "./wait-run";
 import { isUnconfirmedRun } from "./run-diagnostics";
+import { observeWaitTree } from "./wait-tree";
+import { readThreadResults } from "./thread-result-reader";
+import { treeResultText } from "./subagent-tree";
+import type { TreeSnapshot } from "./tree-contracts";
 
 const MAX_WAIT_MS = 86_400_000;
 
@@ -54,8 +58,9 @@ async function waitInbox(ctx: CommandContext, rpc: BrokerRpc, deadline: number, 
   }
 }
 
-async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSignal, deadline: number, id: string) {
-  const ref = await resolveThreadViaBroker(rpc, id);
+async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSignal, deadline: number, id: string, treeMode = false) {
+  const ref = await (treeMode ? bounded(resolveThreadViaBroker(rpc, id), Math.max(0, deadline - performance.now()), signal)
+    : resolveThreadViaBroker(rpc, id));
   const label = ref.shortId ?? ref.threadId.slice(0, 8);
   let superseded = false;
   let decided = false;
@@ -74,9 +79,15 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
       shortId: ref.shortId, event: "superseded", superseded: true });
     return EXIT.IDLE;
   };
-  let snapshot: { thread: ThreadSummary; run: RunResult | null; pending: InboxItem[]; revision?: number } & import("./sa1b-contracts").ConvergenceSummary | undefined;
+  let snapshot: { thread: ThreadSummary; run: RunResult | null; pending: InboxItem[]; revision?: number } & import("./sa1b-contracts").ConvergenceSummary & TreeSnapshot | undefined;
   let runId: string | null = null;
-  const convergence = observeConvergence(rpc, () => runId, (line) => ctx.out.notice(line));
+  const liveNotice = (line: string) => { if (!treeMode || !ctx.parsed.globals.json || ctx.parsed.globals.verbose) ctx.out.notice(line); };
+  const tree = treeMode ? observeWaitTree(rpc, { threadId: ref.threadId, shortId: ref.shortId, deadline, signal,
+    notice: liveNotice, shortIds: () => {
+      try { return new Map(readThreadIndex(ctx.workspace.workspaceDir).map((entry) => [entry.threadId, entry.shortId])); }
+      catch { return new Map(); }
+    } }) : undefined;
+  const convergence = observeConvergence(rpc, () => runId, liveNotice);
   const upstream = observeUpstreamErrors(convergence.rpc, () => runId, (line) => ctx.out.notice(line));
   const buffered: InboxItem[] = [];
   let found!: (items: InboxItem[]) => void;
@@ -85,6 +96,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   // 不能按快照时的 owner 过滤，否则等待途中由别的客户端交接给 broker 的事项会被漏掉。
   // 也不按 threadId 过滤：review 迁到子线程后，它的事项 threadId 是子线程（本连接会另行订阅子线程，见 followChild）。
   const accept = (item: InboxItem) => {
+    if (decided) return;
     if (item.runId === runId && item.kind !== "guardian") found([item]);
   };
   const off = rpc.on("broker/inbox/added", (raw) => {
@@ -99,6 +111,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   // 并检查子线程快照里仍未决的事项（覆盖迁移到订阅之间出现的事项）。
   const watchedChildren = new Set<string>();
   const followChild = (child: string | null | undefined) => {
+    if (decided) return;
     if (!child || child === ref.threadId || watchedChildren.has(child)) return;
     watchedChildren.add(child);
     rpc.request<{ pending: InboxItem[] }>("broker/threads/watch", { threadId: child }).then((view) => {
@@ -122,17 +135,23 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     const rendered = renderPending(items, { threadId: ref.threadId, shortId: label });
     ctx.out.result(rendered.text);
     for (const line of convergenceLines(convergence.fields(), items.length)) ctx.out.notice(line);
-    ctx.out.resultJson({ ...rendered.json as object, ...convergence.fields(), ...upstream.fields() });
+    ctx.out.resultJson({ ...rendered.json as object, ...convergence.fields(), ...upstream.fields(),
+      ...(tree ? { tree: tree.current(snapshot?.run) } : {}) });
     return EXIT.WAITING_RESPONSE;
   };
   try {
-    snapshot = await rpc.request("broker/threads/watch", { threadId: ref.threadId, exclusiveWaiter: true });
+    const initialWatch = rpc.request<NonNullable<typeof snapshot>>("broker/threads/watch", { threadId: ref.threadId, exclusiveWaiter: true });
+    snapshot = await (treeMode ? bounded(initialWatch, Math.max(0, deadline - performance.now()), signal) : initialWatch);
     if (superseded) return outputSuperseded();
     runId = snapshot!.run?.runId ?? snapshot!.thread.lastRunId;
     convergence.accept({ ...snapshot!.run, ...snapshot, runId: runId ?? undefined });
     if (snapshot!.run) snapshot!.run = upstream.apply(snapshot!.run);
     else upstream.refresh();
     if (!runId) throw new CxbError("NOT_FOUND", "线程没有运行记录", { id });
+    if (tree) {
+      const recorded = snapshot!.run ?? readRunRecord(ctx.workspace.workspaceDir, runId);
+      tree.initialize(runId, { ...snapshot, run: recorded }, recorded?.state === "ended" || recorded?.state === "lost");
+    }
     // 快照、缓冲、实时三处事项统一只认目标运行（终审讨论：别的运行的事项不能让 wait 误退 5）。
     const initial = snapshot!.pending.filter((i) => i.kind !== "guardian" && i.runId === runId);
     if (initial.length) return outputPending(initial);
@@ -153,26 +172,46 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     decided = true;
     const run = upstream.apply(winner.run);
     const code = exitCodeForRun(run);
+    // 树模式的等待裁决到此结束。补读与总等待分阶段，原始期限只限制补读预算。
+    // 观察器先冻结，迟到事项、接替、快照和正文回包都不能改变已选出口。
+    if (tree) {
+      if (code === EXIT.CODEX_FAILED) upstream.failure(run);
+      tree.dispose(); convergence.dispose(); upstream.dispose();
+    }
     if (isUnconfirmedRun(run)) {
       if (code === EXIT.CODEX_FAILED) upstream.failure(run);
       ctx.out.resultJson({ ok: false, command: "wait", waitFor: "thread", threadId: ref.threadId, shortId: ref.shortId,
         runId, state: run.state, status: run.status, stopOutcome: run.stopOutcome, interruptReason: run.interruptReason,
-        stopDiagnostics: null, ...convergenceFields(run), ...selectedResultFields(run), ...upstreamResultFields(run) });
+        stopDiagnostics: null, ...convergenceFields(run), ...selectedResultFields(run), ...upstreamResultFields(run),
+        ...(tree ? { tree: tree.current(run) } : {}) });
       return code;
     }
-    showSubagents(ctx, run);
+    showSubagents(ctx, run, treeMode ? { tree: true } : undefined);
     if (code === EXIT.CODEX_FAILED) {
       if (run.upstreamError || resultTurn(run)?.error != null) ctx.out.notice("Codex 执行失败，请用 cxb show 查看运行结果");
       upstream.failure(run);
     }
     ctx.out.result(resultTurn(run)?.output ?? "");
+    let finalTree = tree?.current(run, "terminal");
+    if (finalTree) {
+      const results = await readThreadResults(rpc, finalTree.nodes, { deadline, signal });
+      // 只读结果补充失败不改变父结果。取消仍由命令会话负责资源收束。
+      finalTree = { ...finalTree, nodes: finalTree.nodes.map((node) => ({ ...node, result: results.get(node.threadId) ?? node.result })) };
+      finalTree.outputCoverage = { total: 0, available: 0, truncated: 0, unavailable: 0, omitted: 0 };
+      for (const node of finalTree.nodes) if (node.relationKind === "subagent" && node.result) {
+        finalTree.outputCoverage.total++;
+        finalTree.outputCoverage[node.result.availability]++;
+      }
+      ctx.out.result(`\n${treeResultText(finalTree)}`);
+    }
     ctx.out.resultJson({ ok: code === EXIT.OK, command: "wait", waitFor: "thread", threadId: ref.threadId,
       shortId: ref.shortId, runId, status: run.status, result: resultTurn(run)?.output ?? "", alreadyDone, ...convergenceFields(run), ...selectedResultFields(run), ...upstreamResultFields(run),
       ...((run.subagentJoin || run.interruptReason === "stallTimeout" || run.interruptReason === "upstreamAccessError") && run.interruptReason ? { interruptReason: run.interruptReason } : {}),
       ...(run.loopGuard ? { loopGuard: run.loopGuard } : {}),
       // 子代理停止报告与中断原因（subagentsUnfinished 等）原样带出；没有子代理时字段缺省，旧输出不变。
       ...(run.backgroundCleanup ? { backgroundCleanup: run.backgroundCleanup } : {}),
-      ...(run.childrenStop ? { interruptReason: run.interruptReason, childrenStop: run.childrenStop } : {}) });
+      ...(run.childrenStop ? { interruptReason: run.interruptReason, childrenStop: run.childrenStop } : {}),
+      ...(finalTree ? { tree: finalTree } : {}) });
     return code;
   } catch (error) {
     if (!decided && superseded) return outputSuperseded();
@@ -180,7 +219,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     throw error;
   } finally {
     decided = true;
-    offSuperseded(); off(); offMoved(); convergence.dispose(); upstream.dispose(); signal.removeEventListener("abort", abort); controller.abort();
+    offSuperseded(); off(); offMoved(); tree?.dispose(); convergence.dispose(); upstream.dispose(); signal.removeEventListener("abort", abort); controller.abort();
     // 交接胜出时仍等取消收束，避免遗留 waitRun 的订阅和计时器。
     await running?.catch(() => undefined);
   }
@@ -195,6 +234,7 @@ export const wait: CommandHandler = async (ctx) => {
     const rpc = await bounded(scope.connect(), timeoutMs, scope.signal);
     const id = ctx.parsed.positional[0];
     if (!id || /^(ap_|qu_|mc_|gd_)/.test(id)) return await waitInbox(ctx, rpc, deadline, id);
+    if (ctx.parsed.options.tree) return await waitThread(ctx, rpc, scope.signal, deadline, id, true);
     return await bounded(waitThread(ctx, rpc, scope.signal, deadline, id), Math.max(0, deadline - performance.now()), scope.signal);
   } finally {
     scope.dispose();

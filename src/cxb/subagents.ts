@@ -81,7 +81,7 @@ export function unfinishedNotice(run: RunResult, label: string): string[] {
 }
 
 /** `show P`、`wait`：子代理数量、待答数、未确认的停止明细；因子代理未完成而中断时显示说明。 */
-export function showSubagents(ctx: CommandContext, run: RunResult): void {
+export function showSubagents(ctx: CommandContext, run: RunResult, options?: { tree?: boolean }): void {
   if (run.finalTurnId !== undefined && resultReady(run) === "unavailable") ctx.out.notice("最终结果不可用（unavailable）");
   for (const line of convergenceLines(run, pendingCount(ctx, run) ?? 0)) ctx.out.notice(line);
   if (run.backgroundCleanup && !run.childrenStop) for (const line of backgroundLines(run.threadId, run.backgroundCleanup)) ctx.out.notice(line);
@@ -89,7 +89,7 @@ export function showSubagents(ctx: CommandContext, run: RunResult): void {
   const report = run.childrenStop;
   if (!children.length && !report && run.interruptReason !== "subagentsUnfinished") return;
   const label = safe(run.shortId || run.threadId);
-  if (children.length) {
+  if (children.length && !options?.tree) {
     const pending = pendingCount(ctx, run);
     ctx.out.notice(`子代理 ${children.length} 个${pending === null ? "" : `，待答 ${pending} 项`}`);
   }
