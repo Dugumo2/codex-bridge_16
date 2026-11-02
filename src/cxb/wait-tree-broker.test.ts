@@ -43,6 +43,9 @@ async function terminalTree(h: Sa1bHarness) {
   const value = json(result);
   expect(value).toMatchObject({ ok: true, command: "wait", runId: h.runId, status: "completed", alreadyDone: true });
   expect(value.tree).toMatchObject({ rootThreadId: ROOT, view: "terminal", resultScope: "latestBoundTurnPerThread" });
+  expect(value.tree.stale).toBeUndefined();
+  expect(value.tree.source).toBe("runRecord");
+  expect(value.tree.revision).toBeNull();
   const calls = (await h.state()).calls.slice(before);
   expect(calls.filter((call: any) => ["thread/resume", "turn/start", "turn/steer"].includes(call.method))).toEqual([]);
   return { value, calls, result };

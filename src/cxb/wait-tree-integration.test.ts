@@ -11,6 +11,8 @@ afterEach(cleanupContexts);
 const child = { threadId: "child", parentThreadId: "thread-test", relationKind: "subagent" as const,
   turnIds: ["child-turn"], evidence: "v2Started" as const, finalState: "settled" as const };
 const ended = (patch: Partial<RunResult> = {}) => runResult({ children: [child], ...patch });
+const released = () => ended({ finalTurnId: "turn-test", subagentJoin: { phase: "released", wakeupsStarted: 1, wakeupAttempts: 1, startRetriesUsed: 0,
+  workEpoch: 2, deliveredEpoch: 2, reconciledEpoch: 2, deadlineAt: 1000 } });
 const children = { members: [{ ...child, activity: "settled", pendingCount: 0, conflict: null }],
   discovery: { complete: true, version: 1, incompleteReasons: [] }, inFlightSpawns: 0, stop: null };
 const view = (run = ended()) => ({ thread: thread(), run, pending: [], revision: 1, children });
@@ -274,7 +276,7 @@ for (const alreadyDone of [false, true]) test(`真实停止摘要与完整报告
 });
 
 for (const inFlight of [false, true]) for (const json of [false, true]) {
-  test(`变化尚未补齐时父运行结束：${inFlight ? "快照在途" : "合并窗口"}，${json ? "JSON" : "文本"}标陈旧`, async () => {
+  test(`完整终态不沿用在线陈旧标记：${inFlight ? "快照在途" : "合并窗口"}，${json ? "JSON" : "文本"}`, async () => {
     const c = context(["wait", "abcd1234", "--tree", ...(json ? ["--json"] : [])]), output = wire(c);
     const watching = gate<void>(), refreshing = gate<void>(), reply = gate<unknown>();
     const originalSet = globalThis.setTimeout;
@@ -301,12 +303,15 @@ for (const inFlight of [false, true]) for (const json of [false, true]) {
       c.fake.emit("broker/run/childChanged", { runId: "run-test", rootThreadId: "thread-test", threadId: null, revision: 2 });
       expect(release).toBeDefined();
       if (inFlight) { release!(); await refreshing.wait(); }
-      c.fake.emit("broker/run/ended", { run: ended() });
+      c.fake.emit("broker/run/ended", { run: released() });
       expect(await watchdog(work)).toBe(0); await c.ctx.out.flush();
-      if (json) expect(JSON.parse(output.stdout)).toMatchObject({ result: "中文结果", tree: { view: "terminal", revision: 2,
-        stale: true, inFlightSpawns: null, discovery: null, nodes: [{ threadId: "child" }] } });
+      if (json) {
+        expect(JSON.parse(output.stdout)).toMatchObject({ result: "中文结果", tree: { view: "terminal", source: "runRecord", revision: null,
+          inFlightSpawns: null, discovery: null, nodes: [{ threadId: "child", pendingCount: null }] } });
+        expect(JSON.parse(output.stdout).tree.stale).toBeUndefined();
+      }
       else {
-        expect(output.stdout).toContain("树信息可能陈旧");
+        expect(output.stdout).not.toContain("树信息可能陈旧");
         expect(output.stdout).not.toContain("在途派生 1 个");
       }
       const before = output.stdout;
@@ -320,3 +325,49 @@ for (const inFlight of [false, true]) for (const json of [false, true]) {
     }
   });
 }
+
+for (const json of [false, true]) test(`释放后 watch revision 回落0，再收到 ended：${json ? "JSON" : "文本"}终态不报陈旧`, async () => {
+  const c = context(["wait", "abcd1234", "--tree", ...(json ? ["--json"] : [])]), output = wire(c);
+  const watching = gate<void>(), refreshed = gate<void>();
+  const originalSet = globalThis.setTimeout;
+  let timer: ReturnType<typeof setTimeout> | undefined, release: (() => void) | undefined;
+  const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+    if (ms !== 200) return originalSet(callback, ms, ...args);
+    timer = originalSet(() => {}, 60_000);
+    release = () => { clearTimeout(timer); callback(...args); };
+    return timer;
+  }) as typeof setTimeout);
+  handle(c); const original = c.fake.handle;
+  let watches = 0;
+  c.fake.handle = (method, params) => {
+    if (method !== "broker/threads/watch") return original(method, params);
+    watches++;
+    if (watches === 2) watching.resolve();
+    if (watches > 2) {
+      refreshed.resolve();
+      return { ...view(released()), revision: 0, children: { members: [], discovery: null, inFlightSpawns: 0, stop: null } };
+    }
+    return { ...view(ended({ state: "running", status: null })), revision: 10,
+      children: { ...children, discovery: { complete: false, version: 3, incompleteReasons: ["早期发现未完成"] } } };
+  };
+  const work = wait(c.ctx);
+  try {
+    await watching.wait();
+    c.fake.emit("broker/run/childChanged", { runId: "run-test", rootThreadId: "thread-test", threadId: null, revision: 12 });
+    expect(release).toBeDefined(); release!(); await refreshed.wait();
+    await messageBarrier(() => [c.fake.calls.length]);
+    c.fake.emit("broker/run/ended", { run: released() });
+    expect(await watchdog(work)).toBe(0); await c.ctx.out.flush();
+    if (json) {
+      const result = JSON.parse(output.stdout);
+      expect(result.tree.stale).toBeUndefined();
+      expect(result.tree).toMatchObject({ source: "runRecord", revision: null, discovery: null, inFlightSpawns: null,
+        nodes: [{ threadId: "child", result: { turnId: "child-turn", output: "子结果" } }] });
+    } else {
+      expect(output.stdout).not.toContain("树信息可能陈旧");
+      expect(output.stdout).not.toContain("早期发现未完成");
+      expect(output.stdout).toContain("子结果");
+    }
+    expect(watches).toBe(3); c.checkClean();
+  } finally { await c.cancel(); await work.catch(() => undefined); clearTimeout(timer); timerSpy.mockRestore(); }
+});

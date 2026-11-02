@@ -30,14 +30,38 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
   const controller = new AbortController();
   const abort = () => dispose();
 
+  /** 终态成员来自账本；释放后的在线 revision 不再是这份记录的新鲜度依据。 */
+  const terminalRecordReady = (run: RunResult | null | undefined): run is RunResult => {
+    if (!run || run.runId !== runId || run.state !== "ended" || !Array.isArray(run.children)) return false;
+    const recorded = new Set(run.children.filter((child) => child.relationKind === "subagent").map((child) => child.threadId));
+    // 通知中有成员但账本尚未保存时，不能借 released 把缺失事实隐藏掉。
+    if (snapshot.children?.members.some((child) => child.relationKind === "subagent" && !recorded.has(child.threadId))) return false;
+    const report = run.childrenStop;
+    if ((stopVersion >= 0 || run.stopOutcome != null) && (!report || report.version < stopVersion)) return false;
+    if (report?.discovery.complete === false) return false;
+    // released 由 broker 在发现完整且成员落定后写入；不据此伪造已丢弃的发现版本和在途数量。
+    const released = run.status === "completed" && run.subagentJoin?.phase === "released" && !run.subagentJoin.terminalReason
+      && run.children.every((child) => child.relationKind !== "subagent" || child.finalState === "settled");
+    return released || report?.discovery.complete === true;
+  };
   const current = (run?: RunResult | null, view: TreeView["view"] = "partial"): TreeView => {
-    const tree = buildTree({ rootThreadId: options.threadId, snapshot, run, view, stale,
+    if (view === "terminal" && terminalRecordReady(run)) {
+      // 不混入旧 pendingCount、冲突、发现状态或在途数量；正文仍按账本绑定集合独立补读。
+      return buildTree({ rootThreadId: options.threadId, run, view, shortIds: options.shortIds?.() });
+    }
+    const stopMissing = view === "terminal" && (stopVersion >= 0 || run?.stopOutcome != null)
+      && (!run?.childrenStop || run.childrenStop.version < stopVersion);
+    const viewStale = stale || stopMissing;
+    const tree = buildTree({ rootThreadId: options.threadId, snapshot, run, view, stale: viewStale,
       shortIds: options.shortIds?.() });
     tree.revision = revision < 0 ? null : revision;
     tree.stopVersion = Math.max(stopVersion, tree.stopVersion ?? -1);
     if (tree.stopVersion < 0) tree.stopVersion = null;
     // 成员通知没有全局数量；尚未补齐时只保留成员事实，不把缓存数量当终态证据。
-    if (stale) { tree.discovery = null; tree.inFlightSpawns = null; }
+    if (viewStale) {
+      tree.discovery = view === "terminal" ? run?.childrenStop?.discovery ?? null : null;
+      tree.inFlightSpawns = null;
+    }
     return tree;
   };
   const display = () => {

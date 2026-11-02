@@ -1,6 +1,7 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { observeWaitTree } from "./wait-tree";
-import type { ChildChanged, ChildrenStopReport } from "./contracts";
+import type { ChildChanged, ChildrenStopReport, RunResult } from "./contracts";
+import { treeResultText } from "./subagent-tree";
 import type { TreeSnapshot, WatchTreeMember } from "./tree-contracts";
 import { FakeRpc, runResult } from "./test-fixtures/run-fakes";
 import { gate } from "./test-fixtures/n4b-support";
@@ -144,4 +145,57 @@ test("取消信号释放监听和计时器；无变化不轮询；早已完成�
   await watchdog(messageBarrier(() => [fake.calls.length]));
   expect(lines).toEqual([]); expect(fake.calls).toEqual([]);
   controller.abort(); expect(fake.subscriptions).toBe(0);
+});
+
+const terminal = (patch: Partial<RunResult> = {}) => runResult({ finalTurnId: "turn-test", children: [{ threadId: "child", parentThreadId: "thread-test",
+  relationKind: "subagent", turnIds: ["t"], evidence: "v2Started", finalState: "settled" }],
+  subagentJoin: { phase: "released", workEpoch: 2, deliveredEpoch: 2, reconciledEpoch: 2, wakeupsStarted: 1,
+    wakeupAttempts: 1, startRetriesUsed: 0, deadlineAt: 1000 }, ...patch });
+const stopReport = (): ChildrenStopReport => ({ trigger: "userStop", phase: "unconfirmed", version: 5,
+  root: { thread: "thread-test", phase: "confirmed", check: { ownership: true, turnEnded: true, goalBraked: true, settled: true, verifyDone: true },
+    clearRequested: false, clearConfirmed: false, error: null }, stopped: [], unconfirmed: ["child"], failed: [], conflicts: [], capabilityLimited: [],
+  discovery: { complete: true, version: 2, incompleteReasons: [] }, unsettledSpawns: 0 });
+
+test("partial仍标陈旧；完整释放记录只在terminal投影时取代在线缓存", () => {
+  const c = setup(); c.observer.initialize("run-test", snapshot());
+  c.fake.emit("broker/run/childChanged", event({ revision: 8, pendingCount: 3 }));
+  expect(c.observer.current(terminal(), "partial")).toMatchObject({ stale: true, discovery: null, inFlightSpawns: null });
+  const tree = c.observer.current(terminal(), "terminal");
+  expect(tree.stale).toBeUndefined();
+  expect(tree).toMatchObject({ source: "runRecord", revision: null, discovery: null, inFlightSpawns: null, nodes: [{ pendingCount: null, activity: "settled" }] });
+  // 终态投影不能改写观察器，之后的 partial 仍保留版本落后的事实。
+  expect(c.observer.current().stale).toBe(true);
+});
+
+test("停止报告必须追上已见版本；完整报告可以保留未确认风险而不误报缓存陈旧", () => {
+  const c = setup(); c.observer.initialize("run-test", snapshot());
+  c.fake.emit("broker/run/childChanged", event({ revision: 8, threadId: null, stopVersion: 5, stopPhase: "unconfirmed" }));
+  expect(c.observer.current(terminal(), "terminal").stale).toBe(true);
+  expect(c.observer.current(terminal({ childrenStop: { ...stopReport(), version: 4 } }), "terminal").stale).toBe(true);
+  const tree = c.observer.current(terminal({ status: "interrupted", subagentJoin: undefined,
+    stopOutcome: "unconfirmed", childrenStop: stopReport() }), "terminal");
+  expect(tree.stale).toBeUndefined();
+  expect(tree.stopVersion).toBe(5);
+  expect(treeResultText(tree)).toContain("尚未确认停下");
+});
+
+test("alreadyDone仅有停止摘要而缺完整报告，仍明确标记陈旧", () => {
+  const c = setup(), initial = snapshot(0);
+  initial.run = terminal();
+  initial.children!.stop = { phase: "unconfirmed", version: 5, unconfirmed: 1, conflicts: 0 };
+  c.observer.initialize("run-test", initial, true);
+  expect(c.observer.current(terminal(), "terminal").stale).toBe(true);
+});
+
+test("终态发现不完整或缺少已观察成员，不能借released隐藏缺失事实", () => {
+  const c = setup(); c.observer.initialize("run-test", snapshot());
+  c.fake.emit("broker/run/childChanged", event({ revision: 8 }));
+  const tree = c.observer.current(terminal({ childrenStop: { ...stopReport(),
+    discovery: { complete: false, version: 9, incompleteReasons: ["仍缺成员证据"] } } }), "terminal");
+  expect(tree.stale).toBe(true);
+  expect(tree.discovery?.complete).toBe(false);
+  expect(treeResultText(tree)).toContain("子代理发现不完整：仍缺成员证据");
+  expect(c.observer.current(terminal({ children: [] }), "terminal").stale).toBe(true);
+  expect(c.observer.current(terminal({ state: "running" }), "terminal").stale).toBe(true);
+  expect(c.observer.current(terminal({ subagentJoin: undefined }), "terminal").stale).toBe(true);
 });
