@@ -286,10 +286,7 @@ describe("工作区与 broker 连接联调（N1）", () => {
     expect(readFileSync(registry, "utf8").trim()).not.toBe("");
   }, TEST_LIMIT_MS);
 
-  test("注入处理器经 runCli 完成解析、迁移、真连接、health、清理与 finish 后自然退出", async () => {
-    const legacy = join(env.USERPROFILE!, ".cxb-legacy");
-    mkdirSync(legacy);
-    writeFileSync(join(legacy, "config.json"), JSON.stringify({ model: "mock-model" }));
+  test("注入处理器经 runCli 完成解析、真连接、health、清理与 finish 后自然退出", async () => {
     const ws = resolveWorkspace(root, env);
     try {
       const result = await processes.run(process.execPath, [join(import.meta.dir, "test-fixtures/main-smoke.ts")], {
@@ -299,8 +296,6 @@ describe("工作区与 broker 连接联调（N1）", () => {
       expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, command: "doctor", key: ws.key, launched: true });
       expect(JSON.parse(result.stdout).health).toBeObject();
       expect(result.stderr).toContain("入口清理与 finish 已完成");
-      expect(JSON.parse(readFileSync(join(ws.dataRoot, "config.json"), "utf8"))).toEqual({ model: "mock-model" });
-      expect(existsSync(join(ws.dataRoot, "migrated-from-cxb.json"))).toBe(true);
       expect(alive(readBrokerJson(ws.workspaceDir).pid)).toBe(true);
     } finally {
       // CLI 只关连接；测试负责关闭仍在运行的 broker，不靠它的 idle 超时结束。

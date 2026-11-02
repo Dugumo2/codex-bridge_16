@@ -116,20 +116,6 @@ export interface WorkspaceInfo {
 /** 解析工作区。`dir` 不存在或不是目录时抛 CxbError("USAGE")；git 不可用按「不是仓库」处理。 */
 export type ResolveWorkspace = (dir: string, env?: NodeJS.ProcessEnv) => WorkspaceInfo;
 
-/** 旧数据迁移的结果（拍板 H：只迁 config.json 的有效键与用户模板，不碰旧文件，写已迁移标记）。 */
-export interface MigrationReport {
-  /** 本次是否做了迁移（已有标记、没有旧目录时为 false）。 */
-  migrated: boolean;
-  /** 迁入的配置键。 */
-  configKeys: string[];
-  /** 丢弃的旧配置键（peer 系等已删除的键），供 `-v` 提示。 */
-  droppedKeys: string[];
-  /** 复制的用户模板文件名。 */
-  templates: string[];
-  /** 未迁移的原因或告警（不阻断命令）。 */
-  warnings: string[];
-}
-
 // ─── broker 连接（详细设计 2.2 节；broker-conn.ts 实现）────────────────────────
 
 /** CLI 期望的 broker 协议版本；与 Rust core::PROTOCOL_VERSION 一致。 */
