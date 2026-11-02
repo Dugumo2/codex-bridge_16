@@ -1,7 +1,7 @@
 // src/cxb/lifecycle.ts — 线程归档、永久删除的待核实状态在 CLI 上的展示与提示（任务说明 N7-A 2.3、5.5 节）。
 // broker 是唯一判定者：这里只把它给出的记录和错误原因翻成用户看得懂的状态与下一步命令。
 
-import { sanitizeForTerminal } from "../questions";
+import { sanitizeForTerminal } from "./terminal-text";
 import { CxbError, rpcData, type LifecycleInfo } from "./contracts";
 
 const COMMITTING = new Set(["committing", "upstreamDone", "draining"]);

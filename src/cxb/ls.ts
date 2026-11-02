@@ -1,4 +1,4 @@
-import { sanitizeForTerminal } from "../questions";
+import { sanitizeForTerminal } from "./terminal-text";
 import { CxbError, type BrokerRpc, type LifecycleInfo, type RunResult, type RunModelSummary, type ThreadSummary } from "./contracts";
 import { readAllRuns, readLifecycle, readPendingInbox, readThreadIndex, type ThreadIndexEntry } from "./ledger";
 import { modelLabel, threadModelDisplay, type ModelDisplay } from "./show-model";

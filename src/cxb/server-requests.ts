@@ -1,6 +1,6 @@
 // 服务端请求策略、托管交接与待答摘要（S4 N2 乙路）。
 import { describeGuardianAction } from "../guardian";
-import { questionSummary, sanitizeForTerminal } from "../questions";
+import { questionSummary, sanitizeForTerminal } from "./terminal-text";
 import { NO_RESPONSE } from "../rpc";
 import {
   CxbError, rpcFailure, type AttachServerRequests, type DecidePolicy, type ErrorCode,

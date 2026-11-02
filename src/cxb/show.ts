@@ -1,5 +1,5 @@
 import { childEntry, showChildThread, showSubagents } from "./subagents";
-import { sanitizeForTerminal } from "../questions";
+import { sanitizeForTerminal } from "./terminal-text";
 import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type RunModelSummary, type ThreadSummary, type TurnResult } from "./contracts";
 import { readAllRuns, readRunLog, readThreadIndex, listThreadRuns, type LogLine } from "./ledger";
 import { modelLabel, rerouteLabel, runModelDisplay, threadModelDisplay, type ModelDisplay } from "./show-model";
