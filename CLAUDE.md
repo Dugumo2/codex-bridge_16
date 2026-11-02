@@ -28,8 +28,9 @@ pwsh -File install.ps1 -Prefix <目录>    # 打包安装到并行目录试用
 | `src/cxb/show.ts`、`ls.ts`、`rm.ts`、`inbox.ts`、`reply.ts`、`wait.ts`、`stop.ts` | 其余命令；`command-session.ts` 是它们共用的请求包装与退出码归类 |
 | `src/cxb/server-requests.ts`、`preflight.ts` | 服务端请求（审批、提问、MCP、Guardian）的处理与交接；审批预检 |
 | `src/cxb/ledger.ts`、`thread-ref.ts`、`wait-run.ts`、`stop-thread.ts` | 本地账本只读、线程 ID 解析、等待运行结果、停止 |
-| `src/cxb/workspace.ts`、`config-schema.ts` | 工作区键与数据根、旧数据迁移、持久配置键表 |
-| `src/config.ts`、`rpc.ts`、`types.ts`、`models.ts`、`questions.ts`、`guardian.ts`、`git.ts` | 复用的底层模块（常量与模板、JSON-RPC 端点、协议类型、模型选择、提问答案编码与终端清洗、Guardian 映射、git） |
+| `src/cxb/workspace.ts`、`config-schema.ts` | 工作区键与数据根、持久配置键表 |
+| `src/cxb/terminal-text.ts` | 终端输出清洗与提问摘要 |
+| `src/config.ts`、`rpc.ts`、`types.ts`、`models.ts`、`guardian.ts`、`git.ts` | 复用的底层模块（常量与模板、JSON-RPC 端点、协议类型、模型选择、Guardian 映射、git） |
 | `broker-rs/` | Rust broker：认领与运行账本、inbox、停止、刹车、存储、app-server 接入 |
 | `src/test-support/broker-harness.ts`、`src/cxb/test-fixtures/` | 测试夹具（拉起真实 broker、模拟 codex） |
 | `src/prompts/*.md` | 内置模板 |

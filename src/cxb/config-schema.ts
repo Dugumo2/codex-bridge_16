@@ -1,5 +1,5 @@
 // src/cxb/config-schema.ts — cxb 持久配置键表（命令面规格 3.11 节）：命令行字符串与存储值分别校验；
-// 参数解析（args.ts）、旧数据迁移与 N5 的 config 命令共用这一份。
+// 参数解析（args.ts）与 N5 的 config 命令共用这一份。
 
 import { config } from "../config";
 import { CxbError } from "./contracts";
@@ -54,7 +54,7 @@ function secondsOrZero(max: number): ConfigKeySpec {
     Number, (value) => /^\d+$/.test(value));
 }
 
-/** cxb 的持久配置白名单；迁移与后续 config 命令共用。秒数在存储时不转为毫秒。 */
+/** cxb 的持久配置白名单；参数解析与 config 命令共用。秒数在存储时不转为毫秒。 */
 export const CONFIG_SCHEMA = Object.freeze({
   model: spec("非空模型名（字母、数字及 . _ - / : [ ]）",
     (value) => typeof value === "string" && /^[a-zA-Z0-9._\-/:\[\]]+$/.test(value)),

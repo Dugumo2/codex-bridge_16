@@ -123,6 +123,17 @@ describe("loadTemplateWithMeta", () => {
     expect(body).toBe("Template body {{PROMPT}}");
   });
 
+  test("内置 plan-review 模板：只读沙箱、带 {{PROMPT}}、元数据不进正文", () => {
+    const { meta, body } = loadTemplateWithMeta("plan-review", join(import.meta.dir, "prompts"));
+    expect(meta.name).toBe("plan-review");
+    expect(meta.description).toContain("implementation plan");
+    expect(meta.sandbox).toBe("read-only");
+    expect(body).toContain("{{PROMPT}}");
+    expect(body).toContain("implementation plan");
+    expect(body).not.toContain("---");
+    expect(body).not.toContain("sandbox:");
+  });
+
 });
 
 // ─── parseTemplateFrontmatter ───────────────────────────────────────────────

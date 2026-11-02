@@ -4,7 +4,7 @@ export type * from "./sa1b-contracts";
 // src/cxb/contracts.ts — cxb CLI 各模块之间的接口约定（S4 N1）。
 //
 // 这里只放各路共用的常量、类型与错误类；实现分别在：
-//   workspace.ts（工作区、数据目录、旧数据迁移，拍板 G、H）
+//   workspace.ts（工作区、数据目录，拍板 G）
 //   broker-conn.ts（broker 可执行文件查找、拉起、连接与版本握手，详细设计 2.2 节）
 //   args.ts（参数解析与命令选项表，命令面规格 2.1、2.2 节）
 //   output.ts（stdout/stderr 纪律、JSON 错误对象、退出前 flush，命令面规格 2.4、6.3 节）

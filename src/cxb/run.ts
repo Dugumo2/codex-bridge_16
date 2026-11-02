@@ -603,7 +603,7 @@ export function createRunHandler(deps: ServerRequestDeps): CommandHandler {
     const name = ctx.parsed.options.template;
     if (name) {
       try {
-        // 优先使用 N1 迁入的新目录；内置模板仍复用既有解析器。
+        // 数据根下的用户模板优先于同名内置模板。
         const userDir = join(ctx.workspace.dataRoot, "templates");
         const builtinDir = builtinTemplatesDir();
         const { body, meta } = loadTemplateWithMeta(name, existsSync(join(userDir, `${name}.md`)) ? userDir : builtinDir);
