@@ -1,7 +1,7 @@
 // src/guardian.test.ts — Guardian denial persistence + override-event mapping
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -69,7 +69,7 @@ describe("saveGuardianDenial / listGuardianDenials", () => {
 
   test("skips corrupt files", () => {
     saveGuardianDenial(dir, deniedNotification());
-    Bun.spawnSync(["sh", "-c", `echo garbage > "${join(dir, "broken.json")}"`], { windowsHide: true });
+    writeFileSync(join(dir, "broken.json"), "garbage\n");
     expect(listGuardianDenials(dir)).toHaveLength(1);
   });
 });
