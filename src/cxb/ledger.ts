@@ -299,9 +299,12 @@ function parseLog(text: string, label: string): LogLine[] {
       throw new CxbError("LOCAL_ERROR", `${label}有损坏的行`);
     }
     let source: TreeLogPayload | undefined;
-    if (/^@cxb2(?:\s|$)/.test(content)) {
+    // 旧 writer 会移除正文的所有控制字符，只有实际 TAB 前缀才能无歧义地区分新格式。
+    // 候选版裸 @cxb2 行保留为旧正文，不能据其内容恢复结构来源。
+    if (/^\t@cxb2(?:\s|$)/.test(content)) {
       try {
-        const value: unknown = JSON.parse(content.slice(6));
+        if (!content.startsWith("\t@cxb2 ")) throw new Error("结构化日志边界损坏");
+        const value: unknown = JSON.parse(content.slice(7));
         const nullable = (v: unknown) => v === null || typeof v === "string";
         if (!isObject(value) || !["eventId", "rootThreadId", "threadId"].every((key) => typeof value[key] === "string" && value[key] !== "")
           || !["parentThreadId", "shortId", "turnId", "itemId"].every((key) => nullable(value[key]))

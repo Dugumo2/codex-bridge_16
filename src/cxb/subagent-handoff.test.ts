@@ -120,6 +120,83 @@ describe("子代理身份与复用指导", () => {
 });
 
 describe("来源运行、成员范围与旧数据", () => {
+  test("根线程缺席 children 时按父链区分直接子代理、孙代理与更深后代", async () => {
+    const dir = workspace();
+    const records = [child({ threadId: "G", parentThreadId: "C1" }), child({ threadId: "GG", parentThreadId: "G" }),
+      child({ threadId: "C2" }), child({ threadId: "C1" })];
+    writeIndex(dir, records.map((record) => ({ threadId: record.threadId,
+      sourceSummary: { agentPath: `/root/${record.threadId === "G" ? "C1/G" : record.threadId === "GG" ? "C1/G/GG" : record.threadId}` } })));
+    const text = await collect(dir, run({ children: records }));
+    const entries = text.split("【子代理条目】").slice(1);
+    for (const id of ["C1", "C2"]) {
+      const entry = entries.find((item) => item.includes(`线程 ID："${id}"`))!;
+      expect(entry).toContain("层级：直接子代理");
+      expect(entry).toContain(`agentPath（v2 首选寻址）："/root/${id}"`);
+    }
+    for (const id of ["G", "GG"]) {
+      const entry = entries.find((item) => item.includes(`线程 ID："${id}"`))!;
+      expect(entry).toContain("层级：更深后代");
+      expect(entry).toContain('续派方式：经由直接子代理 "C1"（及其下各级）逐级续派');
+      expect(entry).toContain('该直接子代理完整 agentPath："/root/C1"');
+      expect(entry).not.toContain("agentPath（v2 首选寻址）");
+    }
+    expect(text).toContain("仅对直接子代理：若当轮提供 followup_task");
+    expect(text).toContain("仅对直接子代理：若当轮提供 resume_agent 与 send_input");
+    expect(text).toContain("并在给它的指令里要求它跟进自己的子代理");
+    expect(text).toContain("也不得用它绕过逐级委派：它只排队留言，不保证启动新轮");
+  });
+
+  test("父链缺失即使 agentPath 像孙代理也保持层级未知", async () => {
+    const dir = workspace();
+    writeIndex(dir, [{ threadId: "C1", sourceSummary: { agentPath: "/root/C1" } },
+      { threadId: "G", parentThreadId: "C1", sourceSummary: { agentPath: "/root/C1/G" } }]);
+    const text = await collect(dir, run({ children: [child({ threadId: "C1" }), child({ threadId: "G", parentThreadId: "missing" })] }));
+    const entry = text.split("【子代理条目】").find((item) => item.includes('线程 ID："G"'))!;
+    expect(entry).toContain("层级：层级未知，不能直接唤醒，需先核实");
+    expect(entry).toContain('agentPath（历史完整路径，仅展示，不供根线程直接寻址）："/root/C1/G"');
+    expect(entry).not.toContain("续派方式：经由直接子代理");
+    expect(entry).not.toContain("v2 首选寻址");
+  });
+
+  test("同一线程的父关系冲突时降级为层级未知", async () => {
+    const dir = workspace();
+    const records = [child({ threadId: "C1" }), child({ threadId: "C2" }),
+      child({ threadId: "G", parentThreadId: "C1" }), child({ threadId: "G", parentThreadId: "C2" })];
+    const text = await collect(dir, run({ children: records }));
+    const entry = text.split("【子代理条目】").find((item) => item.includes('线程 ID："G"'))!;
+    expect(entry).toContain("层级：层级未知，不能直接唤醒，需先核实");
+    expect(entry).not.toContain("续派方式：经由直接子代理");
+    expect(entry).not.toContain("v2 首选寻址");
+  });
+
+  test("父链循环、自环与非子代理父关系均降级未知", async () => {
+    const records = [child({ threadId: "cycle-a", parentThreadId: "cycle-b" }), child({ threadId: "cycle-b", parentThreadId: "cycle-a" }),
+      child({ threadId: "self", parentThreadId: "self" }), child({ threadId: "fork", relationKind: "fork" }),
+      child({ threadId: "fork-child", parentThreadId: "fork" }), child({ threadId: "root", parentThreadId: "root" })];
+    const text = await collect(workspace(), run({ children: records }));
+    const entries = text.split("【子代理条目】").slice(1);
+    expect(entries).toHaveLength(5);
+    for (const entry of entries) {
+      expect(entry).toContain("层级：层级未知，不能直接唤醒，需先核实");
+      expect(entry).not.toContain("续派方式：经由直接子代理");
+    }
+  });
+
+  test("成员及总字节配额优先保留直接子代理，并汇总被省略后代", async () => {
+    const records = [...Array.from({ length: 40 }, (_, i) => child({ threadId: `G-${i}`, parentThreadId: "C1" })),
+      child({ threadId: "C1" }), child({ threadId: "C2" })];
+    const fake = broker("长结果".repeat(1000));
+    const text = await collect(workspace(), run({ children: records }), fake);
+    expect(text).toContain('线程 ID："C1"');
+    expect(text).toContain('线程 ID："C2"');
+    expect(text.indexOf('线程 ID："C1"')).toBeLessThan(text.indexOf('线程 ID："G-0"'));
+    expect(fake.calls.filter((call) => call.method === "thread/turns/list").slice(0, 2).map((call) => call.params.threadId)).toEqual(["C1", "C2"]);
+    const omission = text.match(/省略 (\d+) 个子代理条目，其中更深后代 (\d+) 个/);
+    expect(omission).not.toBeNull();
+    expect(omission![1]).toBe(omission![2]);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(HANDOFF_LIMITS.totalBytes);
+  });
+
   test("普通 resume 没有历史目录时无交接单且不发请求", async () => {
     const fake = broker();
     const text = await collectSubagentHandoff({ workspaceDir: workspace(), threadId: "root", rpc: fake.rpc, deadline: performance.now() + 5000 });

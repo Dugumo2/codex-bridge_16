@@ -107,8 +107,10 @@ fn logs(actions: &[Action]) -> Vec<(String, String, String, Value)> {
                         short_id.clone(),
                         fields[1].into(),
                         fields[2].into(),
-                        serde_json::from_str(fields[3].strip_prefix("@cxb2 ").expect("结构化标记"))
-                            .expect("完整 JSON"),
+                        serde_json::from_str(
+                            fields[3].strip_prefix("\t@cxb2 ").expect("结构化标记"),
+                        )
+                        .expect("完整 JSON"),
                     )
                 })
                 .collect(),
@@ -121,6 +123,27 @@ fn item(thread: &str, turn: &str) -> Option<Value> {
     Some(
         json!({"threadId":thread,"turnId":turn,"item":{"id":"same-item","type":"agentMessage","text":"同毫秒同正文"}}),
     )
+}
+
+#[test]
+fn tree_log_实际tab边界与正文标志不会混淆() {
+    let mut m = setup();
+    let mut actions = vec![];
+    m.runs.log(
+        "run-a",
+        1000,
+        "轮次开始",
+        "@cxb2 正文\t控制字符\n仍是摘要",
+        &mut actions,
+    );
+    let lines = logs(&actions);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].3["summary"], "@cxb2 正文 控制字符 仍是摘要");
+    let Action::Store(StoreOp::AppendLog { lines, .. }) = &actions[0] else {
+        panic!("应写入日志");
+    };
+    assert_eq!(lines[0].chars().filter(|c| *c == '\t').count(), 1);
+    assert!(lines[0].contains(" 轮次开始 \t@cxb2 {"));
 }
 
 #[test]

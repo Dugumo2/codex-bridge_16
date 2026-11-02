@@ -23,7 +23,7 @@ describe("show 旧跟随对结构化树日志的兼容", () => {
     const source: TreeLogPayload = { eventId, rootThreadId: "thread-test", threadId: role === "run" ? "thread-test" : role === "execution" ? "review-child" : "ordinary-child",
       parentThreadId: role === "run" ? null : "thread-test", shortId: null, sourceRole: role,
       turnId: null, itemId: null, summary: text, truncated: false };
-    return `${ts} run-test 条目完成 @cxb2 ${JSON.stringify(source)}\n`;
+    return `${ts} run-test 条目完成 \t@cxb2 ${JSON.stringify(source)}\n`;
   }
   test("初始 tail 在 limit 之前过滤普通子来源，终态与资源清理不变", async () => {
     ledger(dir);

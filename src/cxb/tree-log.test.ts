@@ -21,7 +21,7 @@ const payload = (patch: Partial<TreeLogPayload> = {}): TreeLogPayload => ({
   shortId: "abcd1234", sourceRole: "run", turnId: null, itemId: null, summary: "摘要", truncated: false, ...patch,
 });
 const line = (patch: Partial<TreeLogPayload> = {}, event = "轮次开始", stamp = ts, runId = "run-test") =>
-  `${stamp} ${runId} ${event} @cxb2 ${JSON.stringify(payload(patch))}\n`;
+  `${stamp} ${runId} ${event} \t@cxb2 ${JSON.stringify(payload(patch))}\n`;
 const write = (text: string, suffix = "") => writeFileSync(join(dir, "runs", `abcd1234.log${suffix}`), text);
 
 describe("树日志解析与静态保留窗口", () => {
@@ -43,11 +43,38 @@ describe("树日志解析与静态保留窗口", () => {
     expect(rows[0]!.source).toBeUndefined();
     expect(rows[1]!.content).toBe(long);
     expect(rows[1]!.source?.truncated).toBe(true);
-    for (const bad of ["@cxb2", "@cxb2 {", "@cxb2\t{", `@cxb2 ${JSON.stringify({ ...payload(), truncated: "false" })}`,
-      `@cxb2 ${JSON.stringify({ ...payload(), threadId: "" })}`]) {
+  });
+  test("新标志的损坏 JSON 或缺失字段严格报错，不能回退成正文", () => {
+    const { itemId: _missing, ...incomplete } = payload();
+    for (const bad of ["\t@cxb2", "\t@cxb2 {", "\t@cxb2\t{", `\t@cxb2 ${JSON.stringify({ ...payload(), truncated: "false" })}`,
+      `\t@cxb2 ${JSON.stringify({ ...payload(), threadId: "" })}`, `\t@cxb2 ${JSON.stringify(incomplete)}`]) {
       write(`${ts} run-test 轮次开始 ${bad}\n`);
       expect(() => readRunLog(dir, "abcd1234")).toThrow("损坏的 @cxb2 行");
+      expect(() => readRunLogSnapshot(dir, "abcd1234")).toThrow("损坏的 @cxb2 行");
     }
+  });
+  test("裸 @cxb2 旧正文与候选版 JSON 一律来源未知", () => {
+    for (const content of ["@cxb2", "@cxb2 普通正文", "@cxb2 {", `@cxb2 ${JSON.stringify(payload())}`]) {
+      write(`${ts} run-test 轮次开始 ${content}\n`);
+      const rows = readRunLog(dir, "abcd1234")!;
+      expect(rows[0]!.content).toBe(content);
+      expect(rows[0]!.source).toBeUndefined();
+      const tree = treeTimeline("thread-test", rows, [runResult()]);
+      expect(tree.coverage.issues).toEqual([{ code: "legacySourceUnknown", runId: "run-test" }]);
+      expect(tree.items[0]!.threadId).toBeNull();
+    }
+  });
+  test("轮转文件混合旧正文与新摘要中的标志，尾半行不参与解析", () => {
+    const legacy = "@cxb2 {候选版普通正文";
+    const summary = "@cxb2 正文自己的标志与 \\t@cxb2 字面转义";
+    write(`${ts} run-test 运行开始 ${legacy}\n` + line({ eventId: "42:0", summary }), ".1");
+    write(line({ eventId: "42:1", summary: "新的完整摘要" }) + `${ts} run-test 条目完成 \t@cxb2 {`);
+    const read = readRunLogSnapshot(dir, "abcd1234");
+    expect(read.lines!.map((row) => row.content)).toEqual([legacy, summary, "新的完整摘要"]);
+    expect(read.lines![0]!.source).toBeUndefined();
+    expect(read.lines![1]!.source?.summary).toBe(summary);
+    expect(read.issues).toEqual([{ code: "rotationWindow" }, { code: "trailingPartialLine" }]);
+    expect(readRunLog(dir, "abcd1234")).toEqual(read.lines);
   });
   test("轮转备份先于活动文件，同事件 ID 去重但同毫秒同正文的不同事件保留", () => {
     write(line({ eventId: "42:0", summary: "仅备份保留" }) + line({ eventId: "42:1" }), ".1");
@@ -85,7 +112,7 @@ describe("树日志解析与静态保留窗口", () => {
     expect(count).toBe(12);
   });
   test("稳定尾半行有覆盖提示，完整坏行报错，读取失败不会当作日志缺失", () => {
-    write(line() + `${ts} run-test 条目完成 @cxb2 {`);
+    write(line() + `${ts} run-test 条目完成 \t@cxb2 {`);
     expect(readRunLogSnapshot(dir, "abcd1234")).toMatchObject({ lines: [{ source: { eventId: "42:1" } }], issues: [{ code: "trailingPartialLine" }] });
     write("坏行\n");
     expect(() => readRunLog(dir, "abcd1234")).toThrow("损坏的行");
@@ -141,6 +168,21 @@ describe("树日志解析与静态保留窗口", () => {
 });
 
 describe("show 静态树日志离线接口", () => {
+  test("升级后的 log 与 tail 接受旧裸标志正文，树模式仅报告来源未知", async () => {
+    ledger(dir);
+    const content = "@cxb2 升级前保存的普通正文";
+    write(`${ts} run-test 轮次开始 ${content}\n`);
+    for (const mode of ["--log", "--tail"]) {
+      const t = context(dir, ["show", "abcd", mode, "--json"]);
+      expect(await bounded(show(t.ctx), 1000, "旧裸标志日志读取未完成")).toBe(0);
+      const items = mode === "--log" ? t.json[0].runs[0].items : t.json[0].items;
+      expect(items).toEqual([{ ts, kind: "轮次开始", text: `轮次开始 ${content}` }]);
+      const tree = context(dir, ["show", "abcd", mode, "--tree", "--json"]);
+      expect(await bounded(show(tree.ctx), 1000, "旧裸标志树日志读取未完成")).toBe(0);
+      expect(tree.json[0].coverage.issues).toEqual([{ code: "legacySourceUnknown", runId: "run-test" }]);
+      expect(tree.json[0].items[0].threadId).toBeNull();
+    }
+  });
   test("JSON 是单对象、完整身份、条目默认隐藏，失败运行仍退出 0", async () => {
     ledger(dir, [runResult({ status: "failed" })]);
     write(line() + line({ eventId: "42:2", threadId: "child-long-id", parentThreadId: "thread-test", shortId: "kid", sourceRole: "subagent" }, "条目完成"));
@@ -189,7 +231,7 @@ describe("show 静态树日志离线接口", () => {
     ledger(dir, [], [summary(), { ...summary({ threadId: "child", shortId: "cdef1234", lastRunId: null }), parentThreadId: "thread-test" } as ReturnType<typeof summary>]);
     await expect(show(context(dir, ["show", "cdef", "--log", "--tree"]).ctx)).rejects.toMatchObject({ exitCode: 1, message: expect.stringContaining("根线程") });
     await expect(show(context(dir, ["show", "none", "--log", "--tree"]).ctx)).rejects.toMatchObject({ exitCode: 2 });
-    write(`${ts} run-test 轮次开始 @cxb2 {\n`);
+    write(`${ts} run-test 轮次开始 \t@cxb2 {\n`);
     await expect(show(context(dir, ["show", "abcd", "--log", "--tree"]).ctx)).rejects.toMatchObject({ exitCode: 1 });
   });
   test("孙线程 R→C→G 的提示指向有独立运行的 R，不再推荐纯派生 C", async () => {
