@@ -110,6 +110,8 @@ pub struct EvidenceOperation {
     /// 跟进接收方的拒绝纳管理由；保留上游接收事实，不把拒绝误记成发送失败。
     pub rejected_receivers: BTreeMap<String, String>,
     pub proven_turns: BTreeMap<String, BTreeSet<String>>,
+    /// 操作登记瞬间每个接收方已完成轮次的基线；配对只排除这些轮次。
+    pub baseline_turns: BTreeMap<String, BTreeSet<String>>,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

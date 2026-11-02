@@ -57,6 +57,9 @@ export function convergenceFields(run: Partial<RunResult>) {
     ...(active ? { subagentJoin: run.subagentJoin } : {}),
     ...(run.runBudget !== undefined ? { runBudget: run.runBudget } : {}),
     ...(run.autoTurnsStarted !== undefined ? { autoTurnsStarted: run.autoTurnsStarted } : {}),
+    ...(run.convergenceDiagnostic !== undefined ? {
+      convergenceDiagnostic: run.state === "ended" || run.state === "lost" ? null : run.convergenceDiagnostic,
+    } : {}),
     ...(active && run.convergenceConfig !== undefined ? { convergenceConfig: run.convergenceConfig } : {}),
     ...(active && run.executionConfig !== undefined ? { executionConfig: run.executionConfig } : {}),
   };

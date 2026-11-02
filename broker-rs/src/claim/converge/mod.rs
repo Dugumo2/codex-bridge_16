@@ -6,6 +6,7 @@ use crate::sa1b::*;
 use std::collections::{BTreeMap, HashMap};
 
 mod budget;
+mod diagnostics;
 mod drive;
 pub(crate) mod terminal;
 #[cfg(test)]
@@ -127,6 +128,7 @@ impl Machine {
             run_budget: r.run_budget.clone(),
             final_turn_id: r.final_turn_id.clone(),
             auto_turns_started: r.auto_turns_started,
+            convergence_diagnostic: self.convergence_diagnostics(run),
         })
     }
 

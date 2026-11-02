@@ -7,8 +7,10 @@ use serde_json::json;
 mod discovery;
 mod evidence;
 mod lineage_safety;
+mod placeholder;
 mod routing;
 mod tree_log_review;
+mod v2_pairing;
 
 pub(super) const P: &str = "父线程";
 pub(super) const R: &str = "运行甲";

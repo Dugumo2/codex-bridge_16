@@ -220,6 +220,22 @@ impl Machine {
             invalid(&request, actions);
             return;
         }
+        if request.method == "broker/runs/convergenceDiagnostics" {
+            let Some(run) = params
+                .get("runId")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                invalid(&request, actions);
+                return;
+            };
+            ok(
+                &request,
+                json!({"diagnostic": self.convergence_diagnostics(run)}),
+                actions,
+            );
+            return;
+        }
         if request.method == "broker/runs/modelSummaries" {
             let Some(ids) = params
                 .get("threadIds")

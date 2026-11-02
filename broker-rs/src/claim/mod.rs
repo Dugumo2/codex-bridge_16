@@ -1237,6 +1237,7 @@ impl Machine {
             request.method.as_str(),
             "broker/threads/watch"
                 | "broker/threads/list"
+                | "broker/runs/convergenceDiagnostics"
                 | "broker/runs/modelSummaries"
                 | "thread/read"
                 | "thread/turns/list"
@@ -1266,6 +1267,7 @@ impl Machine {
                     | "broker/inbox/list"
                     | "broker/inbox/wait"
                     | "broker/threads/list"
+                    | "broker/runs/convergenceDiagnostics"
                     | "broker/runs/modelSummaries"
                     | "broker/health"
             )
@@ -1297,6 +1299,7 @@ impl Machine {
             | "broker/threads/detach"
             | "broker/threads/watch"
             | "broker/threads/list"
+            | "broker/runs/convergenceDiagnostics"
             | "broker/runs/modelSummaries" => {
                 self.ext_request(request, actions);
                 return;

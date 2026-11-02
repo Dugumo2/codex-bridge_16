@@ -10,6 +10,8 @@ pub struct ConvergenceLedger {
     pub activities: Vec<ActivityFact>,
     pub results: Vec<ResultRef>,
     pub pending: BTreeSet<EvidenceKey>,
+    /// 占位的操作原因独立于可回收的操作缓存；缓存缺失不构成完成证据。
+    pub placeholder_operations: BTreeMap<String, BTreeSet<EvidenceKey>>,
     pub seen_operations: BTreeSet<EvidenceKey>,
     pub next_seq: BTreeMap<String, u64>,
     pub result_versions: BTreeMap<(String, u64), u64>,
@@ -281,6 +283,33 @@ impl Machine {
             if op.outcome == EvidenceOutcome::Failed || bound {
                 ledger.pending.remove(&op.key);
             }
+            for thread in &op.receivers {
+                let resolved = op.outcome == EvidenceOutcome::Failed
+                    || op.rejected_receivers.contains_key(thread)
+                    || self.relations.bindings.values().any(|binding| {
+                        binding.run_id == run
+                            && binding.thread_id == *thread
+                            && binding.status == BindingStatus::Bound
+                            && (binding.operation == op.key
+                                || op
+                                    .proven_turns
+                                    .get(thread)
+                                    .is_some_and(|turns| turns.contains(&binding.turn_id)))
+                    });
+                if resolved {
+                    ledger
+                        .placeholder_operations
+                        .entry(thread.clone())
+                        .or_default()
+                        .remove(&op.key);
+                } else if ledger.pending.contains(&op.key) {
+                    ledger
+                        .placeholder_operations
+                        .entry(thread.clone())
+                        .or_default()
+                        .insert(op.key.clone());
+                }
+            }
         }
         for (thread, member) in &context.members {
             if member.kind != RelationKind::Subagent {
@@ -295,16 +324,40 @@ impl Machine {
                     }
                 }
             }
-            let mut keys: Vec<Option<String>> = if turns.is_empty() {
+            let clear_placeholder = ledger
+                .placeholder_operations
+                .get(thread)
+                .is_some_and(BTreeSet::is_empty)
+                && !self
+                    .relations
+                    .aux
+                    .observed
+                    .get(thread)
+                    .is_some_and(|observed| {
+                        observed.iter().any(|observation| {
+                            !member.bindings.contains(&observation.turn)
+                                || !self
+                                    .convergences
+                                    .observations
+                                    .get(&(thread.clone(), observation.turn.clone()))
+                                    .is_some_and(|fact| {
+                                        fact.conn_epoch == self.relations.conn_epoch
+                                            && fact.activity != MemberActivity::Unknown
+                                    })
+                        })
+                    });
+            let mut keys: Vec<Option<String>> = if turns.is_empty() && clear_placeholder {
+                vec![]
+            } else if turns.is_empty() {
                 vec![None]
             } else {
                 turns.into_iter().map(Some).collect()
             };
-            if self.relations.operations.values().any(|op| {
-                op.run_id == run
-                    && ledger.pending.contains(&op.key)
-                    && op.receivers.contains(thread)
-            }) && !keys.contains(&None)
+            if ledger
+                .placeholder_operations
+                .get(thread)
+                .is_some_and(|reasons| !reasons.is_empty())
+                && !keys.contains(&None)
                 && !self
                     .relations
                     .aux
@@ -410,6 +463,16 @@ impl Machine {
                     fact.result_status = status;
                 }
                 fact.verified = bound && observation.is_some() && member.conflict.is_none();
+            }
+            // 只撤销已有操作原因且全部得到反证的占位；真实轮与未知观察保持原身份。
+            if clear_placeholder {
+                let previous = ledger.activities.len();
+                ledger
+                    .activities
+                    .retain(|fact| fact.key.thread_id != *thread || fact.key.turn_id.is_some());
+                if previous != ledger.activities.len() {
+                    ledger.work_epoch = ledger.work_epoch.saturating_add(1);
+                }
             }
         }
         if before != ledger.work_epoch {

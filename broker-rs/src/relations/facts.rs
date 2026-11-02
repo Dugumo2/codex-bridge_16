@@ -147,6 +147,45 @@ impl Machine {
         }
         let turn = notification_turn(params).map(str::to_owned);
         match event.method.as_str() {
+            "rawResponseItem/completed" => {
+                if let (Some(turn), Some(item)) = (&turn, params.and_then(|p| p.get("item"))) {
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    if item.get("type").and_then(Value::as_str) == Some("function_call")
+                        && matches!(
+                            name.rsplit('.').next(),
+                            Some("followup_task" | "send_message")
+                        )
+                        && matches!(self.parent_run(&thread, turn), ParentRun::Own { .. })
+                    {
+                        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
+                            let now = self.clock.mono_ms;
+                            self.relations
+                                .aux
+                                .followup_starts
+                                .retain(|_, (epoch, _, at)| {
+                                    *epoch == self.relations.conn_epoch
+                                        && now < at.saturating_add(EVIDENCE_TTL_MS)
+                                });
+                            if self.relations.aux.followup_starts.len() < MAX_OPERATIONS {
+                                self.relations
+                                    .aux
+                                    .followup_starts
+                                    .entry(EvidenceKey {
+                                        parent_thread_id: thread.clone(),
+                                        parent_turn_id: turn.clone(),
+                                        item_id: id.into(),
+                                    })
+                                    .or_insert((
+                                        self.relations.conn_epoch,
+                                        self.relations.aux.observation_seq,
+                                        now,
+                                    ));
+                            }
+                        }
+                    }
+                }
+                false
+            }
             "item/started" | "item/completed" => {
                 let item = params.and_then(|p| p.get("item"));
                 let relevant = item
@@ -624,6 +663,33 @@ impl Machine {
             } else {
                 EvidenceOutcome::Pending
             };
+            let begin = (kind == EvidenceKind::V2Interacted)
+                .then(|| self.relations.aux.followup_starts.get(&key).copied())
+                .flatten()
+                .filter(|(epoch, _, _)| *epoch == self.relations.conn_epoch);
+            let baseline_turns = receivers
+                .iter()
+                .filter_map(|child| {
+                    let turns = self.relations.aux.observed.get(child)?;
+                    Some((
+                        child.clone(),
+                        turns
+                            .iter()
+                            .filter(|observation| {
+                                observation.completed
+                                    && begin.is_none_or(|(_, seq, _)| {
+                                        self.relations
+                                            .aux
+                                            .completed_seq
+                                            .get(&(child.clone(), observation.turn.clone()))
+                                            .is_none_or(|completed| *completed <= seq)
+                                    })
+                            })
+                            .map(|observation| observation.turn.clone())
+                            .collect(),
+                    ))
+                })
+                .collect();
             self.relations.operations.insert(
                 key.clone(),
                 EvidenceOperation {
@@ -638,8 +704,11 @@ impl Machine {
                     receivers: BTreeSet::new(),
                     rejected_receivers: BTreeMap::new(),
                     proven_turns: BTreeMap::new(),
-                    first_seen_ms: now,
-                    expires_at_ms: now.saturating_add(EVIDENCE_TTL_MS),
+                    baseline_turns,
+                    first_seen_ms: begin.map_or(now, |(_, _, at)| at),
+                    expires_at_ms: begin
+                        .map_or(now, |(_, _, at)| at)
+                        .saturating_add(EVIDENCE_TTL_MS),
                     parent_ended: false,
                     failure: None,
                 },
@@ -727,27 +796,21 @@ impl Machine {
                 ) =>
             {
                 // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
-                // 只排除首次通知时已完成的旧轮；每个接收方只建一次基线，双通知不重新挂起。
+                // 原始调用开始序号优先；缺失时保守排除首次通知前的完成轮，双通知不重建基线。
                 for child in new_receivers {
                     if self.reject_followup_receiver(&key, &child, actions) {
                         continue;
                     }
-                    let observed = self
-                        .relations
-                        .aux
-                        .observed
+                    // 基线只排除操作开始前已完成的轮次；不能在 Interacted 到达时把之后完成的真实轮次一并当成旧轮。
+                    let baseline = self.relations.operations[&key]
+                        .baseline_turns
                         .get(&child)
-                        .map(|v| {
-                            v.iter()
-                                .filter(|o| o.completed)
-                                .map(|o| o.turn.clone())
-                                .collect()
-                        })
+                        .cloned()
                         .unwrap_or_default();
                     self.convergences
                         .reuse_candidates
                         .entry((key.clone(), child.clone()))
-                        .or_insert(observed);
+                        .or_insert(baseline);
                     self.relations
                         .aux
                         .spawn_waits
@@ -880,6 +943,22 @@ impl Machine {
                     .insert(child.into(), key.clone());
             }
             1 => {
+                if op.kind == EvidenceKind::V2Interacted
+                    && !self
+                        .convergences
+                        .observations
+                        .get(&(child.into(), observed[0].clone()))
+                        .is_some_and(|observation| {
+                            observation.conn_epoch == self.relations.conn_epoch
+                                && observation.activity != MemberActivity::Unknown
+                        })
+                {
+                    self.relations
+                        .aux
+                        .spawn_waits
+                        .insert(child.into(), key.clone());
+                    return;
+                }
                 self.relations.aux.spawn_waits.remove(child);
                 let op = self.relations.operations.get_mut(key).expect("证据操作");
                 op.proven_turns
@@ -896,7 +975,7 @@ impl Machine {
 
     /// 配对只要求证据本身有效；运行确认（settling 定案、继承父轮）可以稍后到达。
     fn evidence_valid_for_pairing(&self, op: &EvidenceOperation, now: u64) -> bool {
-        !op.parent_ended
+        (!op.parent_ended || (op.kind == EvidenceKind::V2Interacted && self.op_confirmed(&op.key)))
             && now < op.expires_at_ms
             && op.conn_epoch == self.relations.conn_epoch
             && op.outcome == EvidenceOutcome::Pending
@@ -1248,7 +1327,7 @@ impl Machine {
         self.routing_reconsider(child, actions);
     }
 
-    /// 父轮结束：此后该轮的证据不能再授予绑定；未配对候选转 unbound，在途派生不再计入。
+    /// 父轮结束：普通未配对候选转 unbound；已确认 v2 跟进在 TTL 内继续等待。
     pub(crate) fn parent_turn_ended(
         &mut self,
         thread: &str,
@@ -1286,6 +1365,13 @@ impl Machine {
             }
             for child in receivers {
                 if self.relations.aux.spawn_waits.get(&child) == Some(&key) {
+                    let keep_v2_wait = self.relations.operations.get(&key).is_some_and(|op| {
+                        op.kind == EvidenceKind::V2Interacted
+                            && self.evidence_valid_for_pairing(op, self.clock.mono_ms)
+                    });
+                    if keep_v2_wait {
+                        continue;
+                    }
                     self.relations.aux.spawn_waits.remove(&child);
                     self.candidate_unbound(&key, &child, "父轮结束前未见首轮", actions);
                 }
@@ -1312,10 +1398,12 @@ impl Machine {
         }
         let now = self.clock.mono_ms;
         let aux = &mut self.relations.aux;
+        aux.observation_seq = aux.observation_seq.saturating_add(1);
         if !aux.observed.contains_key(thread) {
             if aux.observed.len() >= MAX_OBSERVED_THREADS {
                 if let Some(oldest) = aux.observed_order.pop_front() {
                     aux.observed.remove(&oldest);
+                    aux.completed_seq.retain(|(thread, _), _| thread != &oldest);
                 }
             }
             aux.observed_order.push_back(thread.into());
@@ -1336,7 +1424,9 @@ impl Machine {
                     seen_ms: now,
                 });
                 while list.len() > MAX_OBSERVED_TURNS {
-                    list.pop_front();
+                    if let Some(old) = list.pop_front() {
+                        aux.completed_seq.remove(&(thread.into(), old.turn));
+                    }
                 }
                 (true, true)
             }
@@ -1344,8 +1434,32 @@ impl Machine {
         if !changed {
             return;
         }
-        if new {
-            if let Some(key) = self.relations.aux.spawn_waits.get(thread).cloned() {
+        if completed {
+            aux.completed_seq
+                .entry((thread.into(), turn.into()))
+                .or_insert(aux.observation_seq);
+        }
+        if new || completed {
+            let mut keys: BTreeSet<_> = self
+                .relations
+                .aux
+                .spawn_waits
+                .get(thread)
+                .cloned()
+                .into_iter()
+                .collect();
+            keys.extend(
+                self.relations
+                    .operations
+                    .values()
+                    .filter(|op| {
+                        op.kind == EvidenceKind::V2Interacted
+                            && op.receivers.contains(thread)
+                            && self.evidence_valid_for_pairing(op, now)
+                    })
+                    .map(|op| op.key.clone()),
+            );
+            for key in keys {
                 self.pair_first_turn(&key, thread, actions);
                 if self.op_confirmed(&key) {
                     self.materialize(&key, actions);
@@ -1420,6 +1534,12 @@ impl Machine {
     /// 证据到期：未配对候选转 unbound；等待父轮绑定的操作不能再确认。
     pub(super) fn facts_expire(&mut self, actions: &mut Vec<Action>) {
         let now = self.clock.mono_ms;
+        self.relations
+            .aux
+            .followup_starts
+            .retain(|_, (epoch, _, at)| {
+                *epoch == self.relations.conn_epoch && now < at.saturating_add(EVIDENCE_TTL_MS)
+            });
         let expired: Vec<EvidenceKey> = self
             .relations
             .operations

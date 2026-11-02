@@ -714,3 +714,75 @@ fn 二审_r2_历史完成轮不当新工作且多个活动轮不猜测() {
         assert_eq!(m.convergences.ledgers[R].pending.len(), 1);
     }
 }
+
+#[test]
+fn 二审_r2_父轮结束后才出现子轮仍允许唯一配对() {
+    let (mut m, mut mock) = 二审跟进夹具();
+    mock.register(C, Some(P), "v2", false, true);
+    let attached = mock.thread_started(C);
+    mock.inject(&mut m, attached);
+    let (started, completed) = SubagentMock::v2_activity("interacted", P, T, "父后跟进", C);
+    mock.inject(&mut m, started);
+    let parent_done = mock.turn_completed(P, T, "completed");
+    mock.inject(&mut m, parent_done);
+    assert!(m.relations.aux.spawn_waits.contains_key(C));
+    m.clock.mono_ms += 1;
+    let child_started = mock.turn_started(C, "父后子轮");
+    mock.inject(&mut m, child_started);
+    let child_completed = mock.turn_completed(C, "父后子轮", "completed");
+    mock.inject(&mut m, child_completed);
+    mock.inject(&mut m, completed);
+    m.convergence_sync_facts(R);
+    assert_eq!(bound(&m, C, "父后子轮").as_deref(), Some(R));
+    assert!(m.convergences.ledgers[R].pending.is_empty());
+}
+
+#[test]
+fn 二审_r2_子轮先完成后收到_interacted仍按开始基线配对() {
+    let (mut m, mut mock) = 二审跟进夹具();
+    mock.register(C, Some(P), "v2", false, true);
+    let attached = mock.thread_started(C);
+    mock.inject(&mut m, attached);
+    let (started, completed) = SubagentMock::v2_activity("interacted", P, T, "晚到跟进", C);
+    mock.inject(&mut m, Event::Notification { method: "rawResponseItem/completed".into(), params: Some(json!({"threadId":P,"turnId":T,"item":{"type":"function_call","name":"followup_task","call_id":"晚到跟进"}})) });
+    m.clock.mono_ms += 1;
+    let child_started = mock.turn_started(C, "先完成子轮");
+    mock.inject(&mut m, child_started);
+    let child_completed = mock.turn_completed(C, "先完成子轮", "completed");
+    mock.inject(&mut m, child_completed);
+    mock.inject(&mut m, started);
+    mock.inject(&mut m, completed);
+    m.convergence_sync_facts(R);
+    assert_eq!(bound(&m, C, "先完成子轮").as_deref(), Some(R));
+    assert!(m.convergences.ledgers[R].pending.is_empty());
+}
+
+#[test]
+fn 二审_r2_三个_v2跟进均完成后保留唯一轮次并清除pending() {
+    let (mut m, mut mock) = 二审跟进夹具();
+    mock.register(C, Some(P), "v2", false, true);
+    let attached = mock.thread_started(C);
+    mock.inject(&mut m, attached);
+    for index in 0..3 {
+        let item = format!("三次跟进{index}");
+        let (started, completed) = SubagentMock::v2_activity("interacted", P, T, &item, C);
+        mock.inject(&mut m, started);
+        m.clock.mono_ms += 1;
+        let turn = format!("三次子轮{index}");
+        let child_started = mock.turn_started(C, &turn);
+        mock.inject(&mut m, child_started);
+        let child_completed = mock.turn_completed(C, &turn, "completed");
+        mock.inject(&mut m, child_completed);
+        mock.inject(&mut m, completed);
+        m.convergence_sync_facts(R);
+    }
+    assert_eq!(m.convergences.ledgers[R].pending.len(), 0);
+    assert_eq!(
+        m.relations
+            .bindings
+            .values()
+            .filter(|b| b.run_id == R)
+            .count(),
+        3
+    );
+}
