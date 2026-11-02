@@ -280,6 +280,24 @@ function baselineStopDiagnostics(stdout: string, args: string[], run: any): stri
   }
   return `${JSON.stringify(append(json))}\n`;
 }
+/**
+ * 第二期设计第二处允许的基线增量：旧 CLI 不认识 broker 的 `@cxb2` 结构化日志段（设计不承诺旧 CLI 展示新日志），
+ * 按新 CLI 的展示规则还原为「事件 摘要」，摘要为空时只留事件名；其余字节仍逐字比较。
+ */
+function baselineStructuredLog(stdout: string): string {
+  const restore = (text: string) => text.replace(/ @cxb2 (\{.*\})$/gm, (_, payload: string) => {
+    const { summary } = JSON.parse(payload);
+    expect(summary).toBeString();
+    return summary ? ` ${summary}` : "";
+  });
+  return stdout.split("\n").map(line => {
+    if (!line.includes("@cxb2")) return line;
+    let json: unknown;
+    try { json = JSON.parse(line); } catch { return restore(line); }
+    expect(line).toBe(JSON.stringify(json));
+    return JSON.stringify(json, (_, value) => typeof value === "string" ? restore(value) : value);
+  }).join("\n");
+}
 /** 仅为内联审查补上协议回包，复用原模拟器的轮次、停止及分页，不修改 R 路夹具。 */
 class BaselineHarness extends Sa1bHarness {
   override async open(options: { pageSize?: number } = {}) {
@@ -361,8 +379,9 @@ async function baselineSession(main: string, status: "completed" | "interrupted"
     return outputs.map(row => {
       // show 读取落盘记录；run/wait 读取线上快照。新增诊断也保留各自的实际字段顺序。
       const source = row.args[0] === "show" ? disk : run;
-      return { ...row, stdout: normalizeCli(main === BASELINE_CLI && status === "interrupted"
-        ? baselineStopDiagnostics(row.stdout, row.args, source) : row.stdout, h, source), stderr: normalizeCli(row.stderr, h, source) };
+      const stdout = main !== BASELINE_CLI ? row.stdout
+        : baselineStructuredLog(status === "interrupted" ? baselineStopDiagnostics(row.stdout, row.args, source) : row.stdout);
+      return { ...row, stdout: normalizeCli(stdout, h, source), stderr: normalizeCli(row.stderr, h, source) };
     });
   } finally { await h.close(); }
 }

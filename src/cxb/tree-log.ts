@@ -63,20 +63,22 @@ export function treeLogLine(item: TreeLogEvent, labels: ReadonlyMap<string, stri
 /** 只用于提示：沿直接父链寻找最近具有独立运行的祖先，缺链或环不猜测根线程。 */
 function rootLogHint(entry: ThreadIndexEntry, index: ThreadIndexEntry[], runs: RunResult[]): string {
   const byThread = new Map(index.map((item) => [item.threadId, item]));
-  const byRun = new Map(runs.map((run) => [run.runId, run]));
+  const runIds = new Set(runs.map((run) => run.runId));
   const owned = new Set(runs.map((run) => run.threadId));
+  const chain: ThreadIndexEntry[] = [];
   const seen = new Set([entry.threadId]);
-  let parentId = entry.parentThreadId;
-  while (parentId && !seen.has(parentId)) {
+  for (let parentId = entry.parentThreadId; parentId && !seen.has(parentId); parentId = byThread.get(parentId)?.parentThreadId) {
     seen.add(parentId);
     const parent = byThread.get(parentId);
     if (!parent) break;
-    // 元数据被清理时仍可使用索引中的独立运行证据；已有 review 记录不能冒充自己的运行。
-    if (owned.has(parentId) || (parent.lastRunId && !byRun.has(parent.lastRunId))) {
-      return `请使用根线程 ${threadLabel(parentId, parent.shortId)} 查看树日志`;
-    }
-    parentId = parent.parentThreadId;
+    chain.push(parent);
   }
+  // 运行元数据被清理后，索引里悬空的 lastRunId 只是弱证据：broker 会把父运行编号写进 review 执行线程，
+  // 所以 reviewExecution 线程、或与更上层祖先共用同一编号的线程都不算独立运行，继续上溯。
+  const root = chain.find((parent, depth) => owned.has(parent.threadId)
+    || (!!parent.lastRunId && !runIds.has(parent.lastRunId) && parent.relationKind !== "reviewExecution"
+      && !chain.slice(depth + 1).some((above) => above.lastRunId === parent.lastRunId)));
+  if (root) return `请使用根线程 ${threadLabel(root.threadId, root.shortId)} 查看树日志`;
   return "请使用具有独立 cxb 运行的根线程查看树日志（本地血缘缺失或成环，无法定位根线程）";
 }
 

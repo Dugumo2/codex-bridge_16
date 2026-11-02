@@ -188,6 +188,21 @@ describe("show 静态树日志离线接口", () => {
     expect(t.connects).toBe(0);
     expect(t.cleanup.size).toBe(0);
   });
+  // 元数据缺失时 lastRunId 悬空：review 执行线程借用父运行编号，必须继续上溯；真有独立运行编号的线程仍可作根。
+  for (const [name, patch, rootRunId, expected] of [
+    ["review 执行祖先", { relationKind: "reviewExecution", lastRunId: "run-test" }, "run-later", "abcd1234"],
+    ["与上层共用运行编号的祖先", { lastRunId: "run-test" }, "run-test", "abcd1234"],
+    ["有独立运行编号的祖先", { lastRunId: "run-own" }, "run-test", "cdef1234"],
+  ] as const) test(`元数据缺失时根线程提示：${name}指向 ${expected}`, async () => {
+    const child = { ...summary({ threadId: "child", shortId: "cdef1234" }), ...patch, parentThreadId: "thread-test" };
+    const grandchild = { ...summary({ threadId: "grandchild", shortId: "fedc1234", lastRunId: null }), parentThreadId: "child" };
+    ledger(dir, [], [summary({ lastRunId: rootRunId }), child, grandchild]);
+    const t = context(dir, ["show", "fedc", "--log", "--tree"]);
+    await expect(bounded(show(t.ctx), 1000, "根线程定位未结束")).rejects.toMatchObject({
+      exitCode: 1, message: `该线程是派生子线程，请使用根线程 ${expected} 查看树日志`,
+    });
+    expect(t.connects).toBe(0);
+  });
   for (const kind of ["missing", "cycle"] as const) test(`根线程提示遇到${kind === "missing" ? "缺链" : "环"}有界结束且不猜测线程`, async () => {
     const child = { ...summary({ threadId: "child", shortId: "cdef1234", lastRunId: null }), parentThreadId: kind === "missing" ? "missing" : "grandchild" };
     const grandchild = { ...summary({ threadId: "grandchild", shortId: "fedc1234", lastRunId: null }), parentThreadId: "child" };
