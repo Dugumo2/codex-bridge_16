@@ -158,6 +158,17 @@ describe("来源运行、成员范围与旧数据", () => {
     expect(entry).not.toContain("v2 首选寻址");
   });
 
+  test("同一线程的父关系冲突时降级为层级未知", async () => {
+    const dir = workspace();
+    const records = [child({ threadId: "C1" }), child({ threadId: "C2" }),
+      child({ threadId: "G", parentThreadId: "C1" }), child({ threadId: "G", parentThreadId: "C2" })];
+    const text = await collect(dir, run({ children: records }));
+    const entry = text.split("【子代理条目】").find((item) => item.includes('线程 ID："G"'))!;
+    expect(entry).toContain("层级：层级未知，不能直接唤醒，需先核实");
+    expect(entry).not.toContain("续派方式：经由直接子代理");
+    expect(entry).not.toContain("v2 首选寻址");
+  });
+
   test("父链循环、自环与非子代理父关系均降级未知", async () => {
     const records = [child({ threadId: "cycle-a", parentThreadId: "cycle-b" }), child({ threadId: "cycle-b", parentThreadId: "cycle-a" }),
       child({ threadId: "self", parentThreadId: "self" }), child({ threadId: "fork", relationKind: "fork" }),

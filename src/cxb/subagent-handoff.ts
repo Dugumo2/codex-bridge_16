@@ -29,23 +29,34 @@ export function selectHandoffSource(runs: readonly RunResult[], threadId: string
 }
 
 /** 只选来源运行的成员；重复身份保留第一条，不跨记录或跨运行拼接轮次。 */
-export function selectHandoffMembers(run: RunResult): { records: ChildRecord[]; malformed: number } {
+export function selectHandoffMembers(run: RunResult): { records: ChildRecord[]; malformed: number; conflictedThreadIds: ReadonlySet<string> } {
   const { records, malformed } = readChildRecords(run);
   const members = new Map<string, ChildRecord>();
+  const parents = new Map<string, Set<string>>();
+  const kinds = new Map<string, Set<string>>();
+  for (const record of records) {
+    if (!parents.has(record.threadId)) parents.set(record.threadId, new Set());
+    if (!kinds.has(record.threadId)) kinds.set(record.threadId, new Set());
+    parents.get(record.threadId)!.add(record.parentThreadId);
+    kinds.get(record.threadId)!.add(record.relationKind);
+  }
   for (const record of records) if (record.relationKind === "subagent" && !members.has(record.threadId)) members.set(record.threadId, record);
   // 先保留根线程的直接子代理，避免成员或字节配额被深层后代占满。
+  const conflictedThreadIds = new Set([...parents.keys()].filter((threadId) =>
+    parents.get(threadId)!.size > 1 || kinds.get(threadId)!.size > 1));
   return { records: [...members.values()].sort((a, b) =>
-    Number(b.parentThreadId === run.threadId) - Number(a.parentThreadId === run.threadId)), malformed };
+    Number(b.parentThreadId === run.threadId) - Number(a.parentThreadId === run.threadId)), malformed, conflictedThreadIds };
 }
 
 type HandoffHierarchy = { kind: "direct" } | { kind: "descendant"; directChild: ChildRecord } | { kind: "unknown" };
 
 /** 根线程通常不在 children 中；只沿来源运行中可核实的 subagent 父链识别层级。 */
-function memberHierarchy(run: RunResult, child: ChildRecord, members: ReadonlyMap<string, ChildRecord>): HandoffHierarchy {
+function memberHierarchy(run: RunResult, child: ChildRecord, members: ReadonlyMap<string, ChildRecord>, conflictedThreadIds: ReadonlySet<string>): HandoffHierarchy {
   const seen = new Set<string>();
   let current = child;
   while (current.threadId !== run.threadId && !seen.has(current.threadId)) {
     seen.add(current.threadId);
+    if (conflictedThreadIds.has(current.threadId)) return { kind: "unknown" };
     if (current.relationKind !== "subagent") return { kind: "unknown" };
     if (run.threadId && current.parentThreadId === run.threadId) {
       return current === child ? { kind: "direct" } : { kind: "descendant", directChild: current };
@@ -178,7 +189,7 @@ export async function collectSubagentHandoff(options: HandoffOptions): Promise<s
   }
   checkBoundary(options);
   if (!from) return "";
-  const { records, malformed } = selectHandoffMembers(from);
+  const { records, malformed, conflictedThreadIds } = selectHandoffMembers(from);
   if (!records.length && !malformed) return "";
   let index = new Map<string, ThreadIndexEntry>();
   let indexIncomplete = false;
@@ -186,7 +197,7 @@ export async function collectSubagentHandoff(options: HandoffOptions): Promise<s
   catch { indexIncomplete = true; }
   const selected = records.slice(0, HANDOFF_LIMITS.members);
   const members = new Map(records.map((child) => [child.threadId, child]));
-  const hierarchies = new Map(records.map((child) => [child.threadId, memberHierarchy(from, child, members)]));
+  const hierarchies = new Map(records.map((child) => [child.threadId, memberHierarchy(from, child, members, conflictedThreadIds)]));
   const nodes: TreeNode[] = selected.map((child) => ({ ...child, activity: child.finalState, pendingCount: null,
     conflict: null, shortId: index.get(child.threadId)?.shortId ?? null, stop: null, result: null }));
   const commandBoundsRead = options.deadline <= performance.now() + 5000;

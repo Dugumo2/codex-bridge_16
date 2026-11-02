@@ -30,7 +30,7 @@ fn log_rows(actions: &[Action]) -> Vec<Value> {
                 .map(|line| {
                     let parts: Vec<_> = line.splitn(4, ' ').collect();
                     let mut payload: Value =
-                        serde_json::from_str(parts[3].strip_prefix("@cxb2 ").unwrap()).unwrap();
+                        serde_json::from_str(parts[3].strip_prefix("\t@cxb2 ").unwrap()).unwrap();
                     payload["ts"] = json!(parts[0]);
                     payload["runId"] = json!(parts[1]);
                     payload["kind"] = json!(parts[2]);

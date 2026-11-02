@@ -2147,9 +2147,11 @@ mod tree_log_tests {
                 .collect();
             assert_eq!(lines.len(), 1);
             assert_eq!(*lines[0].0, m.runs.runs["candidate"].short_id);
-            assert!(lines[0].1[0].contains(" candidate 归属冲突 @cxb2 "));
-            let payload: Value =
-                serde_json::from_str(lines[0].1[0].split("@cxb2 ").nth(1).unwrap()).unwrap();
+            let (prefix, payload_text) = lines[0].1[0]
+                .split_once("\t@cxb2 ")
+                .expect("严格结构化日志边界");
+            assert!(prefix.contains(" candidate 归属冲突 "));
+            let payload: Value = serde_json::from_str(payload_text).unwrap();
             assert_eq!(payload["threadId"], "child");
             assert_eq!(payload["parentThreadId"], "root");
             assert_eq!(payload["coverageIssue"], "discoveryIncomplete");

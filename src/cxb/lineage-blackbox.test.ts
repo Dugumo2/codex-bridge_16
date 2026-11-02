@@ -359,7 +359,7 @@ test("联合逐层复用：P 跟进 C1，C1 跟进 G 后正常收敛且无误报
   } finally { await bounded(h.close(), 12_000); }
 }, 120_000);
 
-test("联合跨层拒绝：G 未被本运行接纳时 P 直接跟进 G，冲突可见且有限期返回", async () => {
+test("联合跨层拒绝（协调已启用）：G 未被本运行接纳时 P 直接跟进 G，冲突可见且有限期返回", async () => {
   const h = new Sa1bHarness();
   try {
     const source = await handoffHistory(h, false);
@@ -391,5 +391,22 @@ test("联合跨层拒绝：G 未被本运行接纳时 P 直接跟进 G，冲突�
     expect(waited.code, waited.stderr).not.toBe(0);
     expect(waited.stdout + waited.stderr).toMatch(/ownershipConflict|rejectedFollowup|归属冲突/);
     expect((await h.record()).children?.some((child: any) => child.threadId === G && child.turnIds.includes(gTurn)) ?? false).toBe(false);
+  } finally { await bounded(h.close(), 12_000); }
+}, 120_000);
+
+test("联合跨层跟进（协调未启用）：无新成员时运行自然结束且不伪造冲突", async () => {
+  const h = new Sa1bHarness();
+  try {
+    const source = await handoffHistory(h, false);
+    await resumeWithHandoff(h, false, source);
+    expect(ids((await h.watch()).children?.members)).toEqual([]);
+    const gTurn = await followupV2(h, ROOT, h.firstTurn, G);
+    expect(gTurn).not.toBe(source.turns.get(G));
+    await h.finish(G, "协调未启用的上游轮完成", "completed", gTurn);
+    await h.finish(ROOT, "无新成员时父轮完成");
+    const run = await ended(h);
+    expect(run.status).toBe("completed");
+    expect(run.subagentJoin).toBeUndefined();
+    expect(run.children?.some((child: any) => child.threadId === G && child.turnIds.includes(gTurn)) ?? false).toBe(false);
   } finally { await bounded(h.close(), 12_000); }
 }, 120_000);

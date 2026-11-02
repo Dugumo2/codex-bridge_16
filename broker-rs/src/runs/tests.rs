@@ -97,12 +97,13 @@ fn n7_每类日志带运行编号且内容清洗与空内容符合四段格式()
                 .unwrap();
             let parts: Vec<_> = line.splitn(4, ' ').collect();
             assert_eq!(&parts[..3], &["1970-01-01T00:00:01.000Z", run, event]);
-            let payload: Value =
-                serde_json::from_str(parts[3].strip_prefix("@cxb2 ").unwrap()).unwrap();
+            let payload_text = parts[3].strip_prefix("\t@cxb2 ").unwrap();
+            let payload: Value = serde_json::from_str(payload_text).unwrap();
             let summary = payload["summary"].as_str().unwrap();
             assert_eq!(summary.chars().count(), content.chars().count().min(240));
             assert_eq!(payload["truncated"], content.chars().count() > 240);
-            assert!(!parts[3].chars().any(char::is_control));
+            assert!(!payload_text.chars().any(char::is_control));
+            assert_eq!(line.chars().filter(|c| *c == '\t').count(), 1);
             assert_eq!(
                 summary,
                 content
