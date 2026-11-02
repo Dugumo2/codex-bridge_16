@@ -130,3 +130,42 @@ for (const resumed of [false, true]) test(`失败跟进跨进程收敛：${resum
     await bounded(h.close(), 12_000);
   }
 }, 90_000);
+
+test("v2 三个已完成子代理跟进：父轮完成后子轮才开始并最终收敛", async () => {
+  const h = new Sa1bHarness();
+  const children = ["v2-a", "v2-b", "v2-c"];
+  try {
+    await openAndStart(h);
+    for (const child of children) {
+      const previous = await h.spawn(child, ROOT, h.firstTurn, { version: "v2" });
+      await h.finish(child, `前轮:${child}`, "completed", previous);
+      const item = { id: `v2-followup-${child}`, type: "subAgentActivity", kind: "interacted", agentThreadId: child, agentPath: `/root/${child}` };
+      await h.control("inject", { message: { method: "rawResponseItem/completed", params: {
+        threadId: ROOT, turnId: h.firstTurn, item: { type: "function_call", name: "followup_task", call_id: item.id },
+      } } });
+      await h.control("inject", { message: { method: "item/started", params: { threadId: ROOT, turnId: h.firstTurn, item } } });
+      await h.control("item", { threadId: ROOT, turnId: h.firstTurn, item });
+    }
+    const before = await diagnostic(h);
+    expect(before.pendingOperations.filter((op: any) => op.kind === "v2Interacted")).toHaveLength(3);
+    await h.finish(ROOT, "父轮先交结论");
+    expect(h.ended()).toHaveLength(0);
+    for (const child of children) {
+      const { turnId } = await h.control("turn", { threadId: child, action: "start" });
+      await h.finish(child, `跟进结果:${child}`, "completed", turnId);
+    }
+    const { run, input } = await finishReconciliation(h, "跟进结果:v2-a");
+    for (const child of children) expect(input).toContain(`跟进结果:${child}`);
+    expect(run.children).toHaveLength(3);
+    expect(run.children.every((child: any) => child.turnIds.length === 2)).toBe(true);
+    expect(run.subagentJoin.resultCoverage.total).toBe(6);
+    await h.persisted({ state: "ended", status: "completed", children });
+    const log = await cli(h, ["show", ROOT, "--log", "--tree", "--json"], 12_000);
+    expect(log.code, log.stderr).toBe(0);
+    expect(JSON.parse(log.stdout).coverage.issues).toEqual([]);
+    const wait = await cli(h, ["wait", ROOT, "--tree", "--timeout", "10"], 15_000);
+    expect(wait.code, wait.stderr).toBe(0);
+    expect(wait.stdout + wait.stderr).not.toMatch(/陈旧|记录缺口|发现不完整/);
+    expect(await diagnostic(h)).toBeNull();
+  } finally { await bounded(h.close(), 12_000); }
+}, 90_000);

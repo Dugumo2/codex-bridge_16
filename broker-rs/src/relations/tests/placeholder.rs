@@ -190,7 +190,7 @@ fn v2无配对轮次到期与操作回收都继续阻塞() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0]["expired"], true);
     assert_eq!(pending[0]["missing"], false);
-    assert_eq!(pending[0]["outcome"], "Unproven");
+    assert_eq!(pending[0]["outcome"], "unproven");
     assert_eq!(pending[0]["receivers"], json!([C]));
     assert!(expired["activities"]
         .as_array()
@@ -235,4 +235,69 @@ fn 观察缺口后遗漏旧轮保持未核实并保留原结果() {
     assert!(!activity.verified);
     assert_eq!(activity.activity, MemberActivity::Unknown);
     assert!(!settled(&m.convergence_facts(R).unwrap()));
+}
+
+/// 保留已证明的管理关系，但不提供任何当前轮绑定或观察，用于独立验证空占位清理。
+fn without_binding() -> (Machine, SubagentMock) {
+    let (mut m, mock) = prepared();
+    m.relations.bindings.clear();
+    m.relations.aux.observed.remove(C);
+    m.convergences
+        .observations
+        .retain(|(thread, _), _| thread != C);
+    m.convergences
+        .ledgers
+        .get_mut(R)
+        .unwrap()
+        .activities
+        .clear();
+    m.convergences.ledgers.get_mut(R).unwrap().results.clear();
+    m.relations
+        .contexts
+        .get_mut(R)
+        .unwrap()
+        .members
+        .get_mut(C)
+        .unwrap()
+        .bindings
+        .clear();
+    (m, mock)
+}
+
+#[test]
+fn 无既有绑定的失败或拒绝跟进清空占位且同步幂等() {
+    for rejected in [true, false] {
+        let (mut m, mut mock) = without_binding();
+        let (started, completed) =
+            SubagentMock::v1_message("sendInput", P, T, "无绑定跟进", C, !rejected);
+        mock.inject(&mut m, started);
+        assert!(placeholder(&m), "前置：无绑定线程确实建立占位");
+        assert!(m.manage_context(R).unwrap().members[C].bindings.is_empty());
+        let epoch = m.convergences.ledgers[R].work_epoch;
+        m.convergences.ledgers.get_mut(R).unwrap().covered_epoch = Some(epoch);
+        if rejected {
+            m.claims
+                .insert(C.into(), claim(Owner::Client(2), "外轮", "外运行", 9));
+            m.parent_turn_ended(P, T, &mut vec![]);
+            assert!(m.relations.operations[&key("无绑定跟进")]
+                .rejected_receivers
+                .contains_key(C));
+        } else {
+            mock.inject(&mut m, completed);
+        }
+        m.convergence_sync_facts(R);
+        assert!(!placeholder(&m), "无绑定且原因已撤销的占位必须清除");
+        assert_eq!(m.convergences.ledgers[R].work_epoch, epoch + 1);
+        assert_eq!(m.convergences.ledgers[R].covered_epoch, None);
+        assert!(
+            m.current_management_evidence(R, C),
+            "拒绝跟进不能撤销已有管理约束"
+        );
+        let ledger = m.convergences.ledgers[R].clone();
+        m.convergence_sync_facts(R);
+        assert_eq!(
+            m.convergences.ledgers[R], ledger,
+            "空占位不能在每次同步重建再删除"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 //! 在线诊断只读取事实；绝不重新发现、同步账本、绑定活动或推进 epoch。
 use super::*;
-use crate::relations::MemberActivity;
+use crate::relations::{EvidenceKind, EvidenceOutcome, MemberActivity};
 use serde_json::{json, Value};
 
 const MAX_ITEMS: usize = 32;
@@ -8,6 +8,28 @@ const MAX_NESTED: usize = 8;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 // 留出 RPC 外层对象开销，保证整个 diagnostic 回包仍小于 16 KiB。
 const MAX_BYTES: usize = 16 * 1024 - 64;
+
+fn evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::V1Spawn => "v1Spawn",
+        EvidenceKind::V1SendInput => "v1SendInput",
+        EvidenceKind::V1ResumeAgent => "v1ResumeAgent",
+        EvidenceKind::V2Started => "v2Started",
+        EvidenceKind::V2Interacted => "v2Interacted",
+        EvidenceKind::V2Interrupted => "v2Interrupted",
+        EvidenceKind::V2Completed => "v2Completed",
+    }
+}
+
+fn evidence_outcome_label(outcome: EvidenceOutcome) -> &'static str {
+    match outcome {
+        EvidenceOutcome::Pending => "pending",
+        EvidenceOutcome::Proven => "proven",
+        EvidenceOutcome::Unproven => "unproven",
+        EvidenceOutcome::Failed => "failed",
+        EvidenceOutcome::Revoked => "revoked",
+    }
+}
 
 fn identifier(value: &str, omitted: &mut usize) -> String {
     let mut end = value.len().min(MAX_IDENTIFIER_BYTES);
@@ -38,8 +60,11 @@ impl Machine {
         let thread = &runtime.token.claim.thread_id;
         let mut gates = Vec::<&str>::new();
         // 顺序与 drive_once 的短路门一致，后续条目补充同一快照中仍成立的事实门。
-        if runtime.automatic_control_revoked || self.closing || self.quiescing {
+        if runtime.automatic_control_revoked {
             gates.push("automaticControlRevoked");
+        }
+        if self.closing || self.quiescing {
+            gates.push("brokerClosingOrQuiescing");
         }
         // 连接或授权身份失配时，convergence_facts 已返回 None，不能展示旧快照。
         if self
@@ -216,8 +241,8 @@ impl Machine {
                     "turnIds":turns.iter().take(MAX_NESTED).map(|s| identifier(s, &mut omitted_bytes)).collect::<Vec<_>>(),
                     "omittedTurns":turns.len().saturating_sub(MAX_NESTED)})
             }).collect();
-            json!({"kind":op.map(|o| format!("{:?}", o.kind)).unwrap_or_else(|| "unknown".into()),
-                "outcome":op.map(|o| format!("{:?}", o.outcome)).unwrap_or_else(|| "unknown".into()),
+            json!({"kind":op.map(|o| evidence_kind_label(o.kind)).unwrap_or("unknown"),
+                "outcome":op.map(|o| evidence_outcome_label(o.outcome)).unwrap_or("unknown"),
                 "receivers":receivers,"provenTurns":proven,
                 "expiresAt":op.map(|o| if o.expires_at_ms >= self.clock.mono_ms {
                     self.clock.now_ms.saturating_add(o.expires_at_ms - self.clock.mono_ms)
@@ -358,6 +383,7 @@ mod tests {
                     .collect(),
                 rejected_receivers: BTreeMap::from([("rejected".into(), SENTINEL.into())]),
                 receivers,
+                baseline_turns: BTreeMap::new(),
                 first_seen_ms: 0,
                 expires_at_ms: 1,
                 parent_ended: true,
@@ -420,7 +446,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|op| op["kind"] == "V2Interacted"));
+            .any(|op| op["kind"] == "v2Interacted"));
         assert!(snapshot["gates"]
             .as_array()
             .unwrap()
@@ -436,7 +462,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|op| op["kind"] == "V2Interacted")
+            .find(|op| op["kind"] == "v2Interacted")
             .unwrap();
         assert_eq!(op["receivers"].as_array().unwrap().len(), 8);
         assert_eq!(op["omittedReceivers"], 32);
@@ -499,7 +525,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|op| op["kind"] == "V2Interacted" && op["expiresAt"] == 99));
+            .any(|op| op["kind"] == "v2Interacted" && op["expiresAt"] == 99));
         machine.relations.operations.clear();
         let missing = machine.convergence_diagnostics("run-diagnostic").unwrap();
         assert!(missing["pendingOperations"]
@@ -556,5 +582,206 @@ mod tests {
         assert_eq!(snapshot["gate"], "parentNotSettled");
         assert_eq!(snapshot["gates"].as_array().unwrap().len(), 8);
         assert!(snapshot["omitted"]["gates"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn diagnostics_first_gate_distinguishes_runtime_shutdown_from_revoked_control() {
+        let mut machine = fixture();
+        machine.closing = true;
+        let closing = machine.convergence_diagnostics("run-diagnostic").unwrap();
+        assert_eq!(closing["gate"], "brokerClosingOrQuiescing");
+        machine.closing = false;
+        machine.quiescing = true;
+        let quiescing = machine.convergence_diagnostics("run-diagnostic").unwrap();
+        assert_eq!(quiescing["gate"], "brokerClosingOrQuiescing");
+        machine.quiescing = false;
+        machine
+            .convergences
+            .runs
+            .get_mut("run-diagnostic")
+            .unwrap()
+            .automatic_control_revoked = true;
+        let revoked = machine.convergence_diagnostics("run-diagnostic").unwrap();
+        assert_eq!(revoked["gate"], "automaticControlRevoked");
+    }
+
+    #[test]
+    fn diagnostics_rpc_rejects_missing_null_and_non_string_run_id() {
+        for params in [
+            None,
+            Some(json!({})),
+            Some(json!({"runId": null})),
+            Some(json!({"runId": 7})),
+            Some(json!({"runId": ""})),
+        ] {
+            let mut machine = fixture();
+            let actions = apply(
+                &mut machine,
+                Event::ClientRequest {
+                    request: ClientRequest {
+                        conn: 1,
+                        id: json!(99),
+                        method: "broker/runs/convergenceDiagnostics".into(),
+                        params,
+                    },
+                    run_id: None,
+                },
+            );
+            assert!(actions
+                .iter()
+                .any(|action| matches!(action, Action::Send { message, .. }
+                if message["error"]["code"] == -32602)));
+        }
+    }
+
+    fn rpc(machine: &mut Machine, thread: &str) -> Value {
+        let actions = apply(
+            machine,
+            Event::ClientRequest {
+                request: ClientRequest {
+                    conn: 1,
+                    id: json!(991),
+                    method: "broker/runs/convergenceDiagnostics".into(),
+                    params: Some(json!({"runId":"run-diagnostic","threadId":thread})),
+                },
+                run_id: None,
+            },
+        );
+        actions
+            .into_iter()
+            .find_map(|action| match action {
+                Action::Send { message, .. } if message["id"] == 991 => Some(message),
+                _ => None,
+            })
+            .expect("完整请求路由须返回诊断 envelope")
+    }
+
+    #[test]
+    fn diagnostics_full_rpc_lifecycle_purge_shutdown_and_terminal() {
+        for mode in ["lifecycle", "purge", "closing", "quiescing", "terminal"] {
+            let mut machine = fixture();
+            let thread = if matches!(mode, "lifecycle" | "purge") {
+                "idle-thread"
+            } else {
+                "root"
+            };
+            if mode == "lifecycle" {
+                machine.lifecycle_request(
+                    ClientRequest {
+                        conn: 1,
+                        id: json!(81),
+                        method: "thread/archive".into(),
+                        params: Some(json!({"threadId":thread})),
+                    },
+                    crate::store::lifecycle::Kind::Archive,
+                    false,
+                    &mut vec![],
+                );
+                assert!(
+                    machine.lifecycle_error(thread).is_some(),
+                    "前置：生命周期门已存在"
+                );
+            }
+            if mode == "purge" {
+                machine.run_purge_request(
+                    ClientRequest {
+                        conn: 1,
+                        id: json!(82),
+                        method: "broker/threads/purge".into(),
+                        params: Some(json!({"threadId":thread})),
+                    },
+                    thread,
+                    &mut vec![],
+                );
+                assert!(machine.run_purge_busy(thread), "前置：purge门已存在");
+            }
+            machine.closing = mode == "closing";
+            machine.quiescing = mode == "quiescing";
+            if mode == "terminal" {
+                machine.runs.runs.get_mut("run-diagnostic").unwrap().state =
+                    crate::runs::RunState::Ended;
+            }
+            let before = machine.convergences.ledgers["run-diagnostic"].clone();
+            let reply = rpc(&mut machine, thread);
+            assert!(reply.get("error").is_none(), "{mode}: {reply}");
+            assert_eq!(machine.convergences.ledgers["run-diagnostic"], before);
+            if mode == "terminal" {
+                assert!(reply["result"]["diagnostic"].is_null());
+            } else {
+                assert_eq!(reply["result"]["diagnostic"]["runId"], "run-diagnostic");
+            }
+            if matches!(mode, "closing" | "quiescing") {
+                assert_eq!(
+                    reply["result"]["diagnostic"]["gate"],
+                    "brokerClosingOrQuiescing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostics_full_rpc_envelope_is_bounded() {
+        let mut machine = fixture();
+        for index in 0..70 {
+            add_operation(&mut machine, index, 40);
+        }
+        let reply = rpc(&mut machine, "root");
+        assert!(reply.get("error").is_none());
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= 16 * 1024);
+        assert!(
+            reply["result"]["diagnostic"]["omitted"]["pendingOperations"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn diagnostics_first_gate_matches_short_circuit_combinations() {
+        let mut machine = fixture();
+        machine
+            .convergences
+            .progress
+            .get_mut("run-diagnostic")
+            .unwrap()
+            .discovery = Some((1, 1));
+        machine.claims.get_mut("root").unwrap().request_pending = true;
+        machine
+            .convergences
+            .runs
+            .get_mut("run-diagnostic")
+            .unwrap()
+            .automatic_control_revoked = true;
+        machine.closing = true;
+        let gate =
+            |m: &Machine| m.convergence_diagnostics("run-diagnostic").unwrap()["gate"].clone();
+        assert_eq!(gate(&machine), "automaticControlRevoked");
+        machine
+            .convergences
+            .runs
+            .get_mut("run-diagnostic")
+            .unwrap()
+            .automatic_control_revoked = false;
+        assert_eq!(gate(&machine), "brokerClosingOrQuiescing");
+        machine.closing = false;
+        assert_eq!(gate(&machine), "parentNotSettled");
+        machine.claims.get_mut("root").unwrap().state = State::Converging {
+            owner: Owner::Client(1),
+            turn_id: Some("root-turn".into()),
+            parent_status: Some(crate::runs::TurnStatus::Completed),
+            goal_status: None,
+            token: machine.convergences.runs["run-diagnostic"].token.clone(),
+            phase: JoinPhase::WaitingSubtree,
+        };
+        assert_eq!(gate(&machine), "requestInFlight");
+        machine.claims.get_mut("root").unwrap().request_pending = false;
+        assert_eq!(gate(&machine), "discoveryInFlight");
+        machine
+            .convergences
+            .progress
+            .get_mut("run-diagnostic")
+            .unwrap()
+            .discovery = None;
+        assert_eq!(gate(&machine), "discoveryEpochUncovered");
     }
 }

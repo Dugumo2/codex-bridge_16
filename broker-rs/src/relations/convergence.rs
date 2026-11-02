@@ -297,9 +297,11 @@ impl Machine {
                                     .is_some_and(|turns| turns.contains(&binding.turn_id)))
                     });
                 if resolved {
-                    if let Some(reasons) = ledger.placeholder_operations.get_mut(thread) {
-                        reasons.remove(&op.key);
-                    }
+                    ledger
+                        .placeholder_operations
+                        .entry(thread.clone())
+                        .or_default()
+                        .remove(&op.key);
                 } else if ledger.pending.contains(&op.key) {
                     ledger
                         .placeholder_operations
@@ -322,7 +324,31 @@ impl Machine {
                     }
                 }
             }
-            let mut keys: Vec<Option<String>> = if turns.is_empty() {
+            let clear_placeholder = ledger
+                .placeholder_operations
+                .get(thread)
+                .is_some_and(BTreeSet::is_empty)
+                && !self
+                    .relations
+                    .aux
+                    .observed
+                    .get(thread)
+                    .is_some_and(|observed| {
+                        observed.iter().any(|observation| {
+                            !member.bindings.contains(&observation.turn)
+                                || !self
+                                    .convergences
+                                    .observations
+                                    .get(&(thread.clone(), observation.turn.clone()))
+                                    .is_some_and(|fact| {
+                                        fact.conn_epoch == self.relations.conn_epoch
+                                            && fact.activity != MemberActivity::Unknown
+                                    })
+                        })
+                    });
+            let mut keys: Vec<Option<String>> = if turns.is_empty() && clear_placeholder {
+                vec![]
+            } else if turns.is_empty() {
                 vec![None]
             } else {
                 turns.into_iter().map(Some).collect()
@@ -439,12 +465,7 @@ impl Machine {
                 fact.verified = bound && observation.is_some() && member.conflict.is_none();
             }
             // 只撤销已有操作原因且全部得到反证的占位；真实轮与未知观察保持原身份。
-            if ledger
-                .placeholder_operations
-                .get(thread)
-                .is_some_and(BTreeSet::is_empty)
-                && !member.bindings.is_empty()
-            {
+            if clear_placeholder {
                 let previous = ledger.activities.len();
                 ledger
                     .activities

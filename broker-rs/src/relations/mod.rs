@@ -141,6 +141,10 @@ pub struct RelationsAux {
     pub version: u64,
     pub observed: BTreeMap<String, VecDeque<TurnObservation>>,
     pub observed_order: VecDeque<String>,
+    /// 原始工具调用先于执行结果；只存身份、顺序和期限，不保存参数正文。
+    pub followup_starts: BTreeMap<EvidenceKey, (u64, u64, u64)>,
+    pub observation_seq: u64,
+    pub completed_seq: BTreeMap<(String, String), u64>,
     /// 子线程 → 等它首轮的派生操作。
     pub spawn_waits: BTreeMap<String, EvidenceKey>,
     pub parent_waits: BTreeMap<EvidenceKey, ParentWait>,

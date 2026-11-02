@@ -5,7 +5,8 @@ import { convergenceFields } from "./run-result";
 const phases: Record<JoinPhase, string> = { running: "运行中", waitingSubtree: "等待子代理", preparingReconcile: "准备汇总",
   reconciling: "汇总中", finalCheck: "最终核实", released: "已释放", stopping: "异常收尾", abnormal: "异常收尾" };
 const gates: Record<string, string> = {
-  automaticControlRevoked: "自动汇总权限核实", connectionOrAuthorityChanged: "连接与管理权核实", parentNotSettled: "父轮落定",
+  automaticControlRevoked: "自动汇总权限核实", parentNotSettled: "父轮落定",
+  brokerClosingOrQuiescing: "broker 正在关闭或静默",
   conflicts: "归属冲突核实", reconcileOutcomeUnknown: "汇总提交结果核实", rootUnsettled: "根线程落定",
   requestInFlight: "请求处理", stopChangeInFlight: "停止变更处理", discoveryInFlight: "子树发现回包",
   resultReadInFlight: "结果读取回包", retryScheduled: "重试调度", reconcileSubmissionInFlight: "汇总提交回包",

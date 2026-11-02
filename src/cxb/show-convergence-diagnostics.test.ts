@@ -75,6 +75,9 @@ test("终态清除旧诊断，成功阶段只输出中性门名", () => {
   expect(lines).toContain("正在等待：派生操作落定");
   expect(lines.join()).not.toMatch(/缺口|陈旧|不完整|卡住/);
   expect(convergenceLines({ subagentJoin: { ...subagentJoin, phase: "released" }, convergenceDiagnostic: diagnostic }).join()).not.toContain("正在等待");
+  const closing = convergenceLines({ subagentJoin, convergenceDiagnostic: { ...diagnostic, gate: "brokerClosingOrQuiescing" } });
+  expect(closing).toContain("正在等待：broker 正在关闭或静默");
+  expect(closing.join()).not.toContain("自动汇总权限核实");
 });
 
 test("观察器接收在线门名，终态 null 清除且迟到 revision 不能复活", () => {
