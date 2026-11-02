@@ -60,11 +60,9 @@ export function treeLogLine(item: TreeLogEvent, labels: ReadonlyMap<string, stri
   return `${item.ts} [${clean(item.runId ?? "文件")}][${source}] ${item.text}\n`;
 }
 
-/** 只用于提示：沿直接父链寻找最近具有独立运行的祖先，缺链或环不猜测根线程。 */
-function rootLogHint(entry: ThreadIndexEntry, index: ThreadIndexEntry[], runs: RunResult[]): string {
+/** 沿直接父链逐级上溯，遇缺链或环即止；返回已走过的祖先，近者在前。 */
+function ancestors(entry: ThreadIndexEntry, index: ThreadIndexEntry[]): ThreadIndexEntry[] {
   const byThread = new Map(index.map((item) => [item.threadId, item]));
-  const runIds = new Set(runs.map((run) => run.runId));
-  const owned = new Set(runs.map((run) => run.threadId));
   const chain: ThreadIndexEntry[] = [];
   const seen = new Set([entry.threadId]);
   for (let parentId = entry.parentThreadId; parentId && !seen.has(parentId); parentId = byThread.get(parentId)?.parentThreadId) {
@@ -73,11 +71,22 @@ function rootLogHint(entry: ThreadIndexEntry, index: ThreadIndexEntry[], runs: R
     if (!parent) break;
     chain.push(parent);
   }
-  // 运行元数据被清理后，索引里悬空的 lastRunId 只是弱证据：broker 会把父运行编号写进 review 执行线程，
-  // 所以 reviewExecution 线程、或与更上层祖先共用同一编号的线程都不算独立运行，继续上溯。
-  const root = chain.find((parent, depth) => owned.has(parent.threadId)
-    || (!!parent.lastRunId && !runIds.has(parent.lastRunId) && parent.relationKind !== "reviewExecution"
-      && !chain.slice(depth + 1).some((above) => above.lastRunId === parent.lastRunId)));
+  return chain;
+}
+
+/**
+ * 线程是否有自己的 cxb 运行。运行记录是强证据；元数据被清理后索引里悬空的 lastRunId 只是弱证据：
+ * broker 会把父运行编号写进 review 执行线程，所以 reviewExecution 线程、或与更上层祖先共用同一编号的线程都不算。
+ */
+function ownsRun(thread: ThreadIndexEntry, above: ThreadIndexEntry[], runs: RunResult[]): boolean {
+  if (runs.some((run) => run.threadId === thread.threadId)) return true;
+  return !!thread.lastRunId && !runs.some((run) => run.runId === thread.lastRunId) && thread.relationKind !== "reviewExecution"
+    && !above.some((parent) => parent.lastRunId === thread.lastRunId);
+}
+
+/** 只用于提示：沿直接父链寻找最近具有独立运行的祖先，缺链或环不猜测根线程。 */
+function rootLogHint(chain: ThreadIndexEntry[], runs: RunResult[]): string {
+  const root = chain.find((parent, depth) => ownsRun(parent, chain.slice(depth + 1), runs));
   if (root) return `请使用根线程 ${threadLabel(root.threadId, root.shortId)} 查看树日志`;
   return "请使用具有独立 cxb 运行的根线程查看树日志（本地血缘缺失或成环，无法定位根线程）";
 }
@@ -88,8 +97,10 @@ export function showTreeLog(ctx: CommandContext, ref: ThreadRef): 0 {
   const allRuns = readAllRuns(ctx.workspace.workspaceDir);
   const records = allRuns.filter((run) => run.threadId === ref.threadId).sort(compareRunCreation);
   const entry = index.find((item) => item.threadId === ref.threadId);
-  if (entry?.parentThreadId && !entry.lastRunId && records.length === 0) {
-    throw new CxbError("USAGE", `该线程是派生子线程，${rootLogHint(entry, index, allRuns)}`);
+  // 派生线程（含借用父运行编号的 review 执行线程）的事件写在根线程日志里，读自身日志只会得到空结果。
+  if (entry?.parentThreadId && records.length === 0) {
+    const chain = ancestors(entry, index);
+    if (!ownsRun(entry, chain, allRuns)) throw new CxbError("USAGE", `该线程是派生子线程，${rootLogHint(chain, allRuns)}`);
   }
   const snapshot = ref.shortId ? readRunLogSnapshot(ctx.workspace.workspaceDir, ref.shortId)
     : { lines: null, issues: [{ code: "missingLog" as const }] };

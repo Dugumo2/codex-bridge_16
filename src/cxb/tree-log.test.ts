@@ -203,6 +203,16 @@ describe("show 静态树日志离线接口", () => {
     });
     expect(t.connects).toBe(0);
   });
+  // 直接查 review 执行线程：它只借用父运行编号，事件写在根线程日志里，不能读自身空日志冒充结果。
+  for (const metadata of ["missing", "present"] as const) test(`直接查 review 执行线程（元数据${metadata === "missing" ? "缺失" : "完好"}）提示根线程`, async () => {
+    const child = { ...summary({ threadId: "child", shortId: "cdef1234" }), relationKind: "reviewExecution", parentThreadId: "thread-test" };
+    ledger(dir, metadata === "missing" ? [] : [runResult({ reviewThreadId: "child" })], [summary(), child]);
+    const t = context(dir, ["show", "cdef", "--log", "--tree"]);
+    await expect(bounded(show(t.ctx), 1000, "根线程定位未结束")).rejects.toMatchObject({
+      exitCode: 1, message: "该线程是派生子线程，请使用根线程 abcd1234 查看树日志",
+    });
+    expect(t.connects).toBe(0);
+  });
   for (const kind of ["missing", "cycle"] as const) test(`根线程提示遇到${kind === "missing" ? "缺链" : "环"}有界结束且不猜测线程`, async () => {
     const child = { ...summary({ threadId: "child", shortId: "cdef1234", lastRunId: null }), parentThreadId: kind === "missing" ? "missing" : "grandchild" };
     const grandchild = { ...summary({ threadId: "grandchild", shortId: "fedc1234", lastRunId: null }), parentThreadId: "child" };
