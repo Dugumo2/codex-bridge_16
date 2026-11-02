@@ -212,7 +212,9 @@ describe("树文本与变化", () => {
     const unknown = buildTree({ rootThreadId: "root" });
     expect(treeLines(unknown).join("\n")).toContain("发现完整性未知");
     const incomplete = buildTree({ rootThreadId: "root", snapshot: snapshot([], { discovery: { complete: false, version: 1, incompleteReasons: ["缺证据"] }, inFlightSpawns: 1 }) });
-    expect(treeChanges(unknown, incomplete).join("\n")).toContain("子代理发现不完整：缺证据");
+    expect(treeChanges(unknown, incomplete).join("\n")).toContain("子代理发现正在核实");
+    expect(treeChanges(unknown, incomplete).join("\n")).not.toContain("发现不完整");
+    expect(treeLines({ ...incomplete, view: "terminal" }).join("\n")).toContain("子代理发现不完整：缺证据");
     expect(treeChanges(unknown, incomplete).join("\n")).toContain("在途派生 1 个");
     const complete = buildTree({ rootThreadId: "root", snapshot: snapshot([], { discovery: { complete: true, version: 2, incompleteReasons: [] }, inFlightSpawns: 0 }) });
     expect(treeLines(complete).join("\n")).toContain("本次运行没有子代理");

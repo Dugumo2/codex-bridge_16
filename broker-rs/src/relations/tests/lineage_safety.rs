@@ -581,7 +581,7 @@ fn lineage_safety_未知候选空活动账仍在原期限异常终止并保留�
     );
     let generation = m.trees.operations[&tree].generation;
     m.clock.mono_ms = m.trees.operations[&tree].request.first_delivery_deadline_ms;
-    mock.inject(
+    let final_actions = mock.inject(
         &mut m,
         Event::Timer {
             token: ClaimToken {
@@ -596,6 +596,14 @@ fn lineage_safety_未知候选空活动账仍在原期限异常终止并保留�
         },
     );
     assert_eq!(m.runs.runs[R].state, crate::runs::RunState::Ended);
+    assert!(
+        final_actions.iter().any(|action| matches!(action,
+            Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
+                if lines.iter().any(|line| line.contains("记录缺口")
+                    && line.contains("\"coverageIssue\":\"discoveryIncomplete\""))
+        )),
+        "发现无法核实时，树停止定案必须保存真实日志缺口"
+    );
     assert_eq!(
         m.runs.runs[R].status,
         Some(crate::runs::RunStatus::Interrupted)

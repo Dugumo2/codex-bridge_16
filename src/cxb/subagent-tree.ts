@@ -168,8 +168,12 @@ function globalLines(tree: TreeView): string[] {
   }
   if (!tree.nodes.some((node) => node.relationKind === "subagent")) lines.push(tree.discovery?.complete
     ? "本次运行没有子代理" : "未记录子代理成员，发现完整性未知");
-  if (tree.discovery?.complete === false) lines.push(`子代理发现不完整${tree.discovery.incompleteReasons.length
-    ? `：${safeLine(tree.discovery.incompleteReasons.join("；"))}` : ""}`);
+  if (tree.discovery?.complete === false) {
+    // 分类变化会正常使发现覆盖失效；在线核实过程不能提前宣告终态缺口。
+    const decided = tree.view === "terminal" || (tree.stopSummary != null && tree.stopSummary.phase !== "pending");
+    lines.push(decided ? `子代理发现不完整${tree.discovery.incompleteReasons.length
+      ? `：${safeLine(tree.discovery.incompleteReasons.join("；"))}` : ""}` : "子代理发现正在核实");
+  }
   if (tree.inFlightSpawns !== null) lines.push(`在途派生 ${tree.inFlightSpawns} 个`);
   if (tree.unsettledSpawns !== null && tree.unsettledSpawns > 0) lines.push(`还有 ${tree.unsettledSpawns} 个派生尚未落定`);
   if (tree.stale) lines.push("树信息可能陈旧，已保留最后已知成员");

@@ -124,6 +124,55 @@ fn item(thread: &str, turn: &str) -> Option<Value> {
 }
 
 #[test]
+fn tree_log_发现中间态与候选分类不写缺口_恢复完整后结束零误报() {
+    let mut m = setup();
+    let mut actions = vec![];
+    candidate(&mut m, "child", "root");
+    m.refresh_classification("run-a", "child", "Discovery", &mut actions);
+    assert!(!m.manage_context("run-a").unwrap().discovery.complete);
+    m.log_member_change("run-a", "child", MemberChange::Discovery, &mut actions);
+    assert!(logs(&actions).iter().any(|l| l.2 == "候选分类"));
+    assert!(logs(&actions)
+        .iter()
+        .all(|l| l.3.get("coverageIssue").is_none()));
+    m.relations
+        .contexts
+        .get_mut("run-a")
+        .unwrap()
+        .discovery
+        .complete = true;
+    m.run_released("run-a", crate::runs::ReleaseKind::Natural, &mut actions);
+    assert_eq!(m.runs.runs["run-a"].state, RunState::Ended);
+    assert!(logs(&actions).iter().all(|l| l.2 != "记录缺口"));
+}
+
+#[test]
+fn tree_log_定案时发现仍不完整必须记录真缺口() {
+    for shutdown in [false, true] {
+        let mut m = setup();
+        let state = &mut m.relations.contexts.get_mut("run-a").unwrap().discovery;
+        state.complete = false;
+        state.version = 1;
+        state.incomplete_reasons.push("listFailed".into());
+        let mut actions = vec![];
+        if shutdown {
+            m.shutdown_runs(&mut actions);
+            m.shutdown_runs(&mut actions);
+        } else {
+            m.run_released("run-a", crate::runs::ReleaseKind::Natural, &mut actions);
+            m.run_released("run-a", crate::runs::ReleaseKind::Natural, &mut actions);
+        }
+        let gaps: Vec<_> = logs(&actions)
+            .into_iter()
+            .filter(|l| l.3["coverageIssue"] == "discoveryIncomplete")
+            .collect();
+        assert_eq!(gaps.len(), 1, "每次定案只记录一次真实缺口，关闭={shutdown}");
+        assert_eq!(gaps[0].2, "记录缺口");
+        assert_eq!(gaps[0].3["threadId"], "root");
+    }
+}
+
+#[test]
 fn tree_log_根子孙同文件身份与同正文独立事件以及review来源() {
     let mut m = setup();
     bind(&mut m, "run-a", "child", "ct", "root");
