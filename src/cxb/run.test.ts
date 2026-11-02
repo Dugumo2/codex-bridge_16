@@ -562,6 +562,144 @@ function continueUnit(args: string[], opts: { from?: RunResult; server?: "privat
 const methods = (unit: { fake: FakeRpc }) => unit.fake.calls.map((call) => call.method);
 const turnText = (unit: { fake: FakeRpc }) => unit.fake.calls.find((call) => call.method === "turn/start")?.params.input[0].text as string;
 
+function handoffRun(patch: Partial<RunResult> = {}): RunResult {
+  return interrupted({ children: [{ threadId: "thread-child", parentThreadId: "thread-test", relationKind: "subagent",
+    turnIds: ["turn-managed"], evidence: "v2Started", finalState: "settled" }], ...patch });
+}
+
+function handoffIndex() {
+  writeFileSync(join(h.workspace.workspaceDir, "threads.json"), JSON.stringify({ payload: { threads: {
+    abcd1234: { threadId: "thread-test", shortId: "abcd1234", updatedAt: 1000, lastRunId: "run-old" },
+    child123: { threadId: "thread-child", shortId: "child123", updatedAt: 1000, lastRunId: null,
+      parentThreadId: "thread-test", relationKind: "subagent", agentVersion: "v2", canAcceptDirectInput: false,
+      sourceSummary: { kind: "threadSpawn", agentPath: "/root/research", agentNickname: "调研员" } },
+    unrelated: { threadId: "thread-unrelated", shortId: "unrelated", updatedAt: 2000, lastRunId: null,
+      parentThreadId: "thread-test", relationKind: "subagent", agentVersion: "v2" },
+  } } }));
+}
+
+function withHandoffResults(unit: ReturnType<typeof unitExecution>, fail = false) {
+  const original = unit.fake.handle;
+  unit.fake.handle = (method, params) => {
+    if (method === "broker/threads/list") return { threads: [{ threadId: "thread-test", shortId: "abcd1234" }] };
+    if (method === "thread/resume") return { thread: { id: "thread-test" }, sandbox: { type: "readOnly" }, approvalPolicy: "never" };
+    if (method === "thread/turns/list") {
+      if (fail) throw new CxbError("BROKER_UNAVAILABLE", "结果读取失败");
+      return { data: [{ id: "turn-unrelated-newest", status: "completed" }, { id: "turn-managed", status: "completed" }], nextCursor: null };
+    }
+    if (method === "thread/items/list") return { data: [{ turnId: params.turnId,
+      item: { type: "agentMessage", phase: "final_answer", text: params.turnId === "turn-managed" ? "受管轮成果：已验证原接口" : "错误的新轮成果" } }], nextCursor: null };
+    return original(method, params);
+  };
+}
+
+test("子代理交接：continue 包含原运行受管轮与完整原有各节，不混入索引全血缘", async () => {
+  handoffIndex();
+  const unit = continueUnit(["本次补充"], { from: handoffRun() });
+  withHandoffResults(unit);
+  expect(await handler()(unit.ctx)).toBe(0);
+  const text = turnText(unit);
+  for (const heading of ["【续跑说明】", "【目标原文】", "【本次补充】", "【原始要求】", "【已有进度】", "【怎么继续】"]) expect(text).toContain(heading);
+  for (const value of ['来源运行 "run-old"', "thread-child", "/root/research", "followup_task", "受管轮成果：已验证原接口"]) expect(text).toContain(value);
+  expect(text).not.toContain("thread-unrelated");
+  expect(text).not.toContain("错误的新轮成果");
+  expect(unit.fake.calls.find((call) => call.method === "thread/items/list")!.params.turnId).toBe("turn-managed");
+});
+
+test("子代理交接：普通 resume 取最近有记录运行，仅作历史参考且保留本次任务", async () => {
+  handoffIndex();
+  writeRunRecord(handoffRun({ runId: "run-earlier", startedAt: 500,
+    children: [{ threadId: "thread-earlier-child", parentThreadId: "thread-test", relationKind: "subagent", turnIds: [], evidence: "v1Spawn", finalState: "settled" }] }));
+  writeRunRecord(handoffRun());
+  writeRunRecord(runResult({ runId: "run-latest-empty", startedAt: 3000, children: [] }));
+  const unit = unitExecution(["run", "只检查新需求，不恢复旧任务", "--resume", "abcd1234"]);
+  withHandoffResults(unit);
+  expect(await handler()(unit.ctx)).toBe(0);
+  const text = turnText(unit);
+  expect(text.startsWith("只检查新需求，不恢复旧任务\n\n")).toBe(true);
+  for (const value of ["仅作历史参考", "本次用户输入才是任务本身", '来源运行 "run-old"', "受管轮成果：已验证原接口"]) expect(text).toContain(value);
+  for (const forbidden of ["【续跑说明】", "不再阻止", "接着完成原始要求", "继续完成原始要求", "thread-earlier-child", '来源运行 "run-latest-empty"']) expect(text).not.toContain(forbidden);
+  expect(unit.fake.calls.find((call) => call.method === "turn/start")!.params).not.toHaveProperty("cxbContinue");
+});
+
+test("子代理交接：新线程与 review --resume 不补读、不附交接单", async () => {
+  handoffIndex();
+  writeRunRecord(handoffRun());
+  const fresh = unitExecution(["run", "新线程要求"]);
+  withHandoffResults(fresh);
+  expect(await handler()(fresh.ctx)).toBe(0);
+  expect(turnText(fresh)).toBe("新线程要求");
+  expect(methods(fresh)).not.toContain("thread/turns/list");
+  const review = unitExecution(["review", "只审查当前改动", "--resume", "abcd1234"]);
+  withHandoffResults(review);
+  const original = review.fake.handle;
+  review.fake.handle = (method, params) => {
+    if (method === "review/start") return original("turn/start", params);
+    return original(method, params);
+  };
+  expect(await createReviewHandler(fakeServerRequests())(review.ctx)).toBe(0);
+  expect(methods(review)).not.toContain("thread/turns/list");
+  expect(review.fake.calls.find((call) => call.method === "review/start")!.params.target).toEqual({ type: "custom", instructions: "只审查当前改动" });
+});
+
+test("子代理交接：broker 结果读取失败仍可续跑，提示只降级且不中断开工", async () => {
+  handoffIndex();
+  const unit = continueUnit([], { from: handoffRun() });
+  withHandoffResults(unit, true);
+  expect(await handler()(unit.ctx)).toBe(0);
+  expect(turnText(unit)).toContain("thread-child");
+  expect(turnText(unit)).toContain("读取失败");
+  expect(methods(unit)).toContain("turn/start");
+});
+
+test("子代理交接：旧运行没有 children 或 subagentJoin 时不产生空标题，坏条目标不完整", async () => {
+  const legacy = continueUnit([], { from: interrupted() });
+  expect(await handler()(legacy.ctx)).toBe(0);
+  expect(turnText(legacy)).not.toContain("子代理记录");
+  expect(methods(legacy)).not.toContain("thread/turns/list");
+  const ordinary = unitExecution(["run", "没有子代理的新要求", "--resume", "abcd1234"]);
+  withHandoffResults(ordinary);
+  expect(await handler()(ordinary.ctx)).toBe(0);
+  expect(turnText(ordinary)).toBe("没有子代理的新要求");
+  expect(methods(ordinary)).not.toContain("thread/turns/list");
+  const malformed = continueUnit([], { from: interrupted({ children: [null] as unknown as RunResult["children"] }) });
+  expect(await handler()(malformed.ctx)).toBe(0);
+  expect(turnText(malformed)).toContain("记录不完整");
+});
+
+test("子代理交接：补读期间取消退出四且不开工，关闭连接与全部监听", async () => {
+  const unit = continueUnit([], { from: handoffRun() });
+  const original = unit.fake.handle;
+  const requested = deferred<void>();
+  const response = deferred<unknown>();
+  h.disposers.push(() => response.resolve({ data: [], nextCursor: null }));
+  unit.fake.handle = (method, params) => {
+    if (method === "thread/turns/list") { requested.resolve(); return response.promise; }
+    return original(method, params);
+  };
+  const work = handler()(unit.ctx);
+  void work.catch(() => {});
+  await bounded(requested.promise, 3000);
+  await bounded(Promise.all([...unit.callbacks].map((callback) => callback("SIGINT"))), 3000);
+  await expect(work).rejects.toMatchObject({ code: "INTERRUPTED", exitCode: 4 });
+  expect(methods(unit)).not.toContain("turn/start");
+  expect(unit.closed()).toBe(true);
+  expect(unit.fake.subscriptions).toBe(0);
+});
+
+test("子代理交接：补读受总命令期限约束，超时退出三且不开工", async () => {
+  const unit = continueUnit(["--timeout", "1"], { from: handoffRun() });
+  const original = unit.fake.handle;
+  const response = deferred<unknown>();
+  h.disposers.push(() => response.resolve({ data: [], nextCursor: null }));
+  unit.fake.handle = (method, params) => method === "thread/turns/list" ? response.promise : original(method, params);
+  await expect(watchdog(handler()(unit.ctx), 5000, "交接单总命令期限")).rejects.toMatchObject({ code: "TIMEOUT", exitCode: 3 });
+  expect(methods(unit)).toContain("thread/turns/list");
+  expect(methods(unit)).not.toContain("turn/start");
+  expect(unit.closed()).toBe(true);
+  expect(unit.fake.subscriptions).toBe(0);
+});
+
 const realRequests: ServerRequestDeps = { attachServerRequests, handover, renderPending };
 
 for (const scenario of ["清空名单", "名单相同", "仅顺序与其他字段变化", "索引缺失", "线程缺失", "索引损坏", "登记形状异常", "配置形状异常", "只计 false", "全关改回 keep"] as const)

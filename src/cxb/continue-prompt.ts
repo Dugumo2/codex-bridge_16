@@ -97,6 +97,8 @@ export interface ContinuePromptInput {
   goal: { objective: string; status: string } | null;
   /** 本次补充说明（拍板 J），没有时为 null。 */
   supplement: string | null;
+  /** 来源运行的子代理交接单；空值不添加段落，兼容没有子代理字段的旧运行。 */
+  subagentHandoff?: string;
 }
 
 const INTERRUPT_TEXT: Record<NonNullable<RunResult["interruptReason"]>, string> = {
@@ -171,6 +173,8 @@ export function buildContinuePrompt(input: ContinuePromptInput): string {
       ...files.map((file) => `- ${file}`));
   }
   if (progress.incomplete) lines.push("（进度记录在运行中丢过条目，以上列表缺项。）");
+
+  if (input.subagentHandoff) lines.push("", input.subagentHandoff);
 
   lines.push("", "【怎么继续】");
   lines.push("1. 先检查工作区的实际状态，对照上面的进度；以工作区为准，不要以这份清单为准。");

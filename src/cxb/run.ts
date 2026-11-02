@@ -25,6 +25,7 @@ import { convergenceFields, resultPending, resultTurn, selectedResultFields } fr
 import { convergenceLines, observeConvergence } from "./convergence";
 import { observeUpstreamErrors, upstreamResultFields } from "./upstream-errors";
 import { isUnconfirmedRun } from "./run-diagnostics";
+import { collectSubagentHandoff } from "./subagent-handoff";
 
 /** 不把上游消息直接输出，防止错误文本回显提示词或凭据。 */
 export function rpcDetail(error: unknown): { code?: number; message: string } {
@@ -120,7 +121,8 @@ interface ContinueSource { from: RunResult; prompt: string; goal: unknown }
  * 读不到时退回运行记录里登记的 goal。
  */
 async function prepareContinue(request: <T>(method: string, params?: unknown) => Promise<T>, out: Output,
-  args: { workspaceDir: string; threadId: string; label: string; fromRunId?: string; supplement: string | null }): Promise<ContinueSource> {
+  args: { workspaceDir: string; threadId: string; label: string; fromRunId?: string; supplement: string | null;
+    rpc: BrokerRpc; deadline: number; signal: AbortSignal }): Promise<ContinueSource> {
   const { workspaceDir, threadId, label } = args;
   // 带 runId 时快照给的就是那次运行；broker 内存里已没有它时退回读运行记录。
   const snapshot = await request<{ run: RunResult | null }>("broker/threads/watch",
@@ -145,7 +147,9 @@ async function prepareContinue(request: <T>(method: string, params?: unknown) =>
   }
   const objective = (goal as { objective?: unknown } | null)?.objective;
   const status = (goal as { status?: unknown } | null)?.status;
+  const subagentHandoff = await collectSubagentHandoff({ workspaceDir, from, rpc: args.rpc, deadline: args.deadline, signal: args.signal });
   const prompt = buildContinuePrompt({ from, chain, supplement: args.supplement,
+    subagentHandoff,
     goal: typeof objective === "string" ? { objective, status: typeof status === "string" ? status : "unknown" } : null });
   return { from, prompt, goal };
 }
@@ -298,12 +302,17 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     if (plan.command === "review" && model) overrides.config!.review_model = model;
     type ThreadResponse = { thread: { id: string }; model?: string; reasoningEffort?: string };
     let response: ThreadResponse | undefined;
+    let prompt = plan.prompt;
     if (plan.continue) {
       // 续跑不发 thread/start、thread/resume：恢复订阅由 broker 在条件核实里做，并按登记补传覆盖（S1-评审第 28 节）。
       if (!threadId) throw new CxbError("USAGE", "--continue 必须与 --resume 同用。");
       continued = await prepareContinue(request, out, { workspaceDir: ctx.workspace.workspaceDir, threadId, label,
-        fromRunId: plan.continue.fromRunId, supplement: plan.continue.supplement });
+        fromRunId: plan.continue.fromRunId, supplement: plan.continue.supplement, rpc, deadline, signal: controller.signal });
     } else {
+      if (plan.command === "run" && threadId) {
+        const handoff = await collectSubagentHandoff({ workspaceDir: ctx.workspace.workspaceDir, threadId, rpc, deadline, signal: controller.signal });
+        if (handoff) prompt = `${prompt}\n\n【子代理历史参考】\n以下交接单仅作历史参考；本次用户输入才是任务本身，请按本次要求判断是否采用历史成果或复用子代理。\n${handoff}`;
+      }
       const method = threadId ? "thread/resume" : "thread/start";
       const params = { ...(threadId ? { threadId, excludeTurns: true } : { ephemeral: false }), cwd: ctx.workspace.root,
         ...(model ? { model } : {}), sandbox: plan.sandbox, ...approval };
@@ -442,7 +451,7 @@ export async function executeRun(ctx: CommandContext, deps: ServerRequestDeps, p
     };
     const startParams = plan.command === "review"
       ? { threadId, target: plan.review!.target, delivery: "inline", cxbConvergence: { timeoutMs: (options["converge-timeout"] ?? 3600) * 1000 }, cxbRunPolicy }
-      : { threadId, input: [{ type: "text", text: continued ? continued.prompt : plan.prompt!, text_elements: [] }], clientUserMessageId: randomUUID(),
+      : { threadId, input: [{ type: "text", text: continued ? continued.prompt : prompt!, text_elements: [] }], clientUserMessageId: randomUUID(),
         sandboxPolicy: sandboxPolicyFor(plan.sandbox), ...(model ? { model } : {}), ...(reasoning ? { effort: reasoning } : {}), ...approval,
         cxbConvergence: { timeoutMs: (options["converge-timeout"] ?? 3600) * 1000 },
         cxbRunPolicy,
