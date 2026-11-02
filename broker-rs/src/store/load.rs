@@ -21,6 +21,10 @@ struct Summary {
     review_short_id: Option<String>,
     #[serde(rename = "turns", deserialize_with = "pending_turn")]
     pending: bool,
+    #[serde(default)]
+    children: Option<Vec<crate::relations::ChildRecord>>,
+    #[serde(default)]
+    ended_at: Option<u64>,
 }
 
 fn pending_turn<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
@@ -73,6 +77,8 @@ struct Retained {
 }
 
 pub(super) struct Selection {
+    history: crate::runs::child_history::ChildHistory,
+    removed: BTreeMap<String, u64>,
     records: BTreeMap<String, Retained>,
     latest: BTreeMap<String, String>,
     indexed: BTreeMap<String, String>,
@@ -97,6 +103,8 @@ impl Selection {
             })
             .collect();
         Self {
+            history: index.child_history.clone(),
+            removed: index.removed.clone(),
             referenced: indexed.values().cloned().collect(),
             indexed,
             indexed_starts: BTreeMap::new(),
@@ -157,14 +165,35 @@ impl Selection {
         self.records.values().all(|record| record.record.is_some())
     }
 
+    pub fn mark_corrupt_history(&mut self) {
+        self.history.mark_corrupt();
+    }
+
+    fn remember_summary(&mut self, summary: &Summary) {
+        match &summary.children {
+            Some(children) => {
+                self.history.remember(
+                    &summary.run_id,
+                    &summary.thread_id,
+                    children,
+                    summary.ended_at.unwrap_or(summary.started_at),
+                    &self.removed,
+                );
+            }
+            None => self.history.mark_missing(),
+        }
+    }
+
     pub fn scan(&mut self, path: &Path, epoch: u64, gate: &Gate) -> Result<(), StoreError> {
         gate.check()?;
         let bytes = std::fs::metadata(path)?.len();
         if bytes > self.limit {
+            self.history.mark_trimmed();
             tracing::warn!(file = %path.display(), bytes, budget = self.limit, "运行文件超过初始化预算，跳过但保留磁盘文件");
             return Ok(());
         }
         let Some(envelope) = read_envelope_limited::<Summary>(path, self.limit)? else {
+            self.history.mark_missing();
             return Ok(());
         };
         gate.check()?;
@@ -183,6 +212,7 @@ impl Selection {
                 .threads()
                 .any(|thread| self.prefers(thread, &summary))
         {
+            self.remember_summary(&summary);
             return Ok(());
         }
         // 先规划完整淘汰集合；预算仍不足时不能先丢掉其中一部分。
@@ -207,6 +237,7 @@ impl Selection {
                 .min_by_key(|(_, record)| record.summary.started_at)
                 .map(|(id, _)| id.clone());
             let Some(id) = oldest else {
+                self.remember_summary(&summary);
                 tracing::warn!(file = %path.display(), budget = self.limit, "初始化总字节预算不足，跳过运行文件但不删除");
                 return Ok(());
             };
@@ -247,6 +278,8 @@ impl Selection {
                 return Err(error);
             }
         };
+        // 完整旧记录退出选择集之前保留确认归属，早期 R0 不受 R1 无子线程影响。
+        self.remember_summary(&summary);
         for id in suspended {
             tracing::warn!(file = %run_file(&id), budget = self.limit, "初始化总字节预算不足，移出旧记录但不删除文件");
             self.remove(&id);
@@ -286,7 +319,7 @@ impl Selection {
         Ok(())
     }
 
-    pub fn finish(self, index: &mut ThreadIndexFile) -> Result<Vec<RunRecord>, StoreError> {
+    pub fn finish(mut self, index: &mut ThreadIndexFile) -> Result<Vec<RunRecord>, StoreError> {
         if !self.complete() {
             return Err(std::io::Error::other("旧候选恢复未完成，放弃本次初始化").into());
         }
@@ -294,6 +327,8 @@ impl Selection {
             let run = self.records[id].record.as_ref().unwrap();
             super::disk::rebuild_entry(index, thread, run, &self.indexed_starts);
         }
+        self.history.prune(0, &index.removed);
+        index.child_history = self.history;
         Ok(self
             .records
             .into_values()
@@ -306,6 +341,59 @@ impl Selection {
 mod tests {
     use super::*;
     use crate::store::tests::{run, Temp};
+
+    #[test]
+    fn history_r0_survives_scan_even_when_r1_has_no_children() {
+        for order in [["r0", "r1"], ["r1", "r0"]] {
+            let temp = Temp::new();
+            let mut disk = temp.disk();
+            let mut index = ThreadIndexFile::default();
+            let mut selection = Selection::new(&index, 0, 100 * 1024);
+            for id in order {
+                let mut record = run(id, "parent", if id == "r0" { 1 } else { 2 });
+                if id == "r0" {
+                    record.children = vec![crate::runs::child_history::test_child("old-child")];
+                }
+                disk.write_json(&run_file(&id.into()), &serde_json::to_vec(&record).unwrap())
+                    .unwrap();
+                selection
+                    .scan(&disk.dir.join(run_file(&id.into())), disk.epoch, &disk.gate)
+                    .unwrap();
+            }
+            let records = selection.finish(&mut index).unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].run_id, "r1");
+            assert!(records[0].children.is_empty());
+            assert!(index.child_history.has_other_run("old-child", "r2"));
+            assert_eq!(index.child_history.coverage_reason(), "historyMissing");
+        }
+    }
+
+    #[test]
+    fn history_oversized_scan_marks_gap_without_false_completion() {
+        let temp = Temp::new();
+        let mut disk = temp.disk();
+        let mut record = run("large", "parent", 1);
+        record.children = vec![crate::runs::child_history::test_child("unknown-child")];
+        record.input = "x".repeat(2048);
+        disk.write_json(
+            &run_file(&"large".into()),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let mut index = ThreadIndexFile::default();
+        let mut selection = Selection::new(&index, 0, 1024);
+        selection
+            .scan(
+                &disk.dir.join(run_file(&"large".into())),
+                disk.epoch,
+                &disk.gate,
+            )
+            .unwrap();
+        assert!(selection.finish(&mut index).unwrap().is_empty());
+        assert_eq!(index.child_history.coverage_reason(), "historyTrimmed");
+        assert!(!index.child_history.has_other_run("unknown-child", "r2"));
+    }
 
     #[test]
     fn 同线程历史增量筛选不累积全部输出() {

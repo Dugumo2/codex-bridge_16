@@ -230,6 +230,7 @@ pub(crate) fn fixture(count: usize) -> (Machine, ConvergeToken) {
         pending_starts: 0,
         pending_requests: 0,
         unresolved_lookups: 0,
+        unresolved_candidates: 0,
         conflicts: vec![],
         result_refs: refs,
     };

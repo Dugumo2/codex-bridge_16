@@ -345,6 +345,8 @@ impl Machine {
             return false;
         }
         !context.in_flight_spawns.is_empty()
+            || self.run_has_candidates(run)
+            || !self.run_lineage_threads(run).is_empty()
             || context
                 .members
                 .values()
@@ -370,17 +372,34 @@ impl Machine {
         })
     }
 
-    /// 停止范围内的子代理成员：线程 → 所属运行。
+    /// 停止核实范围：完整血缘加本次活动成员。范围本身不授予中断或清理权限。
     fn tree_scope_members(&self, tree_op: u64) -> BTreeMap<String, String> {
         let mut members = BTreeMap::new();
         let Some(work) = self.trees.aux.work.get(&tree_op) else {
             return members;
         };
         for run in &work.runs {
+            for thread in self.run_lineage_threads(run) {
+                if thread != work.root_thread {
+                    members.entry(thread).or_insert_with(|| run.clone());
+                }
+            }
             if let Some(context) = self.manage_context(run) {
+                if let Some(cleanup) = &context.cleanup {
+                    for thread in &cleanup.scope {
+                        if *thread != work.root_thread {
+                            members.entry(thread.clone()).or_insert_with(|| run.clone());
+                        }
+                    }
+                }
                 for (thread, member) in &context.members {
                     if member.kind == RelationKind::Subagent && *thread != work.root_thread {
-                        members.entry(thread.clone()).or_insert_with(|| run.clone());
+                        if self.current_management_evidence(run, thread) {
+                            // 多运行停止时，纯血缘所属上下文不能遮住另一个范围内运行的真实归属。
+                            members.insert(thread.clone(), run.clone());
+                        } else {
+                            members.entry(thread.clone()).or_insert_with(|| run.clone());
+                        }
                     }
                 }
             }
@@ -565,35 +584,6 @@ impl Machine {
                     )
             });
         if historical_cleanup && !self.relations.contexts.contains_key(&run) {
-            let record = &self.runs.runs[&run];
-            // 恢复成员的历史持久化证据，不重建轮次绑定或旧 owner 权限。
-            for child in &record.children {
-                self.relations
-                    .aux
-                    .member_evidence
-                    .insert((run.clone(), child.thread_id.clone()), child.evidence);
-            }
-            let members = record
-                .children
-                .iter()
-                .map(|child| {
-                    let edge = self.thread_relation(&child.thread_id);
-                    (
-                        child.thread_id.clone(),
-                        crate::relations::MemberState {
-                            parent: child.parent_thread_id.clone(),
-                            kind: child.relation_kind,
-                            capability: edge.as_ref().and_then(|e| e.can_accept_direct_input),
-                            agent_version: edge.map_or(AgentVersion::Unknown, |e| e.agent_version),
-                            bindings: child.turn_ids.clone(),
-                            conflict: None,
-                            activity: MemberActivity::Unknown,
-                            pending_requests: 0,
-                            active_goal: None,
-                        },
-                    )
-                })
-                .collect();
             self.relations.contexts.insert(
                 run.clone(),
                 crate::relations::ManageContext {
@@ -605,7 +595,8 @@ impl Machine {
                     gen: 1,
                     authority: Authority::Cleanup { tree_op },
                     policy: crate::policy::Policy::OnRequest,
-                    members,
+                    // 历史停止只恢复独立清理范围，不把历史子线程重建为本次活动成员。
+                    members: BTreeMap::new(),
                     in_flight_spawns: BTreeSet::new(),
                     revision: 0,
                     discovery: empty_discovery(),
@@ -624,6 +615,22 @@ impl Machine {
         }
         // 第 1 步：根屏障与清理策略在停止开始时冻结；已转发的子请求按清理策略撤回。
         self.relations_enter_cleanup(&run, tree_op, actions);
+        if historical_cleanup {
+            let scope: BTreeSet<String> = self.runs.runs[&run]
+                .children
+                .iter()
+                .filter(|child| child.relation_kind == RelationKind::Subagent)
+                .map(|child| child.thread_id.clone())
+                .collect();
+            if let Some(cleanup) = self
+                .relations
+                .contexts
+                .get_mut(&run)
+                .and_then(|c| c.cleanup.as_mut())
+            {
+                cleanup.scope.extend(scope);
+            }
+        }
         if previously_ended {
             self.relations_commit_cleanup(&run, tree_op, actions);
         }
@@ -1246,22 +1253,40 @@ impl Machine {
                 self.manage_context(run)
                     .and_then(|c| c.members.get(thread).cloned())
             });
-            let Some(member) = state else { continue };
+            let activity = state.as_ref().map_or_else(
+                || {
+                    self.relations.aux.observed.get(thread).map_or(
+                        MemberActivity::Unknown,
+                        |turns| {
+                            if turns.iter().any(|turn| !turn.completed) {
+                                MemberActivity::Running
+                            } else {
+                                MemberActivity::Settled
+                            }
+                        },
+                    )
+                },
+                |member| member.activity,
+            );
+            let active_goal = state
+                .as_ref()
+                .and_then(|member| member.active_goal)
+                .or_else(|| self.records.get(thread).map(|r| r.goal_active));
             let key = (tree_op, thread.clone());
             let Some(op) = self.trees.aux.derived.get_mut(&key) else {
                 continue;
             };
             let active = matches!(
-                member.activity,
+                activity,
                 MemberActivity::Running | MemberActivity::Starting | MemberActivity::Unknown
             );
-            let changed = op.seen_activity != Some(member.activity);
-            op.seen_activity = Some(member.activity);
-            if member.active_goal == Some(true) && op.goal_ok() {
+            let changed = op.seen_activity != Some(activity);
+            op.seen_activity = Some(activity);
+            if active_goal == Some(true) && op.goal_ok() {
                 op.goal_checked = false;
                 op.stopped = false;
             }
-            if (changed || member.active_goal == Some(true))
+            if (changed || active_goal == Some(true))
                 && (op.background.busy || op.background.verifying || op.background.confirmed)
             {
                 op.background.invalidate();

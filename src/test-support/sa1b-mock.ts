@@ -11,7 +11,13 @@ export interface MockThread {
   goal: any; usage: any; delivery: DeliveryMode; startMode: StartMode;
   interrupts: any[]; goalWrites: any[]; inputs: any[]; answers: any[]; pendingRequests: RpcMessage[];
 }
-export interface Sa1bOptions { version?: ProtocolVersion; pageSize?: number }
+/** 仅保存模拟服务器的持久事实；连接、通知队列与订阅必须在重连后重新建立。 */
+export interface Sa1bSnapshot { version: 1; serial: number; threads: Record<string, MockThread> }
+export interface Sa1bOptions {
+  version?: ProtocolVersion; pageSize?: number; snapshot?: Sa1bSnapshot;
+  /** 在祖先分页末尾再次返回指定线程，模拟分页间重复但游标仍前进。 */
+  duplicateListIds?: string[];
+}
 
 /** 命令皆为 fixture/sa1b/<名称>，避免与旧夹具控制面相互消费。 */
 export function createSa1bMock(send: (message: RpcMessage, connectionId?: string) => unknown, options: Sa1bOptions = {}) {
@@ -36,8 +42,15 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
     "thread/name/updated", "thread/archived", "thread/unarchived", "thread/deleted", "thread/reverted", "thread/attachment/updated", "thread/project/updated"]);
   const faults = new Map<string, { mode: string; remaining: number }>();
   const background = createBackgroundTerminalsMock(message => emit(message as RpcMessage), { enabled: true });
-  let serial = 0;
+  let serial = options.snapshot?.serial ?? 0;
   const clone = <T>(value: T): T => structuredClone(value);
+  if (options.snapshot) {
+    if (options.snapshot.version !== 1 || !Number.isSafeInteger(serial) || serial < 0) throw new Error("历史快照版本或编号状态无效");
+    for (const [id, saved] of Object.entries(options.snapshot.threads)) {
+      if (saved.id !== id) throw new Error("历史快照线程键与标识不一致");
+      threads.set(id, clone(saved));
+    }
+  }
   const thread = (id: string): MockThread => {
     let t = threads.get(id);
     if (!t) {
@@ -147,6 +160,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
     switch (msg.method?.slice("fixture/sa1b/".length)) {
       // 观测响应不能再次进入事件日志，否则连续 state 会递归复制之前的整份快照。
       case "state": send({ id: msg.id, result: state() }, currentConnection); break;
+      case "snapshot": send({ id: msg.id, result: snapshot() }, currentConnection); break;
       case "connection": subscriptions.set(p.connectionId, new Set(p.threadIds ?? [])); reply(msg.id, {}); break;
       case "fence": (p.direction === "request" ? requestFences : p.direction === "snapshot" ? snapshotFences : p.direction === "response" ? responseFences : fences).set(p.name, { method: p.method, threadId: p.threadId }); reply(msg.id, {}); break;
       case "release": {
@@ -190,6 +204,13 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
         const parent = thread(p.parentThreadId), child = thread(p.childThreadId);
         const pt = parent.turns.find(x => x.id === p.parentTurnId);
         if (!pt) { error(msg.id, "父轮不存在"); break; }
+        if (!child.loaded) {
+          // 对应 core 恢复运行时后的 thread-created 监听器：为当前连接重新附着。
+          // 只恢复本次复用的线程，不回放旧 spawn 条目或历史轮通知。
+          child.loaded = true;
+          for (const subscribed of subscriptions.values()) subscribed.add(child.id);
+          if (p.announce !== false) notify("thread/started", { thread: meta(child) });
+        }
         const value = child.version === "v1"
           ? { type: "collabAgentToolCall", id: `reuse-${++serial}`, tool: "sendInput", status: "completed", senderThreadId: parent.id, receiverThreadIds: [child.id], agentsStates: {} }
           : { type: "subAgentActivity", id: `reuse-${++serial}`, kind: "interacted", agentThreadId: child.id, agentPath: `/root/${child.id}` };
@@ -293,7 +314,11 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
       case "thread/read":
         if (!t!.stored && !t!.loaded) error(msg.id, `thread not loaded: ${t!.id}`);
         else reply(msg.id, { thread: meta(t!, p.includeTurns === true) }); break;
-      case "thread/list": page(msg.id, [...threads.values()].filter(x => (!p.ancestorThreadId || ancestors(x).includes(p.ancestorThreadId)) && x.archived === (p.archived === true)).map(x => meta(x)), p); break;
+      case "thread/list": {
+        const listed = [...threads.values()].filter(x => (!p.ancestorThreadId || ancestors(x).includes(p.ancestorThreadId)) && x.archived === (p.archived === true));
+        const duplicates = p.ancestorThreadId ? (options.duplicateListIds ?? []).flatMap(id => listed.filter(x => x.id === id)) : [];
+        page(msg.id, [...listed, ...duplicates].map(x => meta(x)), p); break;
+      }
       case "thread/loaded/list": page(msg.id, [...threads.values()].filter(x => x.loaded && !x.archived).map(x => x.id), p); break;
       case "thread/turns/list": {
         const turns = p.sortDirection === "asc" ? t!.turns : [...t!.turns].reverse();
@@ -371,5 +396,6 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
       subscriptions: Object.fromEntries([...subscriptions].map(([id, subscribed]) => [id, [...subscribed]])), deliveries,
       queued: Object.fromEntries([...queued].map(([id, requests]) => [id, requests.map(x => x.message)])) });
   }
-  return { handle, state };
+  function snapshot(): Sa1bSnapshot { return clone({ version: 1, serial, threads: Object.fromEntries(threads) }); }
+  return { handle, state, snapshot };
 }

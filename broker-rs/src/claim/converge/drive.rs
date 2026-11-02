@@ -670,6 +670,7 @@ impl Machine {
             && facts.work_epoch == work_epoch
             && facts.pending_starts == 0
             && facts.unresolved_lookups == 0
+            && facts.unresolved_candidates == 0
             && facts.conflicts.is_empty()
         {
             self.convergences
@@ -681,6 +682,16 @@ impl Machine {
             self.convergence_drive(run, actions);
         } else if !result.cancelled && result.state.complete && facts.work_epoch != work_epoch {
             // 在途发现期间的新结果要求立即覆盖新批次，不沿用失败退避。
+            self.convergence_drive(run, actions);
+        } else if !result.cancelled
+            && !result.state.incomplete_reasons.is_empty()
+            && result
+                .state
+                .incomplete_reasons
+                .iter()
+                .all(|reason| reason == "candidateChanged")
+        {
+            // 本次新事实已到达，旧快照作废后立即核实；不把正常工作变化当作传输失败退避。
             self.convergence_drive(run, actions);
         } else {
             self.convergence_retry(run, actions);
@@ -776,6 +787,7 @@ impl Machine {
             !f.discovery.complete
                 || f.discovery_covered_epoch != Some(f.work_epoch)
                 || f.unresolved_lookups > 0
+                || f.unresolved_candidates > 0
         });
         self.convergence_fail(
             run,

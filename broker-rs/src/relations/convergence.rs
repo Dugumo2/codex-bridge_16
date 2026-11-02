@@ -57,7 +57,7 @@ impl Machine {
             .relations
             .contexts
             .iter()
-            .filter(|(_, c)| c.members.contains_key(thread))
+            .filter(|(run, _)| self.run_tracks_thread(run, thread))
             .map(|(run, _)| run.clone())
             .collect();
         for run in runs {
@@ -75,19 +75,23 @@ impl Machine {
             .observations
             .retain(|(t, _), _| t != thread);
         self.convergences.goals.remove(thread);
+        self.relations.aux.candidate_observations.remove(thread);
         self.convergences.capabilities.remove(thread);
         let runs: Vec<_> = self
             .relations
             .contexts
             .iter()
-            .filter(|(_, c)| {
-                c.members.contains_key(thread) || c.identity.execution_thread_id == thread
+            .filter(|(run, c)| {
+                self.run_tracks_thread(run, thread) || c.identity.execution_thread_id == thread
             })
             .map(|(r, _)| r.clone())
             .collect();
         for run in runs {
             if let Some(ledger) = self.convergences.ledgers.get_mut(&run) {
                 ledger.covered_epoch = None;
+            }
+            if self.run_tracks_thread(&run, thread) {
+                self.refresh_member(&run, thread, MemberChange::Activity, actions);
             }
             self.convergence_sync_facts(&run);
             self.touch_context(&run, MemberChange::Activity, actions);
@@ -218,8 +222,31 @@ impl Machine {
         let Some(context) = self.relations.contexts.get(run).cloned() else {
             return;
         };
+        let valid_threads: BTreeSet<String> = context
+            .members
+            .keys()
+            .filter(|t| self.current_management_evidence(run, t))
+            .cloned()
+            .collect();
         let ledger = self.convergences.ledgers.entry(run.into()).or_default();
         let before = ledger.work_epoch;
+        let previous = ledger.activities.len();
+        ledger.activities.retain(|a| {
+            valid_threads.contains(&a.key.thread_id)
+                || a.key.turn_id.as_ref().is_some_and(|t| {
+                    self.relations
+                        .bindings
+                        .get(&(a.key.thread_id.clone(), t.clone()))
+                        .is_some_and(|b| b.run_id == run && b.status == BindingStatus::Bound)
+                })
+        });
+        ledger
+            .results
+            .retain(|r| ledger.activities.iter().any(|a| a.key == r.key));
+        if previous != ledger.activities.len() {
+            ledger.work_epoch = ledger.work_epoch.saturating_add(1);
+            ledger.covered_epoch = None;
+        }
         for op in self.relations.operations.values().filter(|o| {
             o.run_id == run
                 && matches!(
@@ -403,6 +430,18 @@ impl Machine {
             .filter_map(|(t, m)| m.conflict.as_ref().map(|c| format!("{t}: {c}")))
             .take(32)
             .collect();
+        for ((run, thread), classification) in &self.relations.aux.classifications {
+            if run == run_id && conflicts.len() < 32 {
+                if let Membership::Pending(reason) = &classification.membership {
+                    if matches!(
+                        reason.as_str(),
+                        "independentClaim" | "otherRunBinding" | "rejectedFollowup"
+                    ) {
+                        conflicts.push(format!("{thread}: {reason}"));
+                    }
+                }
+            }
+        }
         if ledger.overflow {
             conflicts.push("活动事实超出有界容量".into());
         }
@@ -419,7 +458,10 @@ impl Machine {
             .requests
             .iter()
             .filter(|(key, r)| {
-                r.run_id.as_deref() == Some(run_id)
+                (r.run_id.as_deref() == Some(run_id)
+                    || (r.run_id.is_none()
+                        && r.stage == ChildRequestStage::Lookup
+                        && self.lookup_may_belong(run_id, &r.source_thread_id)))
                     && routing::live_stage(&r.stage)
                     && !self
                         .relations
@@ -454,6 +496,13 @@ impl Machine {
             pending_starts: ledger.pending.union(&context.in_flight_spawns).count(),
             pending_requests,
             unresolved_lookups,
+            unresolved_candidates: self
+                .relations
+                .aux
+                .classifications
+                .iter()
+                .filter(|((r, _), c)| r == run_id && matches!(c.membership, Membership::Pending(_)))
+                .count(),
             conflicts,
             result_refs: ledger.results.clone(),
         })
@@ -464,6 +513,7 @@ pub(crate) fn settled(facts: &ConvergenceFacts) -> bool {
     facts.pending_starts == 0
         && facts.pending_requests == 0
         && facts.unresolved_lookups == 0
+        && facts.unresolved_candidates == 0
         && facts.conflicts.is_empty()
         && facts.activities.iter().all(|a| {
             a.verified

@@ -8,7 +8,9 @@ use serde_json::json;
 
 const P: &str = "父";
 const T: &str = "父轮";
-const R: &str = "收敛运行";
+const R: &str = "run-convergence";
+
+mod lineage;
 
 fn ready() -> ConvergenceReadiness {
     ConvergenceReadiness {

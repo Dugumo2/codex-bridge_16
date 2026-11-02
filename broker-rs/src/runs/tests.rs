@@ -58,6 +58,7 @@ use crate::results::{summarize_item, Snapshot, MAX_TEXT_BYTES};
 use crate::store::{StoreOp, RETENTION_MS};
 use serde_json::json;
 
+mod child_history;
 mod model_inherit;
 mod ue2_diagnostics;
 mod ue2_release;

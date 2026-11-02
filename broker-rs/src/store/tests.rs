@@ -11,6 +11,8 @@ use std::time::{Instant, SystemTime};
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+mod child_history;
+
 pub(crate) struct Temp {
     pub root: PathBuf,
 }
@@ -721,10 +723,12 @@ fn 备份成功但替换失败的重复启动最多留下三份副本() {
     }
     drop(blocker);
     let _disk = temp.disk();
-    assert_eq!(
-        read::<ThreadIndexFile>(&path).payload,
-        ThreadIndexFile::default()
-    );
+    let rebuilt = read::<ThreadIndexFile>(&path).payload;
+    assert_eq!(rebuilt.child_history.coverage_reason(), "historyCorrupt");
+    assert_eq!(rebuilt.version, 0);
+    assert!(rebuilt.threads.is_empty());
+    assert!(rebuilt.removed.is_empty());
+    assert!(rebuilt.purges.is_empty());
     assert_eq!(
         fs::read_dir(temp.dir())
             .unwrap()

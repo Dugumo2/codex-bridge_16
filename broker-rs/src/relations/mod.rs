@@ -8,7 +8,9 @@
 //! 证据期限、回查期限和墓碑用单调毫秒（`Clock::mono_ms`）；请求的收到与截止时间沿用墙钟毫秒。
 pub mod types;
 
+mod classification;
 pub mod convergence;
+pub(crate) use classification::{CandidateClassification, CandidateObservation, Membership};
 mod discovery;
 mod facts;
 mod notify;
@@ -130,6 +132,10 @@ pub struct PendingGuardian {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RelationsAux {
+    /// 发现候选只记录分类与核实进度，不能授予绑定、回答或中断权。
+    pub(crate) classifications: BTreeMap<(String, String), CandidateClassification>,
+    pub(crate) candidate_observations: BTreeMap<String, CandidateObservation>,
+    pub(crate) candidate_versions: BTreeMap<String, u64>,
     pub next_id: u64,
     /// 关系版本：任一血缘边增删改时加一，发现据此判断期间是否变化。
     pub version: u64,
@@ -274,25 +280,15 @@ impl Machine {
     /// 血缘属于线程历史，不自动属于同线程的下一运行。当前运行有派生／复用证据时仍须纳管；
     /// 仅排除已证明属于其他运行的旧成员，未知来源和 pendingInit 继续保守核实。
     pub(crate) fn historical_subagent_for_run(&self, run: &str, thread: &str) -> bool {
-        if self
-            .manage_context(run)
-            .is_some_and(|c| c.members.contains_key(thread))
-            || self
-                .relations
-                .operations
-                .values()
-                .any(|op| op.run_id == run && op.receivers.contains(thread))
-        {
-            return false;
-        }
-        self.runs
-            .runs
-            .values()
-            .any(|r| r.run_id != run && r.children.iter().any(|c| c.thread_id == thread))
-            || self.relations.operations.values().any(|op| {
-                !op.run_id.is_empty() && op.run_id != run && op.receivers.contains(thread)
-            })
+        !self.current_management_evidence(run, thread)
+            && (self.runs.index.child_history.has_other_run(thread, run)
+                || self
+                    .runs
+                    .runs
+                    .values()
+                    .any(|r| r.run_id != run && r.children.iter().any(|c| c.thread_id == thread)))
     }
+
     /// 给自然结束门禁用：活动成员、待答请求、在途派生、未决候选算 some；
     /// 成员上有未归属的活动轮次、或可能属于本运行的回查未决算 unknown。
     pub fn has_managed_activity(&self, run_id: &str) -> Activity {
@@ -300,7 +296,7 @@ impl Machine {
             return Activity::Unknown;
         };
         let now = self.clock.mono_ms;
-        let mut unknown = false;
+        let mut unknown = self.run_has_candidates(run_id);
         if !context.in_flight_spawns.is_empty() {
             return Activity::Some;
         }

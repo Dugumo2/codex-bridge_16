@@ -15,6 +15,7 @@ mod derived;
 mod fx_stop;
 mod gate;
 mod lifecycle;
+mod lineage;
 mod tree;
 
 pub(super) const P: &str = "父线程";

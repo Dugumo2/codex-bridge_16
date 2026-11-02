@@ -571,6 +571,11 @@ pub struct ThreadIndexFile {
     pub version: u64,
     pub threads: ThreadIndex,
     pub removed: BTreeMap<String, u64>,
+    /// 子线程曾属于哪些运行；只恢复历史事实，不恢复任何管理权。
+    /// 可读兼容，不保证无损降级：旧版全量写回会丢弃 childHistory；新版再次恢复时
+    /// 按历史证据缺失处理，仅从仍保留的运行记录补回正向事实，不推断没有历史。
+    #[serde(default)]
+    pub child_history: super::child_history::ChildHistory,
     /// purge 的文件清单随删除标记保留，供部分失败重试与跨重启幂等报告。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub purges: BTreeMap<String, PurgePlan>,

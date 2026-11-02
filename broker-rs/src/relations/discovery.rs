@@ -19,6 +19,7 @@ pub struct SourceState {
 /// 一次发现的进度；完成、到期或关闭时删除。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryWork {
+    pub candidate_versions: BTreeMap<String, u64>,
     pub check_goal_versions: BTreeMap<String, u64>,
     pub checks_queue: VecDeque<(String, String)>,
     pub checks_in_flight: BTreeSet<(String, String)>,
@@ -48,6 +49,9 @@ impl Machine {
         caller: DiscoveryCaller,
         actions: &mut Vec<Action>,
     ) -> u64 {
+        if let DiscoveryScope::Run { run_id } = &scope {
+            self.ensure_context(run_id);
+        }
         let op_id = self.relations.aux.next();
         let generation = self.relations.aux.next();
         let now = self.clock.mono_ms;
@@ -206,6 +210,13 @@ impl Machine {
         if !current {
             actions.push(Action::Debug("丢弃过期发现操作的回包".into()));
             return;
+        }
+        if let DiscoveryCaller::Converge { token, .. } = &self.relations.discoveries[&op_id].caller
+        {
+            if !self.convergence_token_current(token) {
+                actions.push(Action::Debug("丢弃旧连接或旧管理代际的发现回包".into()));
+                return;
+            }
         }
         let check_thread = context
             .params
@@ -492,6 +503,25 @@ impl Machine {
         actions.push(Action::Unschedule {
             key: crate::claim::TimerKey::DiscoveryDeadline(op_id),
         });
+        // 某候选核实完成后，其他回包仍可在途；发布前再检查其版本。
+        for (thread, version) in &work.candidate_versions {
+            if thread != &root
+                && self
+                    .relations
+                    .aux
+                    .candidate_versions
+                    .get(thread)
+                    .copied()
+                    .unwrap_or(0)
+                    != *version
+            {
+                work.reasons.insert("candidateChanged".into());
+                work.missing
+                    .entry(thread.clone())
+                    .or_default()
+                    .push("candidateChanged".into());
+            }
+        }
         let mut all: BTreeMap<String, RelationEdge> = self.relations.edges.clone();
         for (thread, edge) in work.read_edges.iter().chain(work.found.iter()) {
             all.insert(thread.clone(), edge.clone());
@@ -499,19 +529,6 @@ impl Machine {
         let mut members = BTreeMap::new();
         let mut counted = 0usize;
         for (thread, edge) in &all {
-            if let DiscoveryScope::Run { run_id } = &scope {
-                if self.rejected_followup_for_run(run_id, thread) {
-                    continue;
-                }
-            }
-            // 收敛按运行归属筛选；显式整树停止仍保留原来的历史血缘清理范围。
-            if let DiscoveryCaller::Converge { token, .. } = &caller {
-                if self.historical_subagent_for_run(&token.run_id, thread)
-                    || self.rejected_followup_for_run(&token.run_id, thread)
-                {
-                    continue;
-                }
-            }
             // 根深度 0：直接子线程深度 1，最深 8；多走几层只为识别「通到根但超深」。
             let mut current = edge.parent_thread_id.clone();
             let mut depth = 1;
@@ -555,6 +572,11 @@ impl Machine {
         let mut attachments = BTreeMap::new();
         let mut unattached = BTreeSet::new();
         for thread in members.keys() {
+            if let DiscoveryCaller::Converge { token, .. } = &caller {
+                if self.classify_candidate(&token.run_id, thread) == Membership::Historical {
+                    continue;
+                }
+            }
             let evidence = self
                 .relations
                 .attachments
@@ -663,11 +685,31 @@ impl Machine {
             .map(|(r, _)| r.clone())
             .collect();
         for run in &runs {
-            if let Some(context) = self.relations.contexts.get_mut(run) {
-                context.discovery = result.state.clone();
-            }
             for thread in result.members.keys() {
                 self.refresh_member(run, thread, MemberChange::Discovery, actions);
+            }
+            let mut state = result.state.clone();
+            for ((r, thread), classification) in &self.relations.aux.classifications {
+                if r == run {
+                    if let Membership::Pending(reason) = &classification.membership {
+                        state.complete = false;
+                        state
+                            .missing
+                            .entry(thread.clone())
+                            .or_default()
+                            .push(reason.clone());
+                        if !state
+                            .incomplete_reasons
+                            .iter()
+                            .any(|r| r == "unresolvedCandidate")
+                        {
+                            state.incomplete_reasons.push("unresolvedCandidate".into());
+                        }
+                    }
+                }
+            }
+            if let Some(context) = self.relations.contexts.get_mut(run) {
+                context.discovery = state;
             }
             self.touch_context(run, MemberChange::Discovery, actions);
         }
@@ -710,11 +752,6 @@ impl Machine {
         let work = &self.relations.aux.work[&op_id];
         // ancestor/list 已按根过滤；loaded/list 的未知线程必须沿血缘验证。
         for (thread, edge) in work.found.iter().chain(work.read_edges.iter()) {
-            if self.historical_subagent_for_run(&token.run_id, thread)
-                || self.rejected_followup_for_run(&token.run_id, thread)
-            {
-                continue;
-            }
             let mut parent = edge.parent_thread_id.clone();
             for _ in 0..MAX_DEPTH {
                 if parent == root {
@@ -741,9 +778,15 @@ impl Machine {
                     .is_some_and(|l| l.work_epoch > 0));
         // 在传输包装 GoalRead 前建立版本；首次读取不能把“无版本”误判成竞态。
         for thread in &threads {
+            if !self.relations.aux.candidate_versions.contains_key(thread) {
+                self.candidate_changed(thread);
+            }
             self.goal_fact_version(thread);
         }
         self.goal_fact_version(&root);
+        if !self.relations.aux.candidate_versions.contains_key(&root) {
+            self.candidate_changed(&root);
+        }
         let work = self.relations.aux.work.get_mut(&op_id).unwrap();
         let root_goal = (root.clone(), "thread/goal/get".to_owned());
         if !work.checks_done.contains(&root_goal)
@@ -781,6 +824,16 @@ impl Machine {
             };
             work.checks_in_flight
                 .insert((thread.clone(), method.clone()));
+            work.candidate_versions
+                .entry(thread.clone())
+                .or_insert_with(|| {
+                    self.relations
+                        .aux
+                        .candidate_versions
+                        .get(&thread)
+                        .copied()
+                        .unwrap_or(0)
+                });
             if method == "thread/goal/get" {
                 work.check_goal_versions.insert(
                     thread.clone(),
@@ -822,6 +875,30 @@ impl Machine {
             DiscoveryCaller::Converge { token, .. } => token.run_id.clone(),
             _ => return,
         };
+        // 根只核实能力和 goal；自己的新轮不会改变这两项，不能套用子候选版本。
+        // goal 的独立版本仍在下方核验，连接与操作代际已在入口核验。
+        if thread != self.relations.discoveries[&op_id].root
+            && self.relations.aux.work[&op_id]
+                .candidate_versions
+                .get(thread)
+                .copied()
+                .unwrap_or(0)
+                != self
+                    .relations
+                    .aux
+                    .candidate_versions
+                    .get(thread)
+                    .copied()
+                    .unwrap_or(0)
+        {
+            let work = self.relations.aux.work.get_mut(&op_id).unwrap();
+            work.reasons.insert("candidateChanged".into());
+            work.missing
+                .entry(thread.into())
+                .or_default()
+                .push("candidateChanged".into());
+            return;
+        }
         let current_goal = method != "thread/goal/get"
             || self.relations.aux.work[&op_id]
                 .check_goal_versions
@@ -886,6 +963,45 @@ impl Machine {
                     .get("status")
                     .and_then(|s| s.get("type"))
                     .and_then(Value::as_str);
+                let turns = info.get("turns").and_then(Value::as_array);
+                let inactive = matches!(status, Some("notLoaded" | "idle"))
+                    && turns.is_some_and(|turns| {
+                        turns.iter().all(|t| {
+                            matches!(
+                                t.get("status").and_then(Value::as_str),
+                                Some("completed" | "failed" | "interrupted" | "errored")
+                            )
+                        })
+                    });
+                if self.relations.aux.candidate_observations.len() >= MAX_OBSERVED_THREADS
+                    && !self
+                        .relations
+                        .aux
+                        .candidate_observations
+                        .contains_key(thread)
+                {
+                    if let Some(first) = self
+                        .relations
+                        .aux
+                        .candidate_observations
+                        .keys()
+                        .next()
+                        .cloned()
+                    {
+                        self.relations.aux.candidate_observations.remove(&first);
+                    }
+                }
+                self.relations.aux.candidate_observations.insert(
+                    thread.into(),
+                    CandidateObservation {
+                        conn_epoch: self.relations.conn_epoch,
+                        inactive,
+                    },
+                );
+                let historical_only = self.historical_subagent_for_run(&run, thread);
+                if historical_only && inactive {
+                    valid = true;
+                }
                 let verified_closed = self.convergences.closed_threads.contains(thread)
                     && self.convergences.observations.iter().any(|((t, _), o)| {
                         t == thread

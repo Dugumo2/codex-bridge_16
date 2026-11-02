@@ -5,6 +5,9 @@ import { pathToFileURL } from "node:url";
 import type { Subprocess } from "bun";
 import { TestClient, endpointFor, writeMockCodexScript, spawnBroker, waitForSocket, removeDirWithRetry, envWithPathPrefix } from "./broker-harness";
 import { resolveWorkspace } from "../cxb/workspace";
+import type { Sa1bOptions, Sa1bSnapshot } from "./sa1b-mock";
+
+export interface Sa1bPersistedExpectation { state: string; status?: string; children?: string[] }
 
 export const SA1B_ROOT = "root";
 /** 每个场景独立进程、目录、连接；失败路径同样清理。 */
@@ -18,7 +21,9 @@ export class Sa1bHarness {
   runId = "";
   firstTurn = "";
   private drains: Promise<string>[] = [];
-  async open(options: { pageSize?: number } = {}) {
+  private mockOptions: Sa1bOptions = {};
+  private writeMock(options: Sa1bOptions) {
+    this.mockOptions = options;
     const module = pathToFileURL(join(import.meta.dir, "sa1b-mock.ts")).href;
     writeMockCodexScript(this.tempDir, `import { createSa1bMock } from ${JSON.stringify(module)};
 const mock = createSa1bMock((message, connectionId) => { if (connectionId === undefined || connectionId === "broker") process.stdout.write(JSON.stringify(message) + "\\n"); }, ${JSON.stringify(options)});
@@ -26,6 +31,9 @@ let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", chunk => { buffer += chunk; let end; while ((end = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0,end); buffer = buffer.slice(end+1); if (line.trim()) mock.handle(JSON.parse(line)); } });
 process.stdin.on("end", () => process.exit(0));`);
+  }
+  async open(options: Sa1bOptions = {}) {
+    this.writeMock(options);
     await this.launch();
     this.owner = await this.connect();
     return this;
@@ -79,19 +87,35 @@ process.stdin.on("end", () => process.exit(0));`);
     });
     return request;
   }
-  async restart(options: { trimTurns?: number } = {}) {
+  async persisted(expected?: Sa1bPersistedExpectation): Promise<any> {
     // 落盘栅栏：避免用进程强杀与异步存储竞争伪造恢复故障。
     const workspace = resolveWorkspace(this.tempDir, { ...process.env, CXB_HOME: this.home });
     const path = join(workspace.workspaceDir, "runs", `${this.runId}.json`);
-    await this.until(async () => existsSync(path) && JSON.parse(readFileSync(path, "utf8")).payload?.runId === this.runId, 3000, "运行尚未落盘");
+    let payload: any;
+    await this.until(async () => {
+      if (!existsSync(path)) return false;
+      try { payload = JSON.parse(readFileSync(path, "utf8")).payload; } catch { return false; }
+      return payload?.runId === this.runId && (!expected || payload.state === expected.state
+        && (expected.status === undefined || payload.status === expected.status)
+        && (expected.children === undefined || JSON.stringify((payload.children ?? []).map((child: any) => child.threadId).sort())
+          === JSON.stringify([...expected.children].sort())));
+    }, 6000, "运行终态与子成员尚未完整落盘");
+    return payload;
+  }
+  async restart(options: { trimTurns?: number; preserveUpstream?: boolean; snapshot?: Sa1bSnapshot; persisted?: Sa1bPersistedExpectation } = {}) {
+    await this.persisted(options.persisted);
+    const snapshot = options.snapshot ?? (options.preserveUpstream ? await this.control("snapshot") as Sa1bSnapshot : undefined);
     for (const client of this.clients) await client.close();
     for (const proc of this.spawnedProcesses) { proc.kill(); await proc.exited; }
     if (options.trimTurns !== undefined) {
       // 在测试私有存储中构造被裁剪的历史；独立计数与总轮数保持原始值。
+      const workspace = resolveWorkspace(this.tempDir, { ...process.env, CXB_HOME: this.home });
+      const path = join(workspace.workspaceDir, "runs", `${this.runId}.json`);
       const envelope = JSON.parse(readFileSync(path, "utf8"));
       envelope.payload.turns = envelope.payload.turns.slice(-options.trimTurns);
       writeFileSync(path, JSON.stringify(envelope));
     }
+    this.writeMock({ ...this.mockOptions, snapshot });
     await this.launch(); this.owner = await this.connect();
   }
   async cli(args: string[], timeout = 10000) {
