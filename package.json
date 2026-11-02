@@ -1,10 +1,10 @@
 {
   "name": "codex-bridge",
-  "version": "0.3.2",
-  "description": "Claude + Codex collaboration via the Codex app server JSON-RPC protocol",
+  "version": "0.4.0",
+  "description": "cxb is a bridge CLI that lets Claude Code dispatch tasks to Codex app-server through a Rust broker.",
   "type": "module",
   "license": "MIT",
-  "author": "Kevin Qi",
+  "author": "dugumo2",
   "repository": {
     "type": "git",
     "url": "https://github.com/Dugumo2/codex-bridge.git"
