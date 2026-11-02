@@ -1,7 +1,5 @@
 // src/types.ts — Protocol types for Codex app server (JSON-RPC over stdio)
 
-import type { SandboxMode, ReasoningEffort } from "./config";
-
 // --- JSON-RPC primitives ---
 
 export type RequestId = string | number;
@@ -95,15 +93,11 @@ export interface AutoApprovalReviewParams {
   [key: string]: unknown;
 }
 
-/** A Guardian denial captured from item/autoApprovalReview/completed and
- *  persisted under the workspace's guardian/ dir so the user can override
- *  it later with `approve --guardian <review-id>`. */
+/** cxb 将 Guardian 拒绝通知包装为记录，用于回复覆盖与动作摘要。 */
 export interface GuardianDenialRecord {
   reviewId: string;
   threadId: string;
   receivedAt: string;
-  /** Set once the override RPC has been sent; hides it from the pending list. */
-  overriddenAt?: string;
   /** Raw notification payload (camelCase v2 wire shape). */
   notification: AutoApprovalReviewParams;
 }
@@ -122,22 +116,4 @@ export interface Model {
   inputModalities: string[];
   supportsPersonality: boolean;
   isDefault: boolean;
-}
-
-// --- Ask channel (Codex asks mid-turn, anyone answers) ---
-
-/** On-disk shape of a mailbox question file (`{id}.json`). Written by
- *  `cxb ask` from INSIDE Codex's sandbox — which is why the mailbox
- *  lives in temp space (resolveMailboxDir), not the workspace state dir. */
-export interface QuestionRecord {
-  id: string;
-  question: string;
-  askedAt: string;
-  expiresAt: string;
-  workspaceDir: string;
-  /** PID of the asking process (orphan detection for sweeps). */
-  pid: number;
-  /** Set when the deadline lapsed unanswered; the file is kept for the
-   *  audit trail until `clean` sweeps it. */
-  expired?: boolean;
 }

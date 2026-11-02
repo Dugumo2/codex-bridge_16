@@ -1,27 +1,12 @@
-// src/guardian.test.ts — Guardian denial persistence + override-event mapping
+// src/guardian.test.ts — Guardian 事件映射与动作摘要测试。
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
+import { describe, test, expect } from "bun:test";
 import {
   buildGuardianOverrideEvent,
   describeGuardianAction,
-  listGuardianDenials,
   mapGuardianAction,
-  markGuardianDenialOverridden,
-  resolveGuardianDenial,
-  saveGuardianDenial,
 } from "./guardian";
 import type { AutoApprovalReviewParams, GuardianDenialRecord } from "./types";
-
-let dir: string;
-beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "guardian-test-"));
-});
-afterEach(() => {
-  rmSync(dir, { recursive: true, force: true });
-});
 
 function deniedNotification(overrides: Partial<AutoApprovalReviewParams> = {}): AutoApprovalReviewParams {
   return {
@@ -46,58 +31,6 @@ function record(overrides: Partial<AutoApprovalReviewParams> = {}): GuardianDeni
     notification: deniedNotification(overrides),
   };
 }
-
-describe("saveGuardianDenial / listGuardianDenials", () => {
-  test("persists and lists a denial", () => {
-    const path = saveGuardianDenial(dir, deniedNotification());
-    expect(path).not.toBeNull();
-    expect(existsSync(path!)).toBe(true);
-    const listed = listGuardianDenials(dir);
-    expect(listed).toHaveLength(1);
-    expect(listed[0].reviewId).toBe("rev-abc123");
-    expect(listed[0].threadId).toBe("thread-1");
-    expect(listed[0].overriddenAt).toBeUndefined();
-  });
-
-  test("rejects payloads without a usable reviewId or threadId", () => {
-    expect(saveGuardianDenial(dir, deniedNotification({ reviewId: undefined }))).toBeNull();
-    expect(saveGuardianDenial(dir, deniedNotification({ threadId: undefined }))).toBeNull();
-    // Path-traversal-shaped IDs must not become file paths.
-    expect(saveGuardianDenial(dir, deniedNotification({ reviewId: "../evil" }))).toBeNull();
-    expect(listGuardianDenials(dir)).toHaveLength(0);
-  });
-
-  test("skips corrupt files", () => {
-    saveGuardianDenial(dir, deniedNotification());
-    writeFileSync(join(dir, "broken.json"), "garbage\n");
-    expect(listGuardianDenials(dir)).toHaveLength(1);
-  });
-});
-
-describe("resolveGuardianDenial", () => {
-  test("resolves by exact ID and by prefix", () => {
-    saveGuardianDenial(dir, deniedNotification());
-    expect(resolveGuardianDenial(dir, "rev-abc123")?.reviewId).toBe("rev-abc123");
-    expect(resolveGuardianDenial(dir, "rev-a")?.reviewId).toBe("rev-abc123");
-    expect(resolveGuardianDenial(dir, "nope")).toBeNull();
-  });
-
-  test("throws on ambiguous prefix, prefers exact match", () => {
-    saveGuardianDenial(dir, deniedNotification({ reviewId: "rev-1" }));
-    saveGuardianDenial(dir, deniedNotification({ reviewId: "rev-12" }));
-    expect(() => resolveGuardianDenial(dir, "rev")).toThrow(/Ambiguous/);
-    expect(resolveGuardianDenial(dir, "rev-1")?.reviewId).toBe("rev-1");
-  });
-});
-
-describe("markGuardianDenialOverridden", () => {
-  test("stamps the record and survives a reload", () => {
-    saveGuardianDenial(dir, deniedNotification());
-    markGuardianDenialOverridden(dir, "rev-abc123");
-    const reloaded = JSON.parse(readFileSync(join(dir, "rev-abc123.json"), "utf8"));
-    expect(typeof reloaded.overriddenAt).toBe("string");
-  });
-});
 
 describe("mapGuardianAction", () => {
   // Casings verified against codex-rs 0.142 source: the core

@@ -2,7 +2,7 @@
 //
 // broker 写的运行记录带 `children`（受管子线程）与 `childrenStop`（整树停止报告）；这里只读、只展示，
 // 不改已有 JSON 字段。文案按报告生成：未确认或有冲突时不能写「已停止它们」，屏障未解除时提示先 wait/stop 核实。
-import { sanitizeForTerminal } from "../questions";
+import { sanitizeForTerminal } from "./terminal-text";
 import { CxbError, rpcData, rpcFailure, type BackgroundCleanup, type ChildrenStopReport, type ExitCode, type InboxItem, type RunResult } from "./contracts";
 import { readPendingInbox, readThreadIndex, type ThreadIndexEntry } from "./ledger";
 import type { CommandContext } from "./main";

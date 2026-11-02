@@ -1,17 +1,8 @@
-// src/config.ts — Configuration for cxb
+// src/config.ts — cxb 协议配置、参数校验与模板解析。
 
-import { homedir, tmpdir } from "os";
-import { join, basename, resolve, sep } from "path";
-import { createHash } from "crypto";
-import { realpathSync, existsSync, readFileSync, readdirSync } from "fs";
-import { spawnSync } from "child_process";
+import { join } from "path";
+import { existsSync, readFileSync } from "fs";
 import pkg from "../package.json";
-
-function getHome(): string {
-  const home = homedir();
-  if (!home) throw new Error("Cannot determine home directory");
-  return home;
-}
 
 // ─── Model aliases ──────────────────────────────────────────────────────────
 
@@ -24,15 +15,6 @@ const MODEL_ALIASES: Record<string, string> = {
 // The full effort enum the app server accepts, ascending. Not every model
 // advertises every level in its `supportedReasoningEfforts`.
 const VALID_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] as const;
-
-/**
- * True iff `candidate` is the same path as `root` or lives inside `root`.
- * Caller should pass absolute paths; comparison is string-based using the
- * platform separator (so "/a/b" is NOT inside "/a/bb").
- */
-export function isPathInside(candidate: string, root: string): boolean {
-  return candidate === root || candidate.startsWith(root + sep);
-}
 
 // ─── Config object ──────────────────────────────────────────────────────────
 
@@ -62,60 +44,6 @@ export const config = {
   // header all validate against this one number.
   maxTimeoutSeconds: 2_147_483,
   requestTimeout: 30_000, // milliseconds — individual protocol requests (30s)
-  // Broker idle timeout (ms) before a detached broker self-exits. Overridable
-  // via CXB_BROKER_IDLE_TIMEOUT_MS so tests can make brokers exit in
-  // seconds instead of lingering for 30 min and orphaning across test runs.
-  get defaultBrokerIdleTimeout(): number {
-    const raw = process.env.CXB_BROKER_IDLE_TIMEOUT_MS;
-    if (raw !== undefined) {
-      const n = Number(raw);
-      if (Number.isFinite(n) && n > 0) return n;
-    }
-    return 30 * 60 * 1000; // 30 min in ms
-  },
-  // How long a freshly spawned broker gets to bind its socket before the
-  // caller gives up and connects directly. Generous on purpose: falling back
-  // early saves the caller nothing, because a direct connection pays the same
-  // app-server startup cost — it only adds a SECOND concurrent startup, and
-  // concurrent startups are what collide on codex's shared sqlite state. The
-  // wait is cut short anyway when the broker process exits, so this deadline
-  // is only ever paid by a broker that is genuinely still coming up.
-  // Overridable via CXB_BROKER_READY_TIMEOUT_MS for tests.
-  get brokerReadyTimeout(): number {
-    const raw = process.env.CXB_BROKER_READY_TIMEOUT_MS;
-    if (raw !== undefined) {
-      const n = Number(raw);
-      if (Number.isFinite(n) && n > 0) return n;
-    }
-    return 30_000; // 30s in ms
-  },
-
-
-  // Limits
-  maxRunsPerWorkspace: 50,
-
-  // Service identity
-  serviceName: "cxb" as const,
-
-  // Data paths — lazy via getters so the home directory is validated at point of use, not import time.
-  // Lazily created by getWorkspacePaths() on first access.
-  get dataDir() { return join(getHome(), ".cxb-legacy"); },
-
-  /** @deprecated Will be removed when threads module is refactored to use per-workspace state. */
-  /** @deprecated Will be removed when events module is refactored to use per-workspace state. */
-  get logsDir() { return join(this.dataDir, "logs"); },
-  /** @deprecated Will be removed when approvals module is refactored to use per-workspace state. */
-  get approvalsDir() { return join(this.dataDir, "approvals"); },
-  /** @deprecated Will be removed when turns module is refactored to use per-workspace state. */
-  get killSignalsDir() { return join(this.dataDir, "kill-signals"); },
-  /** @deprecated Will be removed when cli module is refactored to use per-workspace state. */
-  get pidsDir() { return join(this.dataDir, "pids"); },
-
-  get configFile() { return join(this.dataDir, "config.json"); },
-
-  // Display
-  threadsListLimit: 20,
-
   clientVersion: pkg.version,
 };
 
@@ -158,99 +86,6 @@ export function validateId(id: string): string {
     throw new Error(`Invalid ID: "${id}"`);
   }
   return id;
-}
-
-// The workspace root for a given cwd is constant for a process's lifetime, but
-// a single command resolves it several times (resolveStateDir, workspaceDirName,
-// and the migration cwd-scope filter all call this on every invocation). Cache
-// by cwd so the `git` subprocess spawns at most once per cwd instead of 2-3×.
-const workspaceDirCache = new Map<string, string>();
-
-/**
- * Find workspace root by running `git rev-parse --show-toplevel`.
- * If not in a git repo, returns the resolved (realpath) cwd.
- * Memoized per cwd — the result is stable within a process.
- */
-export function resolveWorkspaceDir(cwd: string): string {
-  const cached = workspaceDirCache.get(cwd);
-  if (cached !== undefined) return cached;
-  const result = spawnSync("git", ["rev-parse", "--show-toplevel"], {
-    cwd,
-    encoding: "utf-8",
-    timeout: 5000,
-    windowsHide: true,
-  });
-  let wsRoot: string;
-  if (result.status === 0 && result.stdout) {
-    wsRoot = result.stdout.trim();
-  } else {
-    // Canonicalize like git does (it returns the physical path) so state-dir
-    // hashing is stable across symlinked cwds — e.g. macOS's /var → /private/var.
-    const resolved = resolve(cwd);
-    try {
-      wsRoot = realpathSync(resolved);
-    } catch {
-      wsRoot = resolved;
-    }
-  }
-  workspaceDirCache.set(cwd, wsRoot);
-  return wsRoot;
-}
-
-/**
- * `{slug}-{hash}` key identifying a workspace:
- *
- * - slug: sanitized lowercase basename of the workspace root
- * - hash: first 16 chars of SHA-256 of the canonical (realpath) path
- *
- * Shared by the state dir and the ask-channel mailbox so any process that
- * knows the workspace can derive both.
- */
-export function workspaceKey(cwd: string): string {
-  const wsRoot = resolveWorkspaceDir(cwd);
-  let canonical: string;
-  try {
-    canonical = realpathSync(wsRoot);
-  } catch {
-    canonical = resolve(wsRoot);
-  }
-  const slug = basename(canonical).replace(/[^a-zA-Z0-9_-]/g, "_").toLowerCase();
-  return `${slug}-${workspaceHash(cwd)}`;
-}
-
-/** Stable identity of a workspace, independent of its display name: the
- *  hash half of `workspaceKey`. Derived from the canonical workspace ROOT,
- *  so every cwd inside one checkout agrees and two checkouts sharing a
- *  directory name do not. Exported because the peer address needs the same
- *  identity the state dir uses. */
-export function workspaceHash(cwd: string): string {
-  const wsRoot = resolveWorkspaceDir(cwd);
-  let canonical: string;
-  try {
-    canonical = realpathSync(wsRoot);
-  } catch {
-    canonical = resolve(wsRoot);
-  }
-  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
-}
-
-/**
- * Compute per-workspace state directory:
- * `~/.cxb-legacy/workspaces/{slug}-{hash}/`
- */
-export function resolveStateDir(cwd: string): string {
-  return join(getHome(), ".cxb-legacy", "workspaces", workspaceKey(cwd));
-}
-
-/** Root under which every workspace's ask-channel mailbox lives. Temp space,
- *  not ~/.cxb-legacy: the mailbox writer (`cxb ask`) runs INSIDE
- *  Codex's sandbox, where the home state dir is not writable but the temp
- *  dir is (verified: the sandbox propagates TMPDIR verbatim and permits
- *  writes under it). The uid suffix keeps the root private on multi-user
- *  hosts where the temp dir is shared. */
-export function mailboxRoot(): string {
-  const uid = typeof process.getuid === "function" ? String(process.getuid()) : "u";
-  return join(tmpdir(), `cxb-${uid}`);
 }
 
 /**
@@ -317,83 +152,22 @@ export function parseTemplateFrontmatter(raw: string): { meta: TemplateMeta; bod
   };
 }
 
-/**
- * Read a `.md` template file and return its body (frontmatter stripped).
- * Checks user templates dir first (`~/.cxb-legacy/templates/`),
- * then falls back to built-in templates (relative to this file).
- *
- * The optional `promptsDir` parameter overrides both (used in tests).
- */
-export function loadTemplate(name: string, promptsDir?: string): string {
-  const raw = loadTemplateRaw(name, promptsDir);
-  return parseTemplateFrontmatter(raw).body;
-}
-
-/**
- * Load a template and return both its parsed metadata and body.
- */
-export function loadTemplateWithMeta(name: string, promptsDir?: string): { meta: TemplateMeta; body: string } {
+/** 从指定目录加载模板，返回元数据和正文。 */
+export function loadTemplateWithMeta(name: string, promptsDir: string): { meta: TemplateMeta; body: string } {
   return parseTemplateFrontmatter(loadTemplateRaw(name, promptsDir));
 }
 
 /** Load the raw template content (including frontmatter). */
-function loadTemplateRaw(name: string, promptsDir?: string): string {
+function loadTemplateRaw(name: string, promptsDir: string): string {
   if (name.includes("/") || name.includes("\\") || name.includes("..")) {
     throw new Error(`Invalid template name: "${name}"`);
   }
 
-  if (promptsDir) {
-    const filePath = join(promptsDir, `${name}.md`);
-    if (!existsSync(filePath)) {
-      throw new Error(`Template not found: ${filePath}`);
-    }
-    return readFileSync(filePath, "utf-8");
+  const filePath = join(promptsDir, `${name}.md`);
+  if (!existsSync(filePath)) {
+    throw new Error(`Template not found: ${filePath}`);
   }
-
-  // Check user templates first, then built-in
-  const userPath = join(config.dataDir, "templates", `${name}.md`);
-  if (existsSync(userPath)) {
-    return readFileSync(userPath, "utf-8");
-  }
-
-  const builtinPath = join(import.meta.dir, "prompts", `${name}.md`);
-  if (existsSync(builtinPath)) {
-    return readFileSync(builtinPath, "utf-8");
-  }
-
-  throw new Error(`Template "${name}" not found. Place a ${name}.md file in ~/.cxb-legacy/templates/ or check available built-in templates.`);
-}
-
-/**
- * List all available templates from user and built-in directories.
- * User templates override built-in templates with the same name.
- */
-export function listTemplates(): TemplateMeta[] {
-  const templates = new Map<string, TemplateMeta>();
-
-  // Built-in templates
-  const builtinDir = join(import.meta.dir, "prompts");
-  if (existsSync(builtinDir)) {
-    for (const file of readdirSync(builtinDir).filter(f => f.endsWith(".md"))) {
-      const name = file.replace(/\.md$/, "");
-      const raw = readFileSync(join(builtinDir, file), "utf-8");
-      const { meta } = parseTemplateFrontmatter(raw);
-      templates.set(name, { ...meta, name });
-    }
-  }
-
-  // User templates (override built-in)
-  const userDir = join(config.dataDir, "templates");
-  if (existsSync(userDir)) {
-    for (const file of readdirSync(userDir).filter(f => f.endsWith(".md"))) {
-      const name = file.replace(/\.md$/, "");
-      const raw = readFileSync(join(userDir, file), "utf-8");
-      const { meta } = parseTemplateFrontmatter(raw);
-      templates.set(name, { ...meta, name });
-    }
-  }
-
-  return [...templates.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return readFileSync(filePath, "utf-8");
 }
 
 /**

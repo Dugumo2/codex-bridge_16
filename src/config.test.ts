@@ -1,49 +1,23 @@
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
-import { mkdirSync, writeFileSync, rmSync, realpathSync } from "fs";
-import { join, basename, resolve, sep } from "path";
-import { createHash } from "crypto";
+import { mkdtempSync, writeFileSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import {
   config,
   validateId,
-  resolveWorkspaceDir,
-  resolveStateDir,
   resolveModel,
   validateEffort,
-  loadTemplate,
   loadTemplateWithMeta,
   interpolateTemplate,
   parseTemplateFrontmatter,
-  listTemplates,
 } from "./config";
 
 // ─── config object ──────────────────────────────────────────────────────────
 
 describe("config object", () => {
-  test("has data paths under .cxb-legacy", () => {
-    expect(config.dataDir).toContain(".cxb-legacy");
-    expect(config.configFile).toContain("config.json");
-  });
-
-  test("deprecated paths still work", () => {
-    expect(config.logsDir).toContain("logs");
-    expect(config.approvalsDir).toContain("approvals");
-    expect(config.killSignalsDir).toContain("kill-signals");
-    expect(config.pidsDir).toContain("pids");
-  });
-
   test("has protocol timeouts", () => {
     expect(config.requestTimeout).toBeGreaterThan(0);
     expect(config.defaultTimeout).toBeGreaterThan(0);
-  });
-
-  test("has threadsListLimit", () => {
-    expect(config.threadsListLimit).toBe(20);
-  });
-
-  test("has new fields", () => {
-    expect(config.defaultBrokerIdleTimeout).toBe(30 * 60 * 1000);
-    expect(config.maxRunsPerWorkspace).toBe(50);
-    expect(config.serviceName).toBe("cxb");
   });
 
   test("has accepted reasoning efforts", () => {
@@ -71,49 +45,6 @@ describe("validateId", () => {
   test("rejects invalid IDs", () => {
     expect(() => validateId("has spaces")).toThrow("Invalid ID");
     expect(() => validateId("../escape")).toThrow("Invalid ID");
-  });
-});
-
-// ─── resolveWorkspaceDir ────────────────────────────────────────────────────
-
-describe("resolveWorkspaceDir", () => {
-  test("returns git repo root for cwd inside a git repo", () => {
-    const result = resolveWorkspaceDir(process.cwd());
-    // This test repo is a git repo; the root should contain package.json
-    // On Windows, git returns forward-slash paths while process.cwd() uses backslashes
-    expect(resolve(result)).toBe(resolve(process.cwd()));
-  });
-
-  test("returns resolved cwd when not in a git repo", () => {
-    // Use a platform-appropriate temp directory that is not inside a git repo
-    const tmpDir = process.env.TMPDIR ?? (process.platform === "win32" ? process.env.TEMP ?? "C:\\Windows\\Temp" : "/tmp");
-    const result = resolveWorkspaceDir(tmpDir);
-    expect(resolve(result)).toBe(resolve(realpathSync(tmpDir)));
-  });
-});
-
-// ─── resolveStateDir ────────────────────────────────────────────────────────
-
-describe("resolveStateDir", () => {
-  test("returns path under ~/.cxb-legacy/workspaces/", () => {
-    const result = resolveStateDir(process.cwd());
-    expect(result).toContain(`.cxb-legacy${sep}workspaces${sep}`);
-  });
-
-  test("path contains slug and hash", () => {
-    const result = resolveStateDir(process.cwd());
-    const wsRoot = resolveWorkspaceDir(process.cwd());
-    const canonical = realpathSync(wsRoot);
-    const slug = basename(canonical).replace(/[^a-zA-Z0-9_-]/g, "_").toLowerCase();
-    const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 16);
-    expect(result).toContain(`${slug}-${hash}`);
-  });
-
-  test("different paths produce different state dirs", () => {
-    const dir1 = resolveStateDir(process.cwd());
-    const tmpDir = process.env.TMPDIR ?? (process.platform === "win32" ? process.env.TEMP ?? "C:\\Windows\\Temp" : "/tmp");
-    const dir2 = resolveStateDir(tmpDir);
-    expect(dir1).not.toBe(dir2);
   });
 });
 
@@ -153,48 +84,34 @@ describe("validateEffort", () => {
   });
 });
 
-// ─── loadTemplate ───────────────────────────────────────────────────────────
+// ─── loadTemplateWithMeta ───────────────────────────────────────────────────
 
-describe("loadTemplate", () => {
-  const tmpDir = join(process.env.TMPDIR ?? "/tmp", "config-test-prompts");
+describe("loadTemplateWithMeta", () => {
+  let tmpDir: string;
 
   beforeAll(() => {
-    mkdirSync(tmpDir, { recursive: true });
+    tmpDir = mkdtempSync(join(tmpdir(), "config-test-prompts-"));
     writeFileSync(join(tmpDir, "greeting.md"), "Hello, {{NAME}}!");
   });
 
   afterAll(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+    if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test("loads a template file by name", () => {
-    const content = loadTemplate("greeting", tmpDir);
-    expect(content).toBe("Hello, {{NAME}}!");
+  test("从指定目录读取无元数据的模板", () => {
+    expect(loadTemplateWithMeta("greeting", tmpDir)).toEqual({
+      meta: { name: "", description: "" }, body: "Hello, {{NAME}}!",
+    });
   });
 
-  test("throws for missing template", () => {
-    expect(() => loadTemplate("nonexistent", tmpDir)).toThrow();
+  test("指定目录缺少模板时报错", () => {
+    expect(() => loadTemplateWithMeta("nonexistent", tmpDir)).toThrow("Template not found:");
   });
 
-  test("rejects path traversal attempts", () => {
-    expect(() => loadTemplate("../escape")).toThrow("Invalid template name");
-    expect(() => loadTemplate("sub/path")).toThrow("Invalid template name");
-    expect(() => loadTemplate("..\\escape")).toThrow("Invalid template name");
-  });
-
-  test("loads built-in plan-review template without override", () => {
-    const content = loadTemplate("plan-review");
-    expect(content).toContain("{{PROMPT}}");
-    expect(content).toContain("implementation plan");
-    // Frontmatter should be stripped
-    expect(content).not.toContain("---");
-    expect(content).not.toContain("sandbox:");
-  });
-
-  test("strips frontmatter from template with override dir", () => {
-    writeFileSync(join(tmpDir, "with-fm.md"), "---\nname: test\ndescription: A test\n---\nBody here");
-    const content = loadTemplate("with-fm", tmpDir);
-    expect(content).toBe("Body here");
+  test("拒绝模板名称中的路径穿越", () => {
+    for (const name of ["../escape", "sub/path", "..\\escape"]) {
+      expect(() => loadTemplateWithMeta(name, tmpDir)).toThrow("Invalid template name");
+    }
   });
 
   test("loadTemplateWithMeta returns both metadata and body", () => {
@@ -206,9 +123,6 @@ describe("loadTemplate", () => {
     expect(body).toBe("Template body {{PROMPT}}");
   });
 
-  test("throws helpful message for missing template without override", () => {
-    expect(() => loadTemplate("nonexistent-xyz")).toThrow("Template \"nonexistent-xyz\" not found");
-  });
 });
 
 // ─── parseTemplateFrontmatter ───────────────────────────────────────────────
@@ -254,18 +168,6 @@ describe("parseTemplateFrontmatter", () => {
   });
 });
 
-// ─── listTemplates ──────────────────────────────────────────────────────────
-
-describe("listTemplates", () => {
-  test("includes built-in plan-review template", () => {
-    const templates = listTemplates();
-    const planReview = templates.find(t => t.name === "plan-review");
-    expect(planReview).toBeDefined();
-    expect(planReview!.description).toContain("implementation plan");
-    expect(planReview!.sandbox).toBe("read-only");
-  });
-});
-
 // ─── interpolateTemplate ────────────────────────────────────────────────────
 
 describe("interpolateTemplate", () => {
@@ -294,32 +196,3 @@ describe("interpolateTemplate", () => {
     expect(result).toBe("y and y");
   });
 });
-
-describe("brokerReadyTimeout", () => {
-  const ENV = "CXB_BROKER_READY_TIMEOUT_MS";
-  const original = process.env[ENV];
-  afterAll(() => {
-    if (original === undefined) delete process.env[ENV];
-    else process.env[ENV] = original;
-  });
-
-  test("defaults to a window wide enough for a cold app-server", () => {
-    delete process.env[ENV];
-    // Falling back early does not save the caller time — it only adds a
-    // second concurrent app-server startup, which is what collides.
-    expect(config.brokerReadyTimeout).toBe(30_000);
-  });
-
-  test("honors the env override so tests can shorten it", () => {
-    process.env[ENV] = "250";
-    expect(config.brokerReadyTimeout).toBe(250);
-  });
-
-  test("ignores a non-positive or unparseable override", () => {
-    for (const bad of ["0", "-1", "abc", ""]) {
-      process.env[ENV] = bad;
-      expect(config.brokerReadyTimeout).toBe(30_000);
-    }
-  });
-});
-

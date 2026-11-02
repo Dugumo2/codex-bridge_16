@@ -1,4 +1,4 @@
-import { sanitizeForTerminal } from "../questions";
+import { sanitizeForTerminal } from "./terminal-text";
 import { CxbError, EXIT, type InboxItem, type ThreadSummary } from "./contracts";
 import { commandSession } from "./command-session";
 import type { CommandHandler } from "./main";

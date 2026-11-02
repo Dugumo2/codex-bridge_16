@@ -6,7 +6,7 @@ import { builtinTemplatesDir } from "./config-cmd";
 import { sandboxModeOf, sandboxPolicyFor } from "../config";
 import { resolveModelDefaults } from "../models";
 import { resolveRunModel, type ThreadModel } from "./run-model";
-import { sanitizeForTerminal } from "../questions";
+import { sanitizeForTerminal } from "./terminal-text";
 import { NO_RESPONSE, type AnyServerRequestHandler } from "../rpc";
 import { askOverrides } from "./ask-instructions";
 import { absorbedRefusal, buildContinuePrompt, continueRefusal, localContinueRefusal, resolveRunChain } from "./continue-prompt";
