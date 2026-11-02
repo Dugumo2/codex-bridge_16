@@ -592,7 +592,13 @@ export interface ChildrenStopReport {
 export interface CxbOrigin {
   rootThreadId: string; runId: string; parentThreadId: string; relationKind: RelationKind; sourceThreadId: string;
 }
+/**
+ * `broker/run/childChanged`（relations/notify.rs、stop/tree.rs）。成员变化时 threadId 为成员；
+ * 只影响运行整体的变化（在途派生、发现、停止报告）threadId 为 null，成员字段为 null。
+ * 停止报告更新带 stopPhase、stopVersion，且不递增 revision：去重须分别按 revision 与 stopVersion。
+ */
 export interface ChildChanged extends ConvergenceSummary {
-  runId: string; rootThreadId: string; threadId: string | null; parentThreadId?: string;
-  relationKind?: RelationKind; activity?: ChildActivity; pendingCount?: number; revision: number; stopPhase?: TreePhase;
+  runId: string; rootThreadId: string; threadId: string | null; parentThreadId?: string | null;
+  relationKind?: RelationKind | null; activity?: ChildActivity | null; pendingCount?: number | null; revision: number;
+  stopPhase?: TreePhase; stopVersion?: number;
 }

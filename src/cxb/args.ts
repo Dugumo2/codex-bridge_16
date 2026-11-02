@@ -56,6 +56,7 @@ export interface CommandOptions {
   server?: boolean;
   limit?: number;
   full?: boolean;
+  tree?: boolean;
   all?: boolean;
   local?: boolean;
   kind?: "approval" | "question" | "mcp" | "guardian";
@@ -262,12 +263,19 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
     options: [flag("tail", ["--tail"], "显示最近进展，默认 50 行。"), flag("log", ["--log"], "显示完整本地日志。"),
       flag("follow", ["--follow"], "跟随至结束，隐含 --tail。"), flag("server", ["--server"], "强制从服务器读取。"),
       value("limit", ["--limit"], "数量", "最近进展行数，必须是正的安全整数。", integer(), 50),
-      flag("full", ["--full"], "日志包含请求/响应元数据和所有事件类型。")],
+      flag("full", ["--full"], "日志包含请求/响应元数据和所有事件类型。"),
+      flag("tree", ["--tree"], "日志或最近进展包含本线程各次运行纳管的子代理事件，合成一条时间线；须与 --log 或 --tail 同用。")],
     rules: ["必须提供一个线程 ID；默认显示最近一轮结果。", "--log 与 --tail、--follow 互斥；--tail 与 --follow 可以同用。",
-      "--follow --json 输出逐行 JSON（NDJSON），最后一行是终态。"],
+      "--follow --json 输出逐行 JSON（NDJSON），最后一行是终态。",
+      "--tree 须与 --log 或 --tail 同用，不能与 --follow、--server 同用；只读本地日志。"],
     validate: (p) => {
       positionCount(p, 1, 1);
       if (p.options.log && (p.options.tail || p.options.follow)) usage("--log 不能与 --tail 或 --follow 同用。");
+      if (p.options.tree) {
+        if (p.options.follow) usage("--tree 不能与 --follow 同用。");
+        if (p.options.server) usage("--tree 不能与 --server 同用。");
+        if (!p.options.log && !p.options.tail) usage("--tree 须与 --log 或 --tail 同用。");
+      }
       if (p.options.follow) p.options.tail = true;
     },
   },
@@ -299,11 +307,15 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
     validate: validateReply,
   },
   wait: {
-    description: "等待待答事项或整次运行结束", usage: ["cxb wait [线程ID] [--timeout <秒>] [选项]"], globals: [...COMMON, "timeout"], options: [],
-    rules: ["不带 ID 等待本工作区新事项；带 ID 等待整次运行结束。", "默认等待 3600 秒，不允许 --timeout 0。"],
+    description: "等待待答事项或整次运行结束", usage: ["cxb wait [线程ID] [--tree] [--timeout <秒>] [选项]"], globals: [...COMMON, "timeout"],
+    options: [flag("tree", ["--tree"], "等待整次运行时显示子代理树的进度，结束时附每个子代理的结果摘要；须带线程 ID。")],
+    rules: ["不带 ID 等待本工作区新事项；带 ID 等待整次运行结束。", "默认等待 3600 秒，不允许 --timeout 0。",
+      "--tree 只能用于等待线程，不能不带 ID 或等待事项 ID。"],
     validate: (p) => {
       positionCount(p, 0, 1);
       if (p.globals.timeout === 0 && p.explicit.has("timeout")) usage("wait 不允许 --timeout 0。");
+      const target = p.positional[0];
+      if (p.options.tree && (!target || /^(ap_|qu_|mc_|gd_)/.test(target))) usage("--tree 须带线程 ID，不能用于等待事项。");
     },
   },
   stop: {

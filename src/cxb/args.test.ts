@@ -330,12 +330,30 @@ describe("旧命令不作为隐藏别名", () => {
   });
 });
 
+describe("子代理树选项（第二期）", () => {
+  test("wait --tree 只接受线程 ID", () => {
+    expect(parseArgv(["wait", "t1", "--tree"]).options.tree).toBe(true);
+    expect(parseArgv(["wait", "t1"]).options.tree).toBe(false);
+    expectUsage(["wait", "--tree"], "--tree 须带线程 ID");
+    for (const item of ["ap_1", "qu_1", "mc_1", "gd_1"]) expectUsage(["wait", item, "--tree"], "--tree 须带线程 ID");
+  });
+
+  test("show --tree 须与 --log 或 --tail 同用，不能与 --follow、--server 同用", () => {
+    expect(parseArgv(["show", "t1", "--log", "--tree"]).options.tree).toBe(true);
+    expect(parseArgv(["show", "t1", "--tail", "--tree"]).options.tree).toBe(true);
+    expectUsage(["show", "t1", "--tree"], "须与 --log 或 --tail 同用");
+    expectUsage(["show", "t1", "--follow", "--tree"], "不能与 --follow 同用");
+    expectUsage(["show", "t1", "--tail", "--follow", "--tree"], "不能与 --follow 同用");
+    expectUsage(["show", "t1", "--log", "--server", "--tree"], "不能与 --server 同用");
+  });
+});
+
 describe("帮助与选项表", () => {
   const names: CommandName[] = ["run", "review", "show", "ls", "inbox", "reply", "wait", "stop", "rm", "config", "doctor"];
   const expectedFlags: Record<CommandName, string[]> = {
     run: ["--converge-timeout", "--stall-timeout", "--upstream-error-policy", "--mcp", "--no-mcp", "--file", "--resume", "--continue", "--run", "--template", "--goal", "--budget", "--memory", "--detach"],
-    review: ["--converge-timeout", "--stall-timeout", "--upstream-error-policy", "--mcp", "--no-mcp", "--mode", "--ref", "--base", "--resume"], show: ["--tail", "--log", "--follow", "--server", "--limit", "--full"],
-    ls: ["--all", "--limit", "--local"], inbox: ["--kind", "--all", "--limit"], reply: [], wait: [],
+    review: ["--converge-timeout", "--stall-timeout", "--upstream-error-policy", "--mcp", "--no-mcp", "--mode", "--ref", "--base", "--resume"], show: ["--tail", "--log", "--follow", "--server", "--limit", "--full", "--tree"],
+    ls: ["--all", "--limit", "--local"], inbox: ["--kind", "--all", "--limit"], reply: [], wait: ["--tree"],
     stop: ["--abandon", "--clear", "--run"], rm: ["--purge"], config: ["--unset"], doctor: [],
   };
   test("总帮助恰好列出十一条命令和全局选项", () => {

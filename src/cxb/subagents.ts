@@ -11,6 +11,11 @@ import { resultReady } from "./run-result";
 
 const safe = (text: string) => sanitizeForTerminal(text).replace(/[\r\n\u2028\u2029]/g, " ");
 
+/** \u7ebf\u7a0b\u7684\u5c55\u793a\u6807\u7b7e\uff08wait --tree\u3001show --tree \u5171\u7528\uff09\uff1a\u77ed ID \u4f18\u5148\uff1b\u6ca1\u6709\u77ed ID \u65f6\u7528\u5b8c\u6574\u7ebf\u7a0b ID\uff0c\u4e0d\u622a\u65ad\uff0c\u907f\u514d\u9020\u51fa\u4e0d\u53ef\u89e3\u6790\u6216\u4f1a\u51b2\u7a81\u7684\u6807\u8bc6\u3002 */
+export function threadLabel(threadId: string, shortId?: string | null): string {
+  return safe(shortId || threadId);
+}
+
 /** 运行记录里的子代理线程（去重，fork 与 review 执行线程不计）。 */
 export function subagentThreads(run: RunResult): string[] {
   return [...new Set((run.children ?? []).filter((child) => child.relationKind === "subagent").map((child) => child.threadId))];
