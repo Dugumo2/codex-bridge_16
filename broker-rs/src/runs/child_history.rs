@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MAX_CHILD_HISTORY: usize = 4096;
+// 将完整 childHistory 的紧凑 JSON 限为 512 KiB，限制每次 threads.json 全量写的放大。
+pub const MAX_CHILD_HISTORY_BYTES: usize = 512 * 1024;
 const MAX_ID_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,11 +167,13 @@ impl ChildHistory {
         changed
     }
 
-    fn enforce_limit(&mut self) {
-        let count: usize = self.entries.values().map(BTreeMap::len).sum();
-        if count <= MAX_CHILD_HISTORY {
-            return;
+    fn enforce_limit(&mut self) -> bool {
+        let mut count: usize = self.entries.values().map(BTreeMap::len).sum();
+        if count <= MAX_CHILD_HISTORY && json_bytes(self) <= MAX_CHILD_HISTORY_BYTES {
+            return false;
         }
+        self.mark_trimmed();
+        let mut bytes = json_bytes(self);
         let mut facts: Vec<_> = self
             .entries
             .iter()
@@ -179,11 +183,25 @@ impl ChildHistory {
             })
             .collect();
         facts.sort();
-        for (_, thread, run) in facts.into_iter().take(count - MAX_CHILD_HISTORY) {
-            self.entries.get_mut(&thread).unwrap().remove(&run);
+        // observed_at 同时用于 30 天保留期：先裁最早观察的事实；同时间按线程、运行标识排序。
+        for (_, thread, run) in facts {
+            if count <= MAX_CHILD_HISTORY && bytes <= MAX_CHILD_HISTORY_BYTES {
+                break;
+            }
+            let thread_count = self.entries.len();
+            let runs = self.entries.get_mut(&thread).unwrap();
+            let fact = runs.remove(&run).unwrap();
+            // 按实际 JSON 编码扣除键、值、冒号、逗号和空对象外壳，包含标识转义的开销。
+            bytes -= json_bytes(&run) + 1 + json_bytes(&fact);
+            if runs.is_empty() {
+                bytes -= json_bytes(&thread) + 3 + usize::from(thread_count > 1);
+                self.entries.remove(&thread);
+            } else {
+                bytes -= 1;
+            }
+            count -= 1;
         }
-        self.entries.retain(|_, runs| !runs.is_empty());
-        self.mark_trimmed();
+        true
     }
 
     /// 删除与过期都是真正的证据缺口，不能在后续扫描中升级为「没有历史」。
@@ -205,8 +223,21 @@ impl ChildHistory {
         if changed {
             self.mark_trimmed();
         }
-        changed
+        // retained_after 的十进制位数也占预算；水位增长后再次检查。
+        self.enforce_limit() || changed
     }
+}
+
+fn json_bytes(value: &impl Serialize) -> usize {
+    serde_json::to_vec(value).expect("历史字段可序列化").len()
+}
+
+#[cfg(test)]
+pub(crate) fn test_budget_children() -> Vec<ChildRecord> {
+    // 控制字符与多字节字符使序列化大小不同于原始标识长度，且单标识仍小于 1024 字节。
+    (0..600)
+        .map(|number| test_child(&format!("预算{number:04}{}", "\n\"\\中".repeat(100))))
+        .collect()
 }
 
 #[cfg(test)]
@@ -225,6 +256,30 @@ pub(crate) fn test_child(thread: &str) -> ChildRecord {
 mod tests {
     use super::*;
     use crate::runs::ThreadIndexFile;
+
+    #[test]
+    fn history_byte_budget_handles_shared_threads_and_watermark_growth() {
+        let mut history = ChildHistory::default();
+        history.verify_empty_store();
+        let children = test_budget_children();
+        for number in 0..3 {
+            history.remember(
+                &format!("运行{number}\n\""),
+                &"根".repeat(300),
+                &children,
+                1000 + number,
+                &BTreeMap::new(),
+            );
+            assert!(json_bytes(&history) <= MAX_CHILD_HISTORY_BYTES);
+        }
+        assert_eq!(history.coverage_reason(), "historyTrimmed");
+        // 不过期任何记录，只增长水位编码；预算必须仍成立。
+        history.prune(crate::store::RETENTION_MS + 1000, &BTreeMap::new());
+        assert!(json_bytes(&history) <= MAX_CHILD_HISTORY_BYTES);
+        let restored: ChildHistory =
+            serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+        assert_eq!(restored, history);
+    }
 
     #[test]
     fn history_old_new_and_corrupt_formats_keep_explicit_coverage() {

@@ -1,5 +1,118 @@
 use super::*;
-use crate::runs::child_history::test_child;
+use crate::runs::child_history::{test_budget_children, test_child, MAX_CHILD_HISTORY_BYTES};
+
+fn assert_budget(history: &serde_json::Value) {
+    assert!(
+        serde_json::to_vec(history).unwrap().len() <= MAX_CHILD_HISTORY_BYTES,
+        "写盘历史必须满足 512 KiB 序列化预算"
+    );
+    assert_eq!(history["coverage"], "trimmed", "字节裁剪必须标记证据缺口");
+    assert!(
+        history["entries"].get("oldest").is_none(),
+        "必须先裁最旧记录"
+    );
+    assert!(
+        history["entries"].get("newest").is_some(),
+        "必须保留最新记录"
+    );
+}
+
+#[tokio::test]
+async fn history_byte_budget_write_keeps_newest_and_marks_trimmed() {
+    let temp = Temp::new();
+    let (store, mut loaded) = open(temp.config()).await.unwrap();
+    let index = &mut loaded.index;
+    index
+        .child_history
+        .remember("old", "parent", &[test_child("oldest")], 1, &index.removed);
+    let children = test_budget_children();
+    // 候选数据本身确实超预算，且没有触发条数或单标识限制。
+    assert!(serde_json::to_vec(&children).unwrap().len() > MAX_CHILD_HISTORY_BYTES);
+    index
+        .child_history
+        .remember("bulk", &"根".repeat(300), &children, 2, &index.removed);
+    index
+        .child_history
+        .remember("new", "parent", &[test_child("newest")], 3, &index.removed);
+    store.submit(StoreOp::PutThreads(loaded.index));
+    assert!(store
+        .drain(Duration::from_secs(10))
+        .await
+        .abandoned
+        .is_empty());
+    // 读取原始 JSON，避免反序列化再次裁剪而掩盖写盘路径缺陷。
+    let written = read::<serde_json::Value>(&temp.dir().join("threads.json")).payload;
+    assert_budget(&written["childHistory"]);
+}
+
+#[tokio::test]
+async fn history_byte_budget_restore_trims_and_preserves_deletion_on_rebuild() {
+    let temp = Temp::new();
+    let mut disk = temp.disk();
+    let mut entries = serde_json::Map::new();
+    for child in test_budget_children() {
+        entries.insert(
+            child.thread_id,
+            serde_json::json!({
+                "bulk": {"rootThreadId": "根".repeat(300), "observedAt": 2}
+            }),
+        );
+    }
+    for (thread, observed_at) in [("oldest", 1), ("newest", 3), ("deleted-child", 4)] {
+        entries.insert(
+            thread.into(),
+            serde_json::json!({
+                "old": {"rootThreadId": "parent", "observedAt": observed_at}
+            }),
+        );
+    }
+    let mut legacy = serde_json::to_value(ThreadIndexFile::default()).unwrap();
+    legacy["removed"] = serde_json::json!({"deleted-child": 5, "deleted-root": 5});
+    legacy["childHistory"] = serde_json::json!({
+        "coverage": "verified", "retainedAfter": 0, "entries": entries
+    });
+    assert!(serde_json::to_vec(&legacy["childHistory"]).unwrap().len() > MAX_CHILD_HISTORY_BYTES);
+    disk.write_json("threads.json", &serde_json::to_vec(&legacy).unwrap())
+        .unwrap();
+    // 保留完整旧运行，强制真实恢复扫描尝试回灌被删子线程及被删根的子线程。
+    for (id, root, child) in [
+        ("deleted-child-run", "parent", "deleted-child"),
+        ("deleted-root-run", "deleted-root", "root-child"),
+    ] {
+        let mut record = run(id, root, 4);
+        record.children = vec![test_child(child)];
+        disk.write_json(
+            &run_file(&record.run_id),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+    }
+    drop(disk);
+    // 第二次打开也经过同一恢复路径，验证写回后重建仍不能复活删除记录。
+    for _ in 0..2 {
+        let (store, loaded) = open(temp.config()).await.unwrap();
+        assert_budget(&serde_json::to_value(&loaded.index.child_history).unwrap());
+        for thread in ["deleted-child", "root-child"] {
+            assert!(!loaded.index.child_history.has_other_run(thread, "future"));
+        }
+        assert_eq!(loaded.index.removed.get("deleted-child"), Some(&5));
+        assert_eq!(loaded.index.removed.get("deleted-root"), Some(&5));
+        store.submit(StoreOp::PutThreads(loaded.index));
+        assert!(store
+            .drain(Duration::from_secs(10))
+            .await
+            .abandoned
+            .is_empty());
+        let written = read::<serde_json::Value>(&temp.dir().join("threads.json")).payload;
+        assert_budget(&written["childHistory"]);
+        assert!(written["childHistory"]["entries"]
+            .get("deleted-child")
+            .is_none());
+        assert!(written["childHistory"]["entries"]
+            .get("root-child")
+            .is_none());
+    }
+}
 
 fn seed_runs(disk: &mut Disk) {
     let mut r0 = run("r0", "parent", 1);
@@ -222,7 +335,7 @@ async fn history_full_capacity_cost_record() {
             &id('r', number),
             &id('p', number),
             &[test_child(&id('c', number))],
-            now,
+            now + number as u64,
             &index.removed,
         );
     }
@@ -242,7 +355,15 @@ async fn history_full_capacity_cost_record() {
         .values()
         .map(|runs| runs.as_object().unwrap().len())
         .sum();
-    assert_eq!(entry_count, MAX_CHILD_HISTORY);
+    assert!(entry_count > 0 && entry_count < MAX_CHILD_HISTORY);
+    let history_bytes = serde_json::to_vec(&parsed.payload.child_history)
+        .unwrap()
+        .len();
+    assert!(history_bytes <= MAX_CHILD_HISTORY_BYTES);
+    assert_eq!(
+        parsed.payload.child_history.coverage_reason(),
+        "historyTrimmed"
+    );
     drop(parsed);
     drop(disk);
 
@@ -276,15 +397,15 @@ async fn history_full_capacity_cost_record() {
         .runs
         .index
         .child_history
-        .has_other_run(&id('c', 0), "new-run"));
+        .has_other_run(&id('c', MAX_CHILD_HISTORY - 1), "new-run"));
 
     // 一项已确认归属更新 observedAt，走实际全量 PutThreads 写盘路径。
     let mut changed = machine.runs.index.clone();
     assert!(changed.child_history.remember(
-        &id('r', 0),
-        &id('p', 0),
-        &[test_child(&id('c', 0))],
-        now + 1,
+        &id('r', MAX_CHILD_HISTORY - 1),
+        &id('p', MAX_CHILD_HISTORY - 1),
+        &[test_child(&id('c', MAX_CHILD_HISTORY - 1))],
+        now + MAX_CHILD_HISTORY as u64,
         &changed.removed,
     ));
     changed.version += 1;
@@ -303,7 +424,8 @@ async fn history_full_capacity_cost_record() {
     println!(
         "CHILD_HISTORY_COST {}",
         serde_json::json!({
-            "entries": entry_count, "identifierBytes": ID_BYTES,
+            "entries": entry_count, "attemptedEntries": MAX_CHILD_HISTORY, "identifierBytes": ID_BYTES,
+            "childHistoryBytes": history_bytes, "budgetBytes": MAX_CHILD_HISTORY_BYTES,
             "threadsJsonBytes": bytes.len(), "parseMs": parse_ms,
             "emptyStoreAndMachineStartupMs": empty_startup_ms,
             "fullStoreAndMachineStartupMs": startup_ms,

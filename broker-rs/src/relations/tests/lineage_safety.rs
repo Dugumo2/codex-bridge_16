@@ -762,6 +762,54 @@ fn lineage_safety_历史线程合法复用绑定新轮且只汇总本次结果()
 }
 
 #[test]
+fn lineage_safety_byte_budget_evicted_child_still_blocks_without_management() {
+    use crate::runs::child_history::{test_budget_children, MAX_CHILD_HISTORY_BYTES};
+    let (mut m, mut mock) = machine();
+    m.runs.index.child_history.verify_empty_store();
+    history(&mut m, C);
+    assert!(m.runs.index.child_history.has_other_run(C, R));
+    m.runs.index.child_history.remember(
+        "较新运行",
+        &"根".repeat(300),
+        &test_budget_children(),
+        2,
+        &BTreeMap::new(),
+    );
+    assert!(
+        !m.runs.index.child_history.has_other_run(C, R),
+        "旧子证据确实被预算裁掉"
+    );
+    assert!(
+        serde_json::to_vec(&m.runs.index.child_history)
+            .unwrap()
+            .len()
+            <= MAX_CHILD_HISTORY_BYTES
+    );
+    candidate(&mut m, &mut mock, C);
+    discover(
+        &mut m,
+        &mut mock,
+        &[(
+            C,
+            "notLoaded",
+            json!([{"id":"旧轮","status":"completed"}]),
+            false,
+        )],
+    );
+    assert!(m.run_has_candidate(R, C));
+    let facts = m.convergence_facts(R).unwrap();
+    assert_eq!(facts.unresolved_candidates, 1);
+    assert!(facts.activities.is_empty());
+    assert!(facts.result_refs.is_empty());
+    assert!(facts.discovery.missing[C]
+        .iter()
+        .any(|r| r == "historyTrimmed"));
+    assert!(!settled(&facts), "证据缺失必须阻塞收敛");
+    assert!(m.binding(C, "旧轮").is_none());
+    assert!(!m.current_management_evidence(R, C));
+}
+
+#[test]
 fn lineage_safety_缺失损坏裁剪都不能把未知已完成候选当历史排除() {
     for reason in ["historyMissing", "historyCorrupt", "historyTrimmed"] {
         let (mut m, mut mock) = machine();
