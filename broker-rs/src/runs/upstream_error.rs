@@ -271,12 +271,20 @@ fn strip_controls(text: &str) -> String {
 fn redact_headers(text: &str) -> String {
     text.split('\n')
         .map(|line| {
-            if let Some((name, _)) = line.split_once(':') {
-                if matches!(
-                    name.trim().to_ascii_lowercase().as_str(),
-                    "authorization" | "cookie" | "set-cookie"
-                ) {
-                    return format!("{name}: {REDACTED}");
+            // 上游可能在头部前附加错误说明；头名必须完整匹配，不能误认 X-Authorization。
+            let lower = line.to_ascii_lowercase();
+            for (colon, _) in line.match_indices(':') {
+                let name = lower[..colon].trim_end();
+                for header in ["authorization", "cookie", "set-cookie"] {
+                    if let Some(prefix) = name.strip_suffix(header) {
+                        if prefix
+                            .chars()
+                            .next_back()
+                            .is_none_or(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
+                        {
+                            return format!("{}: {REDACTED}", &line[..colon]);
+                        }
+                    }
                 }
             }
             line.into()
@@ -761,6 +769,9 @@ mod tests {
             "https://host/path?apiKEY=abcdef&normal=visible",
             "https://host?token=abcdef&secret=abcdef&password=abcdef&auth=abcdef&signature=abcdef",
             "Authorization: abcdef",
+            "请求失败 Authorization: abcdef",
+            "HTTP error: Authorization: abcdef",
+            "[upstream] COOKIE: abcdef",
             " Cookie: abcdef",
             "Set-Cookie: abcdef",
             "abcdef0123456789abcdef0123456789abcd",
@@ -774,6 +785,10 @@ mod tests {
         assert_eq!(
             sanitize("https://host?token=abcdef&normal=visible").0,
             "https://host?token=[已隐藏]&normal=visible"
+        );
+        assert_eq!(
+            sanitize("X-Authorization: visible").0,
+            "X-Authorization: visible"
         );
     }
 

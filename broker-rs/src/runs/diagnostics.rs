@@ -185,6 +185,7 @@ impl Machine {
         if completion && !self.accept_child_completion(&child, thread, turn) {
             return true;
         }
+        self.log_bound_child_event(&child.run_id, thread, turn, method, params, actions);
         #[cfg(test)]
         self.runs
             .child_event_log

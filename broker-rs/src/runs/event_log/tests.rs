@@ -1,0 +1,394 @@
+use super::*;
+use crate::claim::ReqKind;
+use crate::relations::*;
+use crate::runs::{RunOpen, RunState};
+
+fn setup() -> Machine {
+    let mut m = Machine::new(false);
+    m.clock.now_ms = 1000;
+    m.runs.epoch = 42;
+    open(&mut m, "run-a", "root");
+    m
+}
+
+fn open(m: &mut Machine, run: &str, root: &str) {
+    m.run_opened(
+        RunOpen {
+            run_id: run.into(),
+            thread_id: root.into(),
+            conn: None,
+            kind: ReqKind::TurnStart,
+            joined: false,
+            input: String::new(),
+            continued_from: None,
+        },
+        &mut Vec::new(),
+    );
+    m.relations.contexts.insert(
+        run.into(),
+        ManageContext {
+            identity: RunIdentity {
+                run_id: run.into(),
+                logical_root_thread_id: root.into(),
+                execution_thread_id: root.into(),
+            },
+            gen: 1,
+            authority: Authority::Owner(1),
+            policy: crate::policy::Policy::OnRequest,
+            members: Default::default(),
+            in_flight_spawns: Default::default(),
+            revision: 0,
+            discovery: DiscoveryState {
+                missing: Default::default(),
+                complete: true,
+                version: 0,
+                incomplete_reasons: vec![],
+            },
+            cleanup: None,
+        },
+    );
+}
+
+fn candidate(m: &mut Machine, thread: &str, parent: &str) {
+    m.relations.edges.insert(
+        thread.into(),
+        RelationEdge {
+            child_thread_id: thread.into(),
+            parent_thread_id: parent.into(),
+            kind: RelationKind::Subagent,
+            source_summary: Value::Null,
+            can_accept_direct_input: Some(false),
+            agent_version: AgentVersion::V1,
+            discovered_by: DiscoveredBy::Started,
+        },
+    );
+}
+
+fn bind(m: &mut Machine, run: &str, thread: &str, turn: &str, parent: &str) {
+    candidate(m, thread, parent);
+    m.relations.bindings.insert(
+        (thread.into(), turn.into()),
+        ActivityBinding {
+            thread_id: thread.into(),
+            turn_id: turn.into(),
+            run_id: run.into(),
+            parent_thread_id: parent.into(),
+            evidence: BindingEvidence::V1Spawn,
+            operation: EvidenceKey {
+                parent_thread_id: parent.into(),
+                parent_turn_id: "parent-turn".into(),
+                item_id: "spawn".into(),
+            },
+            status: BindingStatus::Bound,
+        },
+    );
+    m.relations
+        .aux
+        .observed
+        .entry(thread.into())
+        .or_default()
+        .push_back(TurnObservation {
+            turn: turn.into(),
+            started: true,
+            completed: false,
+            seen_ms: m.clock.mono_ms,
+        });
+}
+
+fn logs(actions: &[Action]) -> Vec<(String, String, String, Value)> {
+    actions
+        .iter()
+        .flat_map(|a| match a {
+            Action::Store(StoreOp::AppendLog { short_id, lines }) => lines
+                .iter()
+                .map(|line| {
+                    let fields: Vec<_> = line.splitn(4, ' ').collect();
+                    (
+                        short_id.clone(),
+                        fields[1].into(),
+                        fields[2].into(),
+                        serde_json::from_str(fields[3].strip_prefix("@cxb2 ").expect("结构化标记"))
+                            .expect("完整 JSON"),
+                    )
+                })
+                .collect(),
+            _ => vec![],
+        })
+        .collect()
+}
+
+fn item(thread: &str, turn: &str) -> Option<Value> {
+    Some(
+        json!({"threadId":thread,"turnId":turn,"item":{"id":"same-item","type":"agentMessage","text":"同毫秒同正文"}}),
+    )
+}
+
+#[test]
+fn tree_log_根子孙同文件身份与同正文独立事件以及review来源() {
+    let mut m = setup();
+    bind(&mut m, "run-a", "child", "ct", "root");
+    bind(&mut m, "run-a", "grandchild", "gt", "child");
+    let mut a = vec![];
+    m.runs.log("run-a", 1000, "运行开始", "开始", &mut a);
+    m.log_bound_child_event(
+        "run-a",
+        "child",
+        "ct",
+        "item/completed",
+        &item("child", "ct"),
+        &mut a,
+    );
+    m.log_bound_child_event(
+        "run-a",
+        "grandchild",
+        "gt",
+        "item/completed",
+        &item("grandchild", "gt"),
+        &mut a,
+    );
+    m.runs.runs.get_mut("run-a").unwrap().review_thread_id = Some("review".into());
+    m.runs.log_owned(
+        "run-a",
+        "review",
+        Some("rt"),
+        Some("ri"),
+        1000,
+        "条目完成",
+        "审查",
+        false,
+        &mut a,
+    );
+    let lines = logs(&a);
+    assert_eq!(lines.len(), 4);
+    assert!(lines.iter().all(|l| l.0 == lines[0].0 && l.1 == "run-a"));
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.3["threadId"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["root", "child", "grandchild", "review"]
+    );
+    assert_eq!(lines[2].3["parentThreadId"], "child");
+    assert_eq!(lines[3].3["sourceRole"], "execution");
+    assert_eq!(lines[1].3["summary"], lines[2].3["summary"]);
+    assert_ne!(lines[1].3["eventId"], lines[2].3["eventId"]);
+}
+
+#[test]
+fn tree_log_逐轮逐运行校验不跨账也不接纳冲突() {
+    let mut m = setup();
+    open(&mut m, "run-b", "other-root");
+    bind(&mut m, "run-a", "child", "old-turn", "root");
+    bind(&mut m, "run-b", "child", "new-turn", "other-root");
+    let mut a = vec![];
+    m.log_bound_child_event(
+        "run-a",
+        "child",
+        "new-turn",
+        "item/completed",
+        &item("child", "new-turn"),
+        &mut a,
+    );
+    m.log_bound_child_event(
+        "run-a",
+        "child",
+        "unknown-turn",
+        "item/completed",
+        &item("child", "unknown-turn"),
+        &mut a,
+    );
+    assert!(logs(&a).is_empty());
+    m.log_bound_child_event(
+        "run-a",
+        "child",
+        "old-turn",
+        "item/completed",
+        &item("child", "old-turn"),
+        &mut a,
+    );
+    m.log_bound_child_event(
+        "run-b",
+        "child",
+        "new-turn",
+        "item/completed",
+        &item("child", "new-turn"),
+        &mut a,
+    );
+    assert_eq!(
+        logs(&a).iter().map(|l| l.1.as_str()).collect::<Vec<_>>(),
+        ["run-a", "run-b"]
+    );
+    m.relations
+        .bindings
+        .get_mut(&("child".into(), "old-turn".into()))
+        .unwrap()
+        .status = BindingStatus::Conflict("独立认领".into());
+    a.clear();
+    m.log_bound_child_event(
+        "run-a",
+        "child",
+        "old-turn",
+        "item/completed",
+        &item("child", "old-turn"),
+        &mut a,
+    );
+    assert!(logs(&a).is_empty());
+}
+
+#[test]
+fn tree_log_完成首次接纳且父轮预算空转进度不因日志改变() {
+    let mut m = setup();
+    bind(&mut m, "run-a", "child", "ct", "root");
+    let mut a = vec![];
+    let before = m.runs.runs["run-a"].clone();
+    let guard = m.loop_guards.clone();
+    let params =
+        Some(json!({"threadId":"child","turn":{"id":"ct","status":"completed","items":[]}}));
+    assert!(m.dispatch_child_diagnostic("child", "turn/completed", &params, false, &mut a));
+    assert!(m.dispatch_child_diagnostic("child", "turn/completed", &params, false, &mut a));
+    assert_eq!(logs(&a).iter().filter(|l| l.2 == "轮次完成").count(), 1);
+    let after = &m.runs.runs["run-a"];
+    assert_eq!(after.state, RunState::Running);
+    assert_eq!(after.turns, before.turns);
+    assert_eq!(after.turns_total, before.turns_total);
+    assert_eq!(after.progress, before.progress);
+    assert_eq!(after.run_budget, before.run_budget);
+    assert_eq!(m.loop_guards, guard);
+}
+
+#[test]
+fn tree_log_绑定前完成只补摘要不重放诊断与完成状态() {
+    let mut m = setup();
+    candidate(&mut m, "child", "root");
+    let mut a = vec![];
+    m.buffer_child_event_log(
+        "child",
+        "item/completed",
+        &item("child", "ct"),
+        false,
+        &mut a,
+    );
+    let completed = Some(
+        json!({"threadId":"child","turn":{"id":"ct","status":"failed","error":{"message":"Authorization: secret-value"}}}),
+    );
+    m.buffer_child_event_log("child", "turn/completed", &completed, false, &mut a);
+    assert!(logs(&a).is_empty());
+    m.records
+        .entry("child".into())
+        .or_default()
+        .ended_turns
+        .push_back("ct".into());
+    bind(&mut m, "run-a", "child", "ct", "root");
+    let before = m.runs.runs["run-a"].clone();
+    let active = m.runs.active["run-a"].clone();
+    m.clock.now_ms = 2000;
+    m.flush_bound_event_log("run-a", "child", "ct", "root", &mut a);
+    assert_eq!(m.runs.runs["run-a"], before);
+    assert_eq!(m.runs.active["run-a"], active);
+    assert_eq!(logs(&a).len(), 3);
+    assert!(logs(&a).iter().all(|l| l.3["late"] == true));
+    assert!(!format!("{a:?}").contains("secret-value"));
+    assert!(m.runs.event_log.pending.is_empty());
+    assert_eq!(m.runs.event_log.bytes, 0);
+    a.clear();
+    m.flush_bound_event_log("run-a", "child", "ct", "root", &mut a);
+    assert!(logs(&a).is_empty());
+}
+
+#[test]
+fn tree_log_暂存过期超限与关闭清理() {
+    let mut m = setup();
+    candidate(&mut m, "child", "root");
+    let mut a = vec![];
+    for _ in 0..1000 {
+        m.buffer_child_event_log(
+            "child",
+            "item/completed",
+            &item("child", "ct"),
+            false,
+            &mut a,
+        );
+    }
+    assert!(m.runs.event_log.bytes <= PER_THREAD_BYTES);
+    assert!(logs(&a)
+        .iter()
+        .any(|l| l.3["coverageIssue"] == "beforeBindingUnknown"));
+    let generation = m.runs.event_log.timer.unwrap();
+    m.clock.mono_ms = PENDING_MS;
+    a.clear();
+    m.sweep_event_log(generation, &mut a);
+    assert!(m.runs.event_log.pending.is_empty());
+    assert_eq!(m.runs.event_log.bytes, 0);
+    assert!(m.runs.event_log.timer.is_none());
+    assert!(logs(&a).iter().all(|l| l.2 == "记录缺口"));
+    m.buffer_child_event_log(
+        "child",
+        "item/completed",
+        &item("child", "ct"),
+        false,
+        &mut a,
+    );
+    a.clear();
+    m.shutdown_runs(&mut a);
+    assert!(a.iter().any(|a| matches!(
+        a,
+        Action::Unschedule {
+            key: crate::claim::TimerKey::EventLogSweep
+        }
+    )));
+    assert!(m.runs.event_log.pending.is_empty());
+    assert!(m.runs.event_log.timer.is_none());
+    assert_eq!(m.runs.event_log.bytes, 0);
+}
+
+#[test]
+fn tree_log_全局暂存上限与未知线程不暂存() {
+    let mut m = setup();
+    let mut a = vec![];
+    m.buffer_child_event_log(
+        "unknown",
+        "item/completed",
+        &item("unknown", "t"),
+        false,
+        &mut a,
+    );
+    assert!(m.runs.event_log.pending.is_empty());
+    for n in 0..25 {
+        let thread = format!("child-{n}");
+        candidate(&mut m, &thread, "root");
+        for _ in 0..300 {
+            m.buffer_child_event_log(
+                &thread,
+                "item/completed",
+                &item(&thread, "t"),
+                false,
+                &mut a,
+            );
+        }
+    }
+    assert!(m.runs.event_log.bytes <= GLOBAL_BYTES);
+    assert!(m.runs.event_log.bytes > GLOBAL_BYTES - 1024);
+    assert!(logs(&a)
+        .iter()
+        .any(|l| l.3["coverageIssue"] == "beforeBindingUnknown"));
+}
+
+#[test]
+fn tree_log_摘要截断标记与长身份的json保持完整() {
+    let mut m = setup();
+    let thread = "子线程".repeat(200);
+    let turn = "轮".repeat(300);
+    bind(&mut m, "run-a", &thread, &turn, "root");
+    for (text, truncated) in [("甲".repeat(80), false), ("乙".repeat(81), true)] {
+        let mut a = vec![];
+        let params = Some(
+            json!({"threadId":thread,"turnId":turn,"item":{"id":"条目","type":"agentMessage","text":text}}),
+        );
+        m.log_bound_child_event("run-a", &thread, &turn, "item/completed", &params, &mut a);
+        let lines = logs(&a);
+        assert_eq!(lines[0].3["threadId"], thread);
+        assert_eq!(lines[0].3["turnId"], turn);
+        assert_eq!(lines[0].3["truncated"], truncated);
+        assert_eq!(lines[0].3["summary"].as_str().unwrap().chars().count(), 80);
+    }
+}

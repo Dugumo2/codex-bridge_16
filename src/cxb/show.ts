@@ -1,7 +1,8 @@
 import { childEntry, showChildThread, showSubagents } from "./subagents";
 import { sanitizeForTerminal } from "./terminal-text";
 import { CxbError, rpcFailure, type BrokerRpc, type RunResult, type RunModelSummary, type ThreadSummary, type TurnResult } from "./contracts";
-import { readAllRuns, readRunLog, readThreadIndex, listThreadRuns, type LogLine } from "./ledger";
+import { readAllRuns, readRunLog, readThreadIndex, listThreadRuns, ownLogLines, type LogLine } from "./ledger";
+import { showTreeLog } from "./tree-log";
 import { modelLabel, rerouteLabel, runModelDisplay, threadModelDisplay, type ModelDisplay } from "./show-model";
 import { lifecycleHint, lifecycleLabel } from "./lifecycle";
 import type { CommandContext, CommandHandler } from "./main";
@@ -27,7 +28,7 @@ const clean = (text: string) => sanitizeForTerminal(text);
 const safeSummary = (value: unknown) => clean(JSON.stringify(redactParams(value)) ?? "");
 const eventLine = (line: LogLine) => ({ ts: line.ts, kind: clean(line.event), text: clean(line.text) });
 function tail(ctx: CommandContext, ref: ThreadRef) {
-  return (ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : [])
+  return ownLogLines(ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : [])
     .slice(-Number(ctx.parsed.options.limit)).map(eventLine);
 }
 function printLine(ctx: CommandContext, line: { ts: string; kind: string; text: string }) {
@@ -139,8 +140,8 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
     status: run.status, ready: last?.ready ?? null, result: last?.output ?? "", outputSource: last?.outputSource ?? "none", ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run), ...diagnosticFields(run),
     childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup, interruptReason: run.interruptReason, stopOutcome: run.stopOutcome, continuedFrom: run.continuedFrom, updatedAt: index.updatedAt });
   if (!last) {
-    const failure = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId)
-      ?.filter((line) => line.runId === run.runId && line.event === "启动失败").at(-1) : null;
+    const failure = ref.shortId ? ownLogLines(readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [])
+      .filter((line) => line.runId === run.runId && line.event === "启动失败").at(-1) : null;
     if (run.subagentJoin) ctx.out.notice("最终结果不可用（unavailable）");
     else ctx.out.notice(failure ? String(redactParams(failure.text)) : "运行启动失败，没有生成轮次");
   }
@@ -265,7 +266,7 @@ function linesOfRun(all: LogLine[], runId: string): LogLine[] {
 }
 
 async function showLog(ctx: CommandContext, ref: ThreadRef, connect: () => Promise<BrokerRpc>) {
-  const all = ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : [];
+  const all = ownLogLines(ref.shortId ? readRunLog(ctx.workspace.workspaceDir, ref.shortId) ?? [] : []);
   const records = listThreadRuns(ctx.workspace.workspaceDir, ref.threadId);
   const index = readThreadIndex(ctx.workspace.workspaceDir).find((entry) => entry.threadId === ref.threadId);
   const model = await readThreadModel(ctx, ref, connect, index?.model ?? null, records);
@@ -307,7 +308,7 @@ function renderNotification(method: string, raw: unknown, source: string | null)
 
 /** 本地日志里属于运行 runId 的行（行内带运行编号；迁走的 review 与父线程上的新运行交错写同一文件也分得开）。 */
 function runLogLines(ctx: CommandContext, shortId: string | null, runId: string): LogLine[] {
-  return (shortId ? readRunLog(ctx.workspace.workspaceDir, shortId) ?? [] : []).filter((line) => line.runId === runId);
+  return ownLogLines(shortId ? readRunLog(ctx.workspace.workspaceDir, shortId) ?? [] : []).filter((line) => line.runId === runId);
 }
 
 /**
@@ -459,6 +460,7 @@ export const show: CommandHandler = async (ctx) => {
       return options.follow ? await follow(ctx, rpc, ref, session.signal) : await serverResult(ctx, rpc, ref, resolved.summary?.model ?? null);
     }
     const ref = resolveThreadLocal(ctx.workspace.workspaceDir, id);
+    if (options.tree) return showTreeLog(ctx, ref);
     if (ref.lifecycle) {
       ctx.out.notice(`${lifecycleLabel(ref.lifecycle)}：${lifecycleHint(ref.lifecycle.kind, ref.lifecycle.phase, ref.shortId ?? ref.threadId)}`);
       // purge 已删索引、只剩记录：没有本地结果可显示，--json 带出记录供调用方判断。

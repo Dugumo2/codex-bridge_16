@@ -54,7 +54,7 @@ fn n4_内联与非开放阶段及非活动运行不发迁移通知() {
 }
 use super::*;
 use crate::claim::{Clock, Operation, RequestContext, TimerKind};
-use crate::results::{Snapshot, MAX_TEXT_BYTES};
+use crate::results::{summarize_item, Snapshot, MAX_TEXT_BYTES};
 use crate::store::{StoreOp, RETENTION_MS};
 use serde_json::json;
 
@@ -96,10 +96,14 @@ fn n7_每类日志带运行编号且内容清洗与空内容符合四段格式()
                 .unwrap();
             let parts: Vec<_> = line.splitn(4, ' ').collect();
             assert_eq!(&parts[..3], &["1970-01-01T00:00:01.000Z", run, event]);
-            assert_eq!(parts[3].chars().count(), content.chars().count().min(240));
+            let payload: Value =
+                serde_json::from_str(parts[3].strip_prefix("@cxb2 ").unwrap()).unwrap();
+            let summary = payload["summary"].as_str().unwrap();
+            assert_eq!(summary.chars().count(), content.chars().count().min(240));
+            assert_eq!(payload["truncated"], content.chars().count() > 240);
             assert!(!parts[3].chars().any(char::is_control));
             assert_eq!(
-                parts[3],
+                summary,
                 content
                     .chars()
                     .take(240)
