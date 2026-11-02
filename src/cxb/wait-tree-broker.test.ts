@@ -6,7 +6,7 @@ import { bounded } from "./wait-run";
 
 const convergence = { timeoutMs: 20_000, discoveryTimeoutMs: 400, wakeVerifyTimeoutMs: 600 };
 
-function scenario(name: string, body: (h: Sa1bHarness) => Promise<void>) {
+function scenario(name: string, body: (h: Sa1bHarness) => Promise<void>, timeout = 45_000) {
   test(`wait --tree 真实 broker：${name}`, async () => {
     const h = new Sa1bHarness();
     try {
@@ -14,7 +14,7 @@ function scenario(name: string, body: (h: Sa1bHarness) => Promise<void>) {
       await h.start({ cxbConvergence: convergence });
       await body(h);
     } finally { await bounded(h.close(), 12_000); }
-  }, 45_000);
+  }, timeout);
 }
 
 /** 子任务完成之后显式完成 broker 发起的汇总轮；不以睡眠猜测收敛时机。 */
@@ -146,3 +146,46 @@ scenario("活动子树到期退出 3，沿用 stderr 错误对象且 stdout 留�
   expect(waiting.stdout).toBe("");
   expect(JSON.parse(waiting.stderr)).toMatchObject({ ok: false, error: { code: "TIMEOUT" } });
 });
+
+scenario("父停止而子停止未确认：真实停止数量摘要不冒充完整报告，alreadyDone 保留退出 4", async h => {
+  const childTurn = await h.spawn("child");
+  await h.until(async () => (await h.watch()).children?.members.some((member: any) => member.threadId === "child"),
+    6000, "子代理未纳入运行树");
+  // 子轮可以已中断，但后台命令终止后仍被列出，因此不能声称整个子代理已停下。
+  await h.owner.request("fixture/backgroundTerminals/set", {
+    threadId: "child", scenario: { sessions: [{ processId: "31001", itemId: "child-command", termination: "remaining" }] },
+  }, 6000);
+  await h.control("item", { threadId: "child", turnId: childTurn, item: {
+    id: "child-command", type: "commandExecution", command: "模拟后台命令", processId: "31001", status: "inProgress",
+  } });
+  const stopped: any = await h.owner.request("broker/threads/stop", { threadId: ROOT, runId: h.runId }, 45_000);
+  expect(stopped).toMatchObject({ stopOutcome: "unconfirmed", childrenStop: {
+    root: { phase: "confirmed" }, members: { child: { backgroundCleanup: { remaining: ["31001"] } } },
+  } });
+  let snapshot: any;
+  await h.until(async () => {
+    snapshot = await h.watch();
+    return snapshot.run?.state === "ended";
+  }, 6000, "停止交付后父运行没有结束");
+  expect(snapshot.run).toMatchObject({ status: "interrupted", stopOutcome: "unconfirmed" });
+  expect(snapshot.run.childrenStop.members.child.phase).toBe("unconfirmed");
+  expect(snapshot.run.childrenStop.failed).toContain("child");
+  expect(snapshot.children.members.some((member: any) => member.threadId === "child")).toBe(true);
+  // 直接核对真实协议形状，防止再次用完整报告伪造 watch.children.stop。
+  expect(Object.keys(snapshot.children.stop).sort()).toEqual(["conflicts", "phase", "unconfirmed", "version"]);
+  expect(snapshot.children.stop.unconfirmed).toBeNumber();
+  expect(snapshot.children.stop.unconfirmed).toBe(snapshot.run.childrenStop.unconfirmed.length);
+  expect(snapshot.children.stop.conflicts).toBeNumber();
+  const waiting = await h.cli(["wait", ROOT, "--tree", "--json", "--timeout", "10"], 15_000);
+  expect(waiting.code, waiting.stderr).toBe(4);
+  const value = json(waiting);
+  expect(value).toMatchObject({ ok: false, command: "wait", status: "interrupted", alreadyDone: true });
+  expect(value.tree.nodes).toHaveLength(1);
+  expect(value.tree.nodes[0]!.stop).toMatchObject({ phase: "unconfirmed", source: "runRecord" });
+  expect(value.tree.nodes[0]!.stop!.issues).toContain("核实失败");
+  expect(value.tree.nodes[0]!.result).toMatchObject({ status: "interrupted" });
+  const text = await h.cli(["wait", ROOT, "--tree", "--timeout", "10"], 15_000);
+  expect(text.code, text.stderr).toBe(4);
+  expect(text.stdout).toContain("子代理结果（本次运行最近受管轮）");
+  expect(text.stdout).toContain("尚未确认停下");
+}, 75_000);

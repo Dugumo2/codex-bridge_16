@@ -1,4 +1,4 @@
-import type { ChildActivity, ChildrenStopReport, DiscoveryState, RelationKind, RootStopReport, RunResult, TreePhase, TurnResult } from "./contracts";
+import type { ChildActivity, DiscoveryState, RelationKind, RootStopReport, RunResult, TreePhase, TurnResult } from "./contracts";
 
 /** watch 的树字段；缺省与 null 都表示没有相应证据。 */
 export interface WatchTreeMember {
@@ -12,11 +12,18 @@ export interface WatchTreeMember {
   canAcceptDirectInput?: boolean | null;
   agentVersion?: string | null;
 }
+/** watch 只提供阶段与数量，不包含任何成员级停止核验证据。 */
+export interface WatchStopSummary {
+  phase: TreePhase;
+  version: number;
+  unconfirmed: number;
+  conflicts: number;
+}
 export interface WatchChildren {
   members: WatchTreeMember[];
   discovery: DiscoveryState | null;
   inFlightSpawns: number | null;
-  stop: ChildrenStopReport | null;
+  stop: WatchStopSummary | null;
 }
 export interface TreeSnapshot {
   run?: RunResult | null;
@@ -36,7 +43,7 @@ export interface TreeNodeResult {
 export interface TreeNodeStop {
   phase: TreePhase | null;
   issues: string[];
-  source: "watch" | "runRecord";
+  source: "runRecord";
   report: RootStopReport | null;
 }
 export interface TreeNode extends WatchTreeMember {
@@ -52,6 +59,7 @@ export interface TreeView {
   source: "watch" | "runRecord" | "mixed";
   revision: number | null;
   stopVersion: number | null;
+  stopSummary: WatchStopSummary | null;
   discovery: DiscoveryState | null;
   inFlightSpawns: number | null;
   unsettledSpawns: number | null;

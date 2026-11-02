@@ -58,7 +58,8 @@ async function waitInbox(ctx: CommandContext, rpc: BrokerRpc, deadline: number, 
   }
 }
 
-async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSignal, deadline: number, id: string, treeMode = false) {
+async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSignal, deadline: number, id: string, treeMode = false,
+  selected?: () => void) {
   const ref = await (treeMode ? bounded(resolveThreadViaBroker(rpc, id), Math.max(0, deadline - performance.now()), signal)
     : resolveThreadViaBroker(rpc, id));
   const label = ref.shortId ?? ref.threadId.slice(0, 8);
@@ -74,6 +75,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   });
   const outputSuperseded = () => {
     decided = true;
+    selected?.();
     ctx.out.notice("[cxb] 本次等待已被同一线程的新等待接替，已退出。");
     ctx.out.resultJson({ ok: false, command: "wait", waitFor: "thread", threadId: ref.threadId,
       shortId: ref.shortId, event: "superseded", superseded: true });
@@ -132,6 +134,7 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   const outputPending = (items: InboxItem[]) => {
     if (superseded) return outputSuperseded();
     decided = true;
+    selected?.();
     const rendered = renderPending(items, { threadId: ref.threadId, shortId: label });
     ctx.out.result(rendered.text);
     for (const line of convergenceLines(convergence.fields(), items.length)) ctx.out.notice(line);
@@ -163,13 +166,15 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
     const atSnapshot = snapshot!.run ?? readRunRecord(ctx.workspace.workspaceDir, runId);
     const alreadyDone = atSnapshot?.state === "ended" || atSnapshot?.state === "lost";
     running = waitRun(upstream.rpc, { threadId: ref.threadId, runId, workspaceDir: ctx.workspace.workspaceDir,
-      timeoutMs: Math.max(0, deadline - performance.now()), signal: controller.signal,
+      // 树模式由等待阶段的计时器裁决总期限；下层取整后至少晚一毫秒，避免 RPC 超时抢先归类为 6。
+      timeoutMs: treeMode ? Math.max(0, Math.ceil(deadline - performance.now())) + 1 : Math.max(0, deadline - performance.now()), signal: controller.signal,
       log: (text) => ctx.out.progress(text) });
     const winner = await Promise.race([pending.then((items) => ({ items })), running.then((run) => ({ run })), failure, replacement]);
     if (superseded || "superseded" in winner) return outputSuperseded();
     if ("items" in winner) return outputPending(winner.items);
     // 从这里开始已选定结果出口；输出期间及 finally 收束期间的迟到通知不再改变结果。
     decided = true;
+    selected?.();
     const run = upstream.apply(winner.run);
     const code = exitCodeForRun(run);
     // 树模式的等待裁决到此结束。补读与总等待分阶段，原始期限只限制补读预算。
@@ -225,6 +230,35 @@ async function waitThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSign
   }
 }
 
+/** 先登记等待期限再发 RPC；选定出口立即撤销该期限，补读只使用剩余预算。 */
+async function waitTreeThread(ctx: CommandContext, rpc: BrokerRpc, signal: AbortSignal, deadline: number, id: string) {
+  const controller = new AbortController();
+  const phaseSignal = AbortSignal.any([signal, controller.signal]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let expired = false;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      expired = true;
+      reject(new CxbError("TIMEOUT", "等待运行超时"));
+      controller.abort();
+    }, Math.max(0, deadline - performance.now()));
+  });
+  const close = () => { clearTimeout(timer); timer = undefined; };
+  const selected = () => {
+    // 到期后同批排队的事项或结果不得在 finally 取消收束期间追加输出。
+    if (expired) throw new CxbError("TIMEOUT", "等待运行超时");
+    close();
+  };
+  const work = waitThread(ctx, rpc, phaseSignal, deadline, id, true, selected);
+  try { return await Promise.race([work, timeout]); }
+  finally {
+    close();
+    controller.abort();
+    // 超时胜出时仍等待内部取消收束，避免遗留订阅或迟到输出。
+    await work.catch(() => undefined);
+  }
+}
+
 export const wait: CommandHandler = async (ctx) => {
   const scope = commandSession(ctx);
   const started = performance.now();
@@ -234,7 +268,7 @@ export const wait: CommandHandler = async (ctx) => {
     const rpc = await bounded(scope.connect(), timeoutMs, scope.signal);
     const id = ctx.parsed.positional[0];
     if (!id || /^(ap_|qu_|mc_|gd_)/.test(id)) return await waitInbox(ctx, rpc, deadline, id);
-    if (ctx.parsed.options.tree) return await waitThread(ctx, rpc, scope.signal, deadline, id, true);
+    if (ctx.parsed.options.tree) return await waitTreeThread(ctx, rpc, scope.signal, deadline, id);
     return await bounded(waitThread(ctx, rpc, scope.signal, deadline, id), Math.max(0, deadline - performance.now()), scope.signal);
   } finally {
     scope.dispose();

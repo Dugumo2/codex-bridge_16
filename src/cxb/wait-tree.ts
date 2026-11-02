@@ -36,6 +36,8 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
     tree.revision = revision < 0 ? null : revision;
     tree.stopVersion = Math.max(stopVersion, tree.stopVersion ?? -1);
     if (tree.stopVersion < 0) tree.stopVersion = null;
+    // 成员通知没有全局数量；尚未补齐时只保留成员事实，不把缓存数量当终态证据。
+    if (stale) { tree.discovery = null; tree.inFlightSpawns = null; }
     return tree;
   };
   const display = () => {
@@ -59,10 +61,16 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
   const acceptSnapshot = (next: TreeSnapshot) => {
     if (!active || (next.run && next.run.runId !== runId)) return;
     const nextRevision = Number.isSafeInteger(next.revision) ? next.revision! : -1;
-    const priorStop = snapshot.children?.stop ?? snapshot.run?.childrenStop;
-    const nextStop = next.children?.stop ?? next.run?.childrenStop;
+    const priorStop = snapshot.children?.stop;
+    const nextStop = next.children?.stop;
     const stop = nextStop && (!priorStop || nextStop.version >= priorStop.version) ? nextStop : priorStop ?? null;
-    if (stop) stopVersion = Math.max(stopVersion, stop.version);
+    // 完整报告只来自运行记录，与 watch 的数量摘要分别保留版本。
+    const priorReport = snapshot.run?.childrenStop;
+    const nextReport = next.run?.childrenStop;
+    const report = nextReport && (!priorReport || nextReport.version >= priorReport.version) ? nextReport : priorReport;
+    if (stop || report) stopVersion = Math.max(stopVersion, stop?.version ?? -1, report?.version ?? -1);
+    const baseRun = nextRevision >= snapshotRevision ? next.run ?? snapshot.run : snapshot.run ?? next.run;
+    const run = baseRun && report ? { ...baseRun, childrenStop: report } : baseRun;
     if (nextRevision >= snapshotRevision) {
       // 空快照可能来自已经释放的在线上下文，不能抹掉历史或已经观察到的成员。
       const members = new Map((snapshot.children?.members ?? []).map((member) => [member.threadId, member]));
@@ -71,14 +79,15 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
         if (event.revision > nextRevision) applyMember(members, event);
         else if (event.threadId) changes.delete(event.threadId);
       }
-      snapshot = { run: next.run ?? snapshot.run, revision: Math.max(revision, nextRevision),
+      snapshot = { run, revision: Math.max(revision, nextRevision),
         children: { members: [...members.values()], discovery: next.children?.discovery ?? snapshot.children?.discovery ?? null,
           // 无发现上下文时，线上兼容值 0 不能证明派生已全部落定。
           inFlightSpawns: next.children?.discovery ? next.children.inFlightSpawns : snapshot.children?.inFlightSpawns ?? null, stop } };
       snapshotRevision = nextRevision;
       revision = Math.max(revision, nextRevision);
-    } else if (snapshot.children) snapshot = { ...snapshot, children: { ...snapshot.children, stop } };
-    stale = false;
+    } else snapshot = { ...snapshot, run, ...(snapshot.children ? { children: { ...snapshot.children, stop } } : {}) };
+    // 旧快照可以补成员字段，却不能证明通知之后的全局数量已经刷新。
+    stale = nextRevision < revision || Math.max(nextStop?.version ?? -1, nextReport?.version ?? -1) < stopVersion;
   };
   const schedule = () => {
     if (!active || !runId || timer || inFlight || !dirty) return;
@@ -120,6 +129,7 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
     }
     if (newerStop) stopVersion = event.stopVersion!;
     dirty = true;
+    stale = true;
     display();
     schedule();
   };

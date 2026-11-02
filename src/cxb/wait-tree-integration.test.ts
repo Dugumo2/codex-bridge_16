@@ -5,7 +5,7 @@ import { createOutput } from "./output";
 import { cleanupContexts, context, errorCode, gate, item, thread } from "./test-fixtures/n4b-support";
 import { runResult } from "./test-fixtures/run-fakes";
 import { messageBarrier, watchdog } from "./test-fixtures/test-watchdog";
-import type { RunResult } from "./contracts";
+import { CxbError, type ChildrenStopReport, type RunResult } from "./contracts";
 
 afterEach(cleanupContexts);
 const child = { threadId: "child", parentThreadId: "thread-test", relationKind: "subagent" as const,
@@ -221,3 +221,102 @@ for (const verbose of [false, true]) test(`活动树 JSON 实时变化仅在 ver
   expect(await watchdog(work)).toBe(0); await c.ctx.out.flush();
   expect(JSON.parse(output.stdout).tree.nodes).toHaveLength(1); c.checkClean();
 });
+
+test("第二次 watch 挂起：命令等待期限退出3且 stdout 留空", async () => {
+  const c = context(["wait", "abcd1234", "--tree", "--json", "--timeout", "1"]), output = wire(c);
+  const watching = gate<void>(), reply = gate<unknown>();
+  handle(c, ended({ state: "running", status: null })); const original = c.fake.handle;
+  c.fake.handle = (method, params) => {
+    if (method === "broker/threads/watch" && !params.exclusiveWaiter) { watching.resolve(); return reply.promise; }
+    return original(method, params);
+  };
+  const work = wait(c.ctx);
+  try {
+    await watching.wait();
+    const failure = await watchdog(work.then(() => null, (error: unknown) => error));
+    expect(failure).toBeInstanceOf(CxbError);
+    expect((failure as CxbError).exitCode).toBe(3);
+    c.ctx.out.error(failure); await c.ctx.out.flush();
+    expect(output.stdout).toBe("");
+    expect(JSON.parse(output.stderr).error.code).toBe("TIMEOUT");
+    expect(c.fake.calls.filter((call) => call.method === "broker/threads/watch").map((call) => call.params)).toEqual([
+      { threadId: "thread-test", exclusiveWaiter: true }, { threadId: "thread-test", runId: "run-test" },
+    ]);
+    c.checkClean();
+  } finally {
+    reply.resolve(view()); await c.cancel(); await work.catch(() => undefined);
+  }
+});
+
+for (const alreadyDone of [false, true]) test(`真实停止摘要与完整报告共存，alreadyDone=${alreadyDone} 正常退出4`, async () => {
+  const c = context(["wait", "abcd1234", "--tree", "--json"]), output = wire(c), watching = gate<void>();
+  const report: ChildrenStopReport = { trigger: "userStop", phase: "unconfirmed", version: 8,
+    root: { thread: "thread-test", phase: "confirmed", check: { ownership: true, turnEnded: true, goalBraked: true, settled: true, verifyDone: true },
+      clearRequested: false, clearConfirmed: false, error: null }, stopped: [], unconfirmed: ["child"], failed: [], conflicts: [], capabilityLimited: [],
+    discovery: { complete: true, version: 2, incompleteReasons: [] }, unsettledSpawns: 0 };
+  const final = ended({ status: "interrupted", interruptReason: "stop", stopOutcome: "unconfirmed", childrenStop: report });
+  handle(c, final); const original = c.fake.handle;
+  c.fake.handle = (method, params) => {
+    if (method !== "broker/threads/watch") return original(method, params);
+    if (!params.exclusiveWaiter) watching.resolve();
+    const run = alreadyDone ? final : { ...final, state: "stopping" as const, status: null };
+    return { ...view(run), children: { ...children, stop: { phase: report.phase, version: 8, unconfirmed: 1, conflicts: 0 } } };
+  };
+  const work = wait(c.ctx);
+  try {
+    if (!alreadyDone) { await watching.wait(); c.fake.emit("broker/run/ended", { run: final }); }
+    expect(await watchdog(work)).toBe(4); await c.ctx.out.flush();
+    const result = JSON.parse(output.stdout);
+    expect(result).toMatchObject({ alreadyDone, status: "interrupted", tree: { stopVersion: 8,
+      stopSummary: { phase: "unconfirmed", version: 8, unconfirmed: 1, conflicts: 0 }, nodes: [{ threadId: "child", stop: { source: "runRecord", phase: "unconfirmed" } }] } });
+    expect(result.tree.nodes[0].stop.issues).toContain("尚未确认停下"); c.checkClean();
+  } finally { await c.cancel(); await work.catch(() => undefined); }
+});
+
+for (const inFlight of [false, true]) for (const json of [false, true]) {
+  test(`变化尚未补齐时父运行结束：${inFlight ? "快照在途" : "合并窗口"}，${json ? "JSON" : "文本"}标陈旧`, async () => {
+    const c = context(["wait", "abcd1234", "--tree", ...(json ? ["--json"] : [])]), output = wire(c);
+    const watching = gate<void>(), refreshing = gate<void>(), reply = gate<unknown>();
+    const originalSet = globalThis.setTimeout;
+    const heldTimers = new Set<ReturnType<typeof setTimeout>>();
+    let release: (() => void) | undefined;
+    const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+      if (ms !== 200) return originalSet(callback, ms, ...args);
+      const timer = originalSet(() => {}, 60_000); heldTimers.add(timer);
+      release = () => { clearTimeout(timer); heldTimers.delete(timer); callback(...args); };
+      return timer;
+    }) as typeof setTimeout);
+    handle(c); const original = c.fake.handle;
+    let watches = 0;
+    c.fake.handle = (method, params) => {
+      if (method !== "broker/threads/watch") return original(method, params);
+      watches++;
+      if (watches === 2) watching.resolve();
+      if (watches > 2) { refreshing.resolve(); return reply.promise; }
+      return { ...view(ended({ state: "running", status: null })), children: { ...children, inFlightSpawns: 1 } };
+    };
+    const work = wait(c.ctx);
+    try {
+      await watching.wait();
+      c.fake.emit("broker/run/childChanged", { runId: "run-test", rootThreadId: "thread-test", threadId: null, revision: 2 });
+      expect(release).toBeDefined();
+      if (inFlight) { release!(); await refreshing.wait(); }
+      c.fake.emit("broker/run/ended", { run: ended() });
+      expect(await watchdog(work)).toBe(0); await c.ctx.out.flush();
+      if (json) expect(JSON.parse(output.stdout)).toMatchObject({ result: "中文结果", tree: { view: "terminal", revision: 2,
+        stale: true, inFlightSpawns: null, discovery: null, nodes: [{ threadId: "child" }] } });
+      else {
+        expect(output.stdout).toContain("树信息可能陈旧");
+        expect(output.stdout).not.toContain("在途派生 1 个");
+      }
+      const before = output.stdout;
+      reply.resolve({ ...view(), revision: 2 });
+      await messageBarrier(() => [output.stdout.length, c.fake.calls.length]);
+      expect(output.stdout).toBe(before); c.checkClean();
+      expect(watches).toBe(inFlight ? 3 : 2);
+    } finally {
+      reply.resolve(view()); await c.cancel(); await work.catch(() => undefined);
+      timerSpy.mockRestore(); for (const timer of heldTimers) clearTimeout(timer);
+    }
+  });
+}

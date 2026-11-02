@@ -1,7 +1,7 @@
 import type { ChildrenStopReport, ChildActivity } from "./contracts";
 import { backgroundLines, threadLabel } from "./subagents";
 import { sanitizeForTerminal } from "./terminal-text";
-import type { TreeBuildInput, TreeNode, TreeNodeStop, TreeView } from "./tree-contracts";
+import type { TreeBuildInput, TreeNode, TreeNodeStop, TreeView, WatchStopSummary } from "./tree-contracts";
 
 const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const safeText = (text: string) => sanitizeForTerminal(text).replace(/[\u0080-\u009f\u202a-\u202e\u2066-\u2069]/g, "");
@@ -11,7 +11,7 @@ const activityText: Record<ChildActivity, string> = {
   starting: "启动中", running: "运行中", settled: "活动已落定", unknown: "活动未知",
 };
 
-function memberStop(threadId: string, report: ChildrenStopReport | null, source: TreeNodeStop["source"]): TreeNodeStop | null {
+function memberStop(threadId: string, report: ChildrenStopReport | null): TreeNodeStop | null {
   if (!report) return null;
   const member = report.members?.[threadId] ?? null;
   const issues: string[] = [];
@@ -21,7 +21,7 @@ function memberStop(threadId: string, report: ChildrenStopReport | null, source:
   if (report.capabilityLimited.includes(threadId)) issues.push("能力受限");
   if (member?.error) issues.push(`核实错误：${member.error}`);
   const phase = member?.phase ?? (report.stopped.includes(threadId) ? "confirmed" : report.unconfirmed.includes(threadId) ? "unconfirmed" : null);
-  return member || phase || issues.length ? { phase, issues, source, report: member } : null;
+  return member || phase || issues.length ? { phase, issues, source: "runRecord", report: member } : null;
 }
 
 interface Placement { node: TreeNode; depth: number; group: "root" | "missing" | "cycle" }
@@ -104,12 +104,15 @@ export function buildTree(input: TreeBuildInput): TreeView {
       turnIds: [], shortId: run.reviewShortId ?? null, stop: null, result: null });
   }
   const watchStop = watch?.stop ?? null;
-  const recordStop = run?.childrenStop ?? null;
-  const useWatchStop = !!watchStop && (!recordStop || watchStop.version >= recordStop.version);
-  const stop = useWatchStop ? watchStop : recordStop;
-  const stopSource = useWatchStop ? "watch" : "runRecord";
+  const reports = [input.run?.childrenStop, input.snapshot?.run?.childrenStop].filter((value) => value != null);
+  // 摘要与完整报告各自选版；摘要再新也不能替代逐成员核验证据。
+  const recordStop = reports.reduce<ChildrenStopReport | null>((latest, value) =>
+    !latest || value.version > latest.version ? value : latest, null);
+  const stopSummary: WatchStopSummary | null = recordStop && (!watchStop || recordStop.version >= watchStop.version)
+    ? { phase: recordStop.phase, version: recordStop.version, unconfirmed: recordStop.unconfirmed.length, conflicts: recordStop.conflicts.length }
+    : watchStop;
   // 发现状态有自己的版本；较新的停止报告不能被较旧在线发现快照覆盖。
-  const discoveries = [watch?.discovery, watchStop?.discovery, recordStop?.discovery].filter((value) => value != null);
+  const discoveries = [watch?.discovery, ...reports.map((report) => report.discovery)].filter((value) => value != null);
   const discovery = discoveries.reduce<(typeof discoveries)[number] | null>((latest, value) =>
     !latest || value.version > latest.version ? value : latest, null);
   const members = [...nodes.values()].filter((node) => node.relationKind !== "fork" && node.threadId !== input.rootThreadId);
@@ -121,7 +124,7 @@ export function buildTree(input: TreeBuildInput): TreeView {
       node.activity = finalRecord.finalState ?? "unknown";
     }
     node.shortId = input.shortIds?.get(node.threadId) ?? node.shortId;
-    node.stop = memberStop(node.threadId, stop, stopSource);
+    node.stop = memberStop(node.threadId, recordStop);
     node.result = node.relationKind === "subagent" ? input.results?.get(node.threadId) ?? null : null;
     node.turnIds = [...new Set(node.turnIds)].sort(compare);
   }
@@ -133,9 +136,9 @@ export function buildTree(input: TreeBuildInput): TreeView {
   }
   return { rootThreadId: input.rootThreadId, view: input.view ?? "partial",
     source: watch ? records.length || recordStop ? "mixed" : "watch" : "runRecord",
-    revision: input.snapshot?.revision ?? null, stopVersion: stop?.version ?? null,
+    revision: input.snapshot?.revision ?? null, stopVersion: stopSummary?.version ?? null, stopSummary,
     discovery,
-    inFlightSpawns: watch?.inFlightSpawns ?? null, unsettledSpawns: stop?.unsettledSpawns ?? null,
+    inFlightSpawns: watch?.inFlightSpawns ?? null, unsettledSpawns: recordStop?.unsettledSpawns ?? null,
     resultScope: "latestBoundTurnPerThread", outputCoverage: coverage, nodes: ordered,
     ...(input.stale ? { stale: true } : {}) };
 }
@@ -158,6 +161,11 @@ function nodeStatus(node: TreeNode): string {
 
 function globalLines(tree: TreeView): string[] {
   const lines: string[] = [];
+  if (tree.stopSummary) {
+    const stop = tree.stopSummary;
+    const phase = { pending: "核验中", confirmed: "已确认", unconfirmed: "尚未确认" }[stop.phase];
+    lines.push(`整树停止：${phase}；未确认 ${stop.unconfirmed} 个；归属冲突 ${stop.conflicts} 个`);
+  }
   if (!tree.nodes.some((node) => node.relationKind === "subagent")) lines.push(tree.discovery?.complete
     ? "本次运行没有子代理" : "未记录子代理成员，发现完整性未知");
   if (tree.discovery?.complete === false) lines.push(`子代理发现不完整${tree.discovery.incompleteReasons.length
