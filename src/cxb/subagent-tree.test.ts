@@ -120,11 +120,44 @@ describe("活动、结果与停止证据保持独立", () => {
 
   test("选择较新停止版本，状态独立保留未知", () => {
     const tree = buildTree({ rootThreadId: "root", run: runResult({ children: [child("a")], childrenStop: report({ version: 8, stopped: ["a"] }) }),
-      snapshot: snapshot([member("a")], { stop: report({ version: 7, unconfirmed: ["a"] }) }) });
+      snapshot: snapshot([member("a")], { stop: { phase: "unconfirmed", version: 7, unconfirmed: 1, conflicts: 0 } }) });
     expect(tree.stopVersion).toBe(8);
     expect(tree.nodes[0]!.stop).toMatchObject({ phase: "confirmed", source: "runRecord" });
     expect(tree.nodes[0]!.result).toBeNull();
     expect(treeResultText(tree)).toContain("已确认停下");
+  });
+
+  test("仅停止摘要时展示阶段与数量，不推断成员核验或发现状态", () => {
+    const stop = { phase: "unconfirmed" as const, version: 8, unconfirmed: 2, conflicts: 1 };
+    const tree = buildTree({ rootThreadId: "root", snapshot: snapshot([member("a")], { stop }) });
+    expect(tree.stopSummary).toEqual(stop);
+    expect(tree.stopVersion).toBe(8);
+    expect(tree.nodes[0]!.stop).toBeNull();
+    expect(tree.discovery).toBeNull();
+    expect(tree.unsettledSpawns).toBeNull();
+    expect(treeResultText(tree)).toContain("整树停止：尚未确认；未确认 2 个；归属冲突 1 个");
+    expect(treeLines(tree)[1]).not.toContain("尚未确认停下");
+  });
+
+  test("同版真实停止摘要与完整记录共存，只用完整报告核验成员", () => {
+    const stop = report({ phase: "unconfirmed", unconfirmed: ["a"], failed: ["a"] });
+    const tree = buildTree({ rootThreadId: "root", run: runResult({ children: [child("a")], childrenStop: stop }),
+      snapshot: snapshot([member("a")], { stop: { phase: "unconfirmed", version: stop.version, unconfirmed: 1, conflicts: 0 } }) });
+    expect(tree.nodes[0]!.stop).toMatchObject({ phase: "unconfirmed", source: "runRecord", issues: ["尚未确认停下", "核实失败"] });
+    expect(tree.stopSummary).toEqual({ phase: "unconfirmed", version: stop.version, unconfirmed: 1, conflicts: 0 });
+    expect(treeResultText(tree)).toContain("核实失败");
+  });
+
+  test("完整报告在两份运行记录间独立选版，不被更新摘要替代", () => {
+    const online = snapshot([member("a")], { stop: { phase: "pending", version: 10, unconfirmed: 1, conflicts: 0 } });
+    online.run = runResult({ childrenStop: report({ version: 9, stopped: ["a"] }) });
+    const tree = buildTree({ rootThreadId: "root", run: runResult({ children: [child("a")],
+      childrenStop: report({ version: 8, unconfirmed: ["a"] }) }), snapshot: online });
+    expect(tree.stopVersion).toBe(10);
+    expect(tree.stopSummary?.phase).toBe("pending");
+    expect(tree.nodes[0]!.stop).toMatchObject({ phase: "confirmed", source: "runRecord" });
+    expect(tree.nodes[0]!.stop?.issues).toEqual([]);
+    expect(tree.unsettledSpawns).toBe(0);
   });
 
   test("后台核验与最近受管轮完成并存", () => {
@@ -143,7 +176,7 @@ describe("活动、结果与停止证据保持独立", () => {
     const tree = buildTree({ rootThreadId: "root", view: "terminal",
       run: runResult({ children: [child("a")], childrenStop: report({ version: 2, discovery: newer }) }),
       snapshot: snapshot([member("a")], { discovery: { complete: true, version: 4, incompleteReasons: [] },
-        stop: report({ version: 7, discovery: { complete: true, version: 3, incompleteReasons: [] } }) }) });
+        stop: { phase: "confirmed", version: 7, unconfirmed: 0, conflicts: 0 } }) });
     expect(tree.stopVersion).toBe(7);
     expect(tree.discovery).toEqual(newer);
     expect(treeLines(tree).join("\n")).toContain("停止时发现缺证据");

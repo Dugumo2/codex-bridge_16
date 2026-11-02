@@ -67,8 +67,24 @@ test("旧快照回包重放新成员通知，合并且最多一个在途，固�
   await messageBarrier(() => [c.timers.length, c.lines.length]);
   expect(c.observer.current().nodes[0]).toMatchObject({ activity: "settled", pendingCount: 2 });
   expect(c.observer.current().revision).toBe(4);
+  expect(c.observer.current()).toMatchObject({ stale: true, discovery: null, inFlightSpawns: null });
   expect(c.fake.calls).toHaveLength(1);
   expect(c.timers).toHaveLength(1);
+});
+
+test("新快照覆盖全部已知变化后恢复全局字段，不永久标记陈旧", async () => {
+  const c = setup(), reply = gate<TreeSnapshot>();
+  const initial = snapshot(); initial.children!.inFlightSpawns = 1;
+  c.observer.initialize("run-test", initial);
+  c.fake.handle = () => reply.promise;
+  c.fake.emit("broker/run/childChanged", event({ threadId: null, revision: 2 }));
+  expect(c.observer.current()).toMatchObject({ stale: true, discovery: null, inFlightSpawns: null });
+  c.fire();
+  expect(c.observer.current().stale).toBe(true);
+  reply.resolve(snapshot(2));
+  await messageBarrier(() => [c.lines.length, c.observer.current().stale]);
+  expect(c.observer.current().stale).toBeUndefined();
+  expect(c.observer.current()).toMatchObject({ discovery: { complete: true }, inFlightSpawns: 0 });
 });
 
 test("同 revision 的 stopVersion 单独推进并补取停止报告", async () => {
@@ -77,13 +93,19 @@ test("同 revision 的 stopVersion 单独推进并补取停止报告", async () 
     root: { thread: "thread-test", phase: "confirmed", check: { ownership: true, turnEnded: true, goalBraked: true, settled: true, verifyDone: true }, clearRequested: false, clearConfirmed: false, error: null },
     stopped: [], unconfirmed: ["child"], failed: ["child"], conflicts: [], capabilityLimited: ["child"],
     discovery: { complete: false, version: 2, incompleteReasons: ["缺证据"] }, unsettledSpawns: 1 };
-  c.fake.handle = () => { const next = snapshot(); next.children!.stop = report; done.resolve(); return next; };
+  c.fake.handle = () => {
+    const next = snapshot();
+    next.children!.stop = { phase: report.phase, version: report.version, unconfirmed: report.unconfirmed.length, conflicts: report.conflicts.length };
+    next.run = { ...next.run!, childrenStop: report };
+    done.resolve(); return next;
+  };
   c.observer.initialize("run-test", snapshot());
   c.fake.emit("broker/run/childChanged", event({ revision: 1, threadId: null, stopVersion: 8, stopPhase: "unconfirmed" }));
   expect(c.timers).toHaveLength(1);
   c.fire(); await done.wait();
   await messageBarrier(() => [c.lines.length]);
   expect(c.observer.current().stopVersion).toBe(8);
+  expect(c.observer.current().stopSummary).toEqual({ phase: "unconfirmed", version: 8, unconfirmed: 1, conflicts: 0 });
   expect(c.observer.current().nodes[0]!.stop?.issues).toContain("核实失败");
   expect(c.observer.current(runResult({ childrenStop: { ...report, version: 10 } }), "terminal").stopVersion).toBe(10);
   const count = c.lines.length;
