@@ -709,7 +709,7 @@ impl Machine {
                 // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
                 // 只排除首次通知时已完成的旧轮；每个接收方只建一次基线，双通知不重新挂起。
                 for child in new_receivers {
-                    if self.reject_followup_receiver(&key, &child) {
+                    if self.reject_followup_receiver(&key, &child, actions) {
                         continue;
                     }
                     let observed = self
@@ -824,7 +824,7 @@ impl Machine {
 
     /// 首轮配对：C 恰好观察到一轮就配对；还没有就等；不止一轮说明首轮身份不明，保持 unbound。
     fn pair_first_turn(&mut self, key: &EvidenceKey, child: &str, actions: &mut Vec<Action>) {
-        if self.reject_followup_receiver(key, child) {
+        if self.reject_followup_receiver(key, child, actions) {
             return;
         }
         let now = self.clock.mono_ms;
@@ -912,7 +912,7 @@ impl Machine {
             }
         };
         for child in &op.receivers {
-            if self.reject_followup_receiver(key, child) {
+            if self.reject_followup_receiver(key, child, actions) {
                 continue;
             }
             self.relations
@@ -924,7 +924,7 @@ impl Machine {
             self.refresh_member(&op.run_id, child, MemberChange::Relation, actions);
         }
         for (child, turns) in &op.proven_turns {
-            if self.reject_followup_receiver(key, child) {
+            if self.reject_followup_receiver(key, child, actions) {
                 continue;
             }
             for turn in turns {
@@ -946,7 +946,12 @@ impl Machine {
     }
 
     /// 跟进只提供候选身份，血缘、独立认领与其他运行绑定必须在授予管理权前核实。
-    fn reject_followup_receiver(&mut self, key: &EvidenceKey, child: &str) -> bool {
+    fn reject_followup_receiver(
+        &mut self,
+        key: &EvidenceKey,
+        child: &str,
+        actions: &mut Vec<Action>,
+    ) -> bool {
         let Some(op) = self.relations.operations.get(key) else {
             return false;
         };
@@ -974,6 +979,24 @@ impl Machine {
         } else {
             return false;
         };
+        let run = op.run_id.clone();
+        // 拒绝发生在 bind 之前：按本次操作的候选运行记关系诊断，不能借已有绑定反查归属。
+        // 跟进尚无被接纳的子轮，保留 null turnId，不把旧绑定轮次冒充成本次活动。
+        self.runs.log_source(
+            &run,
+            child,
+            Some(&key.parent_thread_id),
+            "subagent",
+            None,
+            Some(&key.item_id),
+            self.clock.now_ms,
+            "归属冲突",
+            reason,
+            false,
+            false,
+            Some("discoveryIncomplete"),
+            actions,
+        );
         let op = self
             .relations
             .operations

@@ -135,6 +135,45 @@ describe.skipIf(process.platform !== "win32")("静态树日志真实 broker", ()
     expect(child.stdout + child.stderr).toContain("根线程");
   }, 60_000);
 
+  test("祖先未入册时孙线程先完成：沿候选血缘暂存并按原观察时间补写", async () => {
+    const run = await broker.start();
+    const child = await broker.spawn(ROOT, run.turn.id, "unbound-child", "v1", "held");
+    await broker.inject("unbound-child", "thread/started", { thread: { id: "unbound-child", parentThreadId: ROOT,
+      source: { subAgent: { thread_spawn: { parent_thread_id: ROOT, depth: 1 } } }, status: { type: "idle" },
+      canAcceptDirectInput: true, turns: [] } });
+    await broker.inject("unbound-child", "turn/started", { turn: { id: child.turnId, status: "inProgress", items: [] } });
+    const grandchild = await broker.spawn("unbound-child", child.turnId, "early-grandchild", "v1");
+    await broker.inject("early-grandchild", "item/completed", { turnId: grandchild.turnId,
+      item: { id: "early-grandchild-item", type: "agentMessage", text: "祖先绑定前的孙线程摘要" } });
+    await broker.inject("early-grandchild", "error", { turnId: grandchild.turnId, willRetry: true,
+      error: { message: 'HTTP error: headers={"Cookie":"sid=abc123"}', codexErrorInfo: "other" } });
+    await broker.request("fixture/turn", { threadId: "early-grandchild", action: "complete" });
+    await broker.inject(ROOT, "item/completed", { turnId: run.turn.id,
+      item: { id: "before-binding-barrier", type: "agentMessage", text: "孙轮结束后才放行祖先证据" } });
+    await broker.hasRow((row) => row.source?.itemId === "before-binding-barrier");
+    const before = await broker.request("broker/threads/watch", { threadId: ROOT });
+    expect(broker.rows().some((row) => row.source?.threadId === "early-grandchild")).toBe(false);
+    await broker.request("fixture/release", { holdId: child.holdId });
+    await broker.hasRow((row) => row.source?.threadId === "early-grandchild" && row.event === "轮次完成");
+    const rows = broker.rows();
+    const delayed = rows.filter((row) => row.source?.threadId === "early-grandchild"
+      && ["轮次开始", "条目完成", "子线程错误", "轮次完成"].includes(row.event));
+    expect(delayed.map((row) => row.event)).toEqual(["轮次开始", "条目完成", "子线程错误", "轮次完成"]);
+    const barrier = rows.find((row) => row.source?.itemId === "before-binding-barrier")!;
+    for (const row of delayed) {
+      expect(row.runId).toBe(run.runId);
+      expect(row.source).toMatchObject({ late: true, parentThreadId: "unbound-child", turnId: grandchild.turnId });
+      expect(row.ts <= barrier.ts).toBe(true);
+      expect(rows.indexOf(row)).toBeGreaterThan(rows.indexOf(barrier));
+    }
+    expect(delayed.find((row) => row.event === "子线程错误")!.content).toContain('"Cookie":"[已隐藏]"');
+    expect(delayed.find((row) => row.event === "子线程错误")!.content).not.toContain("sid=abc123");
+    const after = await broker.request("broker/threads/watch", { threadId: ROOT });
+    expect(after.run.state).toBe("running");
+    expect(after.run.turns).toEqual(before.run.turns);
+    expect(after.run.turnsTotal).toBe(before.run.turnsTotal);
+  }, 60_000);
+
   test("绑定证据晚于子轮完成：只补日志摘要，保留观察顺序且不重驱动父轮", async () => {
     const run = await broker.start();
     const child = await broker.spawn(ROOT, run.turn.id, "late-child", "v1", "held");

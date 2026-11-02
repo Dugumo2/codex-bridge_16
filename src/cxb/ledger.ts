@@ -274,9 +274,18 @@ function parseLog(text: string, label: string): LogLine[] {
   return parsed;
 }
 
-/** 读线程日志（先 `.log.1` 再 `.log`，按写入顺序）；两者都不存在返回 null。 */
-export function readRunLog(workspaceDir: string, shortId: string): LogLine[] | null {
-  return readRunLogSnapshot(workspaceDir, shortId).lines;
+/** 旧模式单次读取已保留的完整行；正常追加不要求稳定快照，也不重读或重新去重。 */
+export function readRunLog(workspaceDir: string, shortId: string, io: LogReadIO = legacyLogIO): LogLine[] | null {
+  const base = join(workspaceDir, "runs", `${shortId}.log`);
+  const label = `线程 ${shortId} 的日志`;
+  try {
+    const parts = [`${base}.1`, base].filter((path) => io.fingerprint(path) !== null);
+    if (!parts.length) return null;
+    return parts.flatMap((path) => parseLog(io.read(path), label));
+  } catch (cause) {
+    if (cause instanceof CxbError) throw cause;
+    throw new CxbError("LOCAL_ERROR", `${label}无法读取`, { cause });
+  }
 }
 
 /** 文件身份与长度一起核验，避免轮转时把旧活动文件与新备份拼错。接口允许确定性模拟轮转。 */
@@ -284,6 +293,10 @@ export interface LogReadIO {
   fingerprint(path: string): string | null;
   read(path: string): string;
 }
+const legacyLogIO: LogReadIO = {
+  fingerprint: (path) => existsSync(path) ? "存在" : null,
+  read: (path) => readFileSync(path, "utf8"),
+};
 const logIO: LogReadIO = {
   fingerprint(path) {
     try {

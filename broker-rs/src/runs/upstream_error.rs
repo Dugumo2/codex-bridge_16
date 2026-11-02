@@ -271,26 +271,64 @@ fn strip_controls(text: &str) -> String {
 fn redact_headers(text: &str) -> String {
     text.split('\n')
         .map(|line| {
-            // 上游可能在头部前附加错误说明；头名必须完整匹配，不能误认 X-Authorization。
-            let lower = line.to_ascii_lowercase();
+            let mut out = String::new();
+            let mut copied = 0;
             for (colon, _) in line.match_indices(':') {
-                let name = lower[..colon].trim_end();
-                for header in ["authorization", "cookie", "set-cookie"] {
-                    if let Some(prefix) = name.strip_suffix(header) {
-                        if prefix
-                            .chars()
-                            .next_back()
-                            .is_none_or(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_'))
-                        {
-                            return format!("{}: {REDACTED}", &line[..colon]);
+                if colon < copied || !sensitive_header(&line[..colon]) {
+                    continue;
+                }
+                let rest = &line[colon + 1..];
+                let value = colon + 1 + rest.len() - rest.trim_start().len();
+                let quote = line.as_bytes().get(value).copied();
+                // 引号值只替换内部内容，保留闭合引号和其后的其他字段；转义引号不结束值。
+                let (start, end) = if matches!(quote, Some(b'"' | b'\'')) {
+                    let start = value + 1;
+                    let mut escaped = false;
+                    let mut end = line.len();
+                    for (offset, byte) in line.as_bytes()[start..].iter().enumerate() {
+                        if escaped {
+                            escaped = false;
+                        } else if *byte == b'\\' {
+                            escaped = true;
+                        } else if Some(*byte) == quote {
+                            end = start + offset;
+                            break;
                         }
                     }
-                }
+                    (start, end)
+                } else {
+                    (value, line.len())
+                };
+                out.push_str(&line[copied..start]);
+                out.push_str(REDACTED);
+                copied = end;
             }
-            line.into()
+            out.push_str(&line[copied..]);
+            out
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 冒号前紧邻的完整记号（可被成对引号包围）；点、连字符和下划线均属于头名。
+fn sensitive_header(before: &str) -> bool {
+    let before = before.trim_end();
+    let bytes = before.as_bytes();
+    let quoted = matches!(bytes.last(), Some(b'"' | b'\''));
+    let end = bytes.len() - usize::from(quoted);
+    let mut start = end;
+    while start > 0
+        && (bytes[start - 1].is_ascii_alphanumeric()
+            || matches!(bytes[start - 1], b'-' | b'_' | b'.'))
+    {
+        start -= 1;
+    }
+    if quoted && (start == 0 || bytes.get(start - 1) != bytes.last()) {
+        return false;
+    }
+    ["authorization", "cookie", "set-cookie"]
+        .iter()
+        .any(|header| before[start..end].eq_ignore_ascii_case(header))
 }
 
 fn redact_query_values(text: &str) -> String {
@@ -790,6 +828,46 @@ mod tests {
             sanitize("X-Authorization: visible").0,
             "X-Authorization: visible"
         );
+    }
+
+    #[test]
+    fn 认证头完整记号与带引号值脱敏不误伤相邻字段() {
+        for (input, expected) in [
+            (
+                r#"HTTP error: headers={"Cookie":"sid=abc123"}"#,
+                r#"HTTP error: headers={"Cookie":"[已隐藏]"}"#,
+            ),
+            (
+                r#"{"authorization": "Bearer x"}"#,
+                r#"{"authorization": "[已隐藏]"}"#,
+            ),
+            (
+                r#"{"Cookie":"sid=abc123","normal":"visible","Set-Cookie":"b=2"}"#,
+                r#"{"Cookie":"[已隐藏]","normal":"visible","Set-Cookie":"[已隐藏]"}"#,
+            ),
+            (
+                r#"{"Cookie":"sid=abc\"123","normal":"visible"}"#,
+                r#"{"Cookie":"[已隐藏]","normal":"visible"}"#,
+            ),
+            (
+                "请求失败 Authorization: abc123",
+                "请求失败 Authorization: [已隐藏]",
+            ),
+            ("Cookie: abc123\n正常正文", "Cookie: [已隐藏]\n正常正文"),
+        ] {
+            assert_eq!(sanitize(input), (expected.into(), false));
+        }
+        for input in [
+            "X.Authorization: visible",
+            "X.Cookie: visible",
+            "X-Authorization: visible",
+            "MyCookie: visible",
+            "X_Authorization: visible",
+            "1Cookie: visible",
+            r#"{"X.Cookie":"visible","MyCookie":"visible"}"#,
+        ] {
+            assert_eq!(sanitize(input), (input.into(), false));
+        }
     }
 
     #[test]

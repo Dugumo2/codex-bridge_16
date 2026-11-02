@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +9,7 @@ import { treeLogLine, treeTimeline } from "./tree-log";
 import type { TreeLogPayload } from "./tree-log-types";
 import { context, ledger, summary } from "./test-fixtures/n4a-unit";
 import { runResult } from "./test-fixtures/run-fakes";
-import { removeTemp } from "./test-fixtures/main-test-support";
+import { bounded, removeTemp } from "./test-fixtures/main-test-support";
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "cxb-tree-log-")); mkdirSync(join(dir, "runs")); });
@@ -23,6 +24,17 @@ const line = (patch: Partial<TreeLogPayload> = {}, event = "轮次开始", stamp
 const write = (text: string, suffix = "") => writeFileSync(join(dir, "runs", `abcd1234.log${suffix}`), text);
 
 describe("树日志解析与静态保留窗口", () => {
+  test("旧读取在读取期间正常增长时保留当次完整行，树模式仍要求稳定快照", () => {
+    let generation = 0;
+    const io: LogReadIO = {
+      fingerprint: (path) => path.endsWith(".1") ? null : `同一文件:${generation}`,
+      read() { generation++; return line() + `${ts} run-test 条目完成 未写完`; },
+    };
+    expect(readRunLog(dir, "abcd1234", io)?.map((row) => row.text)).toEqual(["轮次开始 摘要"]);
+    expect(generation).toBe(1);
+    expect(() => readRunLogSnapshot(dir, "abcd1234", io)).toThrow("持续变化");
+    expect(generation).toBe(4);
+  });
   test("新旧混合还原正文并严格校验结构，长 JSON 不截断", () => {
     const long = "中文\\\"".repeat(300);
     write(`${ts} run-test 运行开始 旧摘要\n` + line({ summary: long, truncated: true }));
@@ -164,6 +176,72 @@ describe("show 静态树日志离线接口", () => {
     await expect(show(context(dir, ["show", "none", "--log", "--tree"]).ctx)).rejects.toMatchObject({ exitCode: 2 });
     write(`${ts} run-test 轮次开始 @cxb2 {\n`);
     await expect(show(context(dir, ["show", "abcd", "--log", "--tree"]).ctx)).rejects.toMatchObject({ exitCode: 1 });
+  });
+  test("孙线程 R→C→G 的提示指向有独立运行的 R，不再推荐纯派生 C", async () => {
+    const child = { ...summary({ threadId: "child", shortId: "cdef1234", lastRunId: null }), parentThreadId: "thread-test" };
+    const grandchild = { ...summary({ threadId: "grandchild", shortId: "fedc1234", lastRunId: null }), parentThreadId: "child" };
+    ledger(dir, [runResult()], [summary(), child, grandchild]);
+    const t = context(dir, ["show", "fedc", "--log", "--tree"]);
+    await expect(bounded(show(t.ctx), 1000, "根线程定位未结束")).rejects.toMatchObject({
+      exitCode: 1, message: "该线程是派生子线程，请使用根线程 abcd1234 查看树日志",
+    });
+    expect(t.connects).toBe(0);
+    expect(t.cleanup.size).toBe(0);
+  });
+  for (const kind of ["missing", "cycle"] as const) test(`根线程提示遇到${kind === "missing" ? "缺链" : "环"}有界结束且不猜测线程`, async () => {
+    const child = { ...summary({ threadId: "child", shortId: "cdef1234", lastRunId: null }), parentThreadId: kind === "missing" ? "missing" : "grandchild" };
+    const grandchild = { ...summary({ threadId: "grandchild", shortId: "fedc1234", lastRunId: null }), parentThreadId: "child" };
+    ledger(dir, [], [child, grandchild]);
+    const t = context(dir, ["show", "fedc", "--log", "--tree"]);
+    await expect(bounded(show(t.ctx), 1000, "缺链或环未收束")).rejects.toMatchObject({
+      exitCode: 1, message: expect.stringContaining("本地血缘缺失或成环，无法定位根线程"),
+    });
+    expect(t.connects).toBe(0);
+    expect(t.cleanup.size).toBe(0);
+  });
+  for (const mode of ["log", "tail", "follow", "review"] as const) test(`旧 ${mode} 在${mode === "review" ? "补发" : "每次"}读盘期间追加仍成功，来源过滤先于截取和补发`, async () => {
+    ledger(dir);
+    const path = join(dir, "runs", "abcd1234.log");
+    write(line({ eventId: "1:1", summary: "根一" })
+      + line({ eventId: "1:2", summary: "执行二", sourceRole: "execution", threadId: "review-child" }, "条目完成")
+      + line({ eventId: "1:3", summary: "不可泄漏", sourceRole: "subagent", threadId: "ordinary-child" }));
+    const args = mode === "log" ? ["--log", "--full"] : [mode === "tail" ? "--tail" : "--follow", "--limit", "2"];
+    const t = context(dir, ["show", "abcd", ...args, "--json"]);
+    const ended = runResult({ reviewThreadId: mode === "review" ? "review-child" : null });
+    t.fake.handle = (method, params) => {
+      if (method === "broker/threads/list") return { threads: [summary()] };
+      if (method === "broker/runs/modelSummaries") return { runs: [] };
+      if (params.threadId === "review-child") {
+        fs.appendFileSync(path, line({ eventId: "1:4", summary: "执行二", sourceRole: "subagent", threadId: "ordinary-child" }, "条目完成")
+          + line({ eventId: "1:5", summary: "执行二", sourceRole: "execution", threadId: "review-child" }, "条目完成"));
+      }
+      return { thread: summary({ threadId: params.threadId }), run: ended };
+    };
+    let reads = 0;
+    const originalRead = fs.readFileSync;
+    // 在每次读取已取得文本之后同步追加，确定性改变大小，不用时间延迟碰运气。
+    const growing = spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      const result = originalRead(...args);
+      if (String(args[0]) === path) {
+        reads++;
+        // review 用例让初始读取稳定，单独验证第二次补发读取；初始增长由 follow 用例覆盖。
+        if (mode !== "review" || reads > 1) {
+          fs.appendFileSync(path, line({ eventId: `growth:${reads}`, sourceRole: "subagent", threadId: "ordinary-child", summary: "增长的子行不可泄漏" }));
+        }
+      }
+      return result;
+    }) as typeof fs.readFileSync);
+    try {
+      expect(await bounded(show(t.ctx), 2000, "持续追加时旧 show 未完成")).toBe(0);
+      const rows = mode === "log" ? t.json[0].runs[0].items : mode === "tail" ? t.json[0].items : t.json.slice(0, -1);
+      expect(rows.map((row: { text: string }) => row.text)).toEqual(mode === "review"
+        ? ["轮次开始 根一", "条目完成 执行二", "条目完成 执行二"] : ["轮次开始 根一", "条目完成 执行二"]);
+      expect(reads).toBe(mode === "review" ? 2 : 1);
+      expect(t.fake.subscriptions + t.any.size + t.cleanup.size).toBe(0);
+    } finally {
+      growing.mockRestore();
+      for (const cleanup of [...t.cleanup]) await cleanup();
+    }
   });
   test("旧 tail 在 limit 之前去掉普通子来源，根和 review 正文与旧格式逐字一致", async () => {
     ledger(dir);

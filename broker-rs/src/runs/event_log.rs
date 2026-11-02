@@ -411,35 +411,55 @@ impl Machine {
 
     fn event_log_candidates(&self, thread: &str) -> Vec<(String, String)> {
         let mut candidates = std::collections::BTreeMap::new();
-        for (run, context) in &self.relations.contexts {
-            if let Some(member) = context
-                .members
-                .get(thread)
-                .filter(|m| m.kind == RelationKind::Subagent && m.conflict.is_none())
-            {
-                candidates.insert(run.clone(), member.parent.clone());
+        // 祖先尚未绑定时，后代操作的 run_id 为空。沿已知血缘与候选操作继续上溯；
+        // 保存的 parent 始终是事件线程的直接父线程，不能改成找到运行的祖先。
+        // 访问集防止畸形环；这里只决定能否暂存，实际写入仍须逐轮确认绑定。
+        let mut pending = vec![(thread.to_owned(), None::<String>)];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some((current, direct_parent)) = pending.pop() {
+            if !visited.insert((current.clone(), direct_parent.clone())) {
+                continue;
             }
-        }
-        for op in self.relations.operations.values().filter(|op| {
-            op.receivers.contains(thread) && !op.rejected_receivers.contains_key(thread)
-        }) {
-            if self.runs.runs.contains_key(&op.run_id) {
-                candidates.insert(op.run_id.clone(), op.key.parent_thread_id.clone());
-            }
-        }
-        // 血缘只授权暂存，绝不授权写入活动行。
-        if let Some(edge) = self
-            .relations
-            .edges
-            .get(thread)
-            .filter(|e| e.kind == RelationKind::Subagent)
-        {
             for (run, context) in &self.relations.contexts {
-                if context.identity.execution_thread_id == edge.parent_thread_id
-                    || context.members.contains_key(&edge.parent_thread_id)
+                if let Some(member) = context
+                    .members
+                    .get(&current)
+                    .filter(|m| m.kind == RelationKind::Subagent && m.conflict.is_none())
                 {
-                    candidates.insert(run.clone(), edge.parent_thread_id.clone());
+                    candidates.insert(
+                        run.clone(),
+                        direct_parent.as_ref().unwrap_or(&member.parent).clone(),
+                    );
                 }
+                if context.identity.execution_thread_id == current {
+                    if let Some(parent) = &direct_parent {
+                        candidates.insert(run.clone(), parent.clone());
+                    }
+                }
+            }
+            // 独立认领是新的执行根，不借其旧血缘继续向另一个运行追溯。
+            if self.claims.contains_key(&current) {
+                continue;
+            }
+            for op in self.relations.operations.values().filter(|op| {
+                op.receivers.contains(&current) && !op.rejected_receivers.contains_key(&current)
+            }) {
+                let parent = direct_parent
+                    .as_ref()
+                    .unwrap_or(&op.key.parent_thread_id)
+                    .clone();
+                if self.runs.runs.contains_key(&op.run_id) {
+                    candidates.insert(op.run_id.clone(), parent);
+                } else if op.run_id.is_empty() {
+                    pending.push((op.key.parent_thread_id.clone(), Some(parent)));
+                }
+            }
+            if let Some(edge) = self
+                .thread_relation(&current)
+                .filter(|e| e.kind == RelationKind::Subagent)
+            {
+                let parent = direct_parent.unwrap_or_else(|| edge.parent_thread_id.clone());
+                pending.push((edge.parent_thread_id, Some(parent)));
             }
         }
         candidates
