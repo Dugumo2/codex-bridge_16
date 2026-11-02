@@ -3,7 +3,7 @@ use super::*;
 use crate::claim::converge::ConvergenceReadiness;
 use crate::relations::convergence::settled;
 
-fn machine() -> (Machine, SubagentMock) {
+pub(super) fn machine() -> (Machine, SubagentMock) {
     let (mut m, mock) = setup(false);
     assert!(m.enable_convergence(ConvergenceReadiness {
         trusted_inputs: true,

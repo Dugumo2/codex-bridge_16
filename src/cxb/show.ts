@@ -14,7 +14,7 @@ import { observeConvergence } from "./convergence";
 import { diagnosticLine, observeUpstreamErrors, turnCodexErrorInfo, turnErrorLine, upstreamFields, upstreamLabel, upstreamShowLines } from "./upstream-errors";
 import { diagnosticFields, isUnconfirmedRun } from "./run-diagnostics";
 import { stopStageDescription } from "./stop-diagnostics";
-import type { ConvergenceSummary } from "./sa1b-contracts";
+import type { ConvergenceDiagnostic, ConvergenceSummary } from "./sa1b-contracts";
 import { commandSession, wireMessage } from "./command-session";
 
 function unsupported(error: unknown): boolean {
@@ -119,9 +119,25 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
   const index = readThreadIndex(ctx.workspace.workspaceDir).find((entry) => entry.threadId === ref.threadId)!;
   const disk = readAllRuns(ctx.workspace.workspaceDir);
   const run = disk.find((record) => record.runId === index.lastRunId);
-  const model = await readThreadModel(ctx, ref, connect, index.model, disk);
+  let connection: Promise<BrokerRpc> | undefined;
+  const sharedConnect = () => connection ??= connect();
+  const model = await readThreadModel(ctx, ref, sharedConnect, index.model, disk);
   modelNotice(ctx, model);
   if (!run) throw new CxbError("NOT_FOUND", "线程没有运行记录", { id: ref.threadId });
+  let onlineDiagnostic: { convergenceDiagnostic: ConvergenceDiagnostic | null; convergenceDiagnosticStatus: "current" | "none" | "unavailable" } | undefined;
+  if (run.state === "running" || run.state === "stopping") {
+    try {
+      const rpc = await sharedConnect();
+      const reply = await rpc.request<{ diagnostic: ConvergenceDiagnostic | null }>(
+        "broker/runs/convergenceDiagnostics", { runId: run.runId }, { timeoutMs: 3000 });
+      if (!("diagnostic" in reply)) throw new Error("诊断接口没有返回快照状态");
+      onlineDiagnostic = { convergenceDiagnostic: reply.diagnostic, convergenceDiagnosticStatus: reply.diagnostic === null ? "none" : "current" };
+    } catch (error) {
+      if (error instanceof CxbError && error.code === "INTERRUPTED") throw error;
+      onlineDiagnostic = { convergenceDiagnostic: null, convergenceDiagnosticStatus: "unavailable" };
+      ctx.out.notice("无当前诊断（broker 离线或查询未按期返回）");
+    }
+  }
   const last = resultTurn(run);
   resultNotice(ctx, run, ref.shortId ?? ref.threadId);
   if (run.state === "running" || run.state === "stopping" || resultPending(run)) {
@@ -130,7 +146,7 @@ async function localResult(ctx: CommandContext, ref: ThreadRef, connect: () => P
     ctx.out.notice(`结果尚未就绪，请用 cxb wait ${ref.shortId ?? ref.threadId}`);
     showUpstream(ctx, run, stage?.output);
     ctx.out.resultJson({ ok: true, command: "show", ...ref, ...model, mode: "result", runId: run.runId, state: run.state,
-      ...convergenceFields(run), ...selectedResultFields(run), ...upstreamFields(run), ...diagnosticFields(run), ...newInterruptFields(run), ...(stage ? { result: stage.output, stageResult: true } : {}),
+      ...convergenceFields(run), ...onlineDiagnostic, ...selectedResultFields(run), ...upstreamFields(run), ...diagnosticFields(run), ...newInterruptFields(run), ...(stage ? { result: stage.output, stageResult: true } : {}),
       stopOutcome: run.stopOutcome, childrenStop: run.childrenStop, backgroundCleanup: run.backgroundCleanup });
     return 5 as const;
   }

@@ -441,6 +441,8 @@ pub struct TerminalDisposition {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ConvergenceSummary {
+    /// 仅在线内存快照；终态显式 null 清除客户端此前看到的等待门。
+    pub convergence_diagnostic: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_join: Option<SubagentJoin>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -640,10 +642,10 @@ mod tests {
     }
 
     #[test]
-    fn absent_summary_does_not_add_json_fields() {
+    fn absent_summary_explicitly_clears_online_diagnostic() {
         assert_eq!(
             serde_json::to_value(ConvergenceSummary::default()).unwrap(),
-            json!({})
+            json!({"convergenceDiagnostic":null})
         );
         let summary = ConvergenceSummary {
             final_turn_id: Some("最终轮".into()),
@@ -652,7 +654,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(summary).unwrap(),
-            json!({"finalTurnId":"最终轮", "autoTurnsStarted":0})
+            json!({"finalTurnId":"最终轮", "autoTurnsStarted":0,"convergenceDiagnostic":null})
         );
     }
 }

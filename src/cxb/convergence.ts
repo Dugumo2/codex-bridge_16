@@ -4,6 +4,21 @@ import { convergenceFields } from "./run-result";
 
 const phases: Record<JoinPhase, string> = { running: "运行中", waitingSubtree: "等待子代理", preparingReconcile: "准备汇总",
   reconciling: "汇总中", finalCheck: "最终核实", released: "已释放", stopping: "异常收尾", abnormal: "异常收尾" };
+const gates: Record<string, string> = {
+  automaticControlRevoked: "自动汇总权限核实", connectionOrAuthorityChanged: "连接与管理权核实", parentNotSettled: "父轮落定",
+  conflicts: "归属冲突核实", reconcileOutcomeUnknown: "汇总提交结果核实", rootUnsettled: "根线程落定",
+  requestInFlight: "请求处理", stopChangeInFlight: "停止变更处理", discoveryInFlight: "子树发现回包",
+  resultReadInFlight: "结果读取回包", retryScheduled: "重试调度", reconcileSubmissionInFlight: "汇总提交回包",
+  discoveryEpochUncovered: "发现覆盖当前工作批次", discoveryIncomplete: "子树发现核实", pendingOperations: "派生操作落定",
+  pendingRequests: "待答事项", unresolvedLookups: "关系查询落定", unresolvedCandidates: "候选归属核实",
+  activityUnverified: "活动核实", activityUnsettled: "活动落定", activityResultUnknown: "活动结果核实",
+  activityGoalActive: "活动目标结束", activityGoalUnknown: "活动目标状态核实", activityPendingRequests: "活动待答事项",
+  rootGoalTurnInFlight: "根目标轮落定", readyToRelease: "最终释放", awaitingReconcile: "已投递汇总完成",
+  rootCapabilityUnknown: "根线程能力核实", rootNoDirectInput: "根线程输入能力核实", budgetExhausted: "预算收尾",
+  budgetVerification: "预算核实", budgetUnavailable: "预算证据核实", preparingReconcile: "汇总准备",
+  goalTerminal: "目标终态收尾", budgetVerificationExpired: "预算核实期限收尾", convergenceDeadline: "收敛期限收尾",
+  wakeLimit: "汇总次数收尾", autoTurnLimit: "自动父轮次数收尾",
+};
 const reasons: Record<TerminalReason, string> = {
   parentFailed: "父轮失败", parentInterrupted: "父轮中断", userStop: "用户停止", ownerGone: "客户端断开",
   budgetExhausted: "原预算耗尽", budgetIncomplete: "预算证据不完整", convergeDeadline: "收敛期限已到",
@@ -21,6 +36,9 @@ export function convergenceLines(run: ConvergenceSummary & Pick<Partial<RunResul
   const join = run.subagentJoin;
   if (!join) return lines;
   lines.push(`运行协调：${phases[join.phase]}${pending > 0 ? `；等待回答（${pending} 项）` : ""}；唤醒 ${join.wakeupsStarted}/${run.convergenceConfig?.maxWakeups ?? 5} 次，提交 ${join.wakeupAttempts} 次，重试 ${join.startRetriesUsed} 次`);
+  if (join.phase === "waitingSubtree" && run.convergenceDiagnostic) {
+    lines.push(`正在等待：${gates[run.convergenceDiagnostic.gate] ?? "收敛条件核实"}`);
+  }
   lines.push(`收敛期限：${join.deadlineAt === 0 ? "尚未开始收敛计时" : new Date(join.deadlineAt).toISOString()}；工作批次 ${join.workEpoch}，已投递 ${join.deliveredEpoch}，已汇总 ${join.reconciledEpoch}`);
   if (join.resultCoverage) {
     const c = join.resultCoverage;

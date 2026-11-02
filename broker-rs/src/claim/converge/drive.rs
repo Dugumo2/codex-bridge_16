@@ -1108,7 +1108,7 @@ impl Machine {
         true
     }
 
-    fn convergence_budget(&self, token: &ConvergeToken) -> BudgetAdmission {
+    pub(super) fn convergence_budget(&self, token: &ConvergeToken) -> BudgetAdmission {
         #[cfg(test)]
         if let Some(value) = self.convergences.test_budget {
             return value;
@@ -1145,7 +1145,7 @@ impl Machine {
 impl Machine {
     /// goal 非活动对应的协调终态。只在已启用 SA1b 的运行上调用；未启用的运行被暂停时不经过这里，
     /// 保持 SA1b 之前「暂停即正常结束」的语义（用户 2026-10-11 定）。
-    fn goal_terminal(&self, _run: &str, status: Option<&str>) -> Option<TerminalReason> {
+    pub(super) fn goal_terminal(&self, _run: &str, status: Option<&str>) -> Option<TerminalReason> {
         goal_reason(status)
     }
 }
