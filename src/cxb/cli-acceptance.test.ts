@@ -1,6 +1,6 @@
 // cxb 命令行的黑盒验收测试（S4 N1）：只依据命令面规格（第 1、2、4 节），从外部启动 `bun src/cxb/main.ts`，
 // 看退出码、stdout、stderr，不依赖各模块的内部接口。
-// 每个子进程都在临时的 USERPROFILE、HOME、CXB_HOME 下运行，绝不读写开发者真实的 ~/.cxb-legacy 与 ~/.codex-bridge。
+// 每个子进程都在临时的 USERPROFILE、HOME、CXB_HOME 下运行，隔离开发者真实的用户目录与 ~/.codex-bridge 数据。
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";

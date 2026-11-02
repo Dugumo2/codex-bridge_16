@@ -1,9 +1,8 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import fs, { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_KEYS } from "./config-schema";
 import { readUserConfig, writeUserConfig } from "./user-config";
-import { migrateLegacyData } from "./workspace";
 import { N5Harness } from "./test-fixtures/n5a-support";
 
 let h: N5Harness;
@@ -56,19 +55,4 @@ for (const key of CONFIG_KEYS) test(`写入 API 拒绝非法已知键且保留�
   const path = join(h.home, "config.json"); const before = readFileSync(path);
   expect(() => writeUserConfig(h.home, { [key]: "非法 值" })).toThrow("请备份后修复或删除该文件");
   expect(readFileSync(path)).toEqual(before);
-});
-
-test("首次迁移保护已知键非法的目标：字节不变、告警、无完成标记", () => {
-  const legacyRoot = join(h.home, ".cxb-legacy");
-  // 新旧数据根不能包含彼此，独立目录模拟迁移。
-  const dataRoot = join(h.dir, "new-data");
-  mkdirSync(legacyRoot); mkdirSync(dataRoot);
-  writeFileSync(join(legacyRoot, "config.json"), '{"approval":"auto"}');
-  const raw = '{ "timeout": "非法值", "future": 1 }\n';
-  writeFileSync(join(dataRoot, "config.json"), raw);
-  const report = migrateLegacyData({ dataRoot, legacyRoot });
-  expect(report.migrated).toBe(false);
-  expect(report.warnings).toHaveLength(1);
-  expect(readFileSync(join(dataRoot, "config.json"), "utf8")).toBe(raw);
-  expect(readdirSync(dataRoot)).toEqual(["config.json"]);
 });

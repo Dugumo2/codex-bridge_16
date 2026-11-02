@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// src/cxb/main.ts — cxb 入口：解析参数 → 帮助、版本 → 工作区与旧数据迁移 → 交给命令处理（S4 N1 起）。
+// src/cxb/main.ts — cxb 入口：解析参数 → 帮助、版本 → 工作区与用户配置 → 交给命令处理（S4 N1 起）。
 //
 // 各命令的处理函数从 N2 起逐个登记进 HANDLERS；没登记的命令报「尚未提供」并退出 1。
 // broker 连接按需建立（ctx.connect），只看帮助、版本或参数出错时不拉起 broker。
@@ -14,7 +14,7 @@ import { createReviewHandler } from "./review";
 import { createRunHandler } from "./run";
 import { attachServerRequests, handover, renderPending } from "./server-requests";
 import { runMain, type Output, type RegisterCleanup } from "./output";
-import { migrateLegacyData, resolveWorkspace } from "./workspace";
+import { resolveWorkspace } from "./workspace";
 
 /** 连接 broker 的总期限：含拉起 serve 与 app-server 握手（冷启动实测约 1–3 秒，留足余量）。 */
 const CONNECT_TIMEOUT_MS = 30_000;
@@ -72,13 +72,6 @@ export async function execute(parsed: ParsedCommand, out: Output, registerCleanu
   }
 
   const workspace = resolveWorkspace(globals.dir);
-  const migration = migrateLegacyData({ dataRoot: workspace.dataRoot });
-  if (migration.migrated) {
-    out.progress(safeSummary(`已从旧版 ~/.cxb-legacy 迁入配置键 ${migration.configKeys.join("、") || "（无）"}、模板 ${migration.templates.length} 个`));
-    if (migration.droppedKeys.length) out.progress(safeSummary(`未迁入的旧配置键：${migration.droppedKeys.join("、")}`));
-  }
-  for (const warning of migration.warnings) out.progress(safeSummary(`旧数据迁移：${warning}`));
-
   let userConfig: UserConfig | undefined;
   let userConfigError: CxbError | undefined;
   try { userConfig = readUserConfig(workspace.dataRoot); }
