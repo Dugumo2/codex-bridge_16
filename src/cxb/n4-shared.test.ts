@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { RpcError } from "../types";
 import { commandSession } from "./command-session";
 import { CxbError, rpcFailure, type StopReply, type ThreadSummary } from "./contracts";
-import { listThreadRuns, readRunLog, readRunRecord, readThreadIndex } from "./ledger";
+import { listThreadRuns, readChildRecords, readRunLog, readRunRecord, readThreadIndex } from "./ledger";
 import { STOP_SETTLING_LIMIT_MS, stopThread } from "./stop-thread";
 import { context, reasonError } from "./test-fixtures/n4a-unit";
 import { FakeRpc, runResult } from "./test-fixtures/run-fakes";
@@ -66,6 +66,29 @@ describe("ledger：只读 broker 账本", () => {
     expect(readThreadIndex(dir).find((item) => item.threadId === "t-2")).not.toHaveProperty("resumeOverrides");
     writeIndex({ aaaa1111: { ...entry("t-1", "aaaa1111", 1), resumeOverrides: { config: null } } });
     expect(readThreadIndex(dir)[0]?.resumeOverrides).toEqual({ config: null });
+  });
+  test("线程索引带出子线程来源摘要的身份字段，丢弃类型不符的字段，旧索引不添加该字段", () => {
+    const sourceSummary = { kind: "threadSpawn" as const, agentPath: "/root/read_a", agentNickname: "Harvey", agentRole: "worker", depth: 1 };
+    writeIndex({
+      aaaa1111: { ...entry("t-1", "aaaa1111", 1), sourceSummary },
+      bbbb2222: { ...entry("t-2", "bbbb2222", 2), sourceSummary: { kind: "未知", agentPath: 7, agentNickname: "", depth: -1, text: "正文" } },
+      cccc3333: entry("t-3", "cccc3333", 3),
+    });
+    const index = readThreadIndex(dir);
+    expect(index.find((item) => item.threadId === "t-1")?.sourceSummary).toEqual(sourceSummary);
+    expect(index.find((item) => item.threadId === "t-2")).not.toHaveProperty("sourceSummary");
+    expect(index.find((item) => item.threadId === "t-3")).not.toHaveProperty("sourceSummary");
+  });
+  test("运行记录的 children 只采用形状合法的条目，坏条目计数而不当作没有子代理", () => {
+    const good = { threadId: "c-1", parentThreadId: "p", relationKind: "subagent" as const, turnIds: ["t1"], evidence: "v2Started" as const,
+      finalState: "settled" as const };
+    expect(readChildRecords(runResult({ runId: "run-a" }))).toEqual({ records: [], malformed: 0 });
+    expect(readChildRecords({ ...runResult({ runId: "run-a" }), children: [good] } as any)).toEqual({ records: [good], malformed: 0 });
+    for (const bad of [{ ...good, threadId: "" }, { ...good, turnIds: "t1" }, { ...good, turnIds: [""] }, { ...good, evidence: "猜测" },
+      { ...good, finalState: "done" }, { ...good, relationKind: "x" }, null]) {
+      expect(readChildRecords({ ...runResult({ runId: "run-a" }), children: [good, bad] } as any)).toEqual({ records: [good], malformed: 1 });
+    }
+    expect(readChildRecords({ ...runResult({ runId: "run-a" }), children: { c: good } } as any)).toEqual({ records: [], malformed: 1 });
   });
   test("线程索引：不存在为空、按 updatedAt 倒序、损坏抛 LOCAL_ERROR", () => {
     expect(readThreadIndex(dir)).toEqual([]);

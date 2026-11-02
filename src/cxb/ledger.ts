@@ -10,13 +10,25 @@ import { modelTurn } from "./run-result";
 import { CxbError, type LifecycleInfo, type RunMeta, type RunResult, type RunModelSummary, type ModelRun } from "./contracts";
 import type { LogCoverageIssue, TreeLogPayload } from "./tree-log-types";
 
+/**
+ * 子线程来源摘要（Rust relations::facts::edge_from_thread）：只含身份字段，不含正文。
+ * `agentPath` 是 v2 协作工具的寻址键；昵称只供展示，不能用来寻址。
+ */
+export interface SourceSummary {
+  kind?: "threadSpawn" | "review" | "other";
+  agentPath?: string;
+  agentNickname?: string;
+  agentRole?: string;
+  depth?: number;
+}
+
 /** threads.json 里的一项（Rust runs::types::ThreadIndexEntry，只取 CLI 用到的字段）。 */
 export interface ThreadIndexEntry {
   /** 原样读取恢复登记；使用方核实形状，兼容旧索引缺少此字段。 */
   resumeOverrides?: unknown;
   parentThreadId?: string;
   relationKind?: import("./contracts").RelationKind;
-  sourceSummary?: unknown;
+  sourceSummary?: SourceSummary;
   canAcceptDirectInput?: boolean;
   agentVersion?: import("./contracts").AgentVersion;
   threadId: string;
@@ -117,6 +129,40 @@ export function readLifecycle(workspaceDir: string): LifecycleRecord[] {
   }).sort((a, b) => b.updatedAt - a.updatedAt || a.threadId.localeCompare(b.threadId));
 }
 
+const SOURCE_KINDS = new Set(["threadSpawn", "review", "other"]);
+
+/** 只带出形状合法的来源字段；与索引其他可选字段一致，类型不符的字段丢弃而不报损坏。 */
+function withSourceSummary(value: unknown): { sourceSummary?: SourceSummary } {
+  if (!isObject(value)) return {};
+  const summary: SourceSummary = {};
+  if (SOURCE_KINDS.has(value.kind as string)) summary.kind = value.kind as SourceSummary["kind"];
+  for (const key of ["agentPath", "agentNickname", "agentRole"] as const) {
+    if (typeof value[key] === "string" && value[key] !== "") summary[key] = value[key] as string;
+  }
+  if (Number.isSafeInteger(value.depth) && (value.depth as number) >= 0) summary.depth = value.depth as number;
+  return Object.keys(summary).length ? { sourceSummary: summary } : {};
+}
+
+const CHILD_EVIDENCE = new Set(["v1Spawn", "v1Message", "v2Started", "v2Interacted", "inherited"]);
+const CHILD_ACTIVITY = new Set(["starting", "running", "settled", "unknown"]);
+const RELATION_KINDS = new Set(["reviewExecution", "subagent", "fork"]);
+
+/**
+ * 运行记录里本次有归属证据的子线程（`children`）。isRunRecord 不校验这一可选字段，
+ * 使用方经此读取：形状不合法的条目不采用、只计数，调用方据此标注「记录不完整」，不能当作没有子代理。
+ */
+export function readChildRecords(run: RunResult): { records: import("./contracts").ChildRecord[]; malformed: number } {
+  const raw: unknown = run.children;
+  if (raw === undefined) return { records: [], malformed: 0 };
+  if (!Array.isArray(raw)) return { records: [], malformed: 1 };
+  const records = raw.filter((child): child is import("./contracts").ChildRecord => isObject(child)
+    && typeof child.threadId === "string" && child.threadId !== "" && typeof child.parentThreadId === "string"
+    && RELATION_KINDS.has(child.relationKind as string) && CHILD_EVIDENCE.has(child.evidence as string)
+    && CHILD_ACTIVITY.has(child.finalState as string)
+    && Array.isArray(child.turnIds) && child.turnIds.every((turnId) => typeof turnId === "string" && turnId !== ""));
+  return { records, malformed: raw.length - records.length };
+}
+
 /** 读线程索引；文件不存在返回空数组，损坏抛 LOCAL_ERROR。按 updatedAt 倒序。 */
 export function readThreadIndex(workspaceDir: string): ThreadIndexEntry[] {
   const path = join(workspaceDir, "threads.json");
@@ -143,6 +189,7 @@ export function readThreadIndex(workspaceDir: string): ThreadIndexEntry[] {
       ...(typeof entry.relationKind === "string" ? { relationKind: entry.relationKind } : {}),
       ...(typeof entry.canAcceptDirectInput === "boolean" ? { canAcceptDirectInput: entry.canAcceptDirectInput } : {}),
       ...(typeof entry.agentVersion === "string" ? { agentVersion: entry.agentVersion } : {}),
+      ...withSourceSummary(entry.sourceSummary),
     }))
     .sort((a, b) => b.updatedAt - a.updatedAt || a.threadId.localeCompare(b.threadId));
 }
