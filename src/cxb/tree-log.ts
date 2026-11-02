@@ -41,8 +41,12 @@ export function treeTimeline(rootThreadId: string, lines: LogLine[], records: Ru
       ...(source?.late !== undefined ? { late: source.late } : {}) });
   }
   for (const run of records) {
-    if (run.childrenStop?.discovery.complete === false || run.childrenStop?.conflicts.length
-      || run.interruptReason === "discoveryIncomplete" || run.interruptReason === "ownershipConflict") {
+    const stop = run.childrenStop;
+    // 停止核验中的报告也是暂态；只有运行或清理责任定案才能补出覆盖问题。
+    const decided = run.state === "ended" || run.state === "lost" || (stop != null && stop.phase !== "pending")
+      || stop?.cleanupState === "released" || stop?.cleanupState === "abandoned";
+    if (decided && (stop?.discovery.complete === false || stop?.conflicts.length
+      || run.interruptReason === "discoveryIncomplete" || run.interruptReason === "ownershipConflict")) {
       add({ code: "discoveryIncomplete", runId: run.runId });
     }
   }

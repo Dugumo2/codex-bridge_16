@@ -7,6 +7,7 @@ import { ownLogLines, readRunLog, readRunLogSnapshot, type LogReadIO } from "./l
 import { show } from "./show";
 import { treeLogLine, treeTimeline } from "./tree-log";
 import type { TreeLogPayload } from "./tree-log-types";
+import type { ChildrenStopReport } from "./contracts";
 import { context, ledger, summary } from "./test-fixtures/n4a-unit";
 import { runResult } from "./test-fixtures/run-fakes";
 import { bounded, removeTemp } from "./test-fixtures/main-test-support";
@@ -115,6 +116,20 @@ describe("树日志解析与静态保留窗口", () => {
     expect(result.items[0]!.threadId).toBeNull();
     expect(treeLogLine(result.items[0]!, new Map())).toContain("旧执行源未记录");
     expect(result.items[1]!.late).toBe(true);
+  });
+  test("停止核验中不推导日志缺口，定案后仍保留真实发现缺口", () => {
+    const report: ChildrenStopReport = { trigger: "userStop", phase: "pending", version: 1,
+      root: { thread: "thread-test", phase: "pending", check: { ownership: false, turnEnded: false, goalBraked: false, settled: false, verifyDone: false },
+        clearRequested: false, clearConfirmed: false, error: null },
+      stopped: [], unconfirmed: [], failed: [], conflicts: [], capabilityLimited: [],
+      discovery: { complete: false, version: 1, incompleteReasons: ["正在核实"] }, unsettledSpawns: 0 };
+    const running = runResult({ state: "running", status: null, childrenStop: report });
+    expect(treeTimeline("thread-test", [], [running]).coverage.issues).toEqual([]);
+    for (const decided of [
+      { ...running, state: "ended" as const },
+      { ...running, childrenStop: { ...report, phase: "unconfirmed" as const } },
+      { ...running, childrenStop: { ...report, cleanupState: "released" as const } },
+    ]) expect(treeTimeline("thread-test", [], [decided]).coverage.issues).toEqual([{ code: "discoveryIncomplete", runId: "run-test" }]);
   });
   test("来源过滤保留旧行、根与 review，并恢复正文", () => {
     write(`${ts} run-test 运行开始 旧\n` + line({ eventId: "42:1" })

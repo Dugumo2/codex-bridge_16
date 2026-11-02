@@ -19,12 +19,71 @@ async function ended(h: Sa1bHarness) {
   return run;
 }
 
-async function completeWithSummary(h: Sa1bHarness, active: string[]) {
+/** 成功终态必须在日志、文本提示和树结果三个出口一致；不靠过滤历史运行掩盖缺口。 */
+async function noFalseCoverageWarnings(h: Sa1bHarness) {
+  await h.persisted({ state: "ended", status: "completed" });
+  const logged = await h.cli(["show", ROOT, "--log", "--tree", "--json"]);
+  expect(logged.code, logged.stderr).toBe(0);
+  const log = JSON.parse(logged.stdout);
+  if (process.env.CXB_GAP_TIMELINE_REPORT) appendFileSync(process.env.CXB_GAP_TIMELINE_REPORT,
+    JSON.stringify({ runId: h.runId, events: log.items }) + "\n");
+  expect(log.coverage.issues, "成功路径不得留下瞬时发现状态的缺口").toEqual([]);
+  expect(log.items.length, "必须实际检查根日志，不能因空日志而通过").toBeGreaterThan(0);
+  expect(log.items.some((item: any) => item.kind === "记录缺口")).toBe(false);
+  const text = await h.cli(["show", ROOT, "--log", "--tree"]);
+  expect(text.code, text.stderr).toBe(0);
+  expect(text.stdout).not.toContain("记录缺口");
+  expect(text.stderr).not.toContain("日志仅覆盖保留窗口");
+  for (const json of [false, true]) {
+    const waiting = await h.cli(["wait", ROOT, "--tree", ...(json ? ["--json"] : []), "--timeout", "10"], 15_000);
+    expect(waiting.code, waiting.stderr).toBe(0);
+    expect(waiting.stdout + waiting.stderr).not.toContain("陈旧");
+    expect(waiting.stdout + waiting.stderr).not.toContain("发现不完整");
+    if (json) expect(JSON.parse(waiting.stdout).tree.stale).not.toBe(true);
+  }
+}
+
+for (const json of [false, true]) test(`正常成功路径零误报：新父线程派两个子代理，在线等待${json ? "JSON" : "文本"}`, async () => {
+  const h = new Sa1bHarness();
+  try {
+    await h.open({ pageSize: 1 });
+    await h.start({ cxbConvergence: convergence });
+    // 接替通知证明 CLI 已取得独占观察权；之后再派生，覆盖全过程而不靠睡眠猜启动时机。
+    await h.owner.request("broker/threads/watch", { threadId: ROOT, exclusiveWaiter: true });
+    const replaced = h.notes("broker/wait/superseded").length;
+    const waiting = h.cli(["wait", ROOT, "--tree", ...(json ? ["--json"] : []), "--timeout", "30"], 35_000);
+    await h.until(async () => h.notes("broker/wait/superseded").length > replaced, 8000, "CLI 没有接管在线等待");
+    for (const child of NEW) {
+      // 正常通知可以晚于派生条目；扣住元数据通知，让发现列表负责补齐成员能力。
+      await h.control("fence", { name: `started-${child}`, method: "thread/started", threadId: child });
+      const turn = await h.spawn(child);
+      await h.finish(child, `R2结果:${child}`, "completed", turn);
+    }
+    const beforeDiscovery = (await h.watch()).children.members;
+    expect(ids(beforeDiscovery)).toEqual(NEW);
+    expect(beforeDiscovery.every((member: any) => member.canAcceptDirectInput == null), "夹具前置：元数据通知尚未送达").toBe(true);
+    await completeWithSummary(h, NEW, async () => {
+      const discovered = (await h.watch()).children.members;
+      expect(ids(discovered)).toEqual(NEW);
+      expect(discovered.every((member: any) => member.canAcceptDirectInput === true)).toBe(true);
+      for (const child of NEW) await h.control("release", { name: `started-${child}` });
+    });
+    const observed = await waiting;
+    expect(observed.code, observed.stderr).toBe(0);
+    expect(observed.stdout + observed.stderr).not.toContain("陈旧");
+    expect(observed.stdout + observed.stderr).not.toContain("发现不完整");
+    if (json) expect(JSON.parse(observed.stdout).tree.stale).not.toBe(true);
+    await noFalseCoverageWarnings(h);
+  } finally { await bounded(h.close(), 12_000); }
+}, 60_000);
+
+async function completeWithSummary(h: Sa1bHarness, active: string[], afterDiscovery?: () => Promise<void>) {
   await h.finish(ROOT, "父工作轮结束");
   const summary = await h.reconciliation(8000);
   expect(summary, "旧线程被误作活动会卡住 waitingSubtree；必须收到本次汇总").toBeDefined();
   for (const child of active) expect(inputText(summary)).toContain(`R2结果:${child}`);
   expect(inputText(summary)).not.toContain("R1历史结果:");
+  await afterDiscovery?.();
   const turn = (await h.state()).threads.root.turns.at(-1);
   await h.finish(ROOT, "R2汇总完成", "completed", turn.id);
   const run = await ended(h);
@@ -135,6 +194,8 @@ for (const scenario of [
     expect(ids(result.tree.nodes)).toEqual(active);
     expect(JSON.stringify(result.tree)).not.toContain("其他运行的最新结果");
     for (const child of result.tree.nodes) expect(child.result).toMatchObject({ turnId: managed.get(child.threadId), output: `R2结果:${child.threadId}` });
+    // 正常历史、新派生成员及合法旧成员复用均走完整 CLI 零误报验收。
+    if (!scenario.continuing) await noFalseCoverageWarnings(h);
     report.runId = h.runId; report.members = ids(run.children); report.summaryCount = (await h.starts()).length - 1;
     report.status = run.status; report.result = "pass";
   } catch (error) {

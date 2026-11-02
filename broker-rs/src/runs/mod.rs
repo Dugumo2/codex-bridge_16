@@ -1304,6 +1304,10 @@ impl Machine {
         self.runs.touch(run, self.clock.now_ms, actions);
         self.runs
             .log(run, self.clock.now_ms, "运行结束", run, actions);
+        let complete = self
+            .manage_context(run)
+            .is_none_or(|c| c.discovery.complete);
+        self.log_final_discovery(run, complete, actions);
         self.runs.evict();
     }
 
@@ -1622,6 +1626,19 @@ impl Machine {
             return;
         }
         self.clear_pending_event_log(actions);
+        let unfinished: Vec<_> = self
+            .runs
+            .runs
+            .values()
+            .filter(|r| matches!(r.state, RunState::Running | RunState::Stopping))
+            .map(|r| r.run_id.clone())
+            .collect();
+        for run in unfinished {
+            let complete = self
+                .manage_context(&run)
+                .is_none_or(|c| c.discovery.complete);
+            self.log_final_discovery(&run, complete, actions);
+        }
         self.runs.phase = Phase::Draining;
         self.runs.active.clear();
         self.runs.cleanup_scheduled = false;
@@ -1790,6 +1807,8 @@ impl Machine {
         );
         self.runs
             .log(&run, self.clock.now_ms, "运行结束", &detail, actions);
+        // 树停止报告是本次定案的发现结果，不读取可能已被清理变化撤销的实时覆盖。
+        self.log_final_discovery(&run, commit.report.children.discovery.complete, actions);
         self.runs.evict();
     }
 

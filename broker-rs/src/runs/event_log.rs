@@ -590,29 +590,12 @@ impl Machine {
         &mut self,
         run: &str,
         thread: &str,
-        change: MemberChange,
+        _change: MemberChange,
         actions: &mut Vec<Action>,
     ) {
         let Some(context) = self.relations.contexts.get(run) else {
             return;
         };
-        if change == MemberChange::Discovery && !context.discovery.complete {
-            self.runs.log_source(
-                run,
-                &context.identity.logical_root_thread_id,
-                None,
-                "run",
-                None,
-                None,
-                self.clock.now_ms,
-                "记录缺口",
-                "子代理发现范围不完整",
-                false,
-                false,
-                Some("discoveryIncomplete"),
-                actions,
-            );
-        }
         if let Some(member) = context
             .members
             .get(thread)
@@ -634,6 +617,37 @@ impl Machine {
                 actions,
             );
         }
+    }
+
+    /// 只在运行定案时保存发现缺口；分类失效和重新发现期间的状态不代表覆盖丢失。
+    pub(crate) fn log_final_discovery(
+        &mut self,
+        run: &str,
+        complete: bool,
+        actions: &mut Vec<Action>,
+    ) {
+        if complete {
+            return;
+        }
+        let Some(record) = self.runs.runs.get(run) else {
+            return;
+        };
+        let root = record.thread_id.clone();
+        self.runs.log_source(
+            run,
+            &root,
+            None,
+            "run",
+            None,
+            None,
+            self.clock.now_ms,
+            "记录缺口",
+            "运行定案时子代理发现范围仍不完整",
+            false,
+            false,
+            Some("discoveryIncomplete"),
+            actions,
+        );
     }
 }
 

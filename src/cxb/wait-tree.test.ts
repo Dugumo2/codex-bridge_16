@@ -80,8 +80,10 @@ test("新快照覆盖全部已知变化后恢复全局字段，不永久标记�
   c.fake.handle = () => reply.promise;
   c.fake.emit("broker/run/childChanged", event({ threadId: null, revision: 2 }));
   expect(c.observer.current()).toMatchObject({ stale: true, discovery: null, inFlightSpawns: null });
+  expect(c.lines.join("\n")).not.toContain("陈旧");
   c.fire();
   expect(c.observer.current().stale).toBe(true);
+  expect(c.lines.join("\n")).not.toContain("陈旧");
   reply.resolve(snapshot(2));
   await messageBarrier(() => [c.lines.length, c.observer.current().stale]);
   expect(c.observer.current().stale).toBeUndefined();
@@ -123,6 +125,7 @@ test("补快照失败保留树并标陈旧，释放后迟到回包与通知不�
   await messageBarrier(() => [c.lines.length]);
   expect(c.observer.current().stale).toBe(true);
   expect(c.observer.current().nodes).toHaveLength(1);
+  expect(c.lines.join("\n")).toContain("树信息可能陈旧");
   const reply = gate<TreeSnapshot>();
   c.fake.handle = () => reply.promise;
   c.fake.emit("broker/run/childChanged", event({ revision: 3 })); c.fire();
@@ -134,6 +137,21 @@ test("补快照失败保留树并标陈旧，释放后迟到回包与通知不�
   expect(JSON.stringify(c.observer.current())).toBe(before);
   expect(c.lines).toHaveLength(printed);
   expect(c.fake.subscriptions).toBe(0);
+});
+
+test("在线发现重新核实只显示进度，停止定案仍显示真实不完整", async () => {
+  const c = setup();
+  const initial = snapshot();
+  initial.children!.discovery = { complete: false, version: 1, incompleteReasons: ["分类变化后重新核实"] };
+  c.observer.initialize("run-test", initial);
+  expect(c.lines).toContain("子代理发现正在核实");
+  expect(c.lines.join("\n")).not.toContain("发现不完整");
+  const report = { ...stopReport(), discovery: { complete: false, version: 2, incompleteReasons: ["停止核验已失败"] } };
+  c.fake.handle = () => ({ ...snapshot(2), run: terminal({ status: "interrupted", childrenStop: report }) });
+  c.fake.emit("broker/run/childChanged", event({ stopVersion: report.version }));
+  c.fire();
+  await messageBarrier(() => [c.lines.length]);
+  expect(c.lines.join("\n")).toContain("子代理发现不完整：停止核验已失败");
 });
 
 test("取消信号释放监听和计时器；无变化不轮询；早已完成不演示历史", async () => {

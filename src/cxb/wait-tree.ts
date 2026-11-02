@@ -19,6 +19,7 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
   let snapshotRevision = -1;
   let stopVersion = -1;
   let stale = false;
+  let refreshFailed = false;
   let silent = false;
   let printed: TreeView | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -67,6 +68,9 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
   const display = () => {
     if (!active || silent) return;
     const next = current();
+    // 通知领先于合并快照是正常刷新过程；只有实际补读失败才向用户告警。
+    // current 仍保留 partial 数据的新鲜度事实，终态由完整账本单独裁决。
+    if (!refreshFailed) delete next.stale;
     const lines = printed ? treeChanges(printed, next, options.shortId) : treeLines(next, options.shortId);
     printed = next;
     for (const line of lines) options.notice(line);
@@ -112,6 +116,7 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
     } else snapshot = { ...snapshot, run, ...(snapshot.children ? { children: { ...snapshot.children, stop } } : {}) };
     // 旧快照可以补成员字段，却不能证明通知之后的全局数量已经刷新。
     stale = nextRevision < revision || Math.max(nextStop?.version ?? -1, nextReport?.version ?? -1) < stopVersion;
+    if (!stale) refreshFailed = false;
   };
   const schedule = () => {
     if (!active || !runId || timer || inFlight || !dirty) return;
@@ -131,7 +136,7 @@ export function observeWaitTree(rpc: BrokerRpc, options: {
       }, { timeoutMs }), timeoutMs, controller.signal);
       acceptSnapshot(next);
     } catch {
-      if (active) stale = true;
+      if (active) { stale = true; refreshFailed = true; }
     } finally {
       inFlight = false;
       if (active) { display(); schedule(); }
