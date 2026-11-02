@@ -134,6 +134,17 @@ impl Machine {
             self.attach(thread, AttachmentSource::ThreadEvent);
         }
         let thread = thread.to_owned();
+        if matches!(
+            event.method.as_str(),
+            "turn/started"
+                | "turn/completed"
+                | "thread/status/changed"
+                | "thread/closed"
+                | "thread/goal/updated"
+                | "thread/goal/cleared"
+        ) {
+            self.candidate_changed(&thread);
+        }
         let turn = notification_turn(params).map(str::to_owned);
         match event.method.as_str() {
             "item/started" | "item/completed" => {
@@ -281,9 +292,9 @@ impl Machine {
 
     /// 受管成员、活动绑定与清理范围仍需要订阅，Guardian 结束不能解除它们的附着。
     pub(crate) fn relation_needs_subscription(&self, thread: &str) -> bool {
-        self.relations.contexts.values().any(|c| {
+        self.relations.contexts.iter().any(|(run, c)| {
             (c.authority != Authority::Revoked
-                && (c.members.contains_key(thread)
+                && (self.run_observes_thread(run, thread)
                     || c.identity.execution_thread_id == thread
                     || c.identity.logical_root_thread_id == thread))
                 || c.cleanup
@@ -388,7 +399,7 @@ impl Machine {
             .relations
             .contexts
             .iter()
-            .filter(|(_, c)| c.members.contains_key(&thread))
+            .filter(|(run, _)| self.run_tracks_thread(run, &thread))
             .map(|(r, _)| r.clone())
             .collect();
         for run in runs {
@@ -915,6 +926,10 @@ impl Machine {
             if self.reject_followup_receiver(key, child, actions) {
                 continue;
             }
+            if !self.current_management_evidence(&op.run_id, child) {
+                continue;
+            }
+            self.candidate_changed(child);
             self.relations
                 .aux
                 .member_evidence
@@ -1022,25 +1037,13 @@ impl Machine {
 
     /// 已拒绝的跟进候选不能通过后续收敛发现重新入册；本运行已有合法管理证据时仍保留。
     pub(super) fn rejected_followup_for_run(&self, run: &str, child: &str) -> bool {
-        if self
-            .manage_context(run)
-            .is_some_and(|c| c.members.contains_key(child))
-        {
+        if self.current_management_evidence(run, child) {
             return false;
         }
-        let mut rejected = false;
-        for op in self
-            .relations
+        self.relations
             .operations
             .values()
-            .filter(|op| op.run_id == run && op.receivers.contains(child))
-        {
-            if !op.rejected_receivers.contains_key(child) {
-                return false;
-            }
-            rejected = true;
-        }
-        rejected
+            .any(|op| op.run_id == run && op.rejected_receivers.contains_key(child))
     }
 
     /// 写入绑定；独立认领或已有其他运行绑定构成冲突，不覆盖。
@@ -1343,7 +1346,7 @@ impl Machine {
             .relations
             .contexts
             .iter()
-            .filter(|(_, c)| c.members.contains_key(thread))
+            .filter(|(run, _)| self.run_tracks_thread(run, thread))
             .map(|(r, _)| r.clone())
             .collect();
         for run in runs {
@@ -1513,6 +1516,10 @@ impl Machine {
             .collect();
         for run in stale {
             self.relations.contexts.remove(&run);
+            self.relations
+                .aux
+                .classifications
+                .retain(|(r, _), _| r != &run);
             self.relations.bindings.retain(|_, b| b.run_id != run);
             self.relations
                 .aux
@@ -1549,6 +1556,25 @@ impl Machine {
         change: MemberChange,
         actions: &mut Vec<Action>,
     ) {
+        if !self.relations.contexts.contains_key(run) {
+            return;
+        }
+        let classification =
+            self.refresh_classification(run, thread, &format!("{change:?}"), actions);
+        if classification != Membership::Active {
+            let removed = self
+                .relations
+                .contexts
+                .get_mut(run)
+                .unwrap()
+                .members
+                .remove(thread)
+                .is_some();
+            if removed || matches!(classification, Membership::Pending(_)) {
+                self.bump_context_revision(run, "", change, actions);
+            }
+            return;
+        }
         let Some(context) = self.relations.contexts.get(run) else {
             return;
         };
@@ -1763,7 +1789,13 @@ impl Machine {
         let Some(context) = self.relations.contexts.get(run) else {
             return;
         };
-        let mut children = Vec::new();
+        // 已确认发生过的本次归属不能因撤权、清理或重新分类而从运行记录消失。
+        let mut children = self
+            .runs
+            .runs
+            .get(run)
+            .map(|r| r.children.clone())
+            .unwrap_or_default();
         for (thread, member) in &context.members {
             if member.kind != RelationKind::Subagent {
                 continue;
@@ -1778,16 +1810,11 @@ impl Machine {
                 continue;
             };
             // 清理上下文没有恢复活动绑定；刷新时仍应保留账本中已经证明的历史轮次。
-            let mut turn_ids = if context.cleanup.is_some() {
-                self.runs
-                    .runs
-                    .get(run)
-                    .and_then(|r| r.children.iter().find(|c| c.thread_id == *thread))
-                    .map(|c| c.turn_ids.clone())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let mut turn_ids = children
+                .iter()
+                .find(|c| c.thread_id == *thread)
+                .map(|c| c.turn_ids.clone())
+                .unwrap_or_default();
             for turn in &member.bindings {
                 if !turn_ids.contains(turn) {
                     turn_ids.push(turn.clone());
@@ -1796,6 +1823,7 @@ impl Machine {
             if turn_ids.len() > MAX_TURN_IDS {
                 turn_ids.drain(..turn_ids.len() - MAX_TURN_IDS);
             }
+            children.retain(|c| c.thread_id != *thread);
             children.push(ChildRecord {
                 thread_id: thread.clone(),
                 parent_thread_id: member.parent.clone(),

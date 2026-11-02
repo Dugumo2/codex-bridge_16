@@ -6,6 +6,7 @@ use serde_json::json;
 
 mod discovery;
 mod evidence;
+mod lineage_safety;
 mod routing;
 mod tree_log_review;
 

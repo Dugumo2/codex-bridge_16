@@ -174,8 +174,9 @@ fn 分页与已加载补读合并成员_附着齐全为完整() {
     assert_eq!(result.members.keys().cloned().collect::<Vec<_>>(), expected);
     assert!(result.attachments.contains_key(C));
     let context = m.manage_context(R).unwrap();
-    assert!(context.discovery.complete);
-    assert!(context.members.contains_key("孙"));
+    assert!(!context.discovery.complete, "血缘发现完成不证明候选归属");
+    assert!(!context.members.contains_key("孙"));
+    assert!(m.run_has_candidate(R, "孙"));
     assert_eq!(m.thread_relation("孙").unwrap().parent_thread_id, C);
 }
 
@@ -361,9 +362,10 @@ fn 节点超过256_深度超过8_未落定派生_无附着证据都判不完整(
         .state
         .incomplete_reasons
         .contains(&"attachmentMissing".to_owned()));
-    assert_eq!(
-        m.manage_context(R).unwrap().members[C].activity,
-        MemberActivity::Unknown
+    assert!(!m.manage_context(R).unwrap().members.contains_key(C));
+    assert!(
+        m.run_has_candidate(R, C),
+        "无归属和附着的已加载后代仍是未决候选"
     );
 }
 
@@ -455,6 +457,10 @@ fn 二审_r1_已拒绝跟进不会经运行发现重新纳管() {
     let (id, actions) = begin(&mut m);
     finish_simple(&mut m, &mut mock, &actions, vec![thread(C, P)], vec![]);
     let result = m.relations.aux.results.get(&id).expect("发现完成");
-    assert!(!result.members.contains_key(C));
+    assert!(
+        result.members.contains_key(C),
+        "拒绝纳管不能抹掉血缘清理范围"
+    );
     assert!(!m.manage_context(R).unwrap().members.contains_key(C));
+    assert!(m.run_has_candidate(R, C));
 }

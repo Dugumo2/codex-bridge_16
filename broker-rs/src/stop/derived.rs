@@ -810,6 +810,25 @@ impl Machine {
                     && c.gen == op.target.authority_gen
                     && c.members.get(&key.1).is_none_or(|m| m.conflict.is_none())
             })
+            && (op.root || self.derived_member_cleanup_evidence(key))
+    }
+
+    /// 血缘只扩大核实范围；清理仍要求本次归属，或显式历史停止冻结的受管范围。
+    fn derived_member_cleanup_evidence(&self, key: &(u64, String)) -> bool {
+        let Some(op) = self.trees.aux.derived.get(key) else {
+            return false;
+        };
+        self.current_management_evidence(&op.target.run_id, &key.1)
+            || self.manage_context(&op.target.run_id).is_some_and(|c| {
+                c.cleanup.as_ref().is_some_and(|cleanup| {
+                    cleanup.tree_op == key.0
+                        && cleanup.gen == c.gen
+                        && cleanup.scope.contains(&key.1)
+                        && self.runs.runs.get(&op.target.run_id).is_some_and(|r| {
+                            r.children.iter().any(|child| child.thread_id == key.1)
+                        })
+                })
+            })
     }
 
     fn derived_background_next(&mut self, key: &(u64, String), actions: &mut Vec<Action>) {
@@ -872,10 +891,11 @@ impl Machine {
                 .is_some_and(|c| c.run_id.as_deref() == Some(op.target.run_id.as_str()));
         }
         !self.claims.contains_key(&key.1)
+            && self.derived_member_cleanup_evidence(key)
             && self.manage_context(&op.target.run_id).is_some_and(|c| {
                 c.authority != Authority::Revoked
                     && c.gen == op.target.authority_gen
-                    && c.members.get(&key.1).is_some_and(|m| m.conflict.is_none())
+                    && c.members.get(&key.1).is_none_or(|m| m.conflict.is_none())
             })
             && !self.relations.bindings.values().any(|b| {
                 b.thread_id == key.1

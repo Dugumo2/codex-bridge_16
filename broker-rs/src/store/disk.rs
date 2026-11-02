@@ -148,6 +148,13 @@ impl Disk {
         disk.clean_temps()?;
         disk.cleanup(SystemTime::now())?;
         let mut loaded = disk.load()?;
+        // 只有首次建立且确实没有旧文件的工作区，才能把空历史标为已核实。
+        if previous.is_none()
+            && !disk.dir.join("threads.json").exists()
+            && fs::read_dir(disk.dir.join("runs"))?.next().is_none()
+        {
+            loaded.index.child_history.verify_empty_store();
+        }
         config.broker.epoch = epoch;
         let payload = serde_json::to_vec(&config.broker).map_err(json_error)?;
         disk.write_json("broker.json", &payload)?;
@@ -518,7 +525,9 @@ impl Disk {
                 }
                 self.corrupt_index = true;
                 tracing::warn!(%error, "读取线程索引失败，尝试从运行记录重建");
-                ThreadIndexFile::default()
+                let mut index = ThreadIndexFile::default();
+                index.child_history.mark_corrupt();
+                index
             }
             Err(error) => return Err(error.into()),
         };
@@ -543,6 +552,7 @@ impl Disk {
                     return Err(error)
                 }
                 Err(error) => {
+                    selection.mark_corrupt_history();
                     if !selection.complete() {
                         return Err(error);
                     }

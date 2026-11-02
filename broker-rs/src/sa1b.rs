@@ -78,6 +78,8 @@ pub struct ConvergenceFacts {
     pub pending_starts: usize,
     pub pending_requests: usize,
     pub unresolved_lookups: usize,
+    /// 尚未证明属于本次活动或纯历史的发现候选；从不生成 ActivityFact。
+    pub unresolved_candidates: usize,
     pub conflicts: Vec<String>,
     pub result_refs: Vec<ResultRef>,
 }

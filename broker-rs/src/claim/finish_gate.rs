@@ -353,6 +353,10 @@ impl Machine {
     /// 子线程是否处于活动绑定、或属于尚未提交结束的运行；是则返回该运行。
     fn subagent_in_use(&self, thread: &str) -> Option<String> {
         for (run, context) in &self.relations.contexts {
+            // 核实期间不得删除候选；这里只扩大阻塞集合，不授予管理权。
+            if self.run_has_candidate(run, thread) {
+                return Some(run.clone());
+            }
             let Some(member) = context.members.get(thread) else {
                 continue;
             };
@@ -603,7 +607,7 @@ impl Machine {
         for (run, context) in &self.relations.contexts {
             if context.identity.logical_root_thread_id != thread
                 && context.identity.execution_thread_id != thread
-                && !context.members.contains_key(thread)
+                && !self.run_observes_thread(run, thread)
             {
                 continue;
             }
@@ -615,15 +619,20 @@ impl Machine {
             }
             if self.inbox_pending_run(run) > 0
                 && (context.identity.logical_root_thread_id == thread
-                    || context.members.contains_key(thread))
+                    || self.run_observes_thread(run, thread))
                 && context.members.values().any(|m| m.pending_requests > 0)
             {
                 blockers.push(
                     json!({"threadId": thread, "runId": run, "reason": "childRequestsPending"}),
                 );
             }
-            if (context.identity.logical_root_thread_id == thread)
-                && !context.members.is_empty()
+            let root = context.identity.logical_root_thread_id == thread
+                || context.identity.execution_thread_id == thread;
+            if (root && self.run_has_candidates(run)) || self.run_has_candidate(run, thread) {
+                blockers.push(json!({"threadId": thread, "runId": run,
+                    "reason": "discoveryIncomplete", "detail": ["子代理候选归属仍待核实"]}));
+            } else if root
+                && (!context.members.is_empty() || !self.run_lineage_threads(run).is_empty())
                 && !context.discovery.complete
                 && !context.discovery.incomplete_reasons.is_empty()
             {
@@ -653,6 +662,13 @@ impl Machine {
     fn lifecycle_needs_discovery(&self, thread: &str) -> bool {
         self.thread_relation(thread)
             .is_some_and(|e| e.kind == RelationKind::Subagent)
+            || self.relations.contexts.iter().any(|(run, context)| {
+                self.run_has_candidate(run, thread)
+                    || ((context.identity.logical_root_thread_id == thread
+                        || context.identity.execution_thread_id == thread)
+                        && (self.run_has_candidates(run)
+                            || !self.run_lineage_threads(run).is_empty()))
+            })
             || self.runs.runs.values().any(|r| {
                 (r.thread_id == thread || r.review_thread_id.as_deref() == Some(thread))
                     && !r.children.is_empty()

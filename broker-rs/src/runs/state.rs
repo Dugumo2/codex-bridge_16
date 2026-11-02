@@ -233,6 +233,7 @@ impl Runs {
 
     pub(crate) fn put_threads(&mut self, actions: &mut Vec<Action>) {
         if self.phase == Phase::Open {
+            self.index.child_history.prune(0, &self.index.removed);
             self.index.version = self.index.version.checked_add(1).expect("索引版本已耗尽");
             actions.push(Action::Store(StoreOp::PutThreads(self.index.clone())));
         }
@@ -273,6 +274,7 @@ impl Runs {
     }
 
     pub(super) fn cleanup_index(&mut self, now: u64, actions: &mut Vec<Action>) {
+        let history_changed = self.index.child_history.prune(now, &self.index.removed);
         let before = (self.index.threads.len(), self.index.removed.len());
         self.index
             .threads
@@ -283,7 +285,7 @@ impl Runs {
         self.index
             .purges
             .retain(|thread, _| self.index.removed.contains_key(thread));
-        if before != (self.index.threads.len(), self.index.removed.len()) {
+        if history_changed || before != (self.index.threads.len(), self.index.removed.len()) {
             self.put_threads(actions);
         }
         self.cleanup_goals();
@@ -301,6 +303,16 @@ impl Runs {
     }
 
     pub(crate) fn evict(&mut self) {
+        // 完整运行及操作缓存可独立淘汰，确认过的子线程归属必须先留下摘要。
+        for record in self.runs.values() {
+            self.index.child_history.remember(
+                &record.run_id,
+                &record.thread_id,
+                &record.children,
+                record.ended_at.unwrap_or(record.started_at),
+                &self.index.removed,
+            );
+        }
         // 先找父线程的最近运行，再纳入所有索引引用，避免遗漏 review 子线程。
         let mut newest: HashMap<String, (u64, String)> = HashMap::new();
         for record in self.runs.values() {

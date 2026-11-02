@@ -38,6 +38,7 @@ use std::collections::HashMap;
 
 pub mod budget;
 pub mod child_diag;
+pub mod child_history;
 mod diagnostics;
 mod event_log;
 pub mod stall;
@@ -1320,6 +1321,15 @@ impl Machine {
             return;
         }
         record.children = children;
+        if self.runs.index.child_history.remember(
+            run,
+            &record.thread_id,
+            &record.children,
+            self.clock.now_ms,
+            &self.runs.index.removed,
+        ) {
+            self.runs.put_threads(actions);
+        }
         self.runs.put(run, actions);
     }
 
@@ -1457,6 +1467,15 @@ impl Machine {
         }
         self.runs.restored = true;
         self.runs.index = index;
+        for record in &runs {
+            self.runs.index.child_history.remember(
+                &record.run_id,
+                &record.thread_id,
+                &record.children,
+                record.ended_at.unwrap_or(record.started_at),
+                &self.runs.index.removed,
+            );
+        }
         // 旧索引及 store 重建的条目也遵守字段预算，先规范化再产生任何写盘动作。
         for entry in self.runs.index.threads.values_mut() {
             entry.preview = entry.preview.as_deref().map(state::index_preview);
