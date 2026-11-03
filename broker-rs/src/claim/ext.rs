@@ -1201,6 +1201,9 @@ impl Machine {
                 .into_iter()
                 .flat_map(|record| record.watchers.iter().copied()),
         ) {
+            if super::raw_events::is_raw(&event.method) && !self.client_wants_raw(thread_id, conn) {
+                continue;
+            }
             if !sent.contains(&conn) {
                 sent.push(conn);
                 actions.push(Action::Send {

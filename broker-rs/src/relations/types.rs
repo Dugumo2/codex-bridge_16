@@ -112,6 +112,8 @@ pub struct EvidenceOperation {
     pub proven_turns: BTreeMap<String, BTreeSet<String>>,
     /// 操作登记瞬间每个接收方已完成轮次的基线；配对只排除这些轮次。
     pub baseline_turns: BTreeMap<String, BTreeSet<String>>,
+    /// 在 Interacted 首次到达时固定；缺 raw 的旧线程回退，不因迟到 raw 改写模式。
+    pub v2_strict: bool,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

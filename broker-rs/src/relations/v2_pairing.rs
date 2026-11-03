@@ -18,6 +18,7 @@ pub struct FollowupStart {
 pub struct DeliveryFact {
     pub epoch: u64,
     pub seq: u64,
+    pub at: u64,
     pub thread: String,
     pub turn: String,
     pub id: String,
@@ -39,6 +40,7 @@ impl Machine {
         item: &Value,
         actions: &mut Vec<Action>,
     ) -> bool {
+        self.prune_v2_deliveries();
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("");
@@ -168,6 +170,7 @@ impl Machine {
                 self.relations.aux.v2_deliveries.push_back(DeliveryFact {
                     epoch: self.relations.conn_epoch,
                     seq: self.relations.aux.observation_seq,
+                    at: self.clock.mono_ms,
                     thread: thread.into(),
                     turn: turn.into(),
                     id: id.into(),
@@ -241,15 +244,33 @@ impl Machine {
             return false;
         };
         self.relations.aux.v2_deliveries.iter().any(|d| d.epoch == start.epoch && d.thread == child && d.turn == turn
-            && d.seq > start.seq && d.author == author && &d.recipient == recipient && d.message == message && d.trigger == start.trigger
-            && !self.relations.aux.v2_deliveries.iter().any(|previous| previous.thread == child && previous.author == author
-                && previous.message == message && previous.seq <= start.seq)
+            && self.clock.mono_ms < d.at.saturating_add(EVIDENCE_TTL_MS)
+            && d.author == author && &d.recipient == recipient && d.message == message && d.trigger == start.trigger
+            && !self.relations.aux.v2_deliveries.iter().any(|previous| previous.id != d.id && previous.thread == child && previous.author == author
+                && previous.message == message)
             // 相同内容被发送多次时没有可区分的回执，不能凭同一条输入同时核销。
             && !self.relations.aux.followup_starts.iter().any(|(key, other)| key != &op.key && key.parent_thread_id == op.key.parent_thread_id
-                && other.epoch == start.epoch && other.seq < d.seq && other.message == Some(message) && other.trigger == start.trigger))
+                && other.epoch == start.epoch && other.message == Some(message) && other.trigger == start.trigger))
     }
 
     pub(super) fn v2_candidate_turns(&self, op: &EvidenceOperation, child: &str) -> Vec<String> {
+        if !op.v2_strict {
+            // 冷恢复等无 raw 的线程沿用旧版唯一候选规则；它可能误认旧活动轮，属于显式兼容策略。
+            return self
+                .relations
+                .aux
+                .observed
+                .get(child)
+                .into_iter()
+                .flatten()
+                .filter(|o| {
+                    !op.baseline_turns
+                        .get(child)
+                        .is_some_and(|old| old.contains(&o.turn))
+                })
+                .map(|o| o.turn.clone())
+                .collect();
+        }
         let Some(start) = self.v2_start(op) else {
             return vec![];
         };
@@ -284,7 +305,11 @@ impl Machine {
                             other.outcome,
                             EvidenceOutcome::Failed | EvidenceOutcome::Revoked
                         )
-                        && !other.proven_turns.contains_key(child)
+                        && (!other.proven_turns.contains_key(child)
+                            || other
+                                .proven_turns
+                                .get(child)
+                                .is_some_and(|turns| turns.contains(&o.turn)))
                         && self.v2_start(other).is_none()
                 }) {
                     return false;
@@ -363,5 +388,14 @@ impl Machine {
                 self.materialize(&key, actions);
             }
         }
+    }
+
+    pub(super) fn prune_v2_deliveries(&mut self) {
+        let now = self.clock.mono_ms;
+        let epoch = self.relations.conn_epoch;
+        self.relations
+            .aux
+            .v2_deliveries
+            .retain(|d| d.epoch == epoch && now < d.at.saturating_add(EVIDENCE_TTL_MS));
     }
 }

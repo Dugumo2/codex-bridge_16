@@ -6,6 +6,7 @@ export type StartMode = "started" | "steered" | "replyLost" | "transportError";
 export interface RpcMessage { id?: any; method?: string; params?: any; result?: any; error?: any }
 export interface MockTurn { id: string; status: string; items: any[]; error: any }
 export interface MockThread {
+  experimentalRawEvents?: boolean;
   id: string; parentThreadId: string | null; version: ProtocolVersion; turns: MockTurn[];
   loaded: boolean; archived: boolean; pendingInit: boolean; stored: boolean; closing: boolean; canAcceptDirectInput?: boolean;
   goal: any; usage: any; delivery: DeliveryMode; startMode: StartMode;
@@ -37,6 +38,8 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   const busy = new Set<string>();
   const queued = new Map<string, { message: RpcMessage; connectionId: string }[]>();
   const responseContexts = new Map<string, { method: string; threadId?: string; connectionId: string }>();
+  // 只扣放 raw 消费回执，轮次推进仍由现有 turn/reuse 入口控制。
+  const queuedRawInputs = new Map<string, any[]>();
   let currentConnection = "broker";
   const broadcasts = new Set(["thread/started", "thread/status/changed", "thread/goal/updated", "thread/goal/cleared", "thread/closed",
     "thread/name/updated", "thread/archived", "thread/unarchived", "thread/deleted", "thread/reverted", "thread/attachment/updated", "thread/project/updated"]);
@@ -48,14 +51,15 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
     if (options.snapshot.version !== 1 || !Number.isSafeInteger(serial) || serial < 0) throw new Error("历史快照版本或编号状态无效");
     for (const [id, saved] of Object.entries(options.snapshot.threads)) {
       if (saved.id !== id) throw new Error("历史快照线程键与标识不一致");
-      threads.set(id, clone(saved));
+      // raw 是监听器的内存开关，app-server 重启不从持久快照恢复。
+      threads.set(id, { ...clone(saved), experimentalRawEvents: false });
     }
   }
   const thread = (id: string): MockThread => {
     let t = threads.get(id);
     if (!t) {
       t = { id, parentThreadId: null, version: options.version ?? "v1", turns: [], loaded: true, archived: false, stored: true, closing: false,
-        pendingInit: false, canAcceptDirectInput: true, goal: null, usage: null, delivery: "normal", startMode: "started",
+        pendingInit: false, experimentalRawEvents: false, canAcceptDirectInput: true, goal: null, usage: null, delivery: "normal", startMode: "started",
         interrupts: [], goalWrites: [], inputs: [], answers: [], pendingRequests: [] };
       threads.set(id, t);
       for (const subscribed of subscriptions.values()) subscribed.add(id);
@@ -64,6 +68,9 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   };
   const emit = (message: RpcMessage, hold?: string, captured?: string[], connectionId = currentConnection) => {
     const target = message.params?.threadId ?? message.params?.thread?.id;
+    // 与上游一致：raw 开关作用于源线程，先过滤再进入通知扣放设施。
+    if ((message.method === "rawResponseItem/completed" || message.method === "rawResponse/completed")
+      && threads.get(target)?.experimentalRawEvents !== true) return;
     const context = message.method ? undefined : responseContexts.get(JSON.stringify([connectionId, message.id]));
     // 快照栅栏在读取订阅集合前停住，送达栅栏保存当时的接收者；二者不能互相替代。
     const beforeSnapshot = !captured && [...snapshotFences].find(([, f]) => f.method === message.method && (!f.threadId || f.threadId === target))?.[0];
@@ -104,6 +111,8 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
     const turn: MockTurn = { id: id ?? `${t.id}-turn-${++serial}`, status: "inProgress", items: [], error: null };
     t.pendingInit = false; t.turns.push(turn);
     if (announce) notify("turn/started", { threadId: t.id, turn });
+    for (const value of queuedRawInputs.get(t.id) ?? []) notify("rawResponseItem/completed", { threadId: t.id, turnId: turn.id, item: value });
+    queuedRawInputs.delete(t.id);
     return turn;
   }
   function item(t: MockThread, turn: MockTurn, value: any, announce = true) {
@@ -186,6 +195,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
         const pt = parent.turns.find(x => x.id === p.parentTurnId);
         if (!pt) { error(msg.id, "父轮不存在"); break; }
         const child = thread(p.childThreadId); child.parentThreadId = parent.id; child.version = p.version ?? parent.version;
+        child.experimentalRawEvents ||= parent.experimentalRawEvents === true;
         child.canAcceptDirectInput = child.version !== "v2"; child.pendingInit = p.pendingInit === true;
         const id = p.itemId ?? `spawn-${++serial}`;
         const value = child.version === "v1"
@@ -208,16 +218,27 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
           // 对应 core 恢复运行时后的 thread-created 监听器：为当前连接重新附着。
           // 只恢复本次复用的线程，不回放旧 spawn 条目或历史轮通知。
           child.loaded = true;
+          child.experimentalRawEvents = parent.experimentalRawEvents === true;
           for (const subscribed of subscriptions.values()) subscribed.add(child.id);
           if (p.announce !== false) notify("thread/started", { thread: meta(child) });
         }
         const value = child.version === "v1"
           ? { type: "collabAgentToolCall", id: `reuse-${++serial}`, tool: "sendInput", status: "completed", senderThreadId: parent.id, receiverThreadIds: [child.id], agentsStates: {} }
           : { type: "subAgentActivity", id: `reuse-${++serial}`, kind: "interacted", agentThreadId: child.id, agentPath: `/root/${child.id}` };
+        const message = p.message ?? `跟进:${value.id}`;
+        const path = (t: MockThread): string => t.parentThreadId === null ? "/root" : `/root/${t.id}`;
+        if (child.version === "v2") notify("rawResponseItem/completed", { threadId: parent.id, turnId: pt.id,
+          item: { type: "function_call", call_id: value.id, name: "followup_task", arguments: JSON.stringify({ target: child.id, message }) } });
         // 上游先提交消息后通知 interacted；也支持 sendInput 并入既有轮、不再开轮。
         let turn = p.open === false ? child.turns.at(-1) : p.order === "turnFirst" ? start(child) : undefined;
         notify("item/started", { threadId: parent.id, turnId: pt.id, item: value }); item(parent, pt, value);
         if (p.open !== false && !turn) turn = start(child);
+        if (child.version === "v2") {
+          const input = { type: "agent_message", id: `delivery-${value.id}`, author: path(parent), recipient: path(child),
+            content: [{ type: "input_text", text: `Message Type: NEW_TASK\nTask name: ${path(child)}\nSender: ${path(parent)}\nPayload:\n${message}` }] };
+          if (p.consumeOnNextTurn) queuedRawInputs.set(child.id, [...queuedRawInputs.get(child.id) ?? [], input]);
+          else if (turn) notify("rawResponseItem/completed", { threadId: child.id, turnId: turn.id, item: input });
+        }
         reply(msg.id, { turnId: turn?.id }); break;
       }
       case "turn": {
@@ -299,12 +320,13 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
       case "initialized": break;
       case "model/list": reply(msg.id, { data: [{ id: "original-model", model: "original-model", displayName: "测试模型", description: "", isDefault: true,
         supportedReasoningEfforts: [{ reasoningEffort: "high", description: "高" }], defaultReasoningEffort: "high", inputModalities: ["text"] }], nextCursor: null }); break;
-      case "thread/start": { const root = thread(p.id ?? "root"); notify("thread/started", { thread: meta(root) }); reply(msg.id, { thread: meta(root), model: p.model ?? "mock-model", cwd: p.cwd, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }); break; }
+      case "thread/start": { const root = thread(p.id ?? "root"); root.experimentalRawEvents ||= p.experimentalRawEvents === true; notify("thread/started", { thread: meta(root) }); reply(msg.id, { thread: meta(root), model: p.model ?? "mock-model", cwd: p.cwd, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }); break; }
       case "thread/resume": {
         if (!t!.stored) { error(msg.id, `no rollout found for thread id ${t!.id}`); break; }
         if (t!.closing) { error(msg.id, `thread ${t!.id} is closing; retry thread/resume after the thread is closed`); break; }
         if (!t!.loaded) {
           t!.loaded = true;
+          t!.experimentalRawEvents = false;
           for (const subscribed of subscriptions.values()) subscribed.add(t!.id);
           notify("thread/started", { thread: meta(t!) });
         }

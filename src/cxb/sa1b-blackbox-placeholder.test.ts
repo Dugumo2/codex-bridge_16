@@ -2,7 +2,7 @@
 import { expect, test } from "bun:test";
 import { Sa1bHarness, SA1B_ROOT as ROOT } from "../test-support/sa1b-harness";
 import { bounded } from "./wait-run";
-import { beginV2Followup, consumeV2Input } from "./test-fixtures/v2-followup";
+import { followup } from "./test-fixtures/v2-followup";
 
 const CHILD = "placeholder-child";
 const HISTORY = "historical-child";
@@ -17,6 +17,7 @@ function cli(h: Sa1bHarness, args: string[], timeoutMs: number) {
 
 async function openAndStart(h: Sa1bHarness) {
   await bounded(h.open({ pageSize: 1 }), 20_000);
+  await h.owner.request("thread/start", {}, 6000);
   await bounded(h.start({ cxbConvergence: convergence }), 20_000);
 }
 
@@ -34,8 +35,12 @@ async function ended(h: Sa1bHarness): Promise<any> {
   return run;
 }
 
-async function finishReconciliation(h: Sa1bHarness, expectedOutput: string) {
-  const request = await bounded(h.reconciliation(8000), 10_000);
+async function finishReconciliation(h: Sa1bHarness, expectedOutput: string, after = 1) {
+  let request: any;
+  await bounded(h.until(async () => {
+    request = (await h.starts()).slice(after).find((entry: any) => entry.params.clientUserMessageId);
+    return !!request || h.ended().length > 0;
+  }, 8000, "当前运行未进入汇总"), 10_000);
   expect(request, "撤销失败占位后必须实际进入汇总轮").toBeDefined();
   const input = request.params.input.map((item: any) => item.text ?? "").join("\n");
   expect(input).toContain(expectedOutput);
@@ -132,23 +137,116 @@ for (const resumed of [false, true]) test(`失败跟进跨进程收敛：${resum
   }
 }, 90_000);
 
+test("真实 raw 开关下退役旧轮迟到不能核销新跟进", async () => {
+  const h = new Sa1bHarness();
+  try {
+    await openAndStart(h);
+    const previous = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+    await h.finish(CHILD, "历史结果", "completed", previous);
+    await h.finish(ROOT, "历史父完成");
+    await finishReconciliation(h, "历史结果");
+    const response: any = await h.owner.request("turn/start", { threadId: ROOT, input: [{ type: "text", text: "下一运行" }], cxbConvergence: convergence }, 6000);
+    h.runId = response.runId;
+    h.firstTurn = (await h.state()).threads.root.turns.at(-1).id;
+    const before = (await h.starts()).length;
+    await followup(h, CHILD, { open: false, consumeOnNextTurn: true, message: "新运行任务" });
+    for (const status of ["inProgress", "completed"]) await h.control("inject", { message: {
+      method: status === "inProgress" ? "turn/started" : "turn/completed",
+      params: { threadId: CHILD, turn: { id: previous, status, items: [] } },
+    } });
+    expect((await diagnostic(h)).pendingOperations).toHaveLength(1);
+    const { turnId } = await h.control("turn", { threadId: CHILD, action: "start" });
+    await h.finish(CHILD, CURRENT_OUTPUT, "completed", turnId);
+    await h.finish(ROOT, "本次父完成");
+    await finishReconciliation(h, CURRENT_OUTPUT, before);
+    await assertCleanFinalViews(h, turnId);
+  } finally { await bounded(h.close(), 12_000); }
+}, 90_000);
+
+test("冷恢复父线程没有 raw 时宽松回退并正常收尾", async () => {
+  const h = new Sa1bHarness();
+  try {
+    await bounded(h.open(), 20_000);
+    await h.owner.request("thread/start", {}, 6000);
+    await h.control("unload", { threadId: ROOT });
+    await h.owner.request("thread/resume", { threadId: ROOT }, 6000);
+    await bounded(h.start({ cxbConvergence: convergence }), 20_000);
+    expect((await h.state()).threads.root.experimentalRawEvents).toBe(false);
+    const old = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+    await h.finish(CHILD, "旧结果", "completed", old);
+    const reused = await followup(h, CHILD, { message: "新工作" });
+    expect((await h.state()).threads[CHILD].experimentalRawEvents).toBe(false);
+    expect((await h.state()).events.filter((e: any) => e.method === "rawResponseItem/completed")).toHaveLength(0);
+    await h.finish(CHILD, CURRENT_OUTPUT, "completed", reused.turnId);
+    await h.finish(ROOT, "父轮结束");
+    await finishReconciliation(h, CURRENT_OUTPUT);
+    await assertCleanFinalViews(h, reused.turnId);
+  } finally { await bounded(h.close(), 12_000); }
+}, 90_000);
+
+test("父 raw 监听迟到：子轮和消费先送达仍严格关联并收敛", async () => {
+  const h = new Sa1bHarness();
+  try {
+    await openAndStart(h);
+    const old = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+    await h.finish(CHILD, "旧结果", "completed", old);
+    for (const [name, method] of [["raw-parent", "rawResponseItem/completed"], ["start-parent", "item/started"], ["done-parent", "item/completed"]]) {
+      await h.control("fence", { name, method, threadId: ROOT });
+    }
+    const reused = await followup(h, CHILD, { message: "先到子线程的输入", open: true });
+    await h.finish(CHILD, CURRENT_OUTPUT, "completed", reused.turnId);
+    // 按父线程自己的顺序释放，保留父子监听器交错。
+    for (const name of ["raw-parent", "start-parent", "done-parent"]) await h.control("release", { name });
+    await h.finish(ROOT, "父完成");
+    await finishReconciliation(h, CURRENT_OUTPUT);
+    await assertCleanFinalViews(h, reused.turnId);
+  } finally { await bounded(h.close(), 12_000); }
+}, 90_000);
+
+test("真实 raw 开关下旧轮跨基线和重叠操作仍阻塞", async () => {
+  const h = new Sa1bHarness();
+  try {
+    await openAndStart(h);
+    const old = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+    await followup(h, CHILD, { open: false, consumeOnNextTurn: true, message: "第一跟进" });
+    await h.finish(CHILD, "旧轮完但跟进未消费", "completed", old);
+    expect((await diagnostic(h)).pendingOperations).toHaveLength(1);
+    await followup(h, CHILD, { open: false, consumeOnNextTurn: true, message: "第二跟进" });
+    await h.control("fence", { name: "inputs", method: "rawResponseItem/completed", threadId: CHILD });
+    const { turnId } = await h.control("turn", { threadId: CHILD, action: "start" });
+    expect((await diagnostic(h)).pendingOperations).toHaveLength(2);
+    await h.control("release", { name: "inputs" });
+    expect((await diagnostic(h)).pendingOperations).toHaveLength(0);
+    await followup(h, CHILD, { open: false, consumeOnNextTurn: true, message: "尚未消费的第三跟进" });
+    await h.finish(CHILD, "前两个跟进完成", "completed", turnId);
+    expect((await diagnostic(h)).pendingOperations).toHaveLength(1);
+    const finalTurn = (await h.control("turn", { threadId: CHILD, action: "start" })).turnId;
+    await h.finish(CHILD, CURRENT_OUTPUT, "completed", finalTurn);
+    await h.finish(ROOT, "父完成");
+    await finishReconciliation(h, CURRENT_OUTPUT);
+    await assertCleanFinalViews(h, finalTurn);
+  } finally { await bounded(h.close(), 12_000); }
+}, 90_000);
+
 for (const sameTurn of [false, true]) test(`v2 跟进忙碌子代理：${sameTurn ? "旧轮核实输入后吸收" : "旧轮结束后新轮承载"}正常收敛`, async () => {
   const h = new Sa1bHarness();
   try {
     await openAndStart(h);
     const previous = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
-    await beginV2Followup(h, CHILD, "busy-followup", "额外的跟进工作");
+    await h.control("fence", { name: "consume", method: "rawResponseItem/completed", threadId: CHILD });
+    await followup(h, CHILD, { open: false, consumeOnNextTurn: !sameTurn, message: "额外的跟进工作" });
     expect((await diagnostic(h)).pendingOperations.filter((op: any) => op.kind === "v2Interacted")).toHaveLength(1);
     await h.finish(ROOT, "父轮先结束");
     let carryingTurn = previous;
     if (sameTurn) {
-      await consumeV2Input(h, CHILD, previous, "actual-input", "额外的跟进工作");
+      await h.control("release", { name: "consume" });
       expect((await diagnostic(h)).pendingOperations).toHaveLength(0);
       expect(h.ended()).toHaveLength(0);
     } else {
       await h.finish(CHILD, "原任务完成，但还没处理跟进", "completed", previous);
       expect((await diagnostic(h)).pendingOperations).toHaveLength(1);
       expect(h.ended()).toHaveLength(0);
+      await h.control("release", { name: "consume" });
       carryingTurn = (await h.control("turn", { threadId: CHILD, action: "start" })).turnId;
     }
     await h.finish(CHILD, CURRENT_OUTPUT, "completed", carryingTurn);
@@ -166,12 +264,7 @@ test("v2 三个已完成子代理跟进：父轮完成后子轮才开始并最�
     for (const child of children) {
       const previous = await h.spawn(child, ROOT, h.firstTurn, { version: "v2" });
       await h.finish(child, `前轮:${child}`, "completed", previous);
-      const item = { id: `v2-followup-${child}`, type: "subAgentActivity", kind: "interacted", agentThreadId: child, agentPath: `/root/${child}` };
-      await h.control("inject", { message: { method: "rawResponseItem/completed", params: {
-        threadId: ROOT, turnId: h.firstTurn, item: { type: "function_call", name: "followup_task", call_id: item.id },
-      } } });
-      await h.control("inject", { message: { method: "item/started", params: { threadId: ROOT, turnId: h.firstTurn, item } } });
-      await h.control("item", { threadId: ROOT, turnId: h.firstTurn, item });
+      await followup(h, child, { open: false, consumeOnNextTurn: true, message: `工作:${child}` });
     }
     const before = await diagnostic(h);
     expect(before.pendingOperations.filter((op: any) => op.kind === "v2Interacted")).toHaveLength(3);

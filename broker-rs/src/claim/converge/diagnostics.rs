@@ -384,6 +384,7 @@ mod tests {
                 rejected_receivers: BTreeMap::from([("rejected".into(), SENTINEL.into())]),
                 receivers,
                 baseline_turns: BTreeMap::new(),
+                v2_strict: false,
                 first_seen_ms: 0,
                 expires_at_ms: 1,
                 parent_ended: true,

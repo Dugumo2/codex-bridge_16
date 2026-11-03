@@ -99,8 +99,6 @@ describe.skipIf(process.platform !== "win32")("静态树日志真实 broker", ()
     expect(snapshot.run).toMatchObject({ runId: run.runId, state: "running", currentTurnId: run.turn.id });
     expect(snapshot.run.turns).toEqual([]);
     expect(snapshot.run.progress.done.every((item: { itemId: string }) => !["item-child-a", "item-child-b", "item-grandchild"].includes(item.itemId))).toBe(true);
-    if (version === "v2") await broker.inject(ROOT, "rawResponseItem/completed", { turnId: run.turn.id,
-      item: { type: "function_call", name: "followup_task", call_id: "reuse-a", arguments: JSON.stringify({ target: "child-a", message: "复用" }) } });
     const reused = await broker.request("fixture/reuseChild", { parentThreadId: ROOT, parentTurnId: run.turn.id,
       itemId: "reuse-a", childThreadId: "child-a", version, mode: version === "v1" ? "v1Input" : "v2Followup" });
     await broker.inject("child-a", "item/completed", { turnId: reused.turnId, item: { id: "item-reused", type: "agentMessage", text: "复用标记" } });

@@ -19,6 +19,7 @@ pub mod loop_guard_input;
 #[cfg(test)]
 #[path = "tests/m7.rs"]
 mod m7_tests;
+mod raw_events;
 pub mod resume;
 mod settling;
 pub mod shutdown;
@@ -229,6 +230,8 @@ impl Claim {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThreadRecord {
+    /// 客户端主动请求的 raw 可见性；broker 自动开启不等于客户端选择接收。
+    pub raw_clients: HashSet<ConnId>,
     pub ended_turns: VecDeque<String>,
     /// 已释放认领的最近轮次，只隔离迟到生命周期；最多 ENDED_PER_THREAD 项，随线程记录淘汰。
     pub released_turns: VecDeque<String>,
@@ -1058,8 +1061,18 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             state.runs.inflight_starts.remove(&run);
         }
     }
-    for action in &actions {
+    for action in &mut actions {
         if let Action::Request(context) = action {
+            // 上游只有 thread/start 支持此开关；保留 client 原始参数以区分主动订阅。
+            if context.method == "thread/start" {
+                if let Some(params) = context
+                    .params
+                    .get_or_insert_with(|| json!({}))
+                    .as_object_mut()
+                {
+                    params.insert("experimentalRawEvents".into(), json!(true));
+                }
+            }
             if let Some(run) = start_request_run(context) {
                 state.runs.inflight_starts.insert(run.to_owned());
             }
@@ -2361,6 +2374,20 @@ impl Machine {
             }
         }
         self.on_relation_notification(&event, actions);
+        // raw 已交给内部因果观察；不占 settling/review 缓冲，也不进入普通通知广播。
+        if raw_events::is_raw(&event.method) {
+            if let Some(thread) = thread_id(&event.params) {
+                let claim = self.claims.get(thread);
+                self.forward_notification(
+                    thread,
+                    claim.and_then(Claim::owner),
+                    claim.is_some_and(|c| c.owner_gone),
+                    &event,
+                    actions,
+                );
+            }
+            return;
+        }
         if matches!(event.method.as_str(), "item/started" | "item/completed") {
             if let Some(p) = &event.params {
                 if p["item"]["type"] == "commandExecution" {
@@ -3142,6 +3169,16 @@ impl Machine {
             {
                 self.forget_closed_runtime(id);
                 self.status_activity_changed(id);
+                if context.method == "thread/start" {
+                    if let Some(client) = context.client.as_ref().filter(|client| {
+                        client
+                            .params
+                            .as_ref()
+                            .is_some_and(|p| p["experimentalRawEvents"] == true)
+                    }) {
+                        self.record(id).raw_clients.insert(client.conn);
+                    }
+                }
             }
             // 裸 resume 已有确切的请求线程，成功就恢复订阅事实，不依赖服务器
             // 是否在回包里重复给出 thread.id；普通创建请求仍从回包学习新线程。
@@ -3223,6 +3260,9 @@ impl Machine {
         self.on_convergence_owner_disconnect(conn, actions);
         self.lifecycle_disconnect(conn);
         self.live_conns.remove(&conn);
+        for record in self.records.values_mut() {
+            record.raw_clients.remove(&conn);
+        }
         self.cxb_conns.remove(&conn);
         self.inbox_disconnect(conn);
         self.inbox_flush_actions(actions);
