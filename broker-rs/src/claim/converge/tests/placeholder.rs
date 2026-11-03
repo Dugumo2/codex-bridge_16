@@ -2,7 +2,7 @@
 use super::*;
 use std::collections::VecDeque;
 
-fn replies(m: &mut Machine, mock: &SubagentMock, actions: Vec<Action>) {
+pub(super) fn replies(m: &mut Machine, mock: &SubagentMock, actions: Vec<Action>) {
     let mut queue: VecDeque<_> = actions.into();
     let mut count = 0;
     while let Some(action) = queue.pop_front() {

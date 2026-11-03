@@ -2,6 +2,7 @@
 import { expect, test } from "bun:test";
 import { Sa1bHarness, SA1B_ROOT as ROOT } from "../test-support/sa1b-harness";
 import { bounded } from "./wait-run";
+import { beginV2Followup, consumeV2Input } from "./test-fixtures/v2-followup";
 
 const CHILD = "placeholder-child";
 const HISTORY = "historical-child";
@@ -129,6 +130,32 @@ for (const resumed of [false, true]) test(`失败跟进跨进程收敛：${resum
   } finally {
     await bounded(h.close(), 12_000);
   }
+}, 90_000);
+
+for (const sameTurn of [false, true]) test(`v2 跟进忙碌子代理：${sameTurn ? "旧轮核实输入后吸收" : "旧轮结束后新轮承载"}正常收敛`, async () => {
+  const h = new Sa1bHarness();
+  try {
+    await openAndStart(h);
+    const previous = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+    await beginV2Followup(h, CHILD, "busy-followup", "额外的跟进工作");
+    expect((await diagnostic(h)).pendingOperations.filter((op: any) => op.kind === "v2Interacted")).toHaveLength(1);
+    await h.finish(ROOT, "父轮先结束");
+    let carryingTurn = previous;
+    if (sameTurn) {
+      await consumeV2Input(h, CHILD, previous, "actual-input", "额外的跟进工作");
+      expect((await diagnostic(h)).pendingOperations).toHaveLength(0);
+      expect(h.ended()).toHaveLength(0);
+    } else {
+      await h.finish(CHILD, "原任务完成，但还没处理跟进", "completed", previous);
+      expect((await diagnostic(h)).pendingOperations).toHaveLength(1);
+      expect(h.ended()).toHaveLength(0);
+      carryingTurn = (await h.control("turn", { threadId: CHILD, action: "start" })).turnId;
+    }
+    await h.finish(CHILD, CURRENT_OUTPUT, "completed", carryingTurn);
+    const { run } = await finishReconciliation(h, CURRENT_OUTPUT);
+    expect(run.subagentJoin.resultCoverage.total).toBe(sameTurn ? 1 : 2);
+    await assertCleanFinalViews(h, carryingTurn);
+  } finally { await bounded(h.close(), 12_000); }
 }, 90_000);
 
 test("v2 三个已完成子代理跟进：父轮完成后子轮才开始并最终收敛", async () => {

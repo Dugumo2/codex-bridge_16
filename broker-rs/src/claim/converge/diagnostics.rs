@@ -737,51 +737,79 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_first_gate_matches_short_circuit_combinations() {
-        let mut machine = fixture();
-        machine
-            .convergences
-            .progress
-            .get_mut("run-diagnostic")
-            .unwrap()
-            .discovery = Some((1, 1));
-        machine.claims.get_mut("root").unwrap().request_pending = true;
-        machine
-            .convergences
-            .runs
-            .get_mut("run-diagnostic")
-            .unwrap()
-            .automatic_control_revoked = true;
-        machine.closing = true;
-        let gate =
-            |m: &Machine| m.convergence_diagnostics("run-diagnostic").unwrap()["gate"].clone();
-        assert_eq!(gate(&machine), "automaticControlRevoked");
-        machine
-            .convergences
-            .runs
-            .get_mut("run-diagnostic")
-            .unwrap()
-            .automatic_control_revoked = false;
-        assert_eq!(gate(&machine), "brokerClosingOrQuiescing");
-        machine.closing = false;
-        assert_eq!(gate(&machine), "parentNotSettled");
-        machine.claims.get_mut("root").unwrap().state = State::Converging {
-            owner: Owner::Client(1),
-            turn_id: Some("root-turn".into()),
-            parent_status: Some(crate::runs::TurnStatus::Completed),
-            goal_status: None,
-            token: machine.convergences.runs["run-diagnostic"].token.clone(),
-            phase: JoinPhase::WaitingSubtree,
-        };
-        assert_eq!(gate(&machine), "requestInFlight");
-        machine.claims.get_mut("root").unwrap().request_pending = false;
-        assert_eq!(gate(&machine), "discoveryInFlight");
-        machine
-            .convergences
-            .progress
-            .get_mut("run-diagnostic")
-            .unwrap()
-            .discovery = None;
-        assert_eq!(gate(&machine), "discoveryEpochUncovered");
+    fn diagnostics_first_gate_matches_actual_driver_actions() {
+        for mode in ["closing", "parent", "request", "discovery"] {
+            let mut machine = fixture();
+            machine
+                .convergences
+                .runs
+                .get_mut("run-diagnostic")
+                .unwrap()
+                .deadline_mono_ms = 100_000;
+            machine
+                .convergences
+                .progress
+                .get_mut("run-diagnostic")
+                .unwrap()
+                .discovery = None;
+            machine.claims.get_mut("root").unwrap().request_pending = mode != "discovery";
+            machine.closing = mode == "closing";
+            if matches!(mode, "request" | "discovery") {
+                machine.claims.get_mut("root").unwrap().state = State::Converging {
+                    owner: Owner::Client(1),
+                    turn_id: Some("root-turn".into()),
+                    parent_status: Some(crate::runs::TurnStatus::Completed),
+                    goal_status: None,
+                    token: machine.convergences.runs["run-diagnostic"].token.clone(),
+                    phase: JoinPhase::WaitingSubtree,
+                };
+            }
+            let before = machine.clone();
+            let diagnostic = machine.convergence_diagnostics("run-diagnostic").unwrap();
+            assert_eq!(machine, before, "诊断不能预先改变驱动状态");
+            let expected = match mode {
+                "closing" => "brokerClosingOrQuiescing",
+                "parent" => "parentNotSettled",
+                "request" => "requestInFlight",
+                _ => "discoveryEpochUncovered",
+            };
+            assert_eq!(diagnostic["gate"], expected);
+            let mut actions = vec![];
+            machine.convergence_drive("run-diagnostic", &mut actions);
+            let discovers = actions.iter().any(|a| matches!(a,Action::Request(c) if matches!(c.operation,crate::claim::Operation::Discovery { .. })));
+            let retries = actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::Schedule {
+                        kind: TimerKind::ConvergeRetry { .. },
+                        ..
+                    }
+                )
+            });
+            match mode {
+                "closing" | "parent" => {
+                    assert!(
+                        actions.is_empty(),
+                        "首门 {expected} 必须真正阻止驱动产生动作"
+                    );
+                    assert_eq!(machine, before);
+                }
+                "request" => {
+                    assert!(
+                        retries && !discovers,
+                        "请求门必须先排重试，不能越过它发起发现"
+                    );
+                    assert!(machine.convergences.progress["run-diagnostic"]
+                        .discovery
+                        .is_none());
+                }
+                _ => {
+                    assert!(discovers && !retries, "发现覆盖门必须真正启动发现");
+                    assert!(machine.convergences.progress["run-diagnostic"]
+                        .discovery
+                        .is_some());
+                }
+            }
+        }
     }
 }
