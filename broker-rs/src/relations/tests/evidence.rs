@@ -643,6 +643,7 @@ fn 二审_r2_interacted晚于新轮开始仍绑定并清除pending() {
     mock.inject(&mut m, event);
     let event = mock.turn_completed(C, "历史轮", "completed");
     mock.inject(&mut m, event);
+    mock.inject(&mut m, Event::Notification { method: "rawResponseItem/completed".into(), params: Some(json!({"threadId":P,"turnId":T,"item":{"type":"function_call","name":"followup_task","call_id":"跟进"}})) });
     let event = mock.turn_started(C, "跟进轮");
     mock.inject(&mut m, event);
     let (started, completed) = SubagentMock::v2_activity("interacted", P, T, "跟进", C);
@@ -721,6 +722,7 @@ fn 二审_r2_父轮结束后才出现子轮仍允许唯一配对() {
     mock.register(C, Some(P), "v2", false, true);
     let attached = mock.thread_started(C);
     mock.inject(&mut m, attached);
+    mock.inject(&mut m, Event::Notification { method: "rawResponseItem/completed".into(), params: Some(json!({"threadId":P,"turnId":T,"item":{"type":"function_call","name":"followup_task","call_id":"父后跟进"}})) });
     let (started, completed) = SubagentMock::v2_activity("interacted", P, T, "父后跟进", C);
     mock.inject(&mut m, started);
     let parent_done = mock.turn_completed(P, T, "completed");
@@ -765,6 +767,7 @@ fn 二审_r2_三个_v2跟进均完成后保留唯一轮次并清除pending() {
     mock.inject(&mut m, attached);
     for index in 0..3 {
         let item = format!("三次跟进{index}");
+        mock.inject(&mut m, Event::Notification { method: "rawResponseItem/completed".into(), params: Some(json!({"threadId":P,"turnId":T,"item":{"type":"function_call","name":"followup_task","call_id":item}})) });
         let (started, completed) = SubagentMock::v2_activity("interacted", P, T, &item, C);
         mock.inject(&mut m, started);
         m.clock.mono_ms += 1;

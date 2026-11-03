@@ -149,42 +149,10 @@ impl Machine {
         match event.method.as_str() {
             "rawResponseItem/completed" => {
                 if let (Some(turn), Some(item)) = (&turn, params.and_then(|p| p.get("item"))) {
-                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                    if item.get("type").and_then(Value::as_str) == Some("function_call")
-                        && matches!(
-                            name.rsplit('.').next(),
-                            Some("followup_task" | "send_message")
-                        )
-                        && matches!(self.parent_run(&thread, turn), ParentRun::Own { .. })
-                    {
-                        if let Some(id) = item.get("call_id").and_then(Value::as_str) {
-                            let now = self.clock.mono_ms;
-                            self.relations
-                                .aux
-                                .followup_starts
-                                .retain(|_, (epoch, _, at)| {
-                                    *epoch == self.relations.conn_epoch
-                                        && now < at.saturating_add(EVIDENCE_TTL_MS)
-                                });
-                            if self.relations.aux.followup_starts.len() < MAX_OPERATIONS {
-                                self.relations
-                                    .aux
-                                    .followup_starts
-                                    .entry(EvidenceKey {
-                                        parent_thread_id: thread.clone(),
-                                        parent_turn_id: turn.clone(),
-                                        item_id: id.into(),
-                                    })
-                                    .or_insert((
-                                        self.relations.conn_epoch,
-                                        self.relations.aux.observation_seq,
-                                        now,
-                                    ));
-                            }
-                        }
-                    }
+                    self.v2_observe_raw(&thread, turn, item, actions)
+                } else {
+                    false
                 }
-                false
             }
             "item/started" | "item/completed" => {
                 let item = params.and_then(|p| p.get("item"));
@@ -206,6 +174,7 @@ impl Machine {
             }
             "turn/started" => {
                 if let (false, Some(turn)) = (claimed, &turn) {
+                    self.v2_observe_start(&thread, turn);
                     self.convergence_observe_activity(&thread, turn, "running", false);
                     self.observe_turn(&thread, turn, true, false, actions);
                 }
@@ -664,9 +633,13 @@ impl Machine {
                 EvidenceOutcome::Pending
             };
             let begin = (kind == EvidenceKind::V2Interacted)
-                .then(|| self.relations.aux.followup_starts.get(&key).copied())
+                .then(|| self.relations.aux.followup_starts.get(&key).cloned())
                 .flatten()
-                .filter(|(epoch, _, _)| *epoch == self.relations.conn_epoch);
+                .filter(|start| {
+                    start.epoch == self.relations.conn_epoch
+                        && start.run == run_id
+                        && start.generation == authority_gen
+                });
             let baseline_turns = receivers
                 .iter()
                 .filter_map(|child| {
@@ -675,16 +648,7 @@ impl Machine {
                         child.clone(),
                         turns
                             .iter()
-                            .filter(|observation| {
-                                observation.completed
-                                    && begin.is_none_or(|(_, seq, _)| {
-                                        self.relations
-                                            .aux
-                                            .completed_seq
-                                            .get(&(child.clone(), observation.turn.clone()))
-                                            .is_none_or(|completed| *completed <= seq)
-                                    })
-                            })
+                            .filter(|observation| observation.completed)
                             .map(|observation| observation.turn.clone())
                             .collect(),
                     ))
@@ -705,14 +669,28 @@ impl Machine {
                     rejected_receivers: BTreeMap::new(),
                     proven_turns: BTreeMap::new(),
                     baseline_turns,
-                    first_seen_ms: begin.map_or(now, |(_, _, at)| at),
+                    first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
-                        .map_or(now, |(_, _, at)| at)
+                        .as_ref()
+                        .map_or(now, |start| start.at)
                         .saturating_add(EVIDENCE_TTL_MS),
                     parent_ended: false,
                     failure: None,
                 },
             );
+        }
+        if kind == EvidenceKind::V2Interacted {
+            if let Some(path) = item
+                .get("agentPath")
+                .and_then(Value::as_str)
+                .filter(|s| s.len() <= 256)
+            {
+                self.relations
+                    .aux
+                    .v2_receiver_paths
+                    .entry(key.clone())
+                    .or_insert_with(|| path.into());
+            }
         }
         let op = self
             .relations
@@ -906,7 +884,12 @@ impl Machine {
     }
 
     /// 首轮配对：C 恰好观察到一轮就配对；还没有就等；不止一轮说明首轮身份不明，保持 unbound。
-    fn pair_first_turn(&mut self, key: &EvidenceKey, child: &str, actions: &mut Vec<Action>) {
+    pub(super) fn pair_first_turn(
+        &mut self,
+        key: &EvidenceKey,
+        child: &str,
+        actions: &mut Vec<Action>,
+    ) {
         if self.reject_followup_receiver(key, child, actions) {
             return;
         }
@@ -917,24 +900,27 @@ impl Machine {
         if !self.evidence_valid_for_pairing(op, now) {
             return;
         }
-        let observed: Vec<String> = self
-            .relations
-            .aux
-            .observed
-            .get(child)
-            .map(|o| {
-                o.iter()
-                    .filter(|t| {
-                        !self
-                            .convergences
-                            .reuse_candidates
-                            .get(&(key.clone(), child.into()))
-                            .is_some_and(|old| old.contains(&t.turn))
-                    })
-                    .map(|t| t.turn.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let observed: Vec<String> = if op.kind == EvidenceKind::V2Interacted {
+            self.v2_candidate_turns(op, child)
+        } else {
+            self.relations
+                .aux
+                .observed
+                .get(child)
+                .map(|o| {
+                    o.iter()
+                        .filter(|t| {
+                            !self
+                                .convergences
+                                .reuse_candidates
+                                .get(&(key.clone(), child.into()))
+                                .is_some_and(|old| old.contains(&t.turn))
+                        })
+                        .map(|t| t.turn.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         match observed.len() {
             0 => {
                 self.relations
@@ -974,7 +960,7 @@ impl Machine {
     }
 
     /// 配对只要求证据本身有效；运行确认（settling 定案、继承父轮）可以稍后到达。
-    fn evidence_valid_for_pairing(&self, op: &EvidenceOperation, now: u64) -> bool {
+    pub(super) fn evidence_valid_for_pairing(&self, op: &EvidenceOperation, now: u64) -> bool {
         (!op.parent_ended || (op.kind == EvidenceKind::V2Interacted && self.op_confirmed(&op.key)))
             && now < op.expires_at_ms
             && op.conn_epoch == self.relations.conn_epoch
@@ -983,7 +969,7 @@ impl Machine {
     }
 
     /// 运行确认后把配对落实为绑定，并把接收方纳入成员。
-    fn materialize(&mut self, key: &EvidenceKey, actions: &mut Vec<Action>) {
+    pub(super) fn materialize(&mut self, key: &EvidenceKey, actions: &mut Vec<Action>) {
         let Some(op) = self.relations.operations.get(key).cloned() else {
             return;
         };
@@ -1398,12 +1384,12 @@ impl Machine {
         }
         let now = self.clock.mono_ms;
         let aux = &mut self.relations.aux;
-        aux.observation_seq = aux.observation_seq.saturating_add(1);
         if !aux.observed.contains_key(thread) {
             if aux.observed.len() >= MAX_OBSERVED_THREADS {
                 if let Some(oldest) = aux.observed_order.pop_front() {
                     aux.observed.remove(&oldest);
-                    aux.completed_seq.retain(|(thread, _), _| thread != &oldest);
+                    aux.live_turn_starts
+                        .retain(|(thread, _), _| thread != &oldest);
                 }
             }
             aux.observed_order.push_back(thread.into());
@@ -1425,41 +1411,19 @@ impl Machine {
                 });
                 while list.len() > MAX_OBSERVED_TURNS {
                     if let Some(old) = list.pop_front() {
-                        aux.completed_seq.remove(&(thread.into(), old.turn));
+                        aux.live_turn_starts.remove(&(thread.into(), old.turn));
                     }
                 }
                 (true, true)
             }
         };
+        // 配对重试必须先于事件标志去重：发现回查已恢复有效观察，但 started/completed 可能均未变化。
+        self.retry_v2_pairing(thread, actions);
         if !changed {
             return;
         }
-        if completed {
-            aux.completed_seq
-                .entry((thread.into(), turn.into()))
-                .or_insert(aux.observation_seq);
-        }
-        if new || completed {
-            let mut keys: BTreeSet<_> = self
-                .relations
-                .aux
-                .spawn_waits
-                .get(thread)
-                .cloned()
-                .into_iter()
-                .collect();
-            keys.extend(
-                self.relations
-                    .operations
-                    .values()
-                    .filter(|op| {
-                        op.kind == EvidenceKind::V2Interacted
-                            && op.receivers.contains(thread)
-                            && self.evidence_valid_for_pairing(op, now)
-                    })
-                    .map(|op| op.key.clone()),
-            );
-            for key in keys {
+        if new {
+            if let Some(key) = self.relations.aux.spawn_waits.get(thread).cloned() {
                 self.pair_first_turn(&key, thread, actions);
                 if self.op_confirmed(&key) {
                     self.materialize(&key, actions);
@@ -1534,12 +1498,10 @@ impl Machine {
     /// 证据到期：未配对候选转 unbound；等待父轮绑定的操作不能再确认。
     pub(super) fn facts_expire(&mut self, actions: &mut Vec<Action>) {
         let now = self.clock.mono_ms;
-        self.relations
-            .aux
-            .followup_starts
-            .retain(|_, (epoch, _, at)| {
-                *epoch == self.relations.conn_epoch && now < at.saturating_add(EVIDENCE_TTL_MS)
-            });
+        self.relations.aux.followup_starts.retain(|_, start| {
+            start.epoch == self.relations.conn_epoch
+                && now < start.at.saturating_add(EVIDENCE_TTL_MS)
+        });
         let expired: Vec<EvidenceKey> = self
             .relations
             .operations
@@ -1614,6 +1576,7 @@ impl Machine {
                 return false;
             };
             self.relations.operations.remove(&oldest);
+            self.relations.aux.v2_receiver_paths.remove(&oldest);
         }
         true
     }

@@ -63,10 +63,93 @@ fn v2配对缺失开始证据不把先完成轮当作新轮() {
 }
 
 #[test]
+fn v2因果无开始晚到开始及换代丢失基线均保持pending() {
+    for mode in ["无开始", "晚于轮开始", "晚于Interacted", "换代丢失"] {
+        let (mut m, mut mock) = fixture();
+        if mode == "换代丢失" {
+            begin(&mut m, &mut mock);
+            m.relations.conn_epoch += 1;
+        }
+        let event = mock.turn_started(C, "活动轮");
+        mock.inject(&mut m, event);
+        if mode == "晚于轮开始" {
+            begin(&mut m, &mut mock);
+        }
+        interact(&mut m, &mut mock);
+        if mode == "晚于Interacted" {
+            begin(&mut m, &mut mock);
+        }
+        assert_eq!(
+            m.convergences.ledgers[R].pending.len(),
+            1,
+            "{mode}：唯一活动轮不能替代开始证据"
+        );
+        let event = mock.turn_completed(C, "活动轮", "completed");
+        mock.inject(&mut m, event);
+        assert_eq!(
+            m.convergences.ledgers[R].pending.len(),
+            1,
+            "{mode}：完成不能补造开始证据"
+        );
+        assert!(!m
+            .relations
+            .bindings
+            .values()
+            .any(|b| b.status == BindingStatus::Bound));
+    }
+}
+
+#[test]
+fn v2因果退役旧运行迟到轮不被新运行吸收() {
+    let (mut m, mut mock) = super::lineage_safety::machine();
+    spawn_v1(&mut m, &mut mock, C, "旧派生", "旧活动轮");
+    assert!(m.binding(C, "旧活动轮").is_some());
+    // 用正常退役判定回收旧绑定；首个实际开始观察仍属于旧轮，不能因回收而重新计时。
+    m.claims.remove(P);
+    let record = m.runs.runs.get_mut(R).unwrap();
+    record.state = crate::runs::RunState::Ended;
+    record.ended_at = Some(m.clock.now_ms);
+    m.relations.contexts.get_mut(R).unwrap().authority = Authority::Revoked;
+    m.prune_contexts();
+    assert!(m.binding(C, "旧活动轮").is_none());
+    m.claims
+        .insert(P.into(), claim(Owner::Client(1), "新父轮", "新运行", 20));
+    m.run_opened(
+        crate::runs::RunOpen {
+            thread_id: P.into(),
+            run_id: "新运行".into(),
+            conn: Some(1),
+            kind: crate::claim::ReqKind::TurnStart,
+            joined: false,
+            input: "新任务".into(),
+            continued_from: None,
+        },
+        &mut vec![],
+    );
+    m.convergence_begin(P, &mut vec![]);
+    mock.inject(&mut m,Event::Notification {method:"rawResponseItem/completed".into(),params:Some(json!({
+        "threadId":P,"turnId":"新父轮","item":{"type":"function_call","name":"followup_task","call_id":"新跟进"}}))});
+    let event = mock.turn_started(C, "旧活动轮");
+    mock.inject(&mut m, event);
+    let event = mock.turn_completed(C, "旧活动轮", "completed");
+    mock.inject(&mut m, event);
+    let (a, b) = SubagentMock::v2_activity("interacted", P, "新父轮", "新跟进", C);
+    run(&mut m, &mut mock, vec![a, b]);
+    assert_eq!(m.convergences.ledgers["新运行"].pending.len(), 1);
+    assert!(!m
+        .relations
+        .bindings
+        .values()
+        .any(|b| b.status == BindingStatus::Bound));
+}
+
+#[test]
 fn v2配对观察缺口和not_loaded保持pending() {
     for not_loaded in [false, true] {
         let (mut m, mut mock) = fixture();
         begin(&mut m, &mut mock);
+        let event = mock.turn_started(C, "真实轮");
+        mock.inject(&mut m, event);
         let event = mock.turn_completed(C, "真实轮", "completed");
         mock.inject(&mut m, event);
         if not_loaded {
