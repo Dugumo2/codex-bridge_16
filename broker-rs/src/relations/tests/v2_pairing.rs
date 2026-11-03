@@ -63,7 +63,7 @@ fn v2配对缺失开始证据不把先完成轮当作新轮() {
 }
 
 #[test]
-fn v2因果无开始晚到开始及换代丢失基线均保持pending() {
+fn v2无raw回退与已选严格模式互不改写() {
     for mode in ["无开始", "晚于轮开始", "晚于Interacted", "换代丢失"] {
         let (mut m, mut mock) = fixture();
         if mode == "换代丢失" {
@@ -79,23 +79,28 @@ fn v2因果无开始晚到开始及换代丢失基线均保持pending() {
         if mode == "晚于Interacted" {
             begin(&mut m, &mut mock);
         }
+        let strict = mode == "晚于轮开始";
         assert_eq!(
             m.convergences.ledgers[R].pending.len(),
-            1,
-            "{mode}：唯一活动轮不能替代开始证据"
+            usize::from(strict),
+            "{mode}"
         );
         let event = mock.turn_completed(C, "活动轮", "completed");
         mock.inject(&mut m, event);
         assert_eq!(
             m.convergences.ledgers[R].pending.len(),
-            1,
-            "{mode}：完成不能补造开始证据"
+            usize::from(strict),
+            "{mode}"
         );
-        assert!(!m
-            .relations
-            .bindings
-            .values()
-            .any(|b| b.status == BindingStatus::Bound));
+        assert_eq!(
+            m.relations
+                .operations
+                .values()
+                .find(|op| op.key.item_id == "v2操作")
+                .unwrap()
+                .v2_strict,
+            strict
+        );
     }
 }
 
@@ -232,4 +237,18 @@ fn v2配对运行中重启保留失联终态而不恢复授权或消账为成功
         .values()
         .any(|binding| binding.status == BindingStatus::Bound));
     assert_eq!(restored.runs.runs[R].state, crate::runs::RunState::Lost);
+}
+
+#[test]
+fn v2乱序消费暂存有界并按ttl清理() {
+    let (mut m, _) = fixture();
+    for index in 0..=MAX_OPERATIONS {
+        let item = json!({"type":"agent_message","id":format!("input-{index}"),"author":"/root","recipient":format!("/root/{C}"),
+            "content":[{"type":"input_text","text":format!("Message Type: NEW_TASK\nTask name: /root/{C}\nSender: /root\nPayload:\n输入{index}")}]});
+        m.v2_observe_raw(C, "先到轮", &item, &mut vec![]);
+    }
+    assert_eq!(m.relations.aux.v2_deliveries.len(), MAX_OPERATIONS);
+    m.clock.mono_ms += EVIDENCE_TTL_MS;
+    m.prune_v2_deliveries();
+    assert!(m.relations.aux.v2_deliveries.is_empty());
 }

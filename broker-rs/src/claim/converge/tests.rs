@@ -1299,15 +1299,6 @@ fn 集成_跟进复用只绑定明确操作后的新轮() {
         let (mut m, mut mock) = setup();
         spawn(&mut m, &mut mock, P, T, "子", "派生", "旧轮");
         complete(&mut m, &mut mock, "子", "旧轮", "completed");
-        if version == "v2" {
-            notify(
-                &mut m,
-                "rawResponseItem/completed",
-                json!({"threadId":P,"turnId":T,
-                "item":{"type":"function_call","name":"followup_task","call_id":"跟进",
-                    "arguments":json!({"target":"子","message":"跟进"}).to_string()}}),
-            );
-        }
         let item = if version == "v1" {
             json!({"type":"collabAgentToolCall","id":"跟进","tool":"sendInput","status":"completed","senderThreadId":P,"receiverThreadIds":["子"]})
         } else {

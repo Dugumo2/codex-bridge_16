@@ -669,6 +669,7 @@ impl Machine {
                     rejected_receivers: BTreeMap::new(),
                     proven_turns: BTreeMap::new(),
                     baseline_turns,
+                    v2_strict: begin.is_some(),
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
                         .as_ref()
@@ -1498,6 +1499,7 @@ impl Machine {
     /// 证据到期：未配对候选转 unbound；等待父轮绑定的操作不能再确认。
     pub(super) fn facts_expire(&mut self, actions: &mut Vec<Action>) {
         let now = self.clock.mono_ms;
+        self.prune_v2_deliveries();
         self.relations.aux.followup_starts.retain(|_, start| {
             start.epoch == self.relations.conn_epoch
                 && now < start.at.saturating_add(EVIDENCE_TTL_MS)

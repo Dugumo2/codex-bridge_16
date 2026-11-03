@@ -149,16 +149,18 @@ fn 因果隔离_重叠操作须各有输入消费证据才可共享同轮() {
 }
 
 #[test]
-fn 因果隔离_另一未决操作缺基线不能让新轮被抢占() {
+fn 宽松操作先配对不替严格操作消账() {
     let (mut m, mut mock) = base();
     complete(&mut m, &mut mock, C, "旧轮", "completed");
     interacted(&mut m, "没有开始的A");
     raw(&mut m, "B", "第二任务");
     interacted(&mut m, "B");
     apply(&mut m, mock.turn_started(C, "不明承载轮"));
-    pending(&m, 2);
+    pending(&m, 1);
+    delivery(&mut m, "不明承载轮", "B输入", "第二任务", false);
+    pending(&m, 0);
     complete(&mut m, &mut mock, C, "不明承载轮", "completed");
-    pending(&m, 2);
+    finish(&mut m, &mut mock);
 }
 
 #[test]

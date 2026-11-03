@@ -6,7 +6,6 @@ import { expect, test } from "bun:test";
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { Sa1bHarness, SA1B_ROOT as P } from "../test-support/sa1b-harness";
-import { beginV2Followup } from "./test-fixtures/v2-followup";
 
 type H = Sa1bHarness;
 const mark = () => `SA1B_${randomUUID().replaceAll("-", "")}`;
@@ -71,12 +70,7 @@ for (const version of ["v1", "v2"] as const) {
     const marker = mark(); const c = await h.spawn("C", P, h.firstTurn, { version });
     if (shape === "孙代理晚完成") await h.spawn("G", "C", c, { version });
     await h.finish("C", "旧子输出");
-    if (shape === "线程复用") {
-      if (version === "v2") {
-        await beginV2Followup(h, "C", "E02-v2-followup", "处理下一项任务");
-        await h.control("turn", { threadId: "C", action: "start" });
-      } else await h.control("reuse", { parentThreadId: P, parentTurnId: h.firstTurn, childThreadId: "C" });
-    }
+    if (shape === "线程复用") await h.control("reuse", { parentThreadId: P, parentTurnId: h.firstTurn, childThreadId: "C" });
     if (shape === "新派生") await h.spawn("N", P, h.firstTurn, { version });
     await h.finish(P); await held(h);
     const target = shape === "孙代理晚完成" ? "G" : shape === "线程复用" ? "C" : "N";
