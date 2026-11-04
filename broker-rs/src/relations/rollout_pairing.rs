@@ -172,6 +172,19 @@ impl Machine {
             events: vec![(item.clone(), completed)],
         };
         self.relations.aux.rollout.waits.insert(key.clone(), wait);
+        // 调用刚写进父线程文件：不等下一个轮询间隔，尽快读一次。
+        let epoch = self.relations.conn_epoch;
+        let now = self.clock.mono_ms;
+        if let Some(file) = self
+            .relations
+            .aux
+            .rollout
+            .files
+            .get_mut(&key.parent_thread_id)
+            .filter(|f| f.epoch == epoch)
+        {
+            file.next_at = file.next_at.min(now);
+        }
         Ok(true)
     }
 
@@ -253,6 +266,10 @@ impl Machine {
             .get(&(key.parent_thread_id.clone(), key.item_id.clone()))
             .filter(|c| c.epoch == self.relations.conn_epoch);
         if let Some(call) = call {
+            // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。
+            if call.trigger && call.message.is_none() {
+                return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));
+            }
             if !call.trigger || self.raw_thread(&wait.child) {
                 return Some(Decision::Strict(call.clone()));
             }

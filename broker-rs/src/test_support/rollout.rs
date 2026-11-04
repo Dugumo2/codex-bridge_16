@@ -50,6 +50,11 @@ pub(crate) fn install() -> PathBuf {
     dir
 }
 
+/// 卸下本测试线程的夹具（同一测试里先后跑「有夹具」与「无夹具」的情形时用）。
+pub(crate) fn uninstall() {
+    FIXTURE.with(|f| *f.borrow_mut() = None);
+}
+
 pub(crate) fn installed() -> bool {
     FIXTURE.with(|f| f.borrow().is_some())
 }

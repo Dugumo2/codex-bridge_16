@@ -2,15 +2,15 @@
 use super::placeholder::replies;
 use super::*;
 
-const C: &str = "子";
+pub(super) const C: &str = "子";
 
-fn base() -> (Machine, SubagentMock) {
+pub(super) fn base() -> (Machine, SubagentMock) {
     let (mut m, mut mock) = setup();
     spawn(&mut m, &mut mock, P, T, C, "原派生", "旧轮");
     (m, mock)
 }
 
-fn raw(m: &mut Machine, id: &str, message: &str) {
+pub(super) fn raw(m: &mut Machine, id: &str, message: &str) {
     notify(
         m,
         "rawResponseItem/completed",
@@ -20,13 +20,13 @@ fn raw(m: &mut Machine, id: &str, message: &str) {
     );
 }
 
-fn interacted(m: &mut Machine, id: &str) {
+pub(super) fn interacted(m: &mut Machine, id: &str) {
     let (a, b) = SubagentMock::v2_activity("interacted", P, T, id, C);
     apply(m, a);
     apply(m, b);
 }
 
-fn delivery(m: &mut Machine, turn: &str, id: &str, message: &str, encrypted: bool) {
+pub(super) fn delivery(m: &mut Machine, turn: &str, id: &str, message: &str, encrypted: bool) {
     let prefix = format!("Message Type: NEW_TASK\nTask name: /root/{C}\nSender: /root\nPayload:\n");
     let content = if encrypted {
         json!([{"type":"input_text","text":prefix}, {"type":"encrypted_content","encrypted_content":message}])
@@ -41,7 +41,7 @@ fn delivery(m: &mut Machine, turn: &str, id: &str, message: &str, encrypted: boo
     );
 }
 
-fn pending(m: &Machine, count: usize) {
+pub(super) fn pending(m: &Machine, count: usize) {
     assert_eq!(
         m.convergences.ledgers[R].pending.len(),
         count,
@@ -49,7 +49,7 @@ fn pending(m: &Machine, count: usize) {
     );
 }
 
-fn finish(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
+pub(super) fn finish(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
     let mut all = vec![];
     if !matches!(m.claims[P].state, State::Converging { .. }) {
         let actions = complete(m, mock, P, T, "completed");
@@ -195,7 +195,7 @@ fn past_evidence_ttl(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
     replies(m, mock, actions)
 }
 
-fn op<'a>(m: &'a Machine, id: &str) -> &'a EvidenceOperation {
+pub(super) fn op<'a>(m: &'a Machine, id: &str) -> &'a EvidenceOperation {
     m.relations
         .operations
         .values()
@@ -448,7 +448,7 @@ fn 宽松配对诊断标明回退原因且严格操作不带原因() {
 }
 
 /// 正常成功路径不得出现缺口、陈旧、不完整、冲突、过期类提示，也不得发警告。
-fn assert_no_alarm(actions: &[Action]) {
+pub(super) fn assert_no_alarm(actions: &[Action]) {
     for action in actions {
         match action {
             Action::Warn(warning) => panic!("正常路径不应告警：{warning}"),
@@ -541,7 +541,7 @@ fn 观察有缺口时诊断不猜接收方空闲() {
 }
 
 /// 在同一父线程上开新运行：与 `setup` 相同的真实 turn/start 请求、回包与开始通知。
-fn start_run(m: &mut Machine, run: &str, turn: &str, id: u64) -> Vec<Action> {
+pub(super) fn start_run(m: &mut Machine, run: &str, turn: &str, id: u64) -> Vec<Action> {
     let out = apply(
         m,
         Event::ClientRequest {
@@ -813,7 +813,7 @@ fn 同正文跟进发给不同子代理时各凭自己的消费记录配对() {
 }
 
 /// 新运行的收尾驱动：父轮结束后按重试推进发现，直到进入汇总或不再重试。
-fn drive_run(m: &mut Machine, mock: &SubagentMock, run: &str) -> Vec<Action> {
+pub(super) fn drive_run(m: &mut Machine, mock: &SubagentMock, run: &str) -> Vec<Action> {
     let mut all = vec![];
     for _ in 0..8 {
         let progress = &m.convergences.progress[run];

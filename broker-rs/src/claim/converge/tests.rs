@@ -13,6 +13,7 @@ const R: &str = "run-convergence";
 mod causal_pairing;
 mod lineage;
 mod placeholder;
+mod rollout_pairing;
 
 fn ready() -> ConvergenceReadiness {
     ConvergenceReadiness {
