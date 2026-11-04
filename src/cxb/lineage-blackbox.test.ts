@@ -214,7 +214,7 @@ const OLD_TREE = [C1, C2, G].sort();
 const TASK = "R2:按交接资料继续完成本次工作";
 
 /** 路径是上游提供的完整身份；故意不编码父子结构，层级必须来自可核实父链。 */
-const agentPath = (threadId: string) => `/root/${threadId}`;
+const agentPath = (threadId: string) => `/root/agent_${threadId}`;
 
 async function handoffHistory(h: Sa1bHarness, continuing: boolean) {
   await bounded(h.open({ version: "v2", pageSize: 1 }), 15_000);
