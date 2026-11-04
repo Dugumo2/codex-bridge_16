@@ -295,53 +295,132 @@ impl Machine {
             })
     }
 
-    fn v2_input_matches(&self, op: &EvidenceOperation, child: &str, turn: &str) -> bool {
-        let Some(start) = self.v2_start(op) else {
-            return false;
-        };
-        let Some(message) = start.message else {
-            return false;
-        };
-        let Some(recipient) = self.relations.aux.v2_receiver_paths.get(&op.key) else {
-            return false;
-        };
-        let Some(author) = self.v2_sender_path(op) else {
-            return false;
-        };
+    /// 本操作的输入被子代理哪一轮消费；没有可核实的消费记录时为 None。
+    ///
+    /// 同一运行、同一代际里发给同一子代理的同内容跟进可以互换：子代理每消费一条就留下一条消费记录，
+    /// 只要「已核销的操作数」不超过「消费记录数」，待定数就等于真实还在队列里的条数，承载轮也都归同一运行。
+    /// 因此一条消费记录只核销一个同内容操作：已配对的操作先在自己的承载轮里各认一条，
+    /// 其余记录按先后分给尚未配对的操作，且只能分给开始记录早于它的操作（发出之前不可能被消费）。
+    /// 有分不出去的同内容记录，说明有本 broker 没看到开始的同内容发送，整组都不认，等新轮或收敛期限。
+    /// 不同运行或代际的同内容发送不可互换，也整组不认。
+    fn v2_input_turn(&self, op: &EvidenceOperation, child: &str) -> Option<String> {
+        let start = self.v2_start(op)?;
+        let message = start.message?;
+        let recipient = self.relations.aux.v2_receiver_paths.get(&op.key)?;
+        let author = self.v2_sender_path(op)?;
         let index = &self.relations.aux.v2_index;
-        let Some(seqs) = index
+        let mut members: Vec<(&EvidenceKey, &FollowupStart)> = Vec::new();
+        for key in index
+            .starts
+            .get(&(start.epoch, op.key.parent_thread_id.clone(), message))
+            .into_iter()
+            .flatten()
+        {
+            let Some(other) = self.relations.aux.followup_starts.get(key) else {
+                continue;
+            };
+            if other.trigger != start.trigger {
+                continue;
+            }
+            let target_matches = || {
+                other.target.as_ref().is_none_or(|target| {
+                    target == child
+                        || target == recipient
+                        || recipient.ends_with(&format!("/{target}"))
+                })
+            };
+            let same_receiver = match self.relations.operations.get(key) {
+                // 确认发送失败的不会留下消费记录。
+                Some(other_op) if other_op.outcome == EvidenceOutcome::Failed => false,
+                Some(other_op) if !other_op.receivers.is_empty() => {
+                    other_op.receivers.contains(child)
+                        && self
+                            .relations
+                            .aux
+                            .v2_receiver_paths
+                            .get(key)
+                            .is_none_or(|path| path == recipient)
+                }
+                _ => target_matches(),
+            };
+            if !same_receiver {
+                continue;
+            }
+            if other.run != start.run || other.generation != start.generation {
+                return None;
+            }
+            members.push((key, other));
+        }
+        members.sort_by_key(|(_, other)| other.seq);
+        let now = self.clock.mono_ms;
+        // BTreeSet 按序号升序，即消费记录到达的先后。
+        let deliveries: Vec<&DeliveryFact> = index
             .deliveries
             .get(&(start.epoch, child.to_owned(), author, message))
-        else {
-            return false;
-        };
-        // 相同内容被发送多次时没有可区分的回执，不能凭同一条输入同时核销。
-        if seqs.len() != 1
-            || index
-                .starts
-                .get(&(start.epoch, op.key.parent_thread_id.clone(), message))
-                .is_some_and(|keys| {
-                    keys.iter().any(|key| {
-                        key != &op.key
-                            && self
-                                .relations
-                                .aux
-                                .followup_starts
-                                .get(key)
-                                .is_some_and(|other| other.trigger == start.trigger)
-                    })
-                })
-        {
-            return false;
-        }
-        seqs.iter()
+            .into_iter()
+            .flatten()
             .filter_map(|seq| self.v2_delivery(*seq))
-            .any(|d| {
-                d.turn == turn
-                    && self.clock.mono_ms < d.at.saturating_add(EVIDENCE_TTL_MS)
+            .filter(|d| {
+                now < d.at.saturating_add(EVIDENCE_TTL_MS)
                     && &d.recipient == recipient
                     && d.trigger == start.trigger
             })
+            .collect();
+        let mut used = vec![false; deliveries.len()];
+        let mut waiting = Vec::new();
+        for (key, other) in &members {
+            match self
+                .relations
+                .operations
+                .get(*key)
+                .and_then(|o| o.proven_turns.get(child))
+            {
+                Some(turns) => {
+                    if let Some(i) = (0..deliveries.len())
+                        .find(|&i| !used[i] && turns.contains(&deliveries[i].turn))
+                    {
+                        used[i] = true;
+                    }
+                }
+                None => waiting.push((*key, *other)),
+            }
+        }
+        let mut assigned = None;
+        for (key, other) in waiting {
+            if let Some(i) =
+                (0..deliveries.len()).find(|&i| !used[i] && deliveries[i].seq > other.seq)
+            {
+                used[i] = true;
+                if key == &op.key {
+                    assigned = Some(deliveries[i].turn.clone());
+                }
+            }
+        }
+        if used.iter().any(|used| !used) {
+            return None;
+        }
+        assigned
+    }
+
+    /// 已配对操作的消费记录还在时保留其开始记录，否则这条记录会变成来历不明、被同内容的后来者认领。
+    fn v2_consumption_retained(&self, op: &EvidenceOperation) -> bool {
+        let Some(start) = self.relations.aux.followup_starts.get(&op.key) else {
+            return false;
+        };
+        let (Some(message), Some(author)) = (start.message, self.v2_sender_path(op)) else {
+            return false;
+        };
+        op.proven_turns.iter().any(|(child, turns)| {
+            self.relations
+                .aux
+                .v2_index
+                .deliveries
+                .get(&(start.epoch, child.clone(), author.clone(), message))
+                .into_iter()
+                .flatten()
+                .filter_map(|seq| self.v2_delivery(*seq))
+                .any(|d| turns.contains(&d.turn) && d.trigger == start.trigger)
+        })
     }
 
     /// 消费记录按观察序号递增存放，按序号二分查找。
@@ -374,6 +453,7 @@ impl Machine {
         let Some(start) = self.v2_start(op) else {
             return vec![];
         };
+        let input_turn = self.v2_input_turn(op, child);
         self.relations
             .aux
             .observed
@@ -381,7 +461,7 @@ impl Machine {
             .into_iter()
             .flatten()
             .filter(|o| {
-                if self.v2_input_matches(op, child, &o.turn) {
+                if input_turn.as_deref() == Some(o.turn.as_str()) {
                     return true;
                 }
                 let Some(&(epoch, seq)) = self
@@ -506,7 +586,8 @@ impl Machine {
             && self.operation_generation_current(op)
     }
 
-    /// 开始记录默认只留证据期限；操作还在等配对或归属未定案时留到有结果，否则配对依据就丢了。
+    /// 开始记录默认只留证据期限；操作还在等配对或归属未定案时留到有结果，否则配对依据就丢了；
+    /// 已配对操作的消费记录还在时一并保留，供同内容一一核销。
     pub(super) fn prune_followup_starts(&mut self) {
         let now = self.clock.mono_ms;
         let epoch = self.relations.conn_epoch;
@@ -515,7 +596,9 @@ impl Machine {
             .operations
             .values()
             .filter(|op| {
-                self.v2_awaits_pairing(op) || self.relations.aux.parent_waits.contains_key(&op.key)
+                self.v2_awaits_pairing(op)
+                    || self.relations.aux.parent_waits.contains_key(&op.key)
+                    || self.v2_consumption_retained(op)
             })
             .map(|op| op.key.clone())
             .collect();

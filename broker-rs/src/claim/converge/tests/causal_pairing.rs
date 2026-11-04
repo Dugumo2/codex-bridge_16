@@ -643,3 +643,129 @@ fn 根认领释放后再次发现同一向上候选仍按向上处理且新运�
     assert!(m.convergence_facts(R2).unwrap().conflicts.is_empty());
     assert_no_alarm(&all);
 }
+
+#[test]
+fn 同正文两条跟进被同一忙碌轮吸收后各认一条消费记录并最终收敛() {
+    for encrypted in [false, true] {
+        let (mut m, mut mock) = base();
+        let mut all = vec![];
+        raw(&mut m, "A", "同一正文");
+        interacted(&mut m, "A");
+        raw(&mut m, "B", "同一正文");
+        interacted(&mut m, "B");
+        pending(&m, 2);
+        delivery(&mut m, "旧轮", "入站1", "同一正文", encrypted);
+        pending(&m, 1);
+        delivery(&mut m, "旧轮", "入站2", "同一正文", encrypted);
+        pending(&m, 0);
+        all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+        all.extend(finish(&mut m, &mut mock));
+        assert_no_alarm(&all);
+    }
+}
+
+#[test]
+fn 同正文两条只被吸收一条时另一条仍待定直到自己的承载轮() {
+    let (mut m, mut mock) = base();
+    raw(&mut m, "A", "同一正文");
+    interacted(&mut m, "A");
+    raw(&mut m, "B", "同一正文");
+    interacted(&mut m, "B");
+    delivery(&mut m, "旧轮", "入站1", "同一正文", false);
+    pending(&m, 1);
+    // 另一条在旧轮回答之后才到，留在队列里等下一轮：旧轮结束不能把它一起核销。
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    pending(&m, 1);
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    replies(&mut m, &mock, actions);
+    delivery(&mut m, "新轮", "入站2", "同一正文", false);
+    pending(&m, 0);
+    let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+    replies(&mut m, &mock, actions);
+    let all = finish(&mut m, &mut mock);
+    assert_no_alarm(&all);
+}
+
+#[test]
+fn 前一条超过证据期限才被读到时同正文后来者不冒领其消费记录() {
+    for absorbed in [false, true] {
+        let (mut m, mut mock) = base();
+        raw(&mut m, "A", "同一正文");
+        interacted(&mut m, "A");
+        past_evidence_ttl(&mut m, &mut mock);
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        let actions = apply(&mut m, mock.turn_started(C, "第一轮"));
+        replies(&mut m, &mock, actions);
+        delivery(&mut m, "第一轮", "入站A", "同一正文", false);
+        pending(&m, 0);
+        // 第一轮进行中父线程再发同正文：A 的消费记录不能被它认领。
+        raw(&mut m, "B", "同一正文");
+        interacted(&mut m, "B");
+        pending(&m, 1);
+        if absorbed {
+            // 第一轮把它也吸收了：留下自己的消费记录，立即配对。
+            delivery(&mut m, "第一轮", "入站B", "同一正文", false);
+            pending(&m, 0);
+            let actions = complete(&mut m, &mut mock, C, "第一轮", "completed");
+            replies(&mut m, &mock, actions);
+        } else {
+            let actions = complete(&mut m, &mut mock, C, "第一轮", "completed");
+            replies(&mut m, &mock, actions);
+            pending(&m, 1);
+            let actions = apply(&mut m, mock.turn_started(C, "第二轮"));
+            replies(&mut m, &mock, actions);
+            delivery(&mut m, "第二轮", "入站B", "同一正文", false);
+            pending(&m, 0);
+            let actions = complete(&mut m, &mut mock, C, "第二轮", "completed");
+            replies(&mut m, &mock, actions);
+        }
+        let all = finish(&mut m, &mut mock);
+        assert_no_alarm(&all);
+    }
+}
+
+/// 一条：来历不明的记录早于 B 发出，按先后不可能是 B 的。
+/// 两条：B 发出后到了两条同正文记录而 B 只有一条，多出的一条说明有没看到开始的同内容发送，整组不认。
+/// （同正文只到一条且晚于 B 发出时无从区分，属于残余风险，见交付说明。）
+#[test]
+fn 没有开始记录的同正文先被消费时严格跟进不冒领() {
+    for untracked in [1, 2] {
+        let (mut m, mut mock) = base();
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        // raw 迟到于 Interacted：这些操作只能宽松配对，broker 不知道它们的正文。
+        let late: Vec<String> = (0..untracked).map(|i| format!("无开始{i}")).collect();
+        for id in &late {
+            interacted(&mut m, id);
+            raw(&mut m, id, "同一正文");
+            assert!(!op(&m, id).v2_strict);
+        }
+        if untracked == 2 {
+            // 严格跟进 B 先于第一轮发出，但没赶上第一轮取输入；它的 Interacted 晚于两条消费记录才到。
+            raw(&mut m, "B", "同一正文");
+        }
+        let actions = apply(&mut m, mock.turn_started(C, "第一轮"));
+        replies(&mut m, &mock, actions);
+        for i in 0..untracked {
+            delivery(&mut m, "第一轮", &format!("入站{i}"), "同一正文", false);
+        }
+        if untracked == 1 {
+            raw(&mut m, "B", "同一正文");
+        }
+        interacted(&mut m, "B");
+        assert!(op(&m, "B").v2_strict);
+        assert!(
+            op(&m, "B").proven_turns.is_empty(),
+            "来历不明的同正文消费记录不能核销 B"
+        );
+        let actions = complete(&mut m, &mut mock, C, "第一轮", "completed");
+        replies(&mut m, &mock, actions);
+        assert!(op(&m, "B").proven_turns.is_empty());
+        let actions = apply(&mut m, mock.turn_started(C, "第二轮"));
+        replies(&mut m, &mock, actions);
+        delivery(&mut m, "第二轮", "入站B", "同一正文", false);
+        pending(&m, 0);
+        let actions = complete(&mut m, &mut mock, C, "第二轮", "completed");
+        replies(&mut m, &mock, actions);
+        finish(&mut m, &mut mock);
+    }
+}
