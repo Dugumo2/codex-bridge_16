@@ -61,7 +61,7 @@ export interface ConvergenceDiagnostic {
     missingResults: number; activeGoals: number; unknownGoals: number;
   };
   pendingOperations: Array<{
-    kind: string; outcome: string; receivers: string[];
+    kind: string; outcome: string; receivers: string[]; pairingMode: "strict" | "fallback" | null;
     provenTurns: Array<{ threadId: string; turnIds: string[]; omittedTurns: number }>;
     expiresAt: number | null; expired: boolean; missing: boolean; omittedReceivers: number; omittedProvenTurns: number;
   }>;

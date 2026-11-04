@@ -163,7 +163,7 @@ fn 跟进被拒绝只撤销该操作占位并保留管理约束() {
 }
 
 #[test]
-fn v2无配对轮次到期与操作回收都继续阻塞() {
+fn v2无配对轮次超过证据期限与操作回收都继续阻塞() {
     let (mut m, mut mock) = prepared();
     let saved = original(&m);
     let (started, completed) = SubagentMock::v2_activity("interacted", P, T, "v2无轮次", C);
@@ -174,11 +174,12 @@ fn v2无配对轮次到期与操作回收都继续阻塞() {
     m.convergence_sync_facts(R);
     assert_eq!(
         m.relations.operations[&key("v2无轮次")].outcome,
-        EvidenceOutcome::Unproven
+        EvidenceOutcome::Pending,
+        "跟进可能还在子代理队列里，不按证据期限判定"
     );
     assert!(
         m.convergences.ledgers[R].pending.contains(&key("v2无轮次")),
-        "到期不构成结束证明"
+        "超过期限不构成结束证明"
     );
     assert!(placeholder(&m));
     assert_eq!(original(&m), saved);
@@ -188,9 +189,11 @@ fn v2无配对轮次到期与操作回收都继续阻塞() {
         .expect("未配对 v2 操作必须可在线诊断");
     let pending = expired["pendingOperations"].as_array().unwrap();
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0]["expired"], true);
+    assert_eq!(pending[0]["expired"], false);
+    assert!(pending[0]["expiresAt"].is_null());
+    assert_eq!(pending[0]["pairingMode"], "fallback");
     assert_eq!(pending[0]["missing"], false);
-    assert_eq!(pending[0]["outcome"], "unproven");
+    assert_eq!(pending[0]["outcome"], "pending");
     assert_eq!(pending[0]["receivers"], json!([C]));
     assert!(expired["activities"]
         .as_array()

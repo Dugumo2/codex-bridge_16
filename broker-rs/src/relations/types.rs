@@ -114,6 +114,8 @@ pub struct EvidenceOperation {
     pub baseline_turns: BTreeMap<String, BTreeSet<String>>,
     /// 在 Interacted 首次到达时固定；缺 raw 的旧线程回退，不因迟到 raw 改写模式。
     pub v2_strict: bool,
+    /// 由 raw 认出是 `send_message`：上游只入队不开新轮，可能永远等不到承载轮，不授予管理权也不进待定账本。
+    pub v2_queue_only: bool,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

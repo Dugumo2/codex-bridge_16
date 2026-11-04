@@ -91,12 +91,15 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   const reply = (id: any, result: any, hold?: string) => emit({ id, result }, hold);
   const error = (id: any, message: string, code = -32600) => emit({ id, error: { code, message } });
   const notify = (method: string, params: any, hold?: string) => emit({ method, params }, hold);
+  // 与真实探针一致：target 用短名、路径带 /root 前缀，二者都不是线程 ID。
+  const agentName = (t: MockThread): string => `agent_${t.id}`;
+  const agentPath = (t: MockThread): string => t.parentThreadId === null ? "/root" : `/root/${agentName(t)}`;
   const meta = (t: MockThread, includeTurns = false) => ({
     id: t.id, parentThreadId: t.parentThreadId, forkedFromId: null, preview: "", ephemeral: false,
     modelProvider: "openai", createdAt: 1, updatedAt: 1, path: null, cwd: process.env.TEMP!, cliVersion: "0.160.0",
     status: { type: !t.loaded ? "notLoaded" : t.pendingInit ? "active" : t.turns.some(x => x.status === "inProgress") ? "active" : "idle", activeFlags: [] },
     source: t.parentThreadId ? { subAgent: { thread_spawn: { parent_thread_id: t.parentThreadId,
-      depth: ancestors(t).length, agent_path: t.version === "v2" ? `/root/${t.id}` : null,
+      depth: ancestors(t).length, agent_path: t.version === "v2" ? agentPath(t) : null,
       agent_nickname: "测试代理", agent_role: t.version === "v1" ? "default" : null } } } : "vscode",
     ...(t.canAcceptDirectInput === undefined ? {} : { canAcceptDirectInput: t.canAcceptDirectInput }),
     agentNickname: null, agentRole: null, gitInfo: null, name: null, turns: includeTurns ? clone(t.turns) : [],
@@ -145,7 +148,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
       const parent = thread(t.parentThreadId);
       const parentTurn = parent.turns.at(-1);
       if (parentTurn) {
-        const activity = { type: "subAgentActivity", id: `done-${turn.id}`, kind: "completed", agentThreadId: t.id, agentPath: `/root/${t.id}` };
+        const activity = { type: "subAgentActivity", id: `done-${turn.id}`, kind: "completed", agentThreadId: t.id, agentPath: agentPath(t) };
         item(parent, parentTurn, activity, false);
         // 活动事实与尽力投递的结果消息是两种独立信息。
         notify("item/started", { threadId: parent.id, turnId: parentTurn.id, item: activity });
@@ -200,7 +203,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
         const id = p.itemId ?? `spawn-${++serial}`;
         const value = child.version === "v1"
           ? { type: "collabAgentToolCall", id, tool: "spawnAgent", status: "inProgress", senderThreadId: parent.id, receiverThreadIds: [], prompt: null, model: null, reasoningEffort: null, agentsStates: {} }
-          : { type: "subAgentActivity", id, kind: "started", agentThreadId: child.id, agentPath: `/root/${child.id}` };
+          : { type: "subAgentActivity", id, kind: "started", agentThreadId: child.id, agentPath: agentPath(child) };
         if (child.version === "v1") notify("item/started", { threadId: parent.id, turnId: pt.id, item: value });
         if (child.pendingInit) { item(parent, pt, value, false); reply(msg.id, { childThreadId: child.id, turnId: null }); break; }
         if (p.announce !== false) notify("thread/started", { thread: meta(child) });
@@ -224,19 +227,23 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
         }
         const value = child.version === "v1"
           ? { type: "collabAgentToolCall", id: `reuse-${++serial}`, tool: "sendInput", status: "completed", senderThreadId: parent.id, receiverThreadIds: [child.id], agentsStates: {} }
-          : { type: "subAgentActivity", id: `reuse-${++serial}`, kind: "interacted", agentThreadId: child.id, agentPath: `/root/${child.id}` };
+          : { type: "subAgentActivity", id: `reuse-${++serial}`, kind: "interacted", agentThreadId: child.id, agentPath: agentPath(child) };
         const message = p.message ?? `跟进:${value.id}`;
-        const path = (t: MockThread): string => t.parentThreadId === null ? "/root" : `/root/${t.id}`;
+        // 与真实探针一致：工具参数和接收方输入里的正文是同一段密文；send_message 只入队，不开新轮。
+        const queueOnly = p.tool === "send_message";
+        const cipher = `gAAAAA${Buffer.from(message).toString("base64")}`;
         if (child.version === "v2") notify("rawResponseItem/completed", { threadId: parent.id, turnId: pt.id,
-          item: { type: "function_call", call_id: value.id, name: "followup_task", arguments: JSON.stringify({ target: child.id, message }) } });
+          item: { type: "function_call", call_id: value.id, name: queueOnly ? "send_message" : "followup_task", namespace: "collaboration",
+            arguments: JSON.stringify({ target: agentName(child), message: cipher }) } });
         // 上游先提交消息后通知 interacted；也支持 sendInput 并入既有轮、不再开轮。
-        let turn = p.open === false ? child.turns.at(-1) : p.order === "turnFirst" ? start(child) : undefined;
+        let turn = p.open === false || queueOnly ? child.turns.at(-1) : p.order === "turnFirst" ? start(child) : undefined;
         notify("item/started", { threadId: parent.id, turnId: pt.id, item: value }); item(parent, pt, value);
-        if (p.open !== false && !turn) turn = start(child);
+        if (!queueOnly && p.open !== false && !turn) turn = start(child);
         if (child.version === "v2") {
-          const input = { type: "agent_message", id: `delivery-${value.id}`, author: path(parent), recipient: path(child),
-            content: [{ type: "input_text", text: `Message Type: NEW_TASK\nTask name: ${path(child)}\nSender: ${path(parent)}\nPayload:\n${message}` }] };
-          if (p.consumeOnNextTurn) queuedRawInputs.set(child.id, [...queuedRawInputs.get(child.id) ?? [], input]);
+          const input = { type: "agent_message", id: `delivery-${value.id}`, author: agentPath(parent), recipient: agentPath(child),
+            content: [{ type: "input_text", text: `Message Type: ${queueOnly ? "MESSAGE" : "NEW_TASK"}\nTask name: ${agentPath(child)}\nSender: ${agentPath(parent)}\nPayload:\n` },
+              { type: "encrypted_content", encrypted_content: cipher }] };
+          if (p.consumeOnNextTurn || (queueOnly && turn?.status !== "inProgress")) queuedRawInputs.set(child.id, [...queuedRawInputs.get(child.id) ?? [], input]);
           else if (turn) notify("rawResponseItem/completed", { threadId: child.id, turnId: turn.id, item: input });
         }
         reply(msg.id, { turnId: turn?.id }); break;

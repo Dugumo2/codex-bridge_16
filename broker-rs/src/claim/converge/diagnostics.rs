@@ -231,6 +231,10 @@ impl Machine {
         let pending_keys: Vec<_> = ledger.pending.union(&context.in_flight_spawns).collect();
         let pending: Vec<_> = pending_keys.iter().take(MAX_ITEMS).map(|key| {
             let op = self.relations.operations.get(*key);
+            // 等待配对的操作没有期限；模式只供排查，不参与门禁、覆盖问题或告警。
+            let deadline = op.filter(|o| !self.v2_awaits_pairing(o));
+            let pairing_mode = op.filter(|o| o.kind == EvidenceKind::V2Interacted)
+                .map(|o| if o.v2_strict { "strict" } else { "fallback" });
             let receiver_ids: Vec<_> = if let Some(op) = op { op.receivers.iter().collect() } else {
                 ledger.placeholder_operations.iter().filter(|(_, reasons)| reasons.contains(*key)).map(|(thread, _)| thread).collect()
             };
@@ -244,10 +248,11 @@ impl Machine {
             json!({"kind":op.map(|o| evidence_kind_label(o.kind)).unwrap_or("unknown"),
                 "outcome":op.map(|o| evidence_outcome_label(o.outcome)).unwrap_or("unknown"),
                 "receivers":receivers,"provenTurns":proven,
-                "expiresAt":op.map(|o| if o.expires_at_ms >= self.clock.mono_ms {
+                "pairingMode":pairing_mode,
+                "expiresAt":deadline.map(|o| if o.expires_at_ms >= self.clock.mono_ms {
                     self.clock.now_ms.saturating_add(o.expires_at_ms - self.clock.mono_ms)
                 } else { self.clock.now_ms.saturating_sub(self.clock.mono_ms - o.expires_at_ms) }),
-                "expired":op.is_some_and(|o| self.clock.mono_ms >= o.expires_at_ms),
+                "expired":deadline.is_some_and(|o| self.clock.mono_ms >= o.expires_at_ms),
                 "missing":op.is_none(),"omittedReceivers":receiver_ids.len().saturating_sub(MAX_NESTED),
                 "omittedProvenTurns":op.map_or(0, |o| o.proven_turns.len().saturating_sub(MAX_NESTED))})
         }).collect();
@@ -385,6 +390,7 @@ mod tests {
                 receivers,
                 baseline_turns: BTreeMap::new(),
                 v2_strict: false,
+                v2_queue_only: false,
                 first_seen_ms: 0,
                 expires_at_ms: 1,
                 parent_ended: true,

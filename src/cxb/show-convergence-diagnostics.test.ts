@@ -20,7 +20,7 @@ const diagnostic: ConvergenceDiagnostic = {
   gate: "pendingOperations", gates: ["pendingOperations", "activityUnverified"],
   counts: { pendingOperations: 1, pendingRequests: 0, unresolvedLookups: 0, unresolvedCandidates: 0, conflicts: 0,
     activities: 1, unverifiedActivities: 1, unsettledActivities: 1, missingResults: 1, activeGoals: 0, unknownGoals: 1 },
-  pendingOperations: [{ kind: "v2Interacted", outcome: "unproven", receivers: ["child"], provenTurns: [],
+  pendingOperations: [{ kind: "v2Interacted", outcome: "unproven", receivers: ["child"], pairingMode: "strict", provenTurns: [],
     expiresAt: 2000, expired: true, missing: false, omittedReceivers: 0, omittedProvenTurns: 0 }],
   activities: [{ threadId: "child", turnId: null, activitySeq: 2, verified: false, activity: "unknown",
     resultStatus: null, goal: "unknown", pendingRequests: 0 }],

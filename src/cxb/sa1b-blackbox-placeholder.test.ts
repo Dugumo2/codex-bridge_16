@@ -235,7 +235,9 @@ for (const sameTurn of [false, true]) test(`v2 跟进忙碌子代理：${sameTur
     const previous = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
     await h.control("fence", { name: "consume", method: "rawResponseItem/completed", threadId: CHILD });
     await followup(h, CHILD, { open: false, consumeOnNextTurn: !sameTurn, message: "额外的跟进工作" });
-    expect((await diagnostic(h)).pendingOperations.filter((op: any) => op.kind === "v2Interacted")).toHaveLength(1);
+    const followups = (await diagnostic(h)).pendingOperations.filter((op: any) => op.kind === "v2Interacted");
+    expect(followups).toHaveLength(1);
+    expect(followups[0].pairingMode, "broker 新开的线程必须走严格配对").toBe("strict");
     await h.finish(ROOT, "父轮先结束");
     let carryingTurn = previous;
     if (sameTurn) {
@@ -253,6 +255,20 @@ for (const sameTurn of [false, true]) test(`v2 跟进忙碌子代理：${sameTur
     const { run } = await finishReconciliation(h, CURRENT_OUTPUT);
     expect(run.subagentJoin.resultCoverage.total).toBe(sameTurn ? 1 : 2);
     await assertCleanFinalViews(h, carryingTurn);
+  } finally { await bounded(h.close(), 12_000); }
+}, 90_000);
+
+test("v2 只入队消息给空闲子代理：不占待定操作、不开新轮也能收敛", async () => {
+  const h = new Sa1bHarness();
+  try {
+    await openAndStart(h);
+    const turn = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+    await h.finish(CHILD, CURRENT_OUTPUT, "completed", turn);
+    await followup(h, CHILD, { tool: "send_message", message: "顺带告知，不需要处理" });
+    expect((await diagnostic(h)).pendingOperations).toHaveLength(0);
+    await h.finish(ROOT, "父完成");
+    await finishReconciliation(h, CURRENT_OUTPUT);
+    await assertCleanFinalViews(h, turn);
   } finally { await bounded(h.close(), 12_000); }
 }, 90_000);
 

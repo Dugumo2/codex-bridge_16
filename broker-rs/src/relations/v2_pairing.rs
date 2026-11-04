@@ -71,10 +71,7 @@ impl Machine {
                 }
                 let generation = context.gen;
                 let now = self.clock.mono_ms;
-                self.relations.aux.followup_starts.retain(|_, start| {
-                    start.epoch == self.relations.conn_epoch
-                        && now < start.at.saturating_add(EVIDENCE_TTL_MS)
-                });
+                self.prune_followup_starts();
                 if self.relations.aux.followup_starts.len() >= MAX_OPERATIONS {
                     return false;
                 }
@@ -334,7 +331,12 @@ impl Machine {
                     .followup_starts
                     .iter()
                     .any(|(key, other)| {
-                        if key == &op.key || other.epoch != start.epoch || other.seq >= seq {
+                        // 只入队的消息不会开新轮，不是这一轮的候选原因。
+                        if key == &op.key
+                            || !other.trigger
+                            || other.epoch != start.epoch
+                            || other.seq >= seq
+                        {
                             return false;
                         }
                         if let Some(competing) = self.relations.operations.get(key) {
@@ -388,6 +390,36 @@ impl Machine {
                 self.materialize(&key, actions);
             }
         }
+    }
+
+    /// 跟进已进入子代理队列，何时读到取决于它手头的工作，不能按证据期限判失败；
+    /// 一直读不到时由收敛期限兜底。配对或拒绝后 outcome 不再是 Pending，连接或授权换代后也不再成立。
+    pub(crate) fn v2_awaits_pairing(&self, op: &EvidenceOperation) -> bool {
+        op.kind == EvidenceKind::V2Interacted
+            && !op.v2_queue_only
+            && op.outcome == EvidenceOutcome::Pending
+            && !op.receivers.is_empty()
+            && self.op_confirmed(&op.key)
+            && self.operation_generation_current(op)
+    }
+
+    /// 开始记录默认只留证据期限；操作还在等配对或归属未定案时留到有结果，否则配对依据就丢了。
+    pub(super) fn prune_followup_starts(&mut self) {
+        let now = self.clock.mono_ms;
+        let epoch = self.relations.conn_epoch;
+        let keep: BTreeSet<EvidenceKey> = self
+            .relations
+            .operations
+            .values()
+            .filter(|op| {
+                self.v2_awaits_pairing(op) || self.relations.aux.parent_waits.contains_key(&op.key)
+            })
+            .map(|op| op.key.clone())
+            .collect();
+        self.relations.aux.followup_starts.retain(|key, start| {
+            start.epoch == epoch
+                && (now < start.at.saturating_add(EVIDENCE_TTL_MS) || keep.contains(key))
+        });
     }
 
     pub(super) fn prune_v2_deliveries(&mut self) {
