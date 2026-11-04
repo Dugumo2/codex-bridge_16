@@ -178,6 +178,36 @@ fn 无raw_跟进被忙碌轮吸收时配到当前轮() {
     assert_no_alarm(&all);
 }
 
+/// 文件证据只认消费记录，不走「开始于跟进之后的新轮」这条顺序证据：
+/// 吸收记录读到之前旧轮结束、又开了一个与本次跟进无关的新轮，也不能把它认成承载轮。
+#[test]
+fn 无raw_吸收记录读到之前开了无关新轮也不认它() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    call_line(&m, "跟进", "followup_task", C, "补充要求");
+    let mut all = interacted_to(&mut m, "跟进", C);
+    assert!(op(&m, "跟进").v2_strict);
+    // 旧轮吸收了跟进（记录已写，尚未读到），随后结束；又因别的原因开了新轮。
+    m.clock.now_ms += 10;
+    message_line(&m, C, "入站", "NEW_TASK", "补充要求");
+    fx::with(|f| f.hold = true);
+    let actions = complete(&mut m, &mut mock, C, "旧轮", "completed");
+    all.extend(replies(&mut m, &mock, actions));
+    let actions = apply(&mut m, mock.turn_started(C, "无关新轮"));
+    all.extend(replies(&mut m, &mock, actions));
+    all.extend(fx::poll(&mut m));
+    assert!(
+        op(&m, "跟进").proven_turns.is_empty(),
+        "没有消费记录时不按开始顺序认新轮"
+    );
+    all.extend(fx::release_held(&mut m));
+    all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
+    pending(&m, 0);
+    assert_eq!(op(&m, "跟进").proven_turns[C], ["旧轮".to_owned()].into());
+    // 无关新轮没有任何归属证据，按既有规则作为未核实活动阻塞收尾（raw 下相同），这里不再走收尾。
+    drop(all);
+}
+
 // ─── 4. 答完后跟进、顺延到下一轮 ───────────────────────────────────
 
 #[test]
