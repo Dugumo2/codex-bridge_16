@@ -17,10 +17,12 @@ mod notify;
 mod release;
 pub(crate) use release::{ChildBarrier, ChildWaiter, Released};
 pub mod results;
+pub mod rollout_pairing;
 mod routing;
 #[cfg(test)]
 mod tests;
 mod v2_pairing;
+pub use v2_pairing::EvidenceSource;
 
 use crate::claim::{Action, ClaimToken, HeldNotification, HeldRequest, Machine, RequestContext};
 use crate::claim::{Operation, TimerKind};
@@ -151,8 +153,10 @@ pub struct RelationsAux {
     pub v2_deliveries: VecDeque<v2_pairing::DeliveryFact>,
     /// 与开始记录、消费记录同步增删的索引，配对时不必全表扫描。
     pub v2_index: v2_pairing::V2Index,
-    /// 送来过 raw 事件的线程及其连接代际；只用于诊断宽松配对的原因。
+    /// 送来过 raw 事件的线程及其连接代际；用于诊断宽松配对的原因，也决定是否改用会话文件。
     pub v2_raw_threads: BTreeMap<String, u64>,
+    /// 没有 raw 时从会话文件补证据：等文件的操作、跟随中的文件、读到的调用。
+    pub rollout: rollout_pairing::RolloutState,
     /// 子线程 → 等它首轮的派生操作。
     pub spawn_waits: BTreeMap<String, EvidenceKey>,
     pub parent_waits: BTreeMap<EvidenceKey, ParentWait>,
@@ -309,7 +313,7 @@ impl Machine {
         };
         let now = self.clock.mono_ms;
         let mut unknown = self.run_has_candidates(run_id);
-        if !context.in_flight_spawns.is_empty() {
+        if !context.in_flight_spawns.is_empty() || self.rollout_awaiting_for_run(run_id) > 0 {
             return Activity::Some;
         }
         for (thread, member) in &context.members {

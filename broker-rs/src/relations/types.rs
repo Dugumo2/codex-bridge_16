@@ -103,6 +103,27 @@ pub enum V2FallbackReason {
     StartMissing,
     /// 有开始记录，但连接、运行或授权代际已不符，不能沿用。
     StartStale,
+    /// 没有 raw，会话文件的路径拿不到或不合规（thread/read 失败、没有 path、不是本线程的 .jsonl 绝对路径）。
+    RolloutPathUnavailable,
+    /// 没有 raw，会话文件不存在或读不了（含 app-server 在别的机器上）。
+    RolloutUnreadable,
+    /// 没有 raw，等文件的窗口内没在父线程文件里找到这次调用（例如嵌套调用不落 function_call）。
+    RolloutCallMissing,
+    /// 曾按会话文件严格配对，之后文件被截断或读不了，降为宽松。
+    RolloutLost,
+    /// 等文件期间操作已失效（运行结束、停止、连接或授权换代），不再等。
+    RolloutCancelled,
+}
+
+/// 跟进配对证据的来源，只供诊断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2EvidenceSource {
+    /// 本连接的 raw 事件。
+    Raw,
+    /// 会话文件（没有 raw 时）。
+    RolloutFile,
+    /// 没有证据，宽松配对。
+    None,
 }
 
 /// 跟进接收方不纳管的理由。向上与平级是子代理之间的正常协作，不是跟进，不能当「跟进被拒」统计。
@@ -156,10 +177,13 @@ pub struct EvidenceOperation {
     pub proven_turns: BTreeMap<String, BTreeSet<String>>,
     /// 操作登记瞬间每个接收方已完成轮次的基线；配对只排除这些轮次。
     pub baseline_turns: BTreeMap<String, BTreeSet<String>>,
-    /// 在 Interacted 首次到达时固定；缺 raw 的旧线程回退，不因迟到 raw 改写模式。
+    /// 在 Interacted 首次到达时固定；缺 raw 的旧线程可等会话文件定案（见 `rollout_pairing`），
+    /// 定案后不因迟到的 raw 或文件行改写模式。
     pub v2_strict: bool,
     /// 由 raw 认出是 `send_message`：上游只入队不开新轮，可能永远等不到承载轮，不授予管理权也不进待定账本。
     pub v2_queue_only: bool,
+    /// 严格配对的证据来源；与 `v2_strict` 同时固定，只供诊断。
+    pub v2_source: V2EvidenceSource,
     /// 宽松配对的原因，与 `v2_strict` 同时固定；只供诊断，不参与配对、门禁或告警。
     pub v2_fallback: Option<V2FallbackReason>,
     pub first_seen_ms: u64,

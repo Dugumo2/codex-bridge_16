@@ -297,6 +297,11 @@ pub enum Operation {
         generation: u64,
         thread: String,
     },
+    /// 取会话文件路径的 thread/read（没有 raw 的跟进配对用，`relations::rollout_pairing`）。
+    RolloutPath {
+        thread: String,
+        generation: u64,
+    },
     Discovery {
         op_id: u64,
         generation: u64,
@@ -448,6 +453,10 @@ pub enum TimerKind {
         conn_epoch: u64,
         generation: u64,
     },
+    /// 会话文件轮询（只在有操作等文件时排）。
+    RolloutPoll {
+        generation: u64,
+    },
 
     Lifecycle,
     Unsubscribe,
@@ -506,6 +515,7 @@ pub enum TimerKey {
     },
     TreeStopVerify(u64),
     TombstoneExpire(u64),
+    RolloutPoll,
     /// inbox 事项的过期与已关闭项的清理共用一个键（甲路）。
     InboxItem(String),
     /// `broker/inbox/wait` 等待者的超时（甲路）。
@@ -563,6 +573,7 @@ impl TimerKind {
             TimerKind::TombstoneExpire { conn_epoch, .. } => {
                 Some(TimerKey::TombstoneExpire(*conn_epoch))
             }
+            TimerKind::RolloutPoll { .. } => Some(TimerKey::RolloutPoll),
             TimerKind::Inbox(crate::inbox::InboxTimer::Expiry { id, .. }) => {
                 Some(TimerKey::InboxItem(id.clone()))
             }
@@ -663,6 +674,8 @@ pub enum Action {
     Unschedule {
         key: TimerKey,
     },
+    /// 读一次会话文件（只读、有界），结果以 [`Event::RolloutRead`] 回来。
+    ReadRollout(crate::rollout::RolloutReadRequest),
     Warn(String),
     Debug(String),
 }
@@ -761,6 +774,12 @@ pub enum Event {
     },
     /// 关闭第 5 步：等补读的期限已到。
     RunsFinalize,
+    /// [`Action::ReadRollout`] 的结果。
+    RolloutRead {
+        id: u64,
+        thread: String,
+        result: Result<crate::rollout::RolloutChunk, crate::rollout::RolloutError>,
+    },
 }
 
 /// core 在每次 step 前填写的墙钟毫秒与随机数；纯逻辑模块不自行读取时钟或随机源。
@@ -1020,10 +1039,15 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
                 state.runs_finalized = true;
             }
         }
+        Event::RolloutRead { id, thread, result } => {
+            state.rollout_read_done(id, &thread, result, &mut actions)
+        }
     }
     if let Some(thread) = settled_goal {
         state.abandoned_root_goal_settled(&thread, &mut actions);
     }
+    // 会话文件证据先定案，后面的收敛驱动看到的是定案后的操作。
+    state.drive_rollout(&mut actions);
     // 空转刹车在停止驱动之前结算，触发的停止当场发出请求。
     state.drive_convergence_safeguards(&mut actions);
     state.drive_loop_guards(&mut actions);
@@ -1056,6 +1080,8 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     state.prune_goal_versions();
     state.prune_contexts();
     state.convergence_prune();
+    // 本步里运行结束、停止或换代后，不再需要的文件立即停止跟随与轮询。
+    state.drive_rollout(&mut actions);
     if let Some((run, timeout_tag)) = finished_start {
         if timeout_tag.is_none_or(|tag| actions.iter().any(|action| matches!(action, Action::ForgetLate { tag: forgotten } if *forgotten == tag))) {
             state.runs.inflight_starts.remove(&run);
@@ -1809,7 +1835,10 @@ impl Machine {
         // 空转刹车的暂停回包先核对版本，由处理函数自己决定是否学习（旧回包不得覆盖新事实）。
         if !matches!(
             context.operation,
-            Operation::Stop(..) | Operation::LateGoal { .. } | Operation::LoopGuardPause(_)
+            Operation::Stop(..)
+                | Operation::LateGoal { .. }
+                | Operation::LoopGuardPause(_)
+                | Operation::RolloutPath { .. }
         ) && !matches!(&context.operation, Operation::Inbox(rpc) if !self.guardian_resume_can_learn(rpc))
         {
             self.learn_traffic(&context, &result, actions);
@@ -1823,6 +1852,9 @@ impl Machine {
             | Operation::Discovery { .. }
             | Operation::AttachThread { .. }
             | Operation::ChildSubscription { .. } => self.relation_reply(&context, result, actions),
+            Operation::RolloutPath { thread, generation } => {
+                self.rollout_path_reply(thread, *generation, &result)
+            }
             Operation::DerivedStop { .. } => self.tree_reply(&context, result, actions),
             Operation::BudgetVerify { .. }
             | Operation::StartReconciliation { .. }
@@ -3493,6 +3525,7 @@ impl Machine {
             TimerKind::LookupDeadline { .. }
             | TimerKind::DiscoveryDeadline { .. }
             | TimerKind::TombstoneExpire { .. } => self.relation_timer(kind, actions),
+            TimerKind::RolloutPoll { generation } => self.rollout_timer(generation),
             TimerKind::TreeStopWait { .. } | TimerKind::TreeStopVerify { .. } => {
                 self.tree_timer(kind, actions)
             }

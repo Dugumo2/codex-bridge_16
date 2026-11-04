@@ -1,6 +1,8 @@
 //! 在线诊断只读取事实；绝不重新发现、同步账本、绑定活动或推进 epoch。
 use super::*;
-use crate::relations::{EvidenceKind, EvidenceOutcome, MemberActivity, V2FallbackReason};
+use crate::relations::{
+    EvidenceKind, EvidenceOutcome, MemberActivity, V2EvidenceSource, V2FallbackReason,
+};
 use serde_json::{json, Value};
 
 const MAX_ITEMS: usize = 32;
@@ -228,18 +230,50 @@ impl Machine {
         let omitted_gates = gates.len().saturating_sub(MAX_NESTED);
         gates.truncate(MAX_NESTED);
         let mut omitted_bytes = 0;
-        let pending_keys: Vec<_> = ledger.pending.union(&context.in_flight_spawns).collect();
+        // 等会话文件定模式的操作不在账本里，但同样阻止收敛，一并列出。
+        let awaiting_rollout: std::collections::BTreeSet<_> = self
+            .relations
+            .aux
+            .rollout
+            .waits
+            .keys()
+            .filter(|key| {
+                self.relations
+                    .operations
+                    .get(*key)
+                    .is_some_and(|op| op.run_id == run)
+            })
+            .cloned()
+            .collect();
+        let pending_keys: Vec<_> = ledger
+            .pending
+            .union(&context.in_flight_spawns)
+            .chain(awaiting_rollout.iter())
+            .collect();
         let pending: Vec<_> = pending_keys.iter().take(MAX_ITEMS).map(|key| {
             let op = self.relations.operations.get(*key);
             // 等待配对的操作没有期限；模式只供排查，不参与门禁、覆盖问题或告警。
             let deadline = op.filter(|o| !self.v2_awaits_pairing(o));
+            // 等会话文件是中间状态：不算宽松、不给回退原因，也不按终态报警。
+            let awaiting_file = op.is_some_and(|o| self.rollout_awaiting(&o.key));
             let pairing_mode = op.filter(|o| o.kind == EvidenceKind::V2Interacted)
-                .map(|o| if o.v2_strict { "strict" } else { "fallback" });
-            let fallback_reason = op.filter(|o| o.kind == EvidenceKind::V2Interacted)
+                .map(|o| if awaiting_file { "awaitingRollout" } else if o.v2_strict { "strict" } else { "fallback" });
+            let pairing_source = op.filter(|o| o.kind == EvidenceKind::V2Interacted && !awaiting_file)
+                .map(|o| match o.v2_source {
+                    V2EvidenceSource::Raw => "raw",
+                    V2EvidenceSource::RolloutFile => "rolloutFile",
+                    V2EvidenceSource::None => "none",
+                });
+            let fallback_reason = op.filter(|o| o.kind == EvidenceKind::V2Interacted && !awaiting_file)
                 .and_then(|o| o.v2_fallback).map(|reason| match reason {
                     V2FallbackReason::ParentWithoutRaw => "parentWithoutRaw",
                     V2FallbackReason::StartMissing => "startMissing",
                     V2FallbackReason::StartStale => "startStale",
+                    V2FallbackReason::RolloutPathUnavailable => "rolloutPathUnavailable",
+                    V2FallbackReason::RolloutUnreadable => "rolloutUnreadable",
+                    V2FallbackReason::RolloutCallMissing => "rolloutCallMissing",
+                    V2FallbackReason::RolloutLost => "rolloutLost",
+                    V2FallbackReason::RolloutCancelled => "rolloutCancelled",
                 });
             let receiver_ids: Vec<_> = if let Some(op) = op { op.receivers.iter().collect() } else {
                 ledger.placeholder_operations.iter().filter(|(_, reasons)| reasons.contains(*key)).map(|(thread, _)| thread).collect()
@@ -262,7 +296,7 @@ impl Machine {
             json!({"kind":op.map(|o| evidence_kind_label(o.kind)).unwrap_or("unknown"),
                 "outcome":op.map(|o| evidence_outcome_label(o.outcome)).unwrap_or("unknown"),
                 "receivers":receivers,"provenTurns":proven,
-                "pairingMode":pairing_mode,"fallbackReason":fallback_reason,
+                "pairingMode":pairing_mode,"pairingSource":pairing_source,"fallbackReason":fallback_reason,
                 "awaitingPairingSince":awaiting_since,"receiverStates":receiver_states,
                 "expiresAt":deadline.map(|o| if o.expires_at_ms >= self.clock.mono_ms {
                     self.clock.now_ms.saturating_add(o.expires_at_ms - self.clock.mono_ms)
@@ -441,6 +475,7 @@ mod tests {
                 baseline_turns: BTreeMap::new(),
                 v2_strict: false,
                 v2_queue_only: false,
+                v2_source: crate::relations::V2EvidenceSource::None,
                 v2_fallback: Some(V2FallbackReason::ParentWithoutRaw),
                 first_seen_ms: 0,
                 expires_at_ms: 1,

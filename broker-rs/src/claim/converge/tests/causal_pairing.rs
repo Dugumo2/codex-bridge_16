@@ -406,13 +406,18 @@ fn pairing_rows(m: &Machine) -> std::collections::BTreeSet<(String, String)> {
 fn 宽松配对诊断标明回退原因且严格操作不带原因() {
     // 父线程从没送来 raw：典型是跨重启 --resume 恢复的线程。
     // 子代理先空闲：宽松模式才会真正等新轮，而不是吸收旧活动轮。
+    // 本夹具的 app-server 不给会话文件路径：原因写明文件不可用，来源为无。
     let (mut m, mut mock) = base();
     complete(&mut m, &mut mock, C, "旧轮", "completed");
     interacted(&mut m, "无raw父线程");
     pending(&m, 1);
     assert_eq!(
         pairing_rows(&m),
-        [("\"fallback\"".into(), "\"parentWithoutRaw\"".into())].into()
+        [("\"fallback\"".into(), "\"rolloutPathUnavailable\"".into())].into()
+    );
+    assert_eq!(
+        m.convergence_diagnostics(R).unwrap()["pendingOperations"][0]["pairingSource"],
+        "none"
     );
 
     // 父线程送过 raw，只是这次调用缺开始记录；同一账本里的严格操作不带原因。
@@ -423,6 +428,7 @@ fn 宽松配对诊断标明回退原因且严格操作不带原因() {
     interacted(&mut m, "缺开始");
     pending(&m, 2);
     assert_eq!(op(&m, "A").v2_fallback, None);
+    assert_eq!(op(&m, "A").v2_source, V2EvidenceSource::Raw);
     assert_eq!(
         pairing_rows(&m),
         [

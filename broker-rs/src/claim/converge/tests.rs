@@ -24,8 +24,10 @@ fn ready() -> ConvergenceReadiness {
     }
 }
 fn apply(m: &mut Machine, event: Event) -> Vec<Action> {
-    let (next, out) = step(std::mem::take(m), event);
+    let (next, mut out) = step(std::mem::take(m), event);
     *m = next;
+    // 会话文件的路径请求与读取由夹具当场执行（未安装夹具时按 app-server 不给 path 回答）。
+    crate::test_support::rollout::service(m, &mut out);
     out
 }
 fn notify(m: &mut Machine, method: &str, params: serde_json::Value) -> Vec<Action> {

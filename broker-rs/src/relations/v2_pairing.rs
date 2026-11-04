@@ -2,11 +2,22 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+/// 开始记录与消费记录的来源。raw 来自本连接的实时事件，观察序号即因果先后；
+/// 会话文件的观察序号只反映读取时刻，跨文件不可比，先后改看行时间戳（`wall_ms`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceSource {
+    Raw,
+    RolloutFile,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FollowupStart {
     pub epoch: u64,
     pub seq: u64,
     pub at: u64,
+    pub source: EvidenceSource,
+    /// raw：broker 收到时的墙钟毫秒；会话文件：该行的写入时间（同一台机器上的 Codex 时钟）。
+    pub wall_ms: u64,
     pub run: String,
     pub generation: u64,
     pub target: Option<String>,
@@ -19,6 +30,8 @@ pub struct DeliveryFact {
     pub epoch: u64,
     pub seq: u64,
     pub at: u64,
+    pub source: EvidenceSource,
+    pub wall_ms: u64,
     pub thread: String,
     pub turn: String,
     pub id: String,
@@ -79,6 +92,98 @@ fn digest(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
 }
 
+/// 协作工具调用里与配对有关的字段；raw 与会话文件共用同一套解析。
+pub(super) struct ParsedCall {
+    pub call_id: String,
+    pub trigger: bool,
+    pub target: Option<String>,
+    pub message: Option<[u8; 32]>,
+}
+
+pub(super) fn parse_call(item: &Value) -> Option<ParsedCall> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+    let name = name.rsplit('.').next().unwrap_or("");
+    if !matches!(name, "followup_task" | "send_message") {
+        return None;
+    }
+    let call_id = item.get("call_id").and_then(Value::as_str)?;
+    let args = item
+        .get("arguments")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    let target = args
+        .as_ref()
+        .and_then(|a| a.get("target"))
+        .and_then(Value::as_str)
+        .filter(|s| s.len() <= 256)
+        .map(str::to_owned);
+    let message = args
+        .as_ref()
+        .and_then(|a| a.get("message"))
+        .and_then(Value::as_str)
+        .map(digest);
+    Some(ParsedCall {
+        call_id: call_id.into(),
+        trigger: name == "followup_task",
+        target,
+        message,
+    })
+}
+
+/// 子代理收到的一条消息：只留身份、类型与内容摘要。
+pub(super) struct ParsedDelivery {
+    pub id: String,
+    pub author: String,
+    pub recipient: String,
+    pub trigger: bool,
+    pub message: [u8; 32],
+}
+
+pub(super) fn parse_delivery(item: &Value) -> Option<ParsedDelivery> {
+    if item.get("type").and_then(Value::as_str) != Some("agent_message") {
+        return None;
+    }
+    let (Some(id), Some(author), Some(recipient), Some(content)) = (
+        item.get("id").and_then(Value::as_str),
+        item.get("author").and_then(Value::as_str),
+        item.get("recipient").and_then(Value::as_str),
+        item.get("content").and_then(Value::as_array),
+    ) else {
+        return None;
+    };
+    let text = content
+        .first()
+        .filter(|c| c["type"] == "input_text")
+        .and_then(|c| c["text"].as_str())?;
+    let (trigger, body) = match text.strip_prefix("Message Type: NEW_TASK\n") {
+        Some(body) => (true, body),
+        None => (false, text.strip_prefix("Message Type: MESSAGE\n")?),
+    };
+    let prefix = format!("Task name: {recipient}\nSender: {author}\nPayload:\n");
+    let payload = body.strip_prefix(&prefix)?;
+    let message = if content.len() == 1 {
+        digest(payload)
+    } else if content.len() == 2 && payload.is_empty() && content[1]["type"] == "encrypted_content"
+    {
+        digest(content[1]["encrypted_content"].as_str()?)
+    } else {
+        return None;
+    };
+    if author.len() > 256 || recipient.len() > 256 || id.len() > 256 {
+        return None;
+    }
+    Some(ParsedDelivery {
+        id: id.into(),
+        author: author.into(),
+        recipient: recipient.into(),
+        trigger,
+        message,
+    })
+}
+
 impl Machine {
     pub(super) fn v2_observe_raw(
         &mut self,
@@ -91,12 +196,7 @@ impl Machine {
         self.note_raw_thread(thread);
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
-                let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                let name = name.rsplit('.').next().unwrap_or("");
-                if !matches!(name, "followup_task" | "send_message") {
-                    return false;
-                }
-                let Some(id) = item.get("call_id").and_then(Value::as_str) else {
+                let Some(call) = parse_call(item) else {
                     return false;
                 };
                 let facts::ParentRun::Own { run, .. } = self.parent_run(thread, turn) else {
@@ -111,128 +211,113 @@ impl Machine {
                 let key = EvidenceKey {
                     parent_thread_id: thread.into(),
                     parent_turn_id: turn.into(),
-                    item_id: id.into(),
+                    item_id: call.call_id.clone(),
                 };
                 // 开始记录晚于 Interacted 时不补造基线；已知操作的身份不可回写。
                 if self.relations.operations.contains_key(&key) {
                     return false;
                 }
                 let generation = context.gen;
-                let now = self.clock.mono_ms;
-                self.prune_followup_starts();
-                if self.relations.aux.followup_starts.len() >= MAX_OPERATIONS {
-                    return false;
-                }
-                let args = item
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .and_then(|s| serde_json::from_str::<Value>(s).ok());
-                let target = args
-                    .as_ref()
-                    .and_then(|a| a.get("target"))
-                    .and_then(Value::as_str)
-                    .filter(|s| s.len() <= 256)
-                    .map(str::to_owned);
-                let message = args
-                    .as_ref()
-                    .and_then(|a| a.get("message"))
-                    .and_then(Value::as_str)
-                    .map(digest);
-                if !self.relations.aux.followup_starts.contains_key(&key) {
-                    let start = FollowupStart {
-                        epoch: self.relations.conn_epoch,
-                        seq: self.relations.aux.observation_seq,
-                        at: now,
-                        run,
-                        generation,
-                        target,
-                        message,
-                        trigger: name == "followup_task",
-                    };
-                    self.relations.aux.v2_index.add_start(&key, &start);
-                    self.relations.aux.followup_starts.insert(key, start);
-                }
+                let wall_ms = self.clock.now_ms;
+                self.v2_record_start(key, run, generation, call, EvidenceSource::Raw, wall_ms);
                 false
             }
             Some("agent_message") => {
-                let (Some(id), Some(author), Some(recipient), Some(content)) = (
-                    item.get("id").and_then(Value::as_str),
-                    item.get("author").and_then(Value::as_str),
-                    item.get("recipient").and_then(Value::as_str),
-                    item.get("content").and_then(Value::as_array),
-                ) else {
+                let Some(delivery) = parse_delivery(item) else {
                     return false;
                 };
-                if self
-                    .relations
-                    .aux
-                    .v2_index
-                    .delivery_ids
-                    .contains(&(thread.to_owned(), id.to_owned()))
-                {
-                    return false;
-                }
-                let text = content
-                    .first()
-                    .filter(|c| c["type"] == "input_text")
-                    .and_then(|c| c["text"].as_str());
-                let Some(text) = text else {
-                    return false;
-                };
-                let (trigger, body) =
-                    if let Some(body) = text.strip_prefix("Message Type: NEW_TASK\n") {
-                        (true, body)
-                    } else if let Some(body) = text.strip_prefix("Message Type: MESSAGE\n") {
-                        (false, body)
-                    } else {
-                        return false;
-                    };
-                let prefix = format!("Task name: {recipient}\nSender: {author}\nPayload:\n");
-                let Some(payload) = body.strip_prefix(&prefix) else {
-                    return false;
-                };
-                let message = if content.len() == 1 {
-                    digest(payload)
-                } else if content.len() == 2
-                    && payload.is_empty()
-                    && content[1]["type"] == "encrypted_content"
-                {
-                    let Some(encrypted) = content[1]["encrypted_content"].as_str() else {
-                        return false;
-                    };
-                    digest(encrypted)
-                } else {
-                    return false;
-                };
-                if author.len() > 256 || recipient.len() > 256 || id.len() > 256 {
-                    return false;
-                }
-                self.relations.aux.observation_seq =
-                    self.relations.aux.observation_seq.saturating_add(1);
-                let aux = &mut self.relations.aux;
-                if aux.v2_deliveries.len() >= MAX_OPERATIONS {
-                    aux.v2_deliveries.pop_front();
-                    aux.v2_index.rebuild_deliveries(&aux.v2_deliveries);
-                }
-                let fact = DeliveryFact {
-                    epoch: self.relations.conn_epoch,
-                    seq: aux.observation_seq,
-                    at: self.clock.mono_ms,
-                    thread: thread.into(),
-                    turn: turn.into(),
-                    id: id.into(),
-                    author: author.into(),
-                    recipient: recipient.into(),
-                    message,
-                    trigger,
-                };
-                aux.v2_index.add_delivery(&fact);
-                aux.v2_deliveries.push_back(fact);
-                self.retry_v2_pairing(thread, actions);
-                true
+                let wall_ms = self.clock.now_ms;
+                self.v2_record_delivery(
+                    thread,
+                    turn,
+                    delivery,
+                    EvidenceSource::Raw,
+                    wall_ms,
+                    actions,
+                )
             }
             _ => false,
         }
+    }
+
+    /// 登记开始记录；满额或已有同键记录时不登记。返回是否新登记。
+    pub(super) fn v2_record_start(
+        &mut self,
+        key: EvidenceKey,
+        run: String,
+        generation: u64,
+        call: ParsedCall,
+        source: EvidenceSource,
+        wall_ms: u64,
+    ) -> bool {
+        let now = self.clock.mono_ms;
+        self.prune_followup_starts();
+        if self.relations.aux.followup_starts.len() >= MAX_OPERATIONS {
+            return false;
+        }
+        if self.relations.aux.followup_starts.contains_key(&key) {
+            return false;
+        }
+        let start = FollowupStart {
+            epoch: self.relations.conn_epoch,
+            seq: self.relations.aux.observation_seq,
+            at: now,
+            source,
+            wall_ms,
+            run,
+            generation,
+            target: call.target,
+            message: call.message,
+            trigger: call.trigger,
+        };
+        self.relations.aux.v2_index.add_start(&key, &start);
+        self.relations.aux.followup_starts.insert(key, start);
+        true
+    }
+
+    /// 登记一条消费记录并重试配对；同一线程同一条目只登记一次。
+    pub(super) fn v2_record_delivery(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        delivery: ParsedDelivery,
+        source: EvidenceSource,
+        wall_ms: u64,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        if self
+            .relations
+            .aux
+            .v2_index
+            .delivery_ids
+            .contains(&(thread.to_owned(), delivery.id.clone()))
+        {
+            return false;
+        }
+        self.relations.aux.observation_seq = self.relations.aux.observation_seq.saturating_add(1);
+        let aux = &mut self.relations.aux;
+        if aux.v2_deliveries.len() >= MAX_OPERATIONS {
+            aux.v2_deliveries.pop_front();
+            aux.v2_index.rebuild_deliveries(&aux.v2_deliveries);
+        }
+        let fact = DeliveryFact {
+            epoch: self.relations.conn_epoch,
+            seq: aux.observation_seq,
+            at: self.clock.mono_ms,
+            source,
+            wall_ms,
+            thread: thread.into(),
+            turn: turn.into(),
+            id: delivery.id,
+            author: delivery.author,
+            recipient: delivery.recipient,
+            message: delivery.message,
+            trigger: delivery.trigger,
+        };
+        aux.v2_index.add_delivery(&fact);
+        aux.v2_deliveries.push_back(fact);
+        self.retry_v2_pairing(thread, actions);
+        true
     }
 
     /// 记下线程送来过 raw；满额时先丢旧代际，仍满就不再登记（只影响诊断措辞）。
@@ -351,7 +436,19 @@ impl Machine {
             }
             members.push((key, other));
         }
-        members.sort_by_key(|(_, other)| other.seq);
+        // 会话文件的观察序号只反映读取时刻：有文件来源的成员时，先后与配对都改看行时间戳。
+        let by_file = members
+            .iter()
+            .any(|(_, other)| other.source == EvidenceSource::RolloutFile);
+        if by_file {
+            members.sort_by_key(|(_, other)| (other.wall_ms, other.seq));
+        } else {
+            members.sort_by_key(|(_, other)| other.seq);
+        }
+        // 文件末尾窗口里可能有本组成员都还没发出时的旧记录（重启前的同内容消息），它们不可能是本组的。
+        let floor = by_file
+            .then(|| members.iter().map(|(_, other)| other.wall_ms).min())
+            .flatten();
         let now = self.clock.mono_ms;
         // BTreeSet 按序号升序，即消费记录到达的先后。
         let deliveries: Vec<&DeliveryFact> = index
@@ -364,6 +461,7 @@ impl Machine {
                 now < d.at.saturating_add(EVIDENCE_TTL_MS)
                     && &d.recipient == recipient
                     && d.trigger == start.trigger
+                    && (d.source == EvidenceSource::Raw || floor.is_none_or(|f| d.wall_ms >= f))
             })
             .collect();
         let mut used = vec![false; deliveries.len()];
@@ -387,8 +485,8 @@ impl Machine {
         }
         let mut assigned = None;
         for (key, other) in waiting {
-            if let Some(i) =
-                (0..deliveries.len()).find(|&i| !used[i] && deliveries[i].seq > other.seq)
+            if let Some(i) = (0..deliveries.len())
+                .find(|&i| !used[i] && Self::v2_delivered_after(deliveries[i], other))
             {
                 used[i] = true;
                 if key == &op.key {
@@ -400,6 +498,16 @@ impl Machine {
             return None;
         }
         assigned
+    }
+
+    /// 消费记录晚于开始记录：都来自 raw 时按观察序号；有一方来自会话文件时按时间戳
+    /// （同一 Codex 进程写入，毫秒精度，同一毫秒算作之后）。
+    fn v2_delivered_after(d: &DeliveryFact, start: &FollowupStart) -> bool {
+        if d.source == EvidenceSource::Raw && start.source == EvidenceSource::Raw {
+            d.seq > start.seq
+        } else {
+            d.wall_ms >= start.wall_ms
+        }
     }
 
     /// 已配对操作的消费记录还在时保留其开始记录，否则这条记录会变成来历不明、被同内容的后来者认领。
@@ -454,6 +562,20 @@ impl Machine {
             return vec![];
         };
         let input_turn = self.v2_input_turn(op, child);
+        if start.source == EvidenceSource::RolloutFile {
+            // 文件证据的观察序号由读取时刻决定，可能晚于子线程的 turn/started：
+            // 不走「开始于跟进之后的新轮」这条顺序证据，只认消费记录。
+            return self
+                .relations
+                .aux
+                .observed
+                .get(child)
+                .into_iter()
+                .flatten()
+                .filter(|o| input_turn.as_deref() == Some(o.turn.as_str()))
+                .map(|o| o.turn.clone())
+                .collect();
+        }
         self.relations
             .aux
             .observed
@@ -515,10 +637,11 @@ impl Machine {
                     .iter()
                     .any(|(key, other)| {
                         // 只入队的消息不会开新轮，不是这一轮的候选原因。
+                        // 文件来源的开始记录序号不可比，保守地一律当作可能的竞争原因。
                         if key == &op.key
                             || !other.trigger
                             || other.epoch != start.epoch
-                            || other.seq >= seq
+                            || (other.source == EvidenceSource::Raw && other.seq >= seq)
                         {
                             return false;
                         }
