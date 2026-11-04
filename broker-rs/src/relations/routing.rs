@@ -715,6 +715,15 @@ impl Machine {
                     op.authority_gen = context.gen;
                 }
             }
+            // 跟进的开始记录是同一份授权下的配对依据，与操作一起迁移；否则严格跟进在交接后
+            // 再也配不上（文件模式还取不到消费记录的下限）。只迁移本运行、本连接、上一代的记录；
+            // 撤权与换连接不走这里，旧记录照旧失效。
+            let epoch = self.relations.conn_epoch;
+            for start in self.relations.aux.followup_starts.values_mut() {
+                if start.run == run && start.generation == previous_gen && start.epoch == epoch {
+                    start.generation = context.gen;
+                }
+            }
         }
         match kind {
             HandoffKind::Detach => {

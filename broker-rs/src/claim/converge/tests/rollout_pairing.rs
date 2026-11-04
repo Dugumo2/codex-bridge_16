@@ -1126,3 +1126,29 @@ fn 无raw_向前找到上限仍不知当前轮时明确降级为宽松() {
     assert_no_alarm(&all);
     no_lingering_poll(&mut m, &mock);
 }
+
+// ─── 15. 严格跟进未读到时运行合法交接 ──────────────────────────────
+
+#[test]
+fn 无raw_严格跟进未读到时运行转交托管_开始记录随交接迁移仍按文件配对() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    let mut all = complete(&mut m, &mut mock, C, "旧轮", "completed");
+    call_line(&m, "跟进", "followup_task", C, "新工作");
+    all.extend(interacted_to(&mut m, "跟进", C));
+    assert!(op(&m, "跟进").v2_strict);
+    all.extend(super::causal_pairing::detach(&mut m));
+    m.clock.now_ms += 20;
+    turn_marker(C, "新轮", m.clock.now_ms);
+    message_line(&m, C, "入站", "NEW_TASK", "新工作");
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    all.extend(replies(&mut m, &mock, actions));
+    all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
+    pending(&m, 0);
+    assert_eq!(op(&m, "跟进").proven_turns[C], ["新轮".to_owned()].into());
+    let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+    all.extend(replies(&mut m, &mock, actions));
+    all.extend(finish(&mut m, &mut mock));
+    assert_no_alarm(&all);
+    no_lingering_poll(&mut m, &mock);
+}

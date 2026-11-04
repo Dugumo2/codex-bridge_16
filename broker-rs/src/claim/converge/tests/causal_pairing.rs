@@ -1109,3 +1109,137 @@ fn 子代理归属未定时跟进孙代理_有raw_绑定后严格配对且孙新
         assert_no_alarm(&all);
     }
 }
+
+/// 运行转交 broker 托管：走公开的 detach 请求（与 CLI 遇到要人回答的问题时相同）。
+pub(super) fn detach(m: &mut Machine) -> Vec<Action> {
+    let out = apply(
+        m,
+        Event::ClientRequest {
+            request: crate::claim::ClientRequest {
+                conn: 1,
+                id: json!(77),
+                method: "broker/threads/detach".into(),
+                params: Some(json!({"threadId":P,"runId":R,"policy":"on-request"})),
+            },
+            run_id: None,
+        },
+    );
+    assert!(
+        matches!(
+            m.claims[P].owner(),
+            Some(crate::claim::Owner::Broker { .. })
+        ),
+        "{out:?}"
+    );
+    out
+}
+
+/// 严格跟进还没被读到时运行合法交接（detach）：开始记录随操作一起迁到新代际，
+/// 之后的新轮或消费记录照常配对，运行不卡到收敛期限。
+#[test]
+fn 严格跟进未读到时运行转交托管_开始记录随交接迁移仍配对并最终收敛() {
+    for by_delivery in [false, true] {
+        let (mut m, mut mock) = base();
+        let mut all = complete(&mut m, &mut mock, C, "旧轮", "completed");
+        raw(&mut m, "B", "新工作");
+        interacted(&mut m, "B");
+        pending(&m, 1);
+        let gen = m.manage_context(R).unwrap().gen;
+        all.extend(detach(&mut m));
+        assert_eq!(m.manage_context(R).unwrap().gen, gen + 1, "前置：交接换代");
+        let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+        all.extend(replies(&mut m, &mock, actions));
+        if by_delivery {
+            delivery(&mut m, "新轮", "入站", "新工作", false);
+        }
+        pending(&m, 0);
+        assert_eq!(op(&m, "B").proven_turns[C], ["新轮".to_owned()].into());
+        let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        all.extend(finish(&mut m, &mut mock));
+        assert_no_alarm(&all);
+    }
+}
+
+/// owner 断开（OwnerGone）同样是合法交接：开始记录迁移，跟进的新轮仍配给本运行。
+#[test]
+fn 严格跟进未读到时owner断开_开始记录随交接迁移仍配对() {
+    let (mut m, mut mock) = base();
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    raw(&mut m, "B", "新工作");
+    interacted(&mut m, "B");
+    let gen = m.manage_context(R).unwrap().gen;
+    apply(&mut m, Event::Disconnected { conn: 1 });
+    assert_eq!(m.manage_context(R).unwrap().gen, gen + 1, "前置：交接换代");
+    assert!(matches!(
+        m.manage_context(R).unwrap().authority,
+        Authority::Broker { .. }
+    ));
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    replies(&mut m, &mock, actions);
+    assert_eq!(
+        op(&m, "B").proven_turns.get(C),
+        Some(&["新轮".to_owned()].into()),
+        "交接后跟进的新轮仍配对"
+    );
+    assert!(m
+        .binding(C, "新轮")
+        .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound));
+}
+
+/// 撤权（broker/joined 使运行改由外部接管）与换连接后，开始记录不迁移、不再能配对。
+#[test]
+fn 撤权与换连接后开始记录不随之迁移_跟进不再配对() {
+    for case in ["撤权", "换连接"] {
+        let (mut m, mut mock) = base();
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        raw(&mut m, "B", "新工作");
+        interacted(&mut m, "B");
+        let key = op(&m, "B").key.clone();
+        let gen = m.manage_context(R).unwrap().gen;
+        match case {
+            "撤权" => {
+                apply(
+                    &mut m,
+                    Event::ClientRequest {
+                        request: crate::claim::ClientRequest {
+                            conn: 1,
+                            id: json!(78),
+                            method: "broker/joined".into(),
+                            params: Some(json!({"threadId":P,"turnId":T})),
+                        },
+                        run_id: None,
+                    },
+                );
+                assert_eq!(
+                    m.manage_context(R).unwrap().authority,
+                    Authority::Revoked,
+                    "前置：撤权"
+                );
+            }
+            // 生产里没有让连接代际递增的入口（推断：换连接即 broker 重启），与既有用例一样直接换代。
+            _ => {
+                m.relations.conn_epoch += 1;
+                detach(&mut m);
+            }
+        }
+        assert_eq!(
+            m.relations
+                .aux
+                .followup_starts
+                .get(&key)
+                .map(|s| s.generation),
+            Some(gen),
+            "{case}：开始记录不迁移"
+        );
+        let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+        replies(&mut m, &mock, actions);
+        delivery(&mut m, "新轮", "入站", "新工作", false);
+        assert!(op(&m, "B").proven_turns.is_empty(), "{case}");
+        assert!(
+            !m.binding(C, "新轮")
+                .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound),
+            "{case}"
+        );
+    }
+}
