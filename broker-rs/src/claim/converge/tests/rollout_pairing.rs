@@ -784,3 +784,266 @@ fn 有raw的父线程缺开始记录时也不读文件_照原样宽松() {
     assert_eq!(fx::with(|f| (f.path_reads, f.reads)), (0, 0));
     assert_eq!(m.relations.aux.rollout, Default::default());
 }
+
+// ─── 13. 发起方归属未定时的跟进（无 raw） ───────────────────────────
+
+const G: &str = "孙";
+
+/// 跨重启恢复的整棵树：P、C、G 都没有 raw；C、G 的血缘与代理路径来自上次会话写下的线程索引，
+/// 由启动时的 `Event::Restore` 恢复（与生产相同的入口）。本会话还没观察到 C、G 的任何轮次。
+fn resumed_tree(with_paths: bool) -> (Machine, SubagentMock) {
+    let mut m = Machine::default();
+    m.clock.mono_ms = 1_000;
+    m.clock.now_ms = 100_000;
+    assert!(m.enable_convergence(ready()));
+    apply(&mut m, Event::Connected { conn: 1 });
+    apply(&mut m, Event::Initialized { conn: 1, cxb: true });
+    let entry = |thread: &str, parent: &str, short: &str| crate::runs::ThreadIndexEntry {
+        parent_thread_id: Some(parent.into()),
+        relation_kind: Some(RelationKind::Subagent),
+        source_summary: Some(if with_paths {
+            json!({"kind":"threadSpawn","agentPath":format!("/root/{thread}"),"depth":1})
+        } else {
+            json!({"kind":"threadSpawn","depth":1})
+        }),
+        can_accept_direct_input: Some(false),
+        agent_version: Some(AgentVersion::V2),
+        thread_id: thread.into(),
+        short_id: short.into(),
+        last_run_id: None,
+        updated_at: m.clock.now_ms,
+        model: None,
+        preview: None,
+        cwd: None,
+        meta: None,
+        resume_overrides: None,
+    };
+    let mut index = crate::runs::ThreadIndexFile::default();
+    // 上次会话的运行派生过 C 与 G（threads.json 里的 childHistory）。
+    let fact = json!({"上次运行":{"rootThreadId":P,"observedAt":m.clock.now_ms - 60_000}});
+    index.child_history = serde_json::from_value(json!({
+        "coverage":"verified","retainedAfter":0,"entries":{C:fact.clone(),G:fact}
+    }))
+    .unwrap();
+    index.threads.insert("c0001".into(), entry(C, P, "c0001"));
+    index.threads.insert("g0001".into(), entry(G, C, "g0001"));
+    apply(
+        &mut m,
+        Event::Restore {
+            index,
+            runs: vec![],
+            inbox: None,
+        },
+    );
+    m.record(P).subscribed = true;
+    let out = apply(
+        &mut m,
+        Event::ClientRequest {
+            request: ClientRequest {
+                conn: 1,
+                id: json!(1),
+                method: "turn/start".into(),
+                params: Some(json!({"threadId":P,"input":[{"type":"text","text":"任务"}]})),
+            },
+            run_id: Some(R.into()),
+        },
+    );
+    let context = out
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Request(c) if c.method == "turn/start" => Some(c),
+            _ => None,
+        })
+        .unwrap();
+    m.convergences
+        .capabilities
+        .insert(P.into(), (m.relations.conn_epoch, true));
+    m.convergences.test_budget = Some(BudgetAdmission::Allowed);
+    m.convergences.test_read = Some(BatchReadId(9));
+    apply(
+        &mut m,
+        Event::Reply {
+            context,
+            result: Ok(json!({"turn":{"id":T}})),
+        },
+    );
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
+    );
+    let mut mock = SubagentMock::default();
+    mock.register(P, None, "v1", false, true);
+    mock.register(C, Some(P), "v2", false, true);
+    mock.register(G, Some(C), "v2", false, true);
+    fx::install();
+    let at = m.clock.now_ms - 5_000;
+    for thread in [P, C, G] {
+        fx::create(thread);
+        fx::append_line(thread, at, "session_meta", json!({"id":thread}));
+    }
+    fx::append_line(
+        P,
+        at,
+        "event_msg",
+        json!({"type":"task_started","turn_id":T}),
+    );
+    turn_marker(C, "旧轮", at + 1);
+    turn_marker(G, "孙旧轮", at + 1);
+    (m, mock)
+}
+
+/// 线程文件里的协作工具调用。
+fn call_in(m: &Machine, thread: &str, id: &str, name: &str, target: &str, message: &str) {
+    fx::append_line(
+        thread,
+        m.clock.now_ms,
+        "response_item",
+        json!({"type":"function_call","name":name,"namespace":"collaboration","call_id":id,
+            "arguments":json!({"target":target,"message":message}).to_string()}),
+    );
+}
+
+/// 接收方文件里收到的消息：发送方与接收方都给出代理路径。
+fn message_from(m: &Machine, child: &str, sender: &str, id: &str, message: &str) {
+    let text = format!(
+        "Message Type: NEW_TASK\nTask name: /root/{child}\nSender: {sender}\nPayload:\n{message}"
+    );
+    fx::append_line(
+        child,
+        m.clock.now_ms,
+        "response_item",
+        json!({"type":"agent_message","id":id,"author":sender,"recipient":format!("/root/{child}"),
+            "content":[{"type":"input_text","text":text}]}),
+    );
+}
+
+/// P 跟进 C；C 的新轮已开始、消费了跟进并发出对 G 的调用，但 C 的 turn/started 还没到（新轮未绑定）。
+fn followup_child_then_call_grandchild(
+    m: &mut Machine,
+    mock: &SubagentMock,
+    name: &str,
+    id: &str,
+    message: &str,
+) -> Vec<Action> {
+    call_in(m, P, "跟进子", "followup_task", C, "交给你");
+    let mut all = interacted_to(m, "跟进子", C);
+    assert!(op(m, "跟进子").v2_strict);
+    m.clock.now_ms += 20;
+    turn_marker(C, "新轮", m.clock.now_ms);
+    message_from(m, C, "/root", "入站子", "交给你");
+    m.clock.now_ms += 5;
+    call_in(m, C, id, name, G, message);
+    let (a, b) = SubagentMock::v2_activity("interacted", C, "新轮", id, G);
+    all.extend(apply(m, a));
+    all.extend(apply(m, b));
+    all.extend(poll_for(m, mock, ROLLOUT_POLL_MS));
+    assert!(m.binding(C, "新轮").is_none(), "前置：C 的新轮此时还没绑定");
+    all
+}
+
+fn bind_child(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
+    let actions = apply(m, mock.turn_started(C, "新轮"));
+    let mut all = replies(m, mock, actions);
+    all.extend(poll_for(m, mock, ROLLOUT_POLL_MS));
+    assert!(m
+        .binding(C, "新轮")
+        .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound));
+    all
+}
+
+fn grandchild_turn(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
+    m.clock.now_ms += 20;
+    turn_marker(G, "孙新轮", m.clock.now_ms);
+    message_from(m, G, "/root/子", "入站孙", "孙任务");
+    let actions = apply(m, mock.turn_started(G, "孙新轮"));
+    let mut all = replies(m, mock, actions);
+    all.extend(poll_for(m, mock, ROLLOUT_POLL_MS));
+    all
+}
+
+fn wrap_up(m: &mut Machine, mock: &mut SubagentMock, grandchild: bool) -> Vec<Action> {
+    let mut all = vec![];
+    if grandchild {
+        let actions = complete(m, mock, G, "孙新轮", "completed");
+        all.extend(replies(m, mock, actions));
+    }
+    let actions = complete(m, mock, C, "新轮", "completed");
+    all.extend(replies(m, mock, actions));
+    all.extend(finish(m, mock));
+    all
+}
+
+#[test]
+fn 子代理归属未定时留言给空闲孙代理_无raw_按会话文件认出只入队且运行不卡() {
+    let (mut m, mut mock) = resumed_tree(true);
+    let mut all =
+        followup_child_then_call_grandchild(&mut m, &mock, "send_message", "留言孙", "顺便说");
+    all.extend(bind_child(&mut m, &mut mock));
+    let o = op(&m, "留言孙");
+    assert_eq!(o.run_id, R, "C 绑定后接回运行");
+    assert!(o.v2_strict && o.v2_queue_only, "恢复工具类型：只入队");
+    assert_eq!(o.v2_source, V2EvidenceSource::RolloutFile);
+    assert!(o.receivers.is_empty(), "只入队不授予管理权");
+    pending(&m, 0);
+    all.extend(wrap_up(&mut m, &mut mock, false));
+    assert_no_alarm(&all);
+    no_lingering_poll(&mut m, &mock);
+}
+
+#[test]
+fn 子代理归属未定时跟进孙代理_无raw_按会话文件严格配对且孙新轮早晚都收敛() {
+    for grandchild_first in [false, true] {
+        let (mut m, mut mock) = resumed_tree(true);
+        let mut all =
+            followup_child_then_call_grandchild(&mut m, &mock, "followup_task", "跟进孙", "孙任务");
+        if grandchild_first {
+            all.extend(grandchild_turn(&mut m, &mut mock));
+        }
+        all.extend(bind_child(&mut m, &mut mock));
+        if !grandchild_first {
+            pending(&m, 1);
+            all.extend(grandchild_turn(&mut m, &mut mock));
+        }
+        let o = op(&m, "跟进孙");
+        assert!(
+            o.v2_strict && !o.v2_queue_only,
+            "恢复严格证据（孙先开轮：{grandchild_first}）"
+        );
+        assert_eq!(o.v2_source, V2EvidenceSource::RolloutFile);
+        assert_eq!(o.v2_fallback, None);
+        assert_eq!(o.proven_turns[G], ["孙新轮".to_owned()].into());
+        assert!(
+            m.binding(G, "孙新轮")
+                .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound),
+            "孙代理的新轮绑定到本运行（孙先开轮：{grandchild_first}）"
+        );
+        pending(&m, 0);
+        all.extend(wrap_up(&mut m, &mut mock, true));
+        assert_no_alarm(&all);
+        no_lingering_poll(&mut m, &mock);
+    }
+}
+
+/// 文件证据只按消费记录配对，而消费记录按发起方的代理路径比对：C 的代理路径未知时，
+/// 按严格配对只会卡到收敛期限，必须明确退回宽松（诊断带原因），结果与原来的宽松相同。
+#[test]
+fn 子代理代理路径未知时_无raw跟进孙代理退回宽松且孙新轮仍收敛() {
+    let (mut m, mut mock) = resumed_tree(false);
+    let mut all =
+        followup_child_then_call_grandchild(&mut m, &mock, "followup_task", "跟进孙", "孙任务");
+    all.extend(bind_child(&mut m, &mut mock));
+    let o = op(&m, "跟进孙");
+    assert!(!o.v2_strict);
+    assert_eq!(o.v2_fallback, Some(V2FallbackReason::RolloutSenderUnknown));
+    pending(&m, 1);
+    all.extend(grandchild_turn(&mut m, &mut mock));
+    pending(&m, 0);
+    assert_eq!(
+        op(&m, "跟进孙").proven_turns[G],
+        ["孙新轮".to_owned()].into()
+    );
+    all.extend(wrap_up(&mut m, &mut mock, true));
+    assert_no_alarm(&all);
+    no_lingering_poll(&mut m, &mock);
+}

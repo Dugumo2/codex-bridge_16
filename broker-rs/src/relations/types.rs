@@ -113,6 +113,8 @@ pub enum V2FallbackReason {
     RolloutLost,
     /// 等文件期间操作已失效（运行结束、停止、连接或授权换代），不再等。
     RolloutCancelled,
+    /// 没有 raw，文件里找到了 followup_task，但发起方的代理路径未知，比对不了接收方的消费记录。
+    RolloutSenderUnknown,
 }
 
 /// 跟进配对证据的来源，只供诊断。

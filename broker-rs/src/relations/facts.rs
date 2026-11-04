@@ -641,6 +641,8 @@ impl Machine {
                     start.epoch == self.relations.conn_epoch
                         && start.run == run_id
                         && start.generation == authority_gen
+                        // 归属留空的开始记录只配给同样在等发起方绑定的操作。
+                        && (!run_id.is_empty() || parent_run == ParentRun::AwaitBinding)
                 });
             let v2_fallback = (kind == EvidenceKind::V2Interacted && begin.is_none()).then(|| {
                 if self.relations.aux.followup_starts.contains_key(&key) {
@@ -1356,6 +1358,8 @@ impl Machine {
             .map(|(k, _)| k.clone())
             .collect();
         self.refresh_member(run, child, MemberChange::Binding, actions);
+        // 先恢复这一轮存下的调用证据，再接回等它的操作：模式由证据定，接纳接收方在后。
+        self.adopt_pending_starts(child, turn, run);
         for waiting_key in waiting {
             self.relations.aux.parent_waits.remove(&waiting_key);
             if let Some(op) = self.relations.operations.get_mut(&waiting_key) {
@@ -1386,12 +1390,14 @@ impl Machine {
         if matches!(op.kind, EvidenceKind::V1Spawn | EvidenceKind::V2Started) {
             self.materialize(key, actions);
         }
-        // 等发起方绑定期间到达的跟进：现在才能接纳接收方。
+        // 等发起方绑定期间到达的跟进：现在才能接纳接收方。还在等会话文件定模式的，
+        // 由定案时的重放接纳（等文件期间接收方尚未登记）。
         if matches!(
             op.kind,
             EvidenceKind::V1SendInput | EvidenceKind::V1ResumeAgent | EvidenceKind::V2Interacted
         ) && op.outcome == EvidenceOutcome::Pending
             && self.convergence_enabled()
+            && !self.rollout_awaiting(key)
         {
             self.accept_followup_receivers(key, op.receivers.into_iter().collect(), actions);
         }

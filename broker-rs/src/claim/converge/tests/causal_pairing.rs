@@ -991,3 +991,121 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
         assert_no_alarm(&rest);
     }
 }
+
+/// 任意线程上的协作工具调用（raw 的 function_call）。
+pub(super) fn raw_call(
+    m: &mut Machine,
+    thread: &str,
+    turn: &str,
+    name: &str,
+    id: &str,
+    target: &str,
+    message: &str,
+) -> Vec<Action> {
+    notify(
+        m,
+        "rawResponseItem/completed",
+        json!({"threadId":thread,"turnId":turn,"item":{
+        "type":"function_call","name":name,"call_id":id,
+        "arguments":json!({"target":target,"message":message}).to_string()}}),
+    )
+}
+
+/// 子代理 C 刚被跟进、它的新轮还没绑定到运行，就对自己的空闲孙代理 G 留言（send_message）。
+/// 调用证据（raw）须先存下，C 绑定后恢复工具类型：只入队，不让运行等 G 开新轮。
+#[test]
+fn 子代理归属未定时留言给空闲孙代理_有raw_绑定后按只入队处理且运行不卡() {
+    const G: &str = "孙";
+    let (mut m, mut mock) = base();
+    spawn(&mut m, &mut mock, C, "旧轮", G, "派生孙", "孙旧轮");
+    let mut all = complete(&mut m, &mut mock, G, "孙旧轮", "completed");
+    all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+    raw(&mut m, "跟进子", "交给你");
+    interacted(&mut m, "跟进子");
+    // C 的事件先于它的 turn/started 送达：调用与 Interacted 到达时 C 的新轮归属未定。
+    all.extend(raw_call(
+        &mut m,
+        C,
+        "新轮",
+        "send_message",
+        "留言孙",
+        G,
+        "顺便说",
+    ));
+    let (a, b) = SubagentMock::v2_activity("interacted", C, "新轮", "留言孙", G);
+    all.extend(apply(&mut m, a));
+    all.extend(apply(&mut m, b));
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    all.extend(replies(&mut m, &mock, actions));
+    delivery(&mut m, "新轮", "入站", "交给你", false);
+    assert!(m
+        .binding(C, "新轮")
+        .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound));
+    let o = op(&m, "留言孙");
+    assert_eq!(o.run_id, R, "C 绑定后接回运行");
+    assert!(o.v2_strict && o.v2_queue_only, "恢复工具类型：只入队");
+    assert_eq!(o.v2_source, V2EvidenceSource::Raw);
+    assert!(o.receivers.is_empty(), "只入队不授予管理权");
+    pending(&m, 0);
+    let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+    all.extend(replies(&mut m, &mock, actions));
+    all.extend(finish(&mut m, &mut mock));
+    assert_no_alarm(&all);
+}
+
+/// 同一时序下 C 用 followup_task 跟进 G：C 绑定后按 raw 严格配对接纳 G，
+/// G 的新轮早于或晚于 C 绑定都能配上并最终收敛。
+#[test]
+fn 子代理归属未定时跟进孙代理_有raw_绑定后严格配对且孙新轮早晚都收敛() {
+    const G: &str = "孙";
+    for grandchild_first in [false, true] {
+        let (mut m, mut mock) = base();
+        spawn(&mut m, &mut mock, C, "旧轮", G, "派生孙", "孙旧轮");
+        let mut all = complete(&mut m, &mut mock, G, "孙旧轮", "completed");
+        all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+        raw(&mut m, "跟进子", "交给你");
+        interacted(&mut m, "跟进子");
+        all.extend(raw_call(
+            &mut m,
+            C,
+            "新轮",
+            "followup_task",
+            "跟进孙",
+            G,
+            "孙任务",
+        ));
+        let (a, b) = SubagentMock::v2_activity("interacted", C, "新轮", "跟进孙", G);
+        all.extend(apply(&mut m, a));
+        all.extend(apply(&mut m, b));
+        if grandchild_first {
+            let actions = apply(&mut m, mock.turn_started(G, "孙新轮"));
+            all.extend(replies(&mut m, &mock, actions));
+        }
+        let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+        all.extend(replies(&mut m, &mock, actions));
+        delivery(&mut m, "新轮", "入站", "交给你", false);
+        if !grandchild_first {
+            let actions = apply(&mut m, mock.turn_started(G, "孙新轮"));
+            all.extend(replies(&mut m, &mock, actions));
+        }
+        let o = op(&m, "跟进孙");
+        assert!(
+            o.v2_strict && !o.v2_queue_only,
+            "恢复严格证据（孙先开轮：{grandchild_first}）"
+        );
+        assert_eq!(o.v2_source, V2EvidenceSource::Raw);
+        assert_eq!(o.v2_fallback, None);
+        assert!(
+            m.binding(G, "孙新轮")
+                .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound),
+            "孙代理的新轮绑定到本运行（孙先开轮：{grandchild_first}）"
+        );
+        pending(&m, 0);
+        let actions = complete(&mut m, &mut mock, G, "孙新轮", "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        all.extend(finish(&mut m, &mut mock));
+        assert_no_alarm(&all);
+    }
+}

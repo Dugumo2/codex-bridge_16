@@ -136,9 +136,11 @@ impl Machine {
         let Some(op) = self.relations.operations.get(key) else {
             return Ok(false);
         };
+        // 发起方这一轮的归属还没定（等绑定）时同样等文件：调用证据与归属分开保存，
+        // 定案时登记的开始记录归属留空，绑定后补上（`adopt_pending_starts`）。
         if !self.convergence_enabled()
             || op.kind != EvidenceKind::V2Interacted
-            || op.run_id.is_empty()
+            || (op.run_id.is_empty() && !self.awaiting_parent_binding(key))
             || op.outcome != EvidenceOutcome::Pending
         {
             return Ok(false);
@@ -246,8 +248,21 @@ impl Machine {
     fn rollout_wait_live(&self, op: &EvidenceOperation) -> bool {
         op.outcome == EvidenceOutcome::Pending
             && op.conn_epoch == self.relations.conn_epoch
-            && (!self.op_confirmed(&op.key) || self.operation_generation_current(op))
-            && self.rollout_run_live(op)
+            && if op.run_id.is_empty() {
+                // 运行还不知道：只要还在等发起方这一轮的绑定就继续等。
+                self.awaiting_parent_binding(&op.key)
+            } else {
+                (!self.op_confirmed(&op.key) || self.operation_generation_current(op))
+                    && self.rollout_run_live(op)
+            }
+    }
+
+    /// 操作在等发起方这一轮的绑定（发起方是刚被跟进、新轮尚未绑定的子代理）。
+    pub(super) fn awaiting_parent_binding(&self, key: &EvidenceKey) -> bool {
+        matches!(
+            self.relations.aux.parent_waits.get(key),
+            Some(ParentWait::Binding { .. })
+        )
     }
 
     fn rollout_decision(&self, key: &EvidenceKey, wait: &RolloutWait) -> Option<Decision> {
@@ -269,6 +284,10 @@ impl Machine {
             // 没有可比的正文摘要：严格配对只会等到收敛期限，不如照原样宽松。
             if call.trigger && call.message.is_none() {
                 return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));
+            }
+            // 文件证据只按消费记录配对，消费记录按发起方的代理路径比对；路径未知时同样只会卡到期限。
+            if call.trigger && self.v2_sender_path(op).is_none() {
+                return Some(Decision::Fallback(V2FallbackReason::RolloutSenderUnknown));
             }
             if !call.trigger || self.raw_thread(&wait.child) {
                 return Some(Decision::Strict(call.clone()));

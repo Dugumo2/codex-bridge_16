@@ -18,6 +18,7 @@ pub struct FollowupStart {
     pub source: EvidenceSource,
     /// raw：broker 收到时的墙钟毫秒；会话文件：该行的写入时间（同一台机器上的 Codex 时钟）。
     pub wall_ms: u64,
+    /// 空串表示登记时发起方这一轮的归属还没定（等绑定）；绑定后补上运行与代际。
     pub run: String,
     pub generation: u64,
     pub target: Option<String>,
@@ -199,15 +200,6 @@ impl Machine {
                 let Some(call) = parse_call(item) else {
                     return false;
                 };
-                let facts::ParentRun::Own { run, .. } = self.parent_run(thread, turn) else {
-                    return false;
-                };
-                if !self.ensure_context(&run) {
-                    return false;
-                }
-                let Some(context) = self.manage_context(&run) else {
-                    return false;
-                };
                 let key = EvidenceKey {
                     parent_thread_id: thread.into(),
                     parent_turn_id: turn.into(),
@@ -217,7 +209,25 @@ impl Machine {
                 if self.relations.operations.contains_key(&key) {
                     return false;
                 }
-                let generation = context.gen;
+                let (run, generation) = match self.parent_run(thread, turn) {
+                    facts::ParentRun::Own { run, .. } => {
+                        if !self.ensure_context(&run) {
+                            return false;
+                        }
+                        let Some(context) = self.manage_context(&run) else {
+                            return false;
+                        };
+                        let generation = context.gen;
+                        (run, generation)
+                    }
+                    // 发起方这一轮的归属还没定（子代理刚被跟进就转手跟进孙代理）：调用证据与归属分开保存，
+                    // 先存下调用、归属留空；这一轮绑定后由 `adopt_pending_starts` 补上运行与代际。
+                    // 血缘已证明是外部的线程不存。
+                    facts::ParentRun::AwaitBinding if self.lineage_owner(thread) != Some(false) => {
+                        (String::new(), 0)
+                    }
+                    _ => return false,
+                };
                 let wall_ms = self.clock.now_ms;
                 self.v2_record_start(key, run, generation, call, EvidenceSource::Raw, wall_ms);
                 false
@@ -237,6 +247,32 @@ impl Machine {
                 )
             }
             _ => false,
+        }
+    }
+
+    /// 发起方的一轮绑定到运行：归属未定时存下的开始记录（raw 或会话文件）补上运行与当前代际，
+    /// 之后与发起方本来就有归属时登记的记录完全相同。必须先于接回等它的操作。
+    pub(super) fn adopt_pending_starts(&mut self, thread: &str, turn: &str, run: &str) {
+        let Some(generation) = self.relations.contexts.get(run).map(|c| c.gen) else {
+            return;
+        };
+        let epoch = self.relations.conn_epoch;
+        let from = EvidenceKey {
+            parent_thread_id: thread.into(),
+            parent_turn_id: turn.into(),
+            item_id: String::new(),
+        };
+        for (_, start) in self
+            .relations
+            .aux
+            .followup_starts
+            .range_mut(from..)
+            .take_while(|(k, _)| k.parent_thread_id == thread && k.parent_turn_id == turn)
+        {
+            if start.run.is_empty() && start.epoch == epoch {
+                start.run = run.into();
+                start.generation = generation;
+            }
         }
     }
 
@@ -370,7 +406,7 @@ impl Machine {
             })
     }
 
-    fn v2_sender_path(&self, op: &EvidenceOperation) -> Option<String> {
+    pub(super) fn v2_sender_path(&self, op: &EvidenceOperation) -> Option<String> {
         self.thread_relation(&op.key.parent_thread_id)
             .and_then(|edge| edge.source_summary["agentPath"].as_str().map(str::to_owned))
             .or_else(|| {
