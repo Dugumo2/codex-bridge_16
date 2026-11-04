@@ -1058,7 +1058,10 @@ impl Machine {
         if op.rejected_receivers.contains_key(child) {
             return true;
         }
-        let reason = if !self.thread_relation(child).is_some_and(|edge| {
+        let upward = self.is_ancestor_thread(child, &key.parent_thread_id);
+        let reason = if upward {
+            "接收方是发起方的上级，不属于跟进"
+        } else if !self.thread_relation(child).is_some_and(|edge| {
             edge.kind == RelationKind::Subagent && edge.parent_thread_id == key.parent_thread_id
         }) {
             "未核实为本父线程的子代理"
@@ -1076,21 +1079,24 @@ impl Machine {
         let run = op.run_id.clone();
         // 拒绝发生在 bind 之前：按本次操作的候选运行记关系诊断，不能借已有绑定反查归属。
         // 跟进尚无被接纳的子轮，保留 null turnId，不把旧绑定轮次冒充成本次活动。
-        self.runs.log_source(
-            &run,
-            child,
-            Some(&key.parent_thread_id),
-            "subagent",
-            None,
-            Some(&key.item_id),
-            self.clock.now_ms,
-            "归属冲突",
-            reason,
-            false,
-            false,
-            Some("discoveryIncomplete"),
-            actions,
-        );
+        // 子代理向上发消息是正常协作：同样不授予管理权，但不是归属问题，不写冲突和覆盖缺口。
+        if !upward {
+            self.runs.log_source(
+                &run,
+                child,
+                Some(&key.parent_thread_id),
+                "subagent",
+                None,
+                Some(&key.item_id),
+                self.clock.now_ms,
+                "归属冲突",
+                reason,
+                false,
+                false,
+                Some("discoveryIncomplete"),
+                actions,
+            );
+        }
         let op = self
             .relations
             .operations
@@ -1112,6 +1118,21 @@ impl Machine {
             .reuse_candidates
             .remove(&(key.clone(), child.into()));
         true
+    }
+
+    /// 沿可核实的父关系向上查 `ancestor` 是否是 `thread` 的上级；关系未知时不算。
+    fn is_ancestor_thread(&self, ancestor: &str, thread: &str) -> bool {
+        let mut current = thread.to_owned();
+        for _ in 0..=crate::relations::MAX_DEPTH {
+            let Some(edge) = self.thread_relation(&current) else {
+                return false;
+            };
+            if edge.parent_thread_id == ancestor {
+                return true;
+            }
+            current = edge.parent_thread_id;
+        }
+        false
     }
 
     /// 已拒绝的跟进候选不能通过后续收敛发现重新入册；本运行已有合法管理证据时仍保留。
