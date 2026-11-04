@@ -28,6 +28,53 @@ pub struct DeliveryFact {
     pub trigger: bool,
 }
 
+/// 消费记录按（连接代际，接收线程，发送方路径，内容摘要）分组的序号；开始记录按（代际，父线程，内容摘要）分组。
+/// 只由 `v2_pairing` 维护：插入时同步登记，清理或挤出后整体重建，始终与原表一致。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct V2Index {
+    pub(super) deliveries: BTreeMap<(u64, String, String, [u8; 32]), BTreeSet<u64>>,
+    pub(super) delivery_ids: BTreeSet<(String, String)>,
+    pub(super) starts: BTreeMap<(u64, String, [u8; 32]), BTreeSet<EvidenceKey>>,
+}
+
+impl V2Index {
+    fn delivery_group(d: &DeliveryFact) -> (u64, String, String, [u8; 32]) {
+        (d.epoch, d.thread.clone(), d.author.clone(), d.message)
+    }
+
+    fn add_delivery(&mut self, d: &DeliveryFact) {
+        self.deliveries
+            .entry(Self::delivery_group(d))
+            .or_default()
+            .insert(d.seq);
+        self.delivery_ids.insert((d.thread.clone(), d.id.clone()));
+    }
+
+    fn add_start(&mut self, key: &EvidenceKey, start: &FollowupStart) {
+        if let Some(message) = start.message {
+            self.starts
+                .entry((start.epoch, key.parent_thread_id.clone(), message))
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+
+    fn rebuild_deliveries(&mut self, deliveries: &VecDeque<DeliveryFact>) {
+        self.deliveries.clear();
+        self.delivery_ids.clear();
+        for d in deliveries {
+            self.add_delivery(d);
+        }
+    }
+
+    fn rebuild_starts(&mut self, starts: &BTreeMap<EvidenceKey, FollowupStart>) {
+        self.starts.clear();
+        for (key, start) in starts {
+            self.add_start(key, start);
+        }
+    }
+}
+
 fn digest(text: &str) -> [u8; 32] {
     Sha256::digest(text.as_bytes()).into()
 }
@@ -91,11 +138,8 @@ impl Machine {
                     .and_then(|a| a.get("message"))
                     .and_then(Value::as_str)
                     .map(digest);
-                self.relations
-                    .aux
-                    .followup_starts
-                    .entry(key)
-                    .or_insert(FollowupStart {
+                if !self.relations.aux.followup_starts.contains_key(&key) {
+                    let start = FollowupStart {
                         epoch: self.relations.conn_epoch,
                         seq: self.relations.aux.observation_seq,
                         at: now,
@@ -104,7 +148,10 @@ impl Machine {
                         target,
                         message,
                         trigger: name == "followup_task",
-                    });
+                    };
+                    self.relations.aux.v2_index.add_start(&key, &start);
+                    self.relations.aux.followup_starts.insert(key, start);
+                }
                 false
             }
             Some("agent_message") => {
@@ -119,9 +166,9 @@ impl Machine {
                 if self
                     .relations
                     .aux
-                    .v2_deliveries
-                    .iter()
-                    .any(|d| d.thread == thread && d.id == id)
+                    .v2_index
+                    .delivery_ids
+                    .contains(&(thread.to_owned(), id.to_owned()))
                 {
                     return false;
                 }
@@ -162,12 +209,14 @@ impl Machine {
                 }
                 self.relations.aux.observation_seq =
                     self.relations.aux.observation_seq.saturating_add(1);
-                if self.relations.aux.v2_deliveries.len() >= MAX_OPERATIONS {
-                    self.relations.aux.v2_deliveries.pop_front();
+                let aux = &mut self.relations.aux;
+                if aux.v2_deliveries.len() >= MAX_OPERATIONS {
+                    aux.v2_deliveries.pop_front();
+                    aux.v2_index.rebuild_deliveries(&aux.v2_deliveries);
                 }
-                self.relations.aux.v2_deliveries.push_back(DeliveryFact {
+                let fact = DeliveryFact {
                     epoch: self.relations.conn_epoch,
-                    seq: self.relations.aux.observation_seq,
+                    seq: aux.observation_seq,
                     at: self.clock.mono_ms,
                     thread: thread.into(),
                     turn: turn.into(),
@@ -176,7 +225,9 @@ impl Machine {
                     recipient: recipient.into(),
                     message,
                     trigger,
-                });
+                };
+                aux.v2_index.add_delivery(&fact);
+                aux.v2_deliveries.push_back(fact);
                 self.retry_v2_pairing(thread, actions);
                 true
             }
@@ -257,14 +308,49 @@ impl Machine {
         let Some(author) = self.v2_sender_path(op) else {
             return false;
         };
-        self.relations.aux.v2_deliveries.iter().any(|d| d.epoch == start.epoch && d.thread == child && d.turn == turn
-            && self.clock.mono_ms < d.at.saturating_add(EVIDENCE_TTL_MS)
-            && d.author == author && &d.recipient == recipient && d.message == message && d.trigger == start.trigger
-            && !self.relations.aux.v2_deliveries.iter().any(|previous| previous.id != d.id && previous.thread == child && previous.author == author
-                && previous.message == message)
-            // 相同内容被发送多次时没有可区分的回执，不能凭同一条输入同时核销。
-            && !self.relations.aux.followup_starts.iter().any(|(key, other)| key != &op.key && key.parent_thread_id == op.key.parent_thread_id
-                && other.epoch == start.epoch && other.message == Some(message) && other.trigger == start.trigger))
+        let index = &self.relations.aux.v2_index;
+        let Some(seqs) = index
+            .deliveries
+            .get(&(start.epoch, child.to_owned(), author, message))
+        else {
+            return false;
+        };
+        // 相同内容被发送多次时没有可区分的回执，不能凭同一条输入同时核销。
+        if seqs.len() != 1
+            || index
+                .starts
+                .get(&(start.epoch, op.key.parent_thread_id.clone(), message))
+                .is_some_and(|keys| {
+                    keys.iter().any(|key| {
+                        key != &op.key
+                            && self
+                                .relations
+                                .aux
+                                .followup_starts
+                                .get(key)
+                                .is_some_and(|other| other.trigger == start.trigger)
+                    })
+                })
+        {
+            return false;
+        }
+        seqs.iter()
+            .filter_map(|seq| self.v2_delivery(*seq))
+            .any(|d| {
+                d.turn == turn
+                    && self.clock.mono_ms < d.at.saturating_add(EVIDENCE_TTL_MS)
+                    && &d.recipient == recipient
+                    && d.trigger == start.trigger
+            })
+    }
+
+    /// 消费记录按观察序号递增存放，按序号二分查找。
+    fn v2_delivery(&self, seq: u64) -> Option<&DeliveryFact> {
+        let deliveries = &self.relations.aux.v2_deliveries;
+        deliveries
+            .binary_search_by_key(&seq, |d| d.seq)
+            .ok()
+            .map(|i| &deliveries[i])
     }
 
     pub(super) fn v2_candidate_turns(&self, op: &EvidenceOperation, child: &str) -> Vec<String> {
@@ -433,18 +519,36 @@ impl Machine {
             })
             .map(|op| op.key.clone())
             .collect();
-        self.relations.aux.followup_starts.retain(|key, start| {
+        let aux = &mut self.relations.aux;
+        let before = aux.followup_starts.len();
+        aux.followup_starts.retain(|key, start| {
             start.epoch == epoch
                 && (now < start.at.saturating_add(EVIDENCE_TTL_MS) || keep.contains(key))
         });
+        if aux.followup_starts.len() != before {
+            aux.v2_index.rebuild_starts(&aux.followup_starts);
+        }
     }
 
     pub(super) fn prune_v2_deliveries(&mut self) {
         let now = self.clock.mono_ms;
         let epoch = self.relations.conn_epoch;
-        self.relations
-            .aux
-            .v2_deliveries
+        let aux = &mut self.relations.aux;
+        let before = aux.v2_deliveries.len();
+        aux.v2_deliveries
             .retain(|d| d.epoch == epoch && now < d.at.saturating_add(EVIDENCE_TTL_MS));
+        if aux.v2_deliveries.len() != before {
+            aux.v2_index.rebuild_deliveries(&aux.v2_deliveries);
+        }
+    }
+
+    /// 测试用：索引必须与原表重建的结果完全一致。
+    #[cfg(test)]
+    pub(crate) fn v2_index_consistent(&self) -> bool {
+        let aux = &self.relations.aux;
+        let mut rebuilt = V2Index::default();
+        rebuilt.rebuild_deliveries(&aux.v2_deliveries);
+        rebuilt.rebuild_starts(&aux.followup_starts);
+        rebuilt == aux.v2_index
     }
 }
