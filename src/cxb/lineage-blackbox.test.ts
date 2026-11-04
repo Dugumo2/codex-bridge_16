@@ -410,3 +410,22 @@ test("联合跨层跟进（协调未启用）：无新成员时运行自然结�
     expect(run.children?.some((child: any) => child.threadId === G && child.turnIds.includes(gTurn)) ?? false).toBe(false);
   } finally { await bounded(h.close(), 12_000); }
 }, 120_000);
+
+/** 冷恢复后上游不再送 raw；会话文件里的工具调用证明这是 send_message：只入队、不纳管，运行不等收敛期限。 */
+test("冷恢复后留言给空闲历史子代理只入队，运行正常收尾无误报", async () => {
+  const h = new Sa1bHarness();
+  try {
+    const source = await handoffHistory(h, false);
+    await resumeWithHandoff(h, false, source);
+    const root = (await h.state()).threads.root;
+    expect(root.experimentalRawEvents, "前置：冷恢复后 raw 关闭").toBe(false);
+    await h.control("reuse", { parentThreadId: ROOT, parentTurnId: h.firstTurn, childThreadId: C2, tool: "send_message", message: "R2:顺便同步一下" });
+    expect((await h.state()).threads[C2].turns.at(-1).status, "前置：留言不开新轮").toBe("completed");
+    await h.finish(ROOT, "R2:只留言");
+    // 收敛期限 20 秒；ended 只等 10 秒，按期结束说明没有卡到期限。
+    const run = await ended(h);
+    expect(run.status).toBe("completed");
+    expect(ids(run.children)).toEqual([]);
+    await noFalseCoverageWarnings(h);
+  } finally { await bounded(h.close(), 12_000); }
+}, 120_000);

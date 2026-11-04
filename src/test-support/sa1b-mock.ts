@@ -1,4 +1,6 @@
 /** SA1b 独立模拟上游；只用于测试，不推断或替 broker 实现收敛。 */
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createBackgroundTerminalsMock } from "./background-terminals-mock";
 export type ProtocolVersion = "v1" | "v2";
 export type DeliveryMode = "normal" | "delayed" | "dropped";
@@ -18,6 +20,12 @@ export interface Sa1bOptions {
   version?: ProtocolVersion; pageSize?: number; snapshot?: Sa1bSnapshot;
   /** 在祖先分页末尾再次返回指定线程，模拟分页间重复但游标仍前进。 */
   duplicateListIds?: string[];
+  /**
+   * 会话文件根目录（相当于 CODEX_HOME）。设置后与真实 Codex 一样：每个线程写一个 jsonl 会话文件，
+   * thread/read、thread/resume 回包的 thread.path 给出它；文件在磁盘上，重启（快照恢复）后路径不变、内容保留。
+   * raw 开关只影响实时通知，不影响会话文件。
+   */
+  rolloutDir?: string;
 }
 
 /** 命令皆为 fixture/sa1b/<名称>，避免与旧夹具控制面相互消费。 */
@@ -47,6 +55,20 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   const background = createBackgroundTerminalsMock(message => emit(message as RpcMessage), { enabled: true });
   let serial = options.snapshot?.serial ?? 0;
   const clone = <T>(value: T): T => structuredClone(value);
+  // 会话文件：行形如 {"timestamp":"…Z","type":…,"payload":…}，按写入顺序追加；行所在的轮由之前最近的 task_started 决定。
+  const rolloutPath = (id: string): string | null => options.rolloutDir
+    ? join(options.rolloutDir, "sessions", "2026", "11", "05", `rollout-2026-11-05T00-00-00-${id}.jsonl`) : null;
+  const rolloutLine = (type: string, payload: any) => JSON.stringify({ timestamp: new Date().toISOString(), type, payload }) + "\n";
+  const writeRollout = (id: string, type: string, payload: any) => {
+    const path = rolloutPath(id);
+    if (!path) return;
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, rolloutLine(type, payload));
+  };
+  const ensureRollout = (id: string) => {
+    const path = rolloutPath(id);
+    if (path && !existsSync(path)) writeRollout(id, "session_meta", { id, cwd: process.env.TEMP!, originator: "sa1b-mock", cli_version: "0.160.0" });
+  };
   if (options.snapshot) {
     if (options.snapshot.version !== 1 || !Number.isSafeInteger(serial) || serial < 0) throw new Error("历史快照版本或编号状态无效");
     for (const [id, saved] of Object.entries(options.snapshot.threads)) {
@@ -62,6 +84,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
         pendingInit: false, experimentalRawEvents: false, canAcceptDirectInput: true, goal: null, usage: null, delivery: "normal", startMode: "started",
         interrupts: [], goalWrites: [], inputs: [], answers: [], pendingRequests: [] };
       threads.set(id, t);
+      ensureRollout(id);
       for (const subscribed of subscriptions.values()) subscribed.add(id);
     }
     return t;
@@ -96,7 +119,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   const agentPath = (t: MockThread): string => t.parentThreadId === null ? "/root" : `/root/${agentName(t)}`;
   const meta = (t: MockThread, includeTurns = false) => ({
     id: t.id, parentThreadId: t.parentThreadId, forkedFromId: null, preview: "", ephemeral: false,
-    modelProvider: "openai", createdAt: 1, updatedAt: 1, path: null, cwd: process.env.TEMP!, cliVersion: "0.160.0",
+    modelProvider: "openai", createdAt: 1, updatedAt: 1, path: rolloutPath(t.id), cwd: process.env.TEMP!, cliVersion: "0.160.0",
     status: { type: !t.loaded ? "notLoaded" : t.pendingInit ? "active" : t.turns.some(x => x.status === "inProgress") ? "active" : "idle", activeFlags: [] },
     source: t.parentThreadId ? { subAgent: { thread_spawn: { parent_thread_id: t.parentThreadId,
       depth: ancestors(t).length, agent_path: t.version === "v2" ? agentPath(t) : null,
@@ -113,6 +136,10 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   function start(t: MockThread, id?: string, announce = true): MockTurn {
     const turn: MockTurn = { id: id ?? `${t.id}-turn-${++serial}`, status: "inProgress", items: [], error: null };
     t.pendingInit = false; t.turns.push(turn);
+    writeRollout(t.id, "turn_context", { turn_id: turn.id, cwd: process.env.TEMP! });
+    writeRollout(t.id, "event_msg", { type: "task_started", turn_id: turn.id });
+    // 排队的消息在下一轮开始时才记入，记在这一轮里。
+    for (const value of queuedRawInputs.get(t.id) ?? []) writeRollout(t.id, "response_item", value);
     if (announce) notify("turn/started", { threadId: t.id, turn });
     for (const value of queuedRawInputs.get(t.id) ?? []) notify("rawResponseItem/completed", { threadId: t.id, turnId: turn.id, item: value });
     queuedRawInputs.delete(t.id);
@@ -127,6 +154,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
     if (output !== undefined) item(t, turn, { id: `answer-${turn.id}`, type: "agentMessage", text: output, phase: "final_answer" }, announce);
     // errored/shutdown 是 CollabAgentStatus，不是协议 TurnStatus。
     turn.status = status === "errored" ? "failed" : status === "shutdown" ? "interrupted" : status;
+    writeRollout(t.id, "event_msg", { type: "task_complete", turn_id: turn.id });
     if (status === "failed" || status === "errored") turn.error = { message: "测试失败", codexErrorInfo: null, additionalDetails: null };
     if (announce) notify("turn/completed", { threadId: t.id, turn });
     if (status === "shutdown") {
@@ -197,7 +225,16 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
         const parent = thread(p.parentThreadId);
         const pt = parent.turns.find(x => x.id === p.parentTurnId);
         if (!pt) { error(msg.id, "父轮不存在"); break; }
+        const fresh = !threads.has(p.childThreadId);
         const child = thread(p.childThreadId); child.parentThreadId = parent.id; child.version = p.version ?? parent.version;
+        // 与实测一致：新派子代理的会话文件开头抄有父线程的历史（别的轮次的开始与结束等），之后才是它自己的轮。
+        const parentRollout = rolloutPath(parent.id), childRollout = rolloutPath(child.id);
+        if (fresh && child.version === "v2" && parentRollout && childRollout && existsSync(parentRollout)) {
+          for (const line of readFileSync(parentRollout, "utf8").split("\n").filter(Boolean)) {
+            const old = JSON.parse(line);
+            if (old.type !== "session_meta") writeRollout(child.id, old.type, old.payload);
+          }
+        }
         child.experimentalRawEvents ||= parent.experimentalRawEvents === true;
         child.canAcceptDirectInput = child.version !== "v2"; child.pendingInit = p.pendingInit === true;
         const id = p.itemId ?? `spawn-${++serial}`;
@@ -232,9 +269,13 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
         // 与真实探针一致：工具参数和接收方输入里的正文是同一段密文；send_message 只入队，不开新轮。
         const queueOnly = p.tool === "send_message";
         const cipher = `gAAAAA${Buffer.from(message).toString("base64")}`;
-        if (child.version === "v2") notify("rawResponseItem/completed", { threadId: parent.id, turnId: pt.id,
-          item: { type: "function_call", call_id: value.id, name: queueOnly ? "send_message" : "followup_task", namespace: "collaboration",
-            arguments: JSON.stringify({ target: agentName(child), message: cipher }) } });
+        if (child.version === "v2") {
+          const call = { type: "function_call", call_id: value.id, name: queueOnly ? "send_message" : "followup_task", namespace: "collaboration",
+            arguments: JSON.stringify({ target: agentName(child), message: cipher }) };
+          // 工具调用先进写入队列并落盘，工具才执行；raw 关闭时会话文件照写。
+          writeRollout(parent.id, "response_item", call);
+          notify("rawResponseItem/completed", { threadId: parent.id, turnId: pt.id, item: call });
+        }
         // 上游先提交消息后通知 interacted；也支持 sendInput 并入既有轮、不再开轮。
         let turn = p.open === false || queueOnly ? child.turns.at(-1) : p.order === "turnFirst" ? start(child) : undefined;
         notify("item/started", { threadId: parent.id, turnId: pt.id, item: value }); item(parent, pt, value);
@@ -244,7 +285,11 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
             content: [{ type: "input_text", text: `Message Type: ${queueOnly ? "MESSAGE" : "NEW_TASK"}\nTask name: ${agentPath(child)}\nSender: ${agentPath(parent)}\nPayload:\n` },
               { type: "encrypted_content", encrypted_content: cipher }] };
           if (p.consumeOnNextTurn || (queueOnly && turn?.status !== "inProgress")) queuedRawInputs.set(child.id, [...queuedRawInputs.get(child.id) ?? [], input]);
-          else if (turn) notify("rawResponseItem/completed", { threadId: child.id, turnId: turn.id, item: input });
+          else if (turn) {
+            // 消费记录记在消费它的轮里（被忙碌轮吸收时记在当前轮）。
+            writeRollout(child.id, "response_item", input);
+            notify("rawResponseItem/completed", { threadId: child.id, turnId: turn.id, item: input });
+          }
         }
         reply(msg.id, { turnId: turn?.id }); break;
       }
