@@ -49,10 +49,11 @@ fn pending(m: &Machine, count: usize) {
     );
 }
 
-fn finish(m: &mut Machine, mock: &mut SubagentMock) {
+fn finish(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
+    let mut all = vec![];
     if !matches!(m.claims[P].state, State::Converging { .. }) {
         let actions = complete(m, mock, P, T, "completed");
-        replies(m, mock, actions);
+        all.extend(replies(m, mock, actions));
     }
     for _ in 0..8 {
         if m.convergences.progress[R].reading.is_some() {
@@ -62,12 +63,12 @@ fn finish(m: &mut Machine, mock: &mut SubagentMock) {
             break;
         }
         let actions = retry(m);
-        replies(m, mock, actions);
+        all.extend(replies(m, mock, actions));
     }
     if m.convergences.progress[R].reading.is_some() {
         confirm_parent(m);
         let actions = complete(m, mock, P, "汇总轮", "completed");
-        replies(m, mock, actions);
+        all.extend(replies(m, mock, actions));
     }
     assert_eq!(
         m.runs.runs[R].state,
@@ -76,6 +77,7 @@ fn finish(m: &mut Machine, mock: &mut SubagentMock) {
     );
     assert_eq!(m.runs.runs[R].status, Some(RunStatus::Completed));
     assert!(m.convergence_diagnostics(R).is_none());
+    all
 }
 
 #[test]
@@ -184,13 +186,13 @@ fn 因果隔离_忙碌旧轮有匹配输入才允许吸收并最终收敛() {
 }
 
 /// 按真实调度走过证据期限：期限内应发生的到期扫描都要真正触发，否则测不到被判过期的路径。
-fn past_evidence_ttl(m: &mut Machine, mock: &mut SubagentMock) {
+fn past_evidence_ttl(m: &mut Machine, mock: &mut SubagentMock) -> Vec<Action> {
     m.clock.mono_ms += EVIDENCE_TTL_MS + 1;
     m.clock.now_ms += EVIDENCE_TTL_MS + 1;
     let mut actions = vec![];
     m.facts_expire(&mut actions);
     m.convergence_sync_facts(R);
-    replies(m, mock, actions);
+    replies(m, mock, actions)
 }
 
 fn op<'a>(m: &'a Machine, id: &str) -> &'a EvidenceOperation {
@@ -437,4 +439,97 @@ fn 宽松配对诊断标明回退原因且严格操作不带原因() {
     interacted(&mut m, "B");
     assert!(!op(&m, "B").v2_strict);
     assert_eq!(op(&m, "B").v2_fallback, Some(V2FallbackReason::StartStale));
+}
+
+/// 正常成功路径不得出现缺口、陈旧、不完整、冲突、过期类提示，也不得发警告。
+fn assert_no_alarm(actions: &[Action]) {
+    for action in actions {
+        match action {
+            Action::Warn(warning) => panic!("正常路径不应告警：{warning}"),
+            Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => {
+                for line in lines {
+                    for word in [
+                        "缺口",
+                        "冲突",
+                        "陈旧",
+                        "不完整",
+                        "过期",
+                        "coverageIssue",
+                        "Incomplete",
+                        "stale",
+                    ] {
+                        assert!(!line.contains(word), "正常路径不应出现「{word}」：{line}");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn awaiting_row(m: &Machine) -> serde_json::Value {
+    let diagnostic = m.convergence_diagnostics(R).unwrap();
+    let rows = diagnostic["pendingOperations"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    rows[0].clone()
+}
+
+#[test]
+fn 跟进久未读到时诊断给出等待起点与接收方忙闲且正常路径零误报() {
+    let (mut m, mut mock) = base();
+    let since = m.clock.now_ms;
+    let mut all = notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T,"item":{
+        "type":"function_call","name":"followup_task","call_id":"B",
+        "arguments":json!({"target":C,"message":"新工作"}).to_string()}}),
+    );
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T, "B", C);
+    all.extend(apply(&mut m, a));
+    all.extend(apply(&mut m, b));
+    pending(&m, 1);
+    // 子代理还在旧轮里忙：跟进在队列里，诊断如实给出等待起点。
+    let row = awaiting_row(&m);
+    assert_eq!(row["pairingMode"], "strict");
+    assert_eq!(row["awaitingPairingSince"], since);
+    assert_eq!(
+        row["receiverStates"],
+        json!([{"threadId":C,"state":"running"}])
+    );
+    // 超过证据期限后旧轮结束：子代理空闲而跟进仍未读到，起点不变、只是状态变成 idle。
+    all.extend(past_evidence_ttl(&mut m, &mut mock));
+    all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+    let row = awaiting_row(&m);
+    assert_eq!(row["awaitingPairingSince"], since);
+    assert_eq!(row["expired"], false, "等待配对不是过期");
+    assert_eq!(
+        row["receiverStates"],
+        json!([{"threadId":C,"state":"idle"}])
+    );
+    // 子代理读到跟进开新轮：配对后不再等待，运行正常收敛，全程零误报。
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    all.extend(replies(&mut m, &mock, actions));
+    pending(&m, 0);
+    let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+    all.extend(replies(&mut m, &mock, actions));
+    all.extend(finish(&mut m, &mut mock));
+    assert_no_alarm(&all);
+}
+
+#[test]
+fn 观察有缺口时诊断不猜接收方空闲() {
+    let (mut m, mut mock) = base();
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    raw(&mut m, "B", "新工作");
+    interacted(&mut m, "B");
+    assert_eq!(
+        awaiting_row(&m)["receiverStates"],
+        json!([{"threadId":C,"state":"idle"}])
+    );
+    m.convergence_observation_gap(C, &mut vec![]);
+    assert_eq!(
+        awaiting_row(&m)["receiverStates"],
+        json!([{"threadId":C,"state":"unknown"}])
+    );
 }

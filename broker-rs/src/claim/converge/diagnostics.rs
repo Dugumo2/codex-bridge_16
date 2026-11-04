@@ -246,6 +246,14 @@ impl Machine {
             };
             let receivers: Vec<_> = receiver_ids.iter().take(MAX_NESTED)
                 .map(|s| identifier(s, &mut omitted_bytes)).collect();
+            // 跟进还在子代理队列里：给出等了多久、接收方此刻忙还是闲，只供排查，不改收尾判定也不告警。
+            let awaiting = op.filter(|o| self.v2_awaits_pairing(o));
+            let awaiting_since = awaiting.map(|o| self.clock.now_ms.saturating_sub(self.clock.mono_ms.saturating_sub(o.first_seen_ms)));
+            let receiver_states: Vec<_> = awaiting.into_iter().flat_map(|o| o.receivers.iter())
+                .filter(|thread| !op.is_some_and(|o| o.rejected_receivers.contains_key(*thread)))
+                .take(MAX_NESTED)
+                .map(|thread| json!({"threadId":identifier(thread, &mut omitted_bytes),"state":self.receiver_state(thread)}))
+                .collect();
             let proven: Vec<_> = op.into_iter().flat_map(|o| o.proven_turns.iter()).take(MAX_NESTED).map(|(thread, turns)| {
                 json!({"threadId":identifier(thread, &mut omitted_bytes),
                     "turnIds":turns.iter().take(MAX_NESTED).map(|s| identifier(s, &mut omitted_bytes)).collect::<Vec<_>>(),
@@ -255,6 +263,7 @@ impl Machine {
                 "outcome":op.map(|o| evidence_outcome_label(o.outcome)).unwrap_or("unknown"),
                 "receivers":receivers,"provenTurns":proven,
                 "pairingMode":pairing_mode,"fallbackReason":fallback_reason,
+                "awaitingPairingSince":awaiting_since,"receiverStates":receiver_states,
                 "expiresAt":deadline.map(|o| if o.expires_at_ms >= self.clock.mono_ms {
                     self.clock.now_ms.saturating_add(o.expires_at_ms - self.clock.mono_ms)
                 } else { self.clock.now_ms.saturating_sub(self.clock.mono_ms - o.expires_at_ms) }),
@@ -283,6 +292,36 @@ impl Machine {
         });
         bound_snapshot(&mut snapshot);
         Some(snapshot)
+    }
+}
+
+impl Machine {
+    /// 接收方此刻是否有在跑的轮次；观察有缺口（换代、notLoaded）时如实给 unknown，不猜空闲。
+    fn receiver_state(&self, thread: &str) -> &'static str {
+        let Some(turns) = self.relations.aux.observed.get(thread) else {
+            return "unknown";
+        };
+        let mut running = false;
+        for turn in turns {
+            let current = self
+                .convergences
+                .observations
+                .get(&(thread.to_owned(), turn.turn.clone()))
+                .filter(|fact| {
+                    fact.conn_epoch == self.relations.conn_epoch
+                        && fact.activity != MemberActivity::Unknown
+                });
+            match current {
+                None => return "unknown",
+                Some(_) if !turn.completed => running = true,
+                Some(_) => {}
+            }
+        }
+        if running {
+            "running"
+        } else {
+            "idle"
+        }
     }
 }
 
