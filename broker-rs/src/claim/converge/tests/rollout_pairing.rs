@@ -223,6 +223,13 @@ fn 无raw_子代理答完后跟进顺延到下一轮_不配上一轮且上一轮
     all.extend(replies(&mut m, &mock, actions));
     all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
     pending(&m, 1);
+    // 诊断标明严格配对、证据来自会话文件，不给回退原因，也不含任何正文。
+    let diagnostic = m.convergence_diagnostics(R).unwrap();
+    let row = &diagnostic["pendingOperations"][0];
+    assert_eq!(row["pairingMode"], "strict");
+    assert_eq!(row["pairingSource"], "rolloutFile");
+    assert!(row["fallbackReason"].is_null());
+    assert!(!diagnostic.to_string().contains("再做一件"));
     // 父轮也结束：运行进入收敛但必须继续等这次跟进。
     let actions = complete(&mut m, &mut mock, P, T, "completed");
     all.extend(replies(&mut m, &mock, actions));
