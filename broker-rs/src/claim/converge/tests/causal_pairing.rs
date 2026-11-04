@@ -901,7 +901,7 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
     const S: &str = "历史兄弟";
     const R2: &str = "第二运行";
     const T2: &str = "第二父轮";
-    for upward in [false, true] {
+    for (upward, close) in [(false, false), (true, false), (false, true)] {
         let (mut m, mut mock) = base();
         spawn(&mut m, &mut mock, P, T, S, "派生兄弟", "兄弟旧轮");
         let mut all = complete(&mut m, &mut mock, S, "兄弟旧轮", "completed");
@@ -981,15 +981,42 @@ fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收�
             "兄弟新轮结束后应进入汇总"
         );
         assert!(m.convergence_facts(R2).unwrap().conflicts.is_empty());
-        // 兄弟不归本运行管理，它的轮次摘要暂存到期会记「归属确认前摘要暂存过期」；
-        // 这条与本修复无关（事件日志按血缘暂存，修复前同样会记），单独列出，其余仍须零误报。
-        let (sibling_gaps, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|action| {
-            matches!(action, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
-                if lines.iter().all(|line| line.contains("beforeBindingUnknown") && line.contains(S)))
-        });
-        assert!(sibling_gaps.len() <= 1);
-        assert_no_alarm(&rest);
+        // 兄弟已明确判定不归本运行管理（历史子代理、已结束）：它按血缘暂存的轮次摘要
+        // 到期或关闭清理时都正常丢弃，不写「记录缺口」。
+        assert!(
+            m.relations
+                .aux
+                .classifications
+                .get(&(R2.into(), S.into()))
+                .is_some_and(|c| c.membership == Membership::Historical),
+            "前置：兄弟已判定为历史子代理"
+        );
+        if close {
+            all.extend(apply(&mut m, Event::Shutdown));
+        } else {
+            all.extend(sweep_pending_event_log(&mut m, &all));
+        }
+        assert_no_alarm(&all);
     }
+}
+
+/// 走过归属确认前的暂存期限，按最后一次排下的真实计时触发暂存清理。
+fn sweep_pending_event_log(m: &mut Machine, actions: &[Action]) -> Vec<Action> {
+    let (token, kind) = actions
+        .iter()
+        .rev()
+        .find_map(|a| match a {
+            Action::Schedule {
+                token,
+                kind: kind @ TimerKind::Run(crate::runs::RunTimer::EventLogSweep { .. }),
+                ..
+            } => Some((token.clone(), kind.clone())),
+            _ => None,
+        })
+        .expect("前置：有摘要在等归属确认");
+    m.clock.mono_ms += 30_001;
+    m.clock.now_ms += 30_001;
+    apply(m, Event::Timer { token, kind })
 }
 
 /// 任意线程上的协作工具调用（raw 的 function_call）。

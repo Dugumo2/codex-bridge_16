@@ -392,7 +392,11 @@ fn tree_log_暂存过期超限与关闭清理() {
     assert!(m.runs.event_log.pending.is_empty());
     assert_eq!(m.runs.event_log.bytes, 0);
     assert!(m.runs.event_log.timer.is_none());
-    assert!(logs(&a).iter().all(|l| l.2 == "记录缺口"));
+    // 归属仍未决（没有任何历史或管理证据）的暂存到期必须照常告警。
+    assert!(!logs(&a).is_empty());
+    assert!(logs(&a).iter().all(|l| l.2 == "记录缺口"
+        && l.3["coverageIssue"] == "beforeBindingUnknown"
+        && l.3["summary"] == "归属确认前摘要暂存过期"));
     m.buffer_child_event_log(
         "child",
         "item/completed",
@@ -402,6 +406,9 @@ fn tree_log_暂存过期超限与关闭清理() {
     );
     a.clear();
     m.shutdown_runs(&mut a);
+    assert!(logs(&a)
+        .iter()
+        .any(|l| l.2 == "记录缺口" && l.3["summary"] == "broker 关闭时归属尚未确认"));
     assert!(a.iter().any(|a| matches!(
         a,
         Action::Unschedule {
@@ -462,5 +469,45 @@ fn tree_log_摘要截断标记与长身份的json保持完整() {
         assert_eq!(lines[0].3["turnId"], turn);
         assert_eq!(lines[0].3["truncated"], truncated);
         assert_eq!(lines[0].3["summary"].as_str().unwrap().chars().count(), 80);
+    }
+}
+
+/// 上一运行留下的历史兄弟：本运行对它没有任何管理证据，它被唤醒的轮次摘要按血缘暂存后，
+/// 到期或关闭清理时正常丢弃，不写「记录缺口」；同一时刻血缘不明的候选照常告警。
+#[test]
+fn tree_log_明确不归本运行的历史兄弟暂存到期与关闭清理都不写缺口() {
+    for close in [false, true] {
+        let mut m = setup();
+        candidate(&mut m, "sibling", "root");
+        candidate(&mut m, "unknown", "root");
+        m.runs.index.child_history = serde_json::from_value(json!({
+            "coverage":"verified","retainedAfter":0,
+            "entries":{"sibling":{"run-old":{"rootThreadId":"root","observedAt":1}}}
+        }))
+        .unwrap();
+        assert!(m.historical_subagent_for_run("run-a", "sibling"), "前置");
+        assert!(!m.historical_subagent_for_run("run-a", "unknown"), "前置");
+        let mut a = vec![];
+        for thread in ["sibling", "unknown"] {
+            m.buffer_child_event_log(thread, "item/completed", &item(thread, "t"), false, &mut a);
+        }
+        assert_eq!(m.runs.event_log.pending.len(), 2, "前置：两条都按血缘暂存");
+        assert!(logs(&a).is_empty());
+        a.clear();
+        if close {
+            m.shutdown_runs(&mut a);
+        } else {
+            let generation = m.runs.event_log.timer.unwrap();
+            m.clock.mono_ms = PENDING_MS;
+            m.sweep_event_log(generation, &mut a);
+        }
+        assert!(m.runs.event_log.pending.is_empty());
+        assert_eq!(m.runs.event_log.bytes, 0);
+        let gaps: Vec<_> = logs(&a)
+            .into_iter()
+            .filter(|l| l.2 == "记录缺口")
+            .map(|l| l.3["threadId"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(gaps, ["unknown"], "关闭：{close}");
     }
 }

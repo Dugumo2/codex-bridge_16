@@ -1,7 +1,7 @@
 //! 静态树日志：只保存规范化摘要，不重新驱动轮次、诊断、预算或空转状态。
 use super::{state::schedule, Phase, RunTimer, Runs};
 use crate::claim::{Action, Machine};
-use crate::relations::{BindingStatus, MemberChange, RelationKind};
+use crate::relations::{BindingStatus, EvidenceOutcome, MemberChange, RelationKind};
 use crate::store::StoreOp;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -534,11 +534,47 @@ impl Machine {
         }
     }
 
+    /// 暂存到期或关闭时清掉已明确判定不归该运行管理的候选：它们的摘要本来就不该写进该运行，
+    /// 正常丢弃，不是覆盖缺口。典型是上一运行留下的历史兄弟被平级消息唤醒的轮次。
+    ///
+    /// 「明确」指分类用的同一判定——它是别的运行的历史子代理、本运行对它没有任何管理证据
+    /// （[`historical_subagent_for_run`](Machine::historical_subagent_for_run)）——而且此刻也没有
+    /// 任何还可能把它归给本运行的未决证据：等配对或等发起方绑定的跟进、等会话文件的跟进、等首轮的派生。
+    /// 兄弟的轮次还在跑时分类会因活动而暂缓收尾，但那是收敛要等它，不是归属未定。
+    /// 其余候选（血缘或历史不明、证据未决）照常记缺口。
+    fn settle_pending_candidates(&self, pending: &mut Pending) {
+        let thread = pending.thread.clone();
+        pending
+            .candidates
+            .retain(|(run, _)| !self.event_log_disowned(run, &thread));
+    }
+
+    fn event_log_disowned(&self, run: &str, thread: &str) -> bool {
+        if !self.historical_subagent_for_run(run, thread) {
+            return false;
+        }
+        let unresolved = self.relations.operations.values().any(|op| {
+            op.outcome == EvidenceOutcome::Pending
+                && (op.run_id == run || op.run_id.is_empty())
+                && op.receivers.contains(thread)
+                && !op.rejected_receivers.contains_key(thread)
+        }) || self
+            .relations
+            .aux
+            .rollout
+            .waits
+            .values()
+            .any(|w| w.child == thread)
+            || self.relations.aux.spawn_waits.contains_key(thread);
+        !unresolved
+    }
+
     fn expire_event_log(&mut self, actions: &mut Vec<Action>) {
         let pending = std::mem::take(&mut self.runs.event_log.pending);
-        for event in pending {
+        for mut event in pending {
             if event.expires <= self.clock.mono_ms {
                 self.runs.event_log.bytes -= event.bytes;
+                self.settle_pending_candidates(&mut event);
                 self.pending_gap(&event, "归属确认前摘要暂存过期", actions);
             } else {
                 self.runs.event_log.pending.push_back(event);
@@ -572,7 +608,8 @@ impl Machine {
     }
 
     pub(crate) fn clear_pending_event_log(&mut self, actions: &mut Vec<Action>) {
-        for pending in std::mem::take(&mut self.runs.event_log.pending) {
+        for mut pending in std::mem::take(&mut self.runs.event_log.pending) {
+            self.settle_pending_candidates(&mut pending);
             self.pending_gap(&pending, "broker 关闭时归属尚未确认", actions);
         }
         self.runs.event_log.bytes = 0;
