@@ -180,6 +180,7 @@ pub struct EvidenceOperation {
     pub rejected_receivers: BTreeMap<String, FollowupRejection>,
     pub proven_turns: BTreeMap<String, BTreeSet<String>>,
     /// 操作登记瞬间每个接收方已完成轮次的基线；配对只排除这些轮次。
+    /// 等会话文件后退回宽松时，还并入旧版宽松当时不会配的轮次（`rollout_fallback_baseline`）。
     pub baseline_turns: BTreeMap<String, BTreeSet<String>>,
     /// 在 Interacted 首次到达时固定；缺 raw 的旧线程可等会话文件定案（见 `rollout_pairing`），
     /// 定案后不因迟到的 raw 或文件行改写模式。

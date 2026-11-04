@@ -61,6 +61,8 @@ pub struct RolloutWait {
     /// Interacted 到达时的墙钟毫秒，用来给末尾窗口里的旧消息定下限。
     pub wall_ms: u64,
     pub child: String,
+    /// Interacted 到达时接收方已观察到的轮次：退回宽松时据此还原旧版当时会配的那一轮。
+    pub child_turns: Vec<String>,
     pub events: Vec<(Value, bool)>,
 }
 
@@ -167,10 +169,20 @@ impl Machine {
         if self.relations.aux.rollout.waits.len() >= MAX_OPERATIONS {
             return Ok(false);
         }
+        let child_turns = self
+            .relations
+            .aux
+            .observed
+            .get(child)
+            .into_iter()
+            .flatten()
+            .map(|o| o.turn.clone())
+            .collect();
         let wait = RolloutWait {
             deadline_ms: self.clock.mono_ms.saturating_add(ROLLOUT_WAIT_MS),
             wall_ms: self.clock.now_ms,
             child: child.into(),
+            child_turns,
             events: vec![(item.clone(), completed)],
         };
         self.relations.aux.rollout.waits.insert(key.clone(), wait);
@@ -357,11 +369,59 @@ impl Machine {
                 }
             }
         }
+        if matches!(decision, Decision::Fallback(_)) {
+            self.rollout_fallback_baseline(key, &wait);
+        }
         for (item, completed) in &wait.events {
             self.item_evidence_replay(key, item, *completed, actions);
         }
         if !op.run_id.is_empty() {
             self.touch_context(&op.run_id, MemberChange::Activity, actions);
+        }
+    }
+
+    /// 等文件期间接收方的轮次可能已经变了：退回宽松时只留旧版宽松当时会配的那一轮，其余并入基线。
+    ///
+    /// 旧版在 Interacted 到达时就按唯一候选配对：那时恰有一个未完成的候选就配它；一个都没有就配之后出现的
+    /// 第一轮；那时就有多个候选的不猜（首轮身份不明）。等待期间新出现的轮次按观察先后排在后面。
+    /// 到达时就有多个候选的不改动，仍按原规则判为身份不明。
+    fn rollout_fallback_baseline(&mut self, key: &EvidenceKey, wait: &RolloutWait) {
+        let Some(op) = self.relations.operations.get(key) else {
+            return;
+        };
+        let child = &wait.child;
+        let baseline = op.baseline_turns.get(child);
+        let candidates: Vec<String> = self
+            .relations
+            .aux
+            .observed
+            .get(child)
+            .into_iter()
+            .flatten()
+            .filter(|o| !baseline.is_some_and(|old| old.contains(&o.turn)))
+            .map(|o| o.turn.clone())
+            .collect();
+        let (before, after): (Vec<String>, Vec<String>) = candidates
+            .into_iter()
+            .partition(|turn| wait.child_turns.contains(turn));
+        let keep = match before.len() {
+            0 => after.first().cloned(),
+            1 => before.first().cloned(),
+            _ => return,
+        };
+        let excluded: BTreeSet<String> = before
+            .into_iter()
+            .chain(after)
+            .filter(|turn| Some(turn) != keep.as_ref())
+            .collect();
+        if excluded.is_empty() {
+            return;
+        }
+        if let Some(op) = self.relations.operations.get_mut(key) {
+            op.baseline_turns
+                .entry(child.clone())
+                .or_default()
+                .extend(excluded);
         }
     }
 

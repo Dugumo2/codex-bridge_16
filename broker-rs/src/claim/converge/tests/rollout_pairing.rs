@@ -1152,3 +1152,89 @@ fn 无raw_严格跟进未读到时运行转交托管_开始记录随交接迁移
     assert_no_alarm(&all);
     no_lingering_poll(&mut m, &mock);
 }
+
+// ─── 16. 等文件期间轮次变化后退回宽松：结果与旧版宽松一致 ──────────
+
+type Pairing = (
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    EvidenceOutcome,
+    Option<String>,
+);
+
+/// 同一串事件：`with_file` 为假时 app-server 不给会话文件路径，Interacted 到达时当场宽松（即旧版行为）；
+/// 为真时父线程文件里一直没有这次调用，等满窗口才退回宽松。返回跟进最后的配对结果。
+fn fallback_scenario(case: &str, with_file: bool) -> Pairing {
+    fx::uninstall();
+    let (mut m, mut mock) = base();
+    if with_file {
+        files(&m);
+    }
+    let started = |m: &mut Machine, mock: &mut SubagentMock, turn: &str| {
+        let actions = apply(m, mock.turn_started(C, turn));
+        replies(m, mock, actions);
+    };
+    let done = |m: &mut Machine, mock: &mut SubagentMock, turn: &str| {
+        let actions = complete(m, mock, C, turn, "completed");
+        replies(m, mock, actions);
+    };
+    match case {
+        // Interacted 到达时只有活动轮「旧轮」；等待期间它结束，又开始并结束了一轮。
+        "唯一活动轮" => {
+            interacted_to(&mut m, "跟进", C);
+            done(&mut m, &mut mock, "旧轮");
+            started(&mut m, &mut mock, "另一轮");
+            done(&mut m, &mut mock, "另一轮");
+        }
+        // Interacted 到达时子代理空闲；等待期间先后开了两轮。
+        "空闲后两轮" => {
+            done(&mut m, &mut mock, "旧轮");
+            interacted_to(&mut m, "跟进", C);
+            started(&mut m, &mut mock, "第一轮");
+            done(&mut m, &mut mock, "第一轮");
+            started(&mut m, &mut mock, "第二轮");
+        }
+        // Interacted 到达时就有两个候选：按原规则不猜。
+        "到达时两个候选" => {
+            started(&mut m, &mut mock, "并行轮");
+            interacted_to(&mut m, "跟进", C);
+            done(&mut m, &mut mock, "旧轮");
+            started(&mut m, &mut mock, "第三轮");
+        }
+        _ => unreachable!(),
+    }
+    if with_file {
+        assert!(awaiting(&m, "跟进"), "{case}：前置：等文件期间轮次变化");
+    }
+    poll_for(&mut m, &mock, ROLLOUT_WAIT_MS + ROLLOUT_POLL_MS);
+    assert!(!awaiting(&m, "跟进"));
+    let o = op(&m, "跟进");
+    assert!(!o.v2_strict, "{case}");
+    (o.proven_turns.clone(), o.outcome, o.failure.clone())
+}
+
+#[test]
+fn 无raw_等文件期间轮次变化后退回宽松_结果与旧版宽松一致() {
+    let mut mismatches = vec![];
+    for (case, expected) in [
+        ("唯一活动轮", Some("旧轮")),
+        ("空闲后两轮", Some("第一轮")),
+        ("到达时两个候选", None),
+    ] {
+        let old = fallback_scenario(case, false);
+        let new = fallback_scenario(case, true);
+        assert_eq!(
+            old.0
+                .get(C)
+                .map(|turns| turns.iter().cloned().collect::<Vec<_>>()),
+            expected.map(|t| vec![t.to_owned()]),
+            "前置：{case} 的旧版宽松结果"
+        );
+        if new != old {
+            mismatches.push(format!("{case}：新 {new:?}，旧 {old:?}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "退回宽松后与旧版宽松结果不同：{mismatches:?}"
+    );
+}
