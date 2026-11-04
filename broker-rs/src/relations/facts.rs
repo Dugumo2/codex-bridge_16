@@ -814,30 +814,22 @@ impl Machine {
                         | EvidenceKind::V2Interacted
                 ) =>
             {
-                // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
-                // 原始调用开始序号优先；缺失时保守排除首次通知前的完成轮，双通知不重建基线。
-                for child in new_receivers {
-                    if self.reject_followup_receiver(&key, &child, actions) {
-                        continue;
-                    }
-                    // 基线只排除操作开始前已完成的轮次；不能在 Interacted 到达时把之后完成的真实轮次一并当成旧轮。
-                    let baseline = self.relations.operations[&key]
-                        .baseline_turns
-                        .get(&child)
-                        .cloned()
-                        .unwrap_or_default();
-                    self.convergences
-                        .reuse_candidates
-                        .entry((key.clone(), child.clone()))
-                        .or_insert(baseline);
-                    self.relations
-                        .aux
-                        .spawn_waits
-                        .insert(child.clone(), key.clone());
-                    self.pair_first_turn(&key, &child, actions);
-                    self.materialize(&key, actions);
-                }
+                self.accept_followup_receivers(&key, new_receivers, actions);
             }
+            // 发起方这一轮的归属还没定（子代理刚被跟进就转手跟进孙代理）：不能当未证明丢掉，
+            // 接收方已登记，等发起方的轮绑定后由 confirm_waiting 接回。
+            _ if self.convergence_enabled()
+                && !failed
+                && matches!(
+                    kind,
+                    EvidenceKind::V1SendInput
+                        | EvidenceKind::V1ResumeAgent
+                        | EvidenceKind::V2Interacted
+                )
+                && matches!(
+                    self.relations.aux.parent_waits.get(&key),
+                    Some(ParentWait::Binding { .. })
+                ) => {}
             _ => {
                 // sendInput、resumeAgent、v2 interacted/interrupted/completed：不证明新轮，只记事实。
                 let op = self.relations.operations.get_mut(&key).expect("证据操作");
@@ -865,6 +857,38 @@ impl Machine {
                     }
                 }
             }
+        }
+    }
+
+    /// 已确认的跟进接纳接收方：拒绝不合格的，其余进入配对并落实。
+    fn accept_followup_receivers(
+        &mut self,
+        key: &EvidenceKey,
+        children: Vec<String>,
+        actions: &mut Vec<Action>,
+    ) {
+        // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
+        // 原始调用开始序号优先；缺失时保守排除首次通知前的完成轮，双通知不重建基线。
+        for child in children {
+            if self.reject_followup_receiver(key, &child, actions) {
+                continue;
+            }
+            // 基线只排除操作开始前已完成的轮次；不能在 Interacted 到达时把之后完成的真实轮次一并当成旧轮。
+            let baseline = self.relations.operations[key]
+                .baseline_turns
+                .get(&child)
+                .cloned()
+                .unwrap_or_default();
+            self.convergences
+                .reuse_candidates
+                .entry((key.clone(), child.clone()))
+                .or_insert(baseline);
+            self.relations
+                .aux
+                .spawn_waits
+                .insert(child.clone(), key.clone());
+            self.pair_first_turn(key, &child, actions);
+            self.materialize(key, actions);
         }
     }
 
@@ -1176,11 +1200,14 @@ impl Machine {
             Some(FollowupRejection::NotOwnChild)
         } else if self.claims.contains_key(child) {
             Some(FollowupRejection::IndependentClaim)
-        } else if self.relations.bindings.values().any(|binding| {
-            binding.thread_id == child
-                && binding.run_id != run
-                && binding.status == BindingStatus::Bound
-        }) {
+        } else if !run.is_empty()
+            // 发起方归属未定时无从比较；等定案后由 confirm_waiting 重新判定。
+            && self.relations.bindings.values().any(|binding| {
+                binding.thread_id == child
+                    && binding.run_id != run
+                    && binding.status == BindingStatus::Bound
+            })
+        {
             Some(FollowupRejection::OtherRunBinding)
         } else {
             None
@@ -1358,6 +1385,15 @@ impl Machine {
         }
         if matches!(op.kind, EvidenceKind::V1Spawn | EvidenceKind::V2Started) {
             self.materialize(key, actions);
+        }
+        // 等发起方绑定期间到达的跟进：现在才能接纳接收方。
+        if matches!(
+            op.kind,
+            EvidenceKind::V1SendInput | EvidenceKind::V1ResumeAgent | EvidenceKind::V2Interacted
+        ) && op.outcome == EvidenceOutcome::Pending
+            && self.convergence_enabled()
+        {
+            self.accept_followup_receivers(key, op.receivers.into_iter().collect(), actions);
         }
     }
 

@@ -464,6 +464,17 @@ impl Machine {
                     && (d.source == EvidenceSource::Raw || floor.is_none_or(|f| d.wall_ms >= f))
             })
             .collect();
+        // 父子事件由不同监听器送来，消费记录可能先于开始记录被看到，不能一律按先后排除。
+        // 只有这个父线程对该子代理还有不知正文的（宽松）跟进时，早到的记录才可能是别人的。
+        let unknown_sender = self.relations.operations.values().any(|o| {
+            o.kind == EvidenceKind::V2Interacted
+                && !o.v2_strict
+                && o.conn_epoch == start.epoch
+                && o.key.parent_thread_id == op.key.parent_thread_id
+                && o.receivers.contains(child)
+                && !o.rejected_receivers.contains_key(child)
+                && o.outcome != EvidenceOutcome::Failed
+        });
         let mut used = vec![false; deliveries.len()];
         let mut waiting = Vec::new();
         for (key, other) in &members {
@@ -485,9 +496,9 @@ impl Machine {
         }
         let mut assigned = None;
         for (key, other) in waiting {
-            if let Some(i) = (0..deliveries.len())
-                .find(|&i| !used[i] && Self::v2_delivered_after(deliveries[i], other))
-            {
+            if let Some(i) = (0..deliveries.len()).find(|&i| {
+                !used[i] && Self::v2_delivered_after(deliveries[i], other, unknown_sender)
+            }) {
                 used[i] = true;
                 if key == &op.key {
                     assigned = Some(deliveries[i].turn.clone());
@@ -500,11 +511,12 @@ impl Machine {
         assigned
     }
 
-    /// 消费记录晚于开始记录：都来自 raw 时按观察序号；有一方来自会话文件时按时间戳
-    /// （同一 Codex 进程写入，毫秒精度，同一毫秒算作之后）。
-    fn v2_delivered_after(d: &DeliveryFact, start: &FollowupStart) -> bool {
+    /// 这条消费记录能否归给这个开始记录。都来自 raw 时观察序号不代表真实先后，
+    /// 只在可能有别的发送者（`unknown_sender`）时才按序号排除早到的记录；
+    /// 有一方来自会话文件时按时间戳（同一 Codex 进程写入，毫秒精度，同一毫秒算作之后）。
+    fn v2_delivered_after(d: &DeliveryFact, start: &FollowupStart, unknown_sender: bool) -> bool {
         if d.source == EvidenceSource::Raw && start.source == EvidenceSource::Raw {
-            d.seq > start.seq
+            !unknown_sender || d.seq > start.seq
         } else {
             d.wall_ms >= start.wall_ms
         }

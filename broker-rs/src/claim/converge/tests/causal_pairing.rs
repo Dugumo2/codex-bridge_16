@@ -779,6 +779,65 @@ fn 没有开始记录的同正文先被消费时严格跟进不冒领() {
 }
 
 #[test]
+fn 父线程事件晚到_消费记录先于开始记录被看到仍配对并最终收敛() {
+    let (mut m, mut mock) = base();
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    // 子线程的事件先送达：新轮和消费记录都在父线程的调用记录之前被看到。
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    replies(&mut m, &mock, actions);
+    delivery(&mut m, "新轮", "入站", "先到的正文", false);
+    raw(&mut m, "跟进", "先到的正文");
+    interacted(&mut m, "跟进");
+    assert!(op(&m, "跟进").v2_strict);
+    pending(&m, 0);
+    let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+    replies(&mut m, &mock, actions);
+    finish(&mut m, &mut mock);
+}
+
+#[test]
+fn 子代理归属未定时转手跟进孙代理_定案后接回孙代理并最终收敛() {
+    const G: &str = "孙";
+    // 孙代理的新轮可能晚于子代理绑定，也可能早于它；后一种只能靠绑定时接回。
+    for grandchild_first in [false, true] {
+        let (mut m, mut mock) = base();
+        spawn(&mut m, &mut mock, C, "旧轮", G, "派生孙", "孙旧轮");
+        complete(&mut m, &mut mock, G, "孙旧轮", "completed");
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        raw(&mut m, "跟进子", "交给你");
+        interacted(&mut m, "跟进子");
+        // 子代理的新轮还没绑定到运行，它发出的跟进先到。
+        let (started, done) = SubagentMock::v2_activity("interacted", C, "新轮", "跟进孙", G);
+        apply(&mut m, started);
+        apply(&mut m, done);
+        if grandchild_first {
+            let actions = apply(&mut m, mock.turn_started(G, "孙新轮"));
+            replies(&mut m, &mock, actions);
+        }
+        let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+        replies(&mut m, &mock, actions);
+        delivery(&mut m, "新轮", "入站", "交给你", false);
+        if !grandchild_first {
+            let actions = apply(&mut m, mock.turn_started(G, "孙新轮"));
+            replies(&mut m, &mock, actions);
+        }
+        assert!(
+            m.relations
+                .bindings
+                .get(&(G.to_string(), "孙新轮".to_string()))
+                .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound),
+            "孙代理的新轮必须绑定到本运行（孙先开轮：{grandchild_first}）"
+        );
+        pending(&m, 0);
+        let actions = complete(&mut m, &mut mock, G, "孙新轮", "completed");
+        replies(&mut m, &mock, actions);
+        let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+        replies(&mut m, &mock, actions);
+        finish(&mut m, &mut mock);
+    }
+}
+
+#[test]
 fn 同正文跟进发给不同子代理时各凭自己的消费记录配对() {
     const C2: &str = "子二";
     let (mut m, mut mock) = base();
