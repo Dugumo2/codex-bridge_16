@@ -1084,6 +1084,11 @@ fn 无raw_轮次标记在末尾窗口之外时向前找到当前轮_吸收的跟
     all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
     pending(&m, 0);
     assert_eq!(op(&m, "跟进").proven_turns[C], ["旧轮".to_owned()].into());
+    // 按消费记录严格配上，不是降级后宽松碰巧配到同一轮。
+    let o = op(&m, "跟进");
+    assert!(o.v2_strict, "找到当前轮后仍按文件严格配对");
+    assert_eq!(o.v2_source, V2EvidenceSource::RolloutFile);
+    assert_eq!(o.v2_fallback, None);
     let bytes = fx::with(|f| f.bytes);
     assert!(
         bytes <= 2 * crate::rollout::MAX_TAIL_BYTES + 64 * 1024,
