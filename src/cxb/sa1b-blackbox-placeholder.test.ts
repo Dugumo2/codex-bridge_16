@@ -238,6 +238,7 @@ for (const sameTurn of [false, true]) test(`v2 跟进忙碌子代理：${sameTur
     const followups = (await diagnostic(h)).pendingOperations.filter((op: any) => op.kind === "v2Interacted");
     expect(followups).toHaveLength(1);
     expect(followups[0].pairingMode, "broker 新开的线程必须走严格配对").toBe("strict");
+    expect(followups[0].fallbackReason, "严格配对不带回退原因").toBeNull();
     await h.finish(ROOT, "父轮先结束");
     let carryingTurn = previous;
     if (sameTurn) {

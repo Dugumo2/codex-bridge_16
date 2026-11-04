@@ -94,6 +94,17 @@ pub enum EvidenceOutcome {
     Failed,
     Revoked,
 }
+/// v2 跟进为什么只能宽松配对；在 Interacted 首次到达时按当时已知事实判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2FallbackReason {
+    /// 本连接内还没收到过父线程的任何 raw 事件；典型是跨重启 `--resume` 的线程，上游只有 thread/start 有 raw 开关。
+    ParentWithoutRaw,
+    /// 父线程送过 raw，但这次调用的开始记录没有先于 Interacted 到达（迟到或因上限未登记）。
+    StartMissing,
+    /// 有开始记录，但连接、运行或授权代际已不符，不能沿用。
+    StartStale,
+}
+
 /// v1 completed 的代理状态不等于发送成功；v2 双通知只登记一次。
 /// 证据最迟于父轮结束、授权撤销、连接换代失效；已绑定轮次保留历史。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +127,8 @@ pub struct EvidenceOperation {
     pub v2_strict: bool,
     /// 由 raw 认出是 `send_message`：上游只入队不开新轮，可能永远等不到承载轮，不授予管理权也不进待定账本。
     pub v2_queue_only: bool,
+    /// 宽松配对的原因，与 `v2_strict` 同时固定；只供诊断，不参与配对、门禁或告警。
+    pub v2_fallback: Option<V2FallbackReason>,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

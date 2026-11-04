@@ -385,3 +385,56 @@ fn 观察恢复_缺口及未加载回查同轮后配对并最终收敛() {
         finish(&mut m, &mut mock);
     }
 }
+
+fn pairing_rows(m: &Machine) -> std::collections::BTreeSet<(String, String)> {
+    m.convergence_diagnostics(R).unwrap()["pendingOperations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["pairingMode"].to_string(),
+                row["fallbackReason"].to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn 宽松配对诊断标明回退原因且严格操作不带原因() {
+    // 父线程从没送来 raw：典型是跨重启 --resume 恢复的线程。
+    // 子代理先空闲：宽松模式才会真正等新轮，而不是吸收旧活动轮。
+    let (mut m, mut mock) = base();
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    interacted(&mut m, "无raw父线程");
+    pending(&m, 1);
+    assert_eq!(
+        pairing_rows(&m),
+        [("\"fallback\"".into(), "\"parentWithoutRaw\"".into())].into()
+    );
+
+    // 父线程送过 raw，只是这次调用缺开始记录；同一账本里的严格操作不带原因。
+    let (mut m, mut mock) = base();
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    raw(&mut m, "A", "第一任务");
+    interacted(&mut m, "A");
+    interacted(&mut m, "缺开始");
+    pending(&m, 2);
+    assert_eq!(op(&m, "A").v2_fallback, None);
+    assert_eq!(
+        pairing_rows(&m),
+        [
+            ("\"fallback\"".into(), "\"startMissing\"".into()),
+            ("\"strict\"".into(), "null".into()),
+        ]
+        .into()
+    );
+
+    // 有开始记录但授权已换代：不能沿用，原因写明失效而不是缺失。
+    let (mut m, _mock) = base();
+    raw(&mut m, "B", "唯一跟进输入");
+    m.relations.contexts.get_mut(R).unwrap().gen += 1;
+    interacted(&mut m, "B");
+    assert!(!op(&m, "B").v2_strict);
+    assert_eq!(op(&m, "B").v2_fallback, Some(V2FallbackReason::StartStale));
+}

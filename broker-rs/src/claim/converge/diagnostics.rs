@@ -1,6 +1,6 @@
 //! 在线诊断只读取事实；绝不重新发现、同步账本、绑定活动或推进 epoch。
 use super::*;
-use crate::relations::{EvidenceKind, EvidenceOutcome, MemberActivity};
+use crate::relations::{EvidenceKind, EvidenceOutcome, MemberActivity, V2FallbackReason};
 use serde_json::{json, Value};
 
 const MAX_ITEMS: usize = 32;
@@ -235,6 +235,12 @@ impl Machine {
             let deadline = op.filter(|o| !self.v2_awaits_pairing(o));
             let pairing_mode = op.filter(|o| o.kind == EvidenceKind::V2Interacted)
                 .map(|o| if o.v2_strict { "strict" } else { "fallback" });
+            let fallback_reason = op.filter(|o| o.kind == EvidenceKind::V2Interacted)
+                .and_then(|o| o.v2_fallback).map(|reason| match reason {
+                    V2FallbackReason::ParentWithoutRaw => "parentWithoutRaw",
+                    V2FallbackReason::StartMissing => "startMissing",
+                    V2FallbackReason::StartStale => "startStale",
+                });
             let receiver_ids: Vec<_> = if let Some(op) = op { op.receivers.iter().collect() } else {
                 ledger.placeholder_operations.iter().filter(|(_, reasons)| reasons.contains(*key)).map(|(thread, _)| thread).collect()
             };
@@ -248,7 +254,7 @@ impl Machine {
             json!({"kind":op.map(|o| evidence_kind_label(o.kind)).unwrap_or("unknown"),
                 "outcome":op.map(|o| evidence_outcome_label(o.outcome)).unwrap_or("unknown"),
                 "receivers":receivers,"provenTurns":proven,
-                "pairingMode":pairing_mode,
+                "pairingMode":pairing_mode,"fallbackReason":fallback_reason,
                 "expiresAt":deadline.map(|o| if o.expires_at_ms >= self.clock.mono_ms {
                     self.clock.now_ms.saturating_add(o.expires_at_ms - self.clock.mono_ms)
                 } else { self.clock.now_ms.saturating_sub(self.clock.mono_ms - o.expires_at_ms) }),
@@ -300,7 +306,9 @@ fn bound_snapshot(snapshot: &mut Value) {
 mod tests {
     use super::*;
     use crate::claim::{step, ClientRequest, Event};
-    use crate::relations::{EvidenceKey, EvidenceKind, EvidenceOperation, EvidenceOutcome};
+    use crate::relations::{
+        EvidenceKey, EvidenceKind, EvidenceOperation, EvidenceOutcome, V2FallbackReason,
+    };
     use crate::test_support::subagent::SubagentMock;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -391,6 +399,7 @@ mod tests {
                 baseline_turns: BTreeMap::new(),
                 v2_strict: false,
                 v2_queue_only: false,
+                v2_fallback: Some(V2FallbackReason::ParentWithoutRaw),
                 first_seen_ms: 0,
                 expires_at_ms: 1,
                 parent_ended: true,

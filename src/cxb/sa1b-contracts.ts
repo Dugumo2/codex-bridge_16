@@ -62,6 +62,8 @@ export interface ConvergenceDiagnostic {
   };
   pendingOperations: Array<{
     kind: string; outcome: string; receivers: string[]; pairingMode: "strict" | "fallback" | null;
+    /** 宽松配对的原因：父线程没送过 raw（如 --resume 恢复）、缺这次调用的开始记录、开始记录已换代失效。 */
+    fallbackReason: "parentWithoutRaw" | "startMissing" | "startStale" | null;
     provenTurns: Array<{ threadId: string; turnIds: string[]; omittedTurns: number }>;
     expiresAt: number | null; expired: boolean; missing: boolean; omittedReceivers: number; omittedProvenTurns: number;
   }>;

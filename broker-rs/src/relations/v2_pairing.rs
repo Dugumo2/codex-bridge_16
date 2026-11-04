@@ -41,6 +41,7 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) -> bool {
         self.prune_v2_deliveries();
+        self.note_raw_thread(thread);
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("");
@@ -181,6 +182,22 @@ impl Machine {
             }
             _ => false,
         }
+    }
+
+    /// 记下线程送来过 raw；满额时先丢旧代际，仍满就不再登记（只影响诊断措辞）。
+    fn note_raw_thread(&mut self, thread: &str) {
+        let epoch = self.relations.conn_epoch;
+        let threads = &mut self.relations.aux.v2_raw_threads;
+        if threads.get(thread) == Some(&epoch) {
+            return;
+        }
+        if threads.len() >= MAX_OPERATIONS && !threads.contains_key(thread) {
+            threads.retain(|_, seen| *seen == epoch);
+            if threads.len() >= MAX_OPERATIONS {
+                return;
+            }
+        }
+        threads.insert(thread.into(), epoch);
     }
 
     pub(super) fn v2_observe_start(&mut self, thread: &str, turn: &str) {

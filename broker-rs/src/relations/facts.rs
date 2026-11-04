@@ -640,6 +640,17 @@ impl Machine {
                         && start.run == run_id
                         && start.generation == authority_gen
                 });
+            let v2_fallback = (kind == EvidenceKind::V2Interacted && begin.is_none()).then(|| {
+                if self.relations.aux.followup_starts.contains_key(&key) {
+                    V2FallbackReason::StartStale
+                } else if self.relations.aux.v2_raw_threads.get(parent)
+                    == Some(&self.relations.conn_epoch)
+                {
+                    V2FallbackReason::StartMissing
+                } else {
+                    V2FallbackReason::ParentWithoutRaw
+                }
+            });
             let baseline_turns = receivers
                 .iter()
                 .filter_map(|child| {
@@ -671,6 +682,7 @@ impl Machine {
                     baseline_turns,
                     v2_strict: begin.is_some(),
                     v2_queue_only: begin.as_ref().is_some_and(|start| !start.trigger),
+                    v2_fallback,
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
                         .as_ref()

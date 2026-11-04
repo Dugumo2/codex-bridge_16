@@ -149,6 +149,8 @@ pub struct RelationsAux {
     pub live_turn_starts: BTreeMap<(String, String), (u64, u64)>,
     pub v2_receiver_paths: BTreeMap<EvidenceKey, String>,
     pub v2_deliveries: VecDeque<v2_pairing::DeliveryFact>,
+    /// 送来过 raw 事件的线程及其连接代际；只用于诊断宽松配对的原因。
+    pub v2_raw_threads: BTreeMap<String, u64>,
     /// 子线程 → 等它首轮的派生操作。
     pub spawn_waits: BTreeMap<String, EvidenceKey>,
     pub parent_waits: BTreeMap<EvidenceKey, ParentWait>,
