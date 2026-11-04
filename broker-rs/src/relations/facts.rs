@@ -1078,22 +1078,22 @@ impl Machine {
         }
         let upward = self.is_ancestor_thread(child, &key.parent_thread_id);
         let peer = !upward && self.is_peer_thread(child, &key.parent_thread_id);
-        let reason = if upward {
-            "接收方是发起方的上级，不属于跟进"
+        let rejection = if upward {
+            FollowupRejection::Upward
         } else if peer {
-            "接收方是发起方的平级，不属于跟进"
+            FollowupRejection::Peer
         } else if !self.thread_relation(child).is_some_and(|edge| {
             edge.kind == RelationKind::Subagent && edge.parent_thread_id == key.parent_thread_id
         }) {
-            "未核实为本父线程的子代理"
+            FollowupRejection::NotOwnChild
         } else if self.claims.contains_key(child) {
-            "接收方已有独立认领"
+            FollowupRejection::IndependentClaim
         } else if self.relations.bindings.values().any(|binding| {
             binding.thread_id == child
                 && binding.run_id != op.run_id
                 && binding.status == BindingStatus::Bound
         }) {
-            "接收方已绑定其他运行"
+            FollowupRejection::OtherRunBinding
         } else {
             return false;
         };
@@ -1101,7 +1101,7 @@ impl Machine {
         // 拒绝发生在 bind 之前：按本次操作的候选运行记关系诊断，不能借已有绑定反查归属。
         // 跟进尚无被接纳的子轮，保留 null turnId，不把旧绑定轮次冒充成本次活动。
         // 子代理向上或向平级发消息是正常协作：同样不授予管理权，但不是归属问题，不写冲突和覆盖缺口。
-        if !upward && !peer {
+        if !rejection.is_collaboration() {
             self.runs.log_source(
                 &run,
                 child,
@@ -1111,7 +1111,7 @@ impl Machine {
                 Some(&key.item_id),
                 self.clock.now_ms,
                 "归属冲突",
-                reason,
+                rejection.reason(),
                 false,
                 false,
                 Some("discoveryIncomplete"),
@@ -1123,7 +1123,7 @@ impl Machine {
             .operations
             .get_mut(key)
             .expect("跟进操作存在");
-        op.rejected_receivers.insert(child.into(), reason.into());
+        op.rejected_receivers.insert(child.into(), rejection);
         op.proven_turns.remove(child);
         if op
             .receivers
@@ -1163,14 +1163,19 @@ impl Machine {
     }
 
     /// 已拒绝的跟进候选不能通过后续收敛发现重新入册；本运行已有合法管理证据时仍保留。
-    pub(super) fn rejected_followup_for_run(&self, run: &str, child: &str) -> bool {
+    /// 子代理向上或向平级（含上一运行留下的兄弟）发消息不是跟进，不算跟进被拒；
+    /// 那样的候选按其余事实分类（例如兄弟被唤醒的新轮仍按活动轮阻塞收敛）。
+    pub(crate) fn rejected_followup_for_run(&self, run: &str, child: &str) -> bool {
         if self.current_management_evidence(run, child) {
             return false;
         }
-        self.relations
-            .operations
-            .values()
-            .any(|op| op.run_id == run && op.rejected_receivers.contains_key(child))
+        self.relations.operations.values().any(|op| {
+            op.run_id == run
+                && op
+                    .rejected_receivers
+                    .get(child)
+                    .is_some_and(|rejection| !rejection.is_collaboration())
+        })
     }
 
     /// 写入绑定；独立认领或已有其他运行绑定构成冲突，不覆盖。

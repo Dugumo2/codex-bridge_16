@@ -105,6 +105,39 @@ pub enum V2FallbackReason {
     StartStale,
 }
 
+/// 跟进接收方不纳管的理由。向上与平级是子代理之间的正常协作，不是跟进，不能当「跟进被拒」统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowupRejection {
+    /// 接收方是发起方的上级。
+    Upward,
+    /// 接收方与发起方同属一棵代理树、又不是它的下级。
+    Peer,
+    /// 未核实为本父线程的子代理（含越级跟进孙代理）。
+    NotOwnChild,
+    /// 接收方已有独立认领。
+    IndependentClaim,
+    /// 接收方已绑定其他运行。
+    OtherRunBinding,
+}
+
+impl FollowupRejection {
+    /// 运行记录与诊断用的说明文字。
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Upward => "接收方是发起方的上级，不属于跟进",
+            Self::Peer => "接收方是发起方的平级，不属于跟进",
+            Self::NotOwnChild => "未核实为本父线程的子代理",
+            Self::IndependentClaim => "接收方已有独立认领",
+            Self::OtherRunBinding => "接收方已绑定其他运行",
+        }
+    }
+
+    /// 向上或平级消息：不授予管理权，也不是归属问题。
+    pub fn is_collaboration(self) -> bool {
+        matches!(self, Self::Upward | Self::Peer)
+    }
+}
+
 /// v1 completed 的代理状态不等于发送成功；v2 双通知只登记一次。
 /// 证据最迟于父轮结束、授权撤销、连接换代失效；已绑定轮次保留历史。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +152,7 @@ pub struct EvidenceOperation {
     pub outcome: EvidenceOutcome,
     pub receivers: BTreeSet<String>,
     /// 跟进接收方的拒绝纳管理由；保留上游接收事实，不把拒绝误记成发送失败。
-    pub rejected_receivers: BTreeMap<String, String>,
+    pub rejected_receivers: BTreeMap<String, FollowupRejection>,
     pub proven_turns: BTreeMap<String, BTreeSet<String>>,
     /// 操作登记瞬间每个接收方已完成轮次的基线；配对只排除这些轮次。
     pub baseline_turns: BTreeMap<String, BTreeSet<String>>,

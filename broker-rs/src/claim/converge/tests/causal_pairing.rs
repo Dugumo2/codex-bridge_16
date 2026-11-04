@@ -578,7 +578,9 @@ fn 根认领释放后再次发现同一向上候选仍按向上处理且新运�
     let (a, b) = SubagentMock::v2_activity("interacted", C, "旧轮", "首次向上", P);
     let mut all = apply(&mut m, a);
     all.extend(apply(&mut m, b));
-    assert!(op(&m, "首次向上").rejected_receivers[P].contains("上级"));
+    assert!(op(&m, "首次向上").rejected_receivers[P]
+        .reason()
+        .contains("上级"));
     all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
     all.extend(finish(&mut m, &mut mock));
     assert!(!m.claims.contains_key(P), "前置：根认领已释放");
@@ -610,7 +612,7 @@ fn 根认领释放后再次发现同一向上候选仍按向上处理且新运�
     m.convergence_sync_facts(R2);
     let again = op(&m, "再次向上");
     assert_eq!(again.run_id, R2);
-    assert!(again.rejected_receivers[P].contains("上级"));
+    assert!(again.rejected_receivers[P].reason().contains("上级"));
     assert!(!m.manage_context(R2).unwrap().members.contains_key(P));
     assert!(m.convergences.ledgers[R2].pending.is_empty());
 
@@ -802,4 +804,125 @@ fn 同正文跟进发给不同子代理时各凭自己的消费记录配对() {
     complete(&mut m, &mut mock, C2, "子二旧轮", "completed");
     let all = finish(&mut m, &mut mock);
     assert_no_alarm(&all);
+}
+
+/// 新运行的收尾驱动：父轮结束后按重试推进发现，直到进入汇总或不再重试。
+fn drive_run(m: &mut Machine, mock: &SubagentMock, run: &str) -> Vec<Action> {
+    let mut all = vec![];
+    for _ in 0..8 {
+        let progress = &m.convergences.progress[run];
+        if progress.reading.is_some() || progress.retry_at.is_none() {
+            break;
+        }
+        let runtime = m.convergences.runs[run].clone();
+        m.clock.mono_ms = progress.retry_at.unwrap();
+        let mut out = vec![];
+        m.convergence_timer(
+            TimerKind::ConvergeRetry {
+                token: runtime.token,
+                attempt: runtime.discovery_retry,
+            },
+            &mut out,
+        );
+        all.extend(replies(m, mock, out));
+    }
+    all
+}
+
+/// 上一运行派生的兄弟：本运行的子代理给它发平级消息（或它向上回消息）不是跟进被拒，
+/// 不能记 rejectedFollowup 冲突把运行卡到收敛期限；兄弟被唤醒的新轮已开始时仍按活动轮阻塞收敛。
+#[test]
+fn 历史兄弟收到平级消息不算冲突_兄弟新轮在跑时仍阻塞收敛() {
+    const S: &str = "历史兄弟";
+    const R2: &str = "第二运行";
+    const T2: &str = "第二父轮";
+    for upward in [false, true] {
+        let (mut m, mut mock) = base();
+        spawn(&mut m, &mut mock, P, T, S, "派生兄弟", "兄弟旧轮");
+        let mut all = complete(&mut m, &mut mock, S, "兄弟旧轮", "completed");
+        all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+        all.extend(finish(&mut m, &mut mock));
+        assert!(!m.claims.contains_key(P), "前置：上一运行已结束");
+
+        // 新运行只跟进 C；S 是上一运行留下的兄弟。
+        all.extend(start_run(&mut m, R2, T2, 2));
+        all.extend(notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":P,"turnId":T2,"item":{
+            "type":"function_call","name":"followup_task","call_id":"跟进C",
+            "arguments":json!({"target":C,"message":"继续"}).to_string()}}),
+        ));
+        let (a, b) = SubagentMock::v2_activity("interacted", P, T2, "跟进C", C);
+        all.extend(apply(&mut m, a));
+        all.extend(apply(&mut m, b));
+        let actions = apply(&mut m, mock.turn_started(C, "C新轮"));
+        all.extend(replies(&mut m, &mock, actions));
+        assert!(m
+            .binding(C, "C新轮")
+            .is_some_and(|b| b.run_id == R2 && b.status == BindingStatus::Bound));
+
+        // C 给历史兄弟 S 发平级消息，S 被唤醒开新轮；upward 时 C 另向上给 P 发消息。
+        let (a, b) = SubagentMock::v2_activity("interacted", C, "C新轮", "平级消息", S);
+        all.extend(apply(&mut m, a));
+        all.extend(apply(&mut m, b));
+        assert_eq!(
+            op(&m, "平级消息").rejected_receivers[S],
+            FollowupRejection::Peer
+        );
+        let actions = apply(&mut m, mock.turn_started(S, "兄弟新轮"));
+        all.extend(replies(&mut m, &mock, actions));
+        if upward {
+            let (a, b) = SubagentMock::v2_activity("interacted", C, "C新轮", "向上消息", P);
+            all.extend(apply(&mut m, a));
+            all.extend(apply(&mut m, b));
+            assert_eq!(
+                op(&m, "向上消息").rejected_receivers[P],
+                FollowupRejection::Upward
+            );
+            assert!(!m.rejected_followup_for_run(R2, P), "向上不算跟进被拒");
+        }
+        assert!(!m.rejected_followup_for_run(R2, S), "平级不算跟进被拒");
+
+        let actions = complete(&mut m, &mut mock, C, "C新轮", "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        let actions = complete(&mut m, &mut mock, P, T2, "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        all.extend(drive_run(&mut m, &mock, R2));
+        // 维护者接受的代价：兄弟新轮已经开始，按活动候选阻塞收尾，但不是冲突。
+        assert!(
+            m.convergences.progress[R2].reading.is_none(),
+            "兄弟新轮在跑时不能收尾"
+        );
+        let facts = m.convergence_facts(R2).unwrap();
+        assert!(facts.conflicts.is_empty(), "{:?}", facts.conflicts);
+        assert!(
+            m.relations
+                .aux
+                .classifications
+                .get(&(R2.into(), S.into()))
+                .is_some_and(
+                    |c| c.membership == Membership::Pending("candidateActivityActive".into())
+                ),
+            "兄弟按活动候选阻塞"
+        );
+
+        // 兄弟新轮结束后运行正常收尾，全程零误报。
+        let actions = complete(&mut m, &mut mock, S, "兄弟新轮", "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        all.extend(drive_run(&mut m, &mock, R2));
+        assert!(
+            m.convergences.progress[R2].reading.is_some(),
+            "兄弟新轮结束后应进入汇总"
+        );
+        assert!(m.convergence_facts(R2).unwrap().conflicts.is_empty());
+        // 兄弟不归本运行管理，它的轮次摘要暂存到期会记「归属确认前摘要暂存过期」；
+        // 这条与本修复无关（事件日志按血缘暂存，修复前同样会记），单独列出，其余仍须零误报。
+        let (sibling_gaps, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|action| {
+            matches!(action, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
+                if lines.iter().all(|line| line.contains("beforeBindingUnknown") && line.contains(S)))
+        });
+        assert!(sibling_gaps.len() <= 1);
+        assert_no_alarm(&rest);
+    }
 }

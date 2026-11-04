@@ -433,7 +433,10 @@ mod tests {
                     .iter()
                     .map(|r| (r.clone(), turns.clone()))
                     .collect(),
-                rejected_receivers: BTreeMap::from([("rejected".into(), SENTINEL.into())]),
+                rejected_receivers: BTreeMap::from([(
+                    "rejected".into(),
+                    crate::relations::FollowupRejection::IndependentClaim,
+                )]),
                 receivers,
                 baseline_turns: BTreeMap::new(),
                 v2_strict: false,

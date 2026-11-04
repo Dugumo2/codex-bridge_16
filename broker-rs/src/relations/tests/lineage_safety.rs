@@ -237,7 +237,7 @@ fn lineage_safety_旧成员不能让失败撤销拒绝与旧代操作重新获�
             "revoked" => op.outcome = EvidenceOutcome::Revoked,
             "rejected" => {
                 op.rejected_receivers
-                    .insert(C.into(), "独立认领冲突".into());
+                    .insert(C.into(), FollowupRejection::IndependentClaim);
             }
             "connection" => op.conn_epoch = op.conn_epoch.saturating_add(1),
             "generation" => op.authority_gen = op.authority_gen.saturating_add(1),

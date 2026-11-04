@@ -334,7 +334,10 @@ fn v2兄弟与隔房子代理互发不记归属冲突且不授管理权() {
             .values()
             .find(|op| op.key.item_id == item)
             .unwrap();
-        assert!(op.rejected_receivers[target].contains("平级"), "{item}");
+        assert!(
+            op.rejected_receivers[target].reason().contains("平级"),
+            "{item}"
+        );
         assert!(log_lines_with(&actions, "归属冲突").is_empty(), "{item}");
         assert!(
             log_lines_with(&actions, "discoveryIncomplete").is_empty(),
