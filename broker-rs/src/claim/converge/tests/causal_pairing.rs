@@ -769,3 +769,37 @@ fn 没有开始记录的同正文先被消费时严格跟进不冒领() {
         finish(&mut m, &mut mock);
     }
 }
+
+#[test]
+fn 同正文跟进发给不同子代理时各凭自己的消费记录配对() {
+    const C2: &str = "子二";
+    let (mut m, mut mock) = base();
+    spawn(&mut m, &mut mock, P, T, C2, "派生子二", "子二旧轮");
+    raw(&mut m, "A", "同一正文");
+    interacted(&mut m, "A");
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T,"item":{
+        "type":"function_call","name":"followup_task","call_id":"B",
+        "arguments":json!({"target":C2,"message":"同一正文"}).to_string()}}),
+    );
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T, "B", C2);
+    apply(&mut m, a);
+    apply(&mut m, b);
+    pending(&m, 2);
+    delivery(&mut m, "旧轮", "入站A", "同一正文", false);
+    pending(&m, 1);
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":C2,"turnId":"子二旧轮","item":{
+        "type":"agent_message","id":"入站B","author":"/root","recipient":format!("/root/{C2}"),
+        "content":[{"type":"input_text","text":format!("Message Type: NEW_TASK\nTask name: /root/{C2}\nSender: /root\nPayload:\n同一正文")}]}}),
+    );
+    pending(&m, 0);
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    complete(&mut m, &mut mock, C2, "子二旧轮", "completed");
+    let all = finish(&mut m, &mut mock);
+    assert_no_alarm(&all);
+}
