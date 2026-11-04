@@ -276,6 +276,7 @@ impl Machine {
                     V2FallbackReason::RolloutCancelled => "rolloutCancelled",
                     V2FallbackReason::RolloutSenderUnknown => "rolloutSenderUnknown",
                     V2FallbackReason::RolloutTurnUnknown => "rolloutTurnUnknown",
+                    V2FallbackReason::RawUnknown => "rawUnknown",
                 });
             let receiver_ids: Vec<_> = if let Some(op) = op { op.receivers.iter().collect() } else {
                 ledger.placeholder_operations.iter().filter(|(_, reasons)| reasons.contains(*key)).map(|(thread, _)| thread).collect()

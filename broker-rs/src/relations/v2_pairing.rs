@@ -2,6 +2,15 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+/// 线程在本连接代际里是否送过 raw。只有确认没有（`NotSeen`）才能改读会话文件；
+/// 登记表满了、没登记上的线程是 `Unknown`，照原来的宽松走，一次都不读文件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawCapability {
+    Seen,
+    NotSeen,
+    Unknown,
+}
+
 /// 开始记录与消费记录的来源。raw 来自本连接的实时事件，观察序号即因果先后；
 /// 会话文件的观察序号只反映读取时刻，跨文件不可比，先后改看行时间戳（`wall_ms`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,20 +365,35 @@ impl Machine {
         true
     }
 
-    /// 记下线程送来过 raw；满额时先丢旧代际，仍满就不再登记（只影响诊断措辞）。
+    /// 记下线程送来过 raw；满额时先丢旧代际，仍满就记下「本代际登记不全」。
+    /// 登记决定会不会读会话文件：登记不上的线程只能算能力未知，不能算没有 raw（见 [`RawCapability`]）。
     fn note_raw_thread(&mut self, thread: &str) {
         let epoch = self.relations.conn_epoch;
-        let threads = &mut self.relations.aux.v2_raw_threads;
+        let aux = &mut self.relations.aux;
+        let threads = &mut aux.v2_raw_threads;
         if threads.get(thread) == Some(&epoch) {
             return;
         }
         if threads.len() >= MAX_OPERATIONS && !threads.contains_key(thread) {
             threads.retain(|_, seen| *seen == epoch);
             if threads.len() >= MAX_OPERATIONS {
+                aux.v2_raw_overflow = Some(epoch);
                 return;
             }
         }
         threads.insert(thread.into(), epoch);
+    }
+
+    /// 线程在本连接代际里有没有送过 raw。
+    pub(crate) fn raw_capability(&self, thread: &str) -> RawCapability {
+        let epoch = self.relations.conn_epoch;
+        if self.relations.aux.v2_raw_threads.get(thread) == Some(&epoch) {
+            RawCapability::Seen
+        } else if self.relations.aux.v2_raw_overflow == Some(epoch) {
+            RawCapability::Unknown
+        } else {
+            RawCapability::NotSeen
+        }
     }
 
     pub(super) fn v2_observe_start(&mut self, thread: &str, turn: &str) {

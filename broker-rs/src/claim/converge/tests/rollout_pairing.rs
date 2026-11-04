@@ -1238,3 +1238,101 @@ fn 无raw_等文件期间轮次变化后退回宽松_结果与旧版宽松一致
         "退回宽松后与旧版宽松结果不同：{mismatches:?}"
     );
 }
+
+// ─── 17. raw 线程登记满额：能力未知时不读文件 ───────────────────────
+
+/// 本连接里另有 `count` 个线程送来过 raw（真实的 rawResponseItem 通知），把登记表占满。
+fn other_raw_threads(m: &mut Machine, from: usize, count: usize) {
+    for i in from..from + count {
+        notify(
+            m,
+            "rawResponseItem/completed",
+            json!({"threadId":format!("别的线程{i}"),"turnId":"轮","item":{"type":"reasoning","summary":[]}}),
+        );
+    }
+}
+
+/// 父线程其实送过 raw，只是登记表已满没登记上：容量不足不能当成「没有 raw」去读它的会话文件，
+/// 能力未知时照原来的宽松走，诊断写明原因。
+#[test]
+fn raw登记满额时父线程能力未知_不读会话文件且照原样宽松() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    let mut all = complete(&mut m, &mut mock, C, "旧轮", "completed");
+    other_raw_threads(&mut m, 0, crate::relations::MAX_OPERATIONS);
+    // 父线程送来 raw（这次调用的开始记录没赶上）。
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T,"item":{"type":"reasoning","summary":[]}}),
+    );
+    call_line(&m, "跟进", "followup_task", C, "新工作");
+    all.extend(interacted_to(&mut m, "跟进", C));
+    assert!(!awaiting(&m, "跟进"), "不等文件");
+    let o = op(&m, "跟进");
+    assert!(!o.v2_strict);
+    assert_eq!(o.v2_fallback, Some(V2FallbackReason::RawUnknown));
+    pending(&m, 1);
+    all.extend(fallback_completes(&mut m, &mut mock, "跟进"));
+    assert!(
+        !fx::touches_rollout(&all),
+        "能力未知时不发路径请求、不读文件"
+    );
+    assert_eq!(fx::with(|f| (f.path_reads, f.reads)), (0, 0));
+    assert_no_alarm(&all);
+}
+
+/// 等文件期间登记表满了：此后父、子线程是否有 raw 都不再确定，立即停止读文件并退回宽松。
+#[test]
+fn 等文件期间raw登记满额_停止读文件并退回宽松() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    let mut all = complete(&mut m, &mut mock, C, "旧轮", "completed");
+    other_raw_threads(&mut m, 0, crate::relations::MAX_OPERATIONS - 1);
+    all.extend(interacted_to(&mut m, "跟进", C));
+    assert!(awaiting(&m, "跟进"), "前置：登记未满时照常等文件");
+    other_raw_threads(&mut m, crate::relations::MAX_OPERATIONS, 2);
+    let reads = fx::with(|f| f.reads);
+    all.extend(poll_for(&mut m, &mock, 2 * ROLLOUT_POLL_MS));
+    assert!(!awaiting(&m, "跟进"));
+    assert_eq!(fx::with(|f| f.reads), reads, "满额后不再读文件");
+    assert_eq!(
+        op(&m, "跟进").v2_fallback,
+        Some(V2FallbackReason::RawUnknown)
+    );
+    all.extend(fallback_completes(&mut m, &mut mock, "跟进"));
+    assert_no_alarm(&all);
+    no_lingering_poll(&mut m, &mock);
+}
+
+/// 等文件期间父线程送来了 raw：有 raw 的线程不得再读会话文件，这次调用的开始记录已经错过，
+/// 按 raw 下缺开始记录的同一结论（startMissing）宽松，结果与原来相同。
+#[test]
+fn 等文件期间父线程送来raw_停止读它的文件并按缺开始记录宽松() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    let mut all = complete(&mut m, &mut mock, C, "旧轮", "completed");
+    all.extend(interacted_to(&mut m, "跟进", C));
+    assert!(awaiting(&m, "跟进"));
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T,"item":{"type":"reasoning","summary":[]}}),
+    );
+    let reads = fx::with(|f| f.log.iter().filter(|(t, _)| t == P).count());
+    call_line(&m, "跟进", "followup_task", C, "新工作");
+    all.extend(poll_for(&mut m, &mock, 2 * ROLLOUT_POLL_MS));
+    assert!(!awaiting(&m, "跟进"));
+    assert_eq!(
+        fx::with(|f| f.log.iter().filter(|(t, _)| t == P).count()),
+        reads,
+        "父线程送来 raw 后不再读它的文件"
+    );
+    assert_eq!(
+        op(&m, "跟进").v2_fallback,
+        Some(V2FallbackReason::StartMissing)
+    );
+    all.extend(fallback_completes(&mut m, &mut mock, "跟进"));
+    assert_no_alarm(&all);
+    no_lingering_poll(&mut m, &mock);
+}

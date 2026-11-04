@@ -647,12 +647,13 @@ impl Machine {
             let v2_fallback = (kind == EvidenceKind::V2Interacted && begin.is_none()).then(|| {
                 if self.relations.aux.followup_starts.contains_key(&key) {
                     V2FallbackReason::StartStale
-                } else if self.relations.aux.v2_raw_threads.get(parent)
-                    == Some(&self.relations.conn_epoch)
-                {
-                    V2FallbackReason::StartMissing
                 } else {
-                    V2FallbackReason::ParentWithoutRaw
+                    match self.raw_capability(parent) {
+                        v2_pairing::RawCapability::Seen => V2FallbackReason::StartMissing,
+                        v2_pairing::RawCapability::NotSeen => V2FallbackReason::ParentWithoutRaw,
+                        // 登记表满了：不知道有没有 raw，不能据此去读会话文件。
+                        v2_pairing::RawCapability::Unknown => V2FallbackReason::RawUnknown,
+                    }
                 }
             });
             parent_without_raw = v2_fallback == Some(V2FallbackReason::ParentWithoutRaw);

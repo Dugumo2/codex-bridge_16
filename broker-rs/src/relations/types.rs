@@ -117,6 +117,8 @@ pub enum V2FallbackReason {
     RolloutSenderUnknown,
     /// 没有 raw，接收方文件的末尾窗口向前找到上限仍定位不到当前轮，读到的消息对不上轮次。
     RolloutTurnUnknown,
+    /// raw 线程登记表已满，线程是否送过 raw 未知：容量不足不能当成「没有 raw」去读会话文件。
+    RawUnknown,
 }
 
 /// 跟进配对证据的来源，只供诊断。

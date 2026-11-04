@@ -155,6 +155,8 @@ pub struct RelationsAux {
     pub v2_index: v2_pairing::V2Index,
     /// 送来过 raw 事件的线程及其连接代际；用于诊断宽松配对的原因，也决定是否改用会话文件。
     pub v2_raw_threads: BTreeMap<String, u64>,
+    /// 某连接代际里登记表满过、有线程没登记上：该代际里没登记的线程是否有 raw 未知（不是「没有」）。
+    pub v2_raw_overflow: Option<u64>,
     /// 没有 raw 时从会话文件补证据：等文件的操作、跟随中的文件、读到的调用。
     pub rollout: rollout_pairing::RolloutState,
     /// 子线程 → 等它首轮的派生操作。

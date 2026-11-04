@@ -16,7 +16,7 @@
 //! [`Event::RolloutRead`](crate::claim::Event::RolloutRead) 回来；路径用 thread/read 请求拿。
 //! 只在有操作等文件或等文件里的消费记录时才轮询，操作有结果、运行结束、停止、连接或授权换代后立即停止。
 //! 有 raw 的线程一次都不读。不存、不记任何正文，只用摘要与字段名。
-use super::v2_pairing::{parse_call, parse_delivery, EvidenceSource, ParsedCall};
+use super::v2_pairing::{parse_call, parse_delivery, EvidenceSource, ParsedCall, RawCapability};
 use super::*;
 use crate::rollout::{
     RolloutChunk, RolloutCursor, RolloutError, RolloutReadRequest, RolloutRecord,
@@ -110,8 +110,9 @@ fn read_failure(error: RolloutError) -> V2FallbackReason {
 }
 
 impl Machine {
-    fn raw_thread(&self, thread: &str) -> bool {
-        self.relations.aux.v2_raw_threads.get(thread) == Some(&self.relations.conn_epoch)
+    /// 只有确认本连接里没送过 raw 的线程才读会话文件；送过 raw 的、或登记满了能力未知的，一次都不读。
+    fn file_allowed(&self, thread: &str) -> bool {
+        self.raw_capability(thread) == RawCapability::NotSeen
     }
 
     fn rollout_file_failed(&self, thread: &str) -> Option<V2FallbackReason> {
@@ -161,10 +162,14 @@ impl Machine {
         if let Some(reason) = self.rollout_file_failed(&key.parent_thread_id) {
             return Err(reason);
         }
-        if !self.raw_thread(child) {
-            if let Some(reason) = self.rollout_file_failed(child) {
-                return Err(reason);
+        match self.raw_capability(child) {
+            RawCapability::Seen => {}
+            RawCapability::NotSeen => {
+                if let Some(reason) = self.rollout_file_failed(child) {
+                    return Err(reason);
+                }
             }
+            RawCapability::Unknown => return Err(V2FallbackReason::RawUnknown),
         }
         if self.relations.aux.rollout.waits.len() >= MAX_OPERATIONS {
             return Ok(false);
@@ -284,6 +289,15 @@ impl Machine {
         if !self.rollout_wait_live(op) {
             return Some(Decision::Fallback(V2FallbackReason::RolloutCancelled));
         }
+        // 等待期间父线程的能力变了：送来了 raw（这次调用的开始记录已经错过），或登记满了不再确定。
+        // 两种都不能再读它的文件，按 raw 下的同一结论定案。
+        match self.raw_capability(&key.parent_thread_id) {
+            RawCapability::NotSeen => {}
+            RawCapability::Seen => return Some(Decision::Fallback(V2FallbackReason::StartMissing)),
+            RawCapability::Unknown => {
+                return Some(Decision::Fallback(V2FallbackReason::RawUnknown))
+            }
+        }
         let expired = self.clock.mono_ms >= wait.deadline_ms;
         let call = self
             .relations
@@ -301,8 +315,13 @@ impl Machine {
             if call.trigger && self.v2_sender_path(op).is_none() {
                 return Some(Decision::Fallback(V2FallbackReason::RolloutSenderUnknown));
             }
-            if !call.trigger || self.raw_thread(&wait.child) {
-                return Some(Decision::Strict(call.clone()));
+            match self.raw_capability(&wait.child) {
+                _ if !call.trigger => return Some(Decision::Strict(call.clone())),
+                RawCapability::Seen => return Some(Decision::Strict(call.clone())),
+                RawCapability::Unknown => {
+                    return Some(Decision::Fallback(V2FallbackReason::RawUnknown))
+                }
+                RawCapability::NotSeen => {}
             }
             if let Some(reason) = self.rollout_file_failed(&wait.child) {
                 return Some(Decision::Fallback(reason));
@@ -439,7 +458,7 @@ impl Machine {
         op.v2_strict = false;
         op.v2_source = V2EvidenceSource::None;
         op.v2_fallback = Some(match reason {
-            V2FallbackReason::RolloutTurnUnknown => reason,
+            V2FallbackReason::RolloutTurnUnknown | V2FallbackReason::RawUnknown => reason,
             _ => V2FallbackReason::RolloutLost,
         });
         let receivers: Vec<String> = op.receivers.iter().cloned().collect();
@@ -487,8 +506,13 @@ impl Machine {
             .filter_map(|op| {
                 op.receivers
                     .iter()
-                    .filter(|r| !op.rejected_receivers.contains_key(*r) && !self.raw_thread(r))
-                    .find_map(|r| self.rollout_file_failed(r))
+                    .filter(|r| !op.rejected_receivers.contains_key(*r))
+                    .find_map(|r| match self.raw_capability(r) {
+                        RawCapability::Seen => None,
+                        RawCapability::NotSeen => self.rollout_file_failed(r),
+                        // 登记满了：接收方的文件不能再读，严格配对只会卡住。
+                        RawCapability::Unknown => Some(V2FallbackReason::RawUnknown),
+                    })
                     .map(|reason| (op.key.clone(), reason))
             })
             .collect();
@@ -590,26 +614,24 @@ impl Machine {
     }
 
     /// 需要跟随的文件：等文件的操作的父线程与接收方，以及按文件证据定为严格、还在等消费记录的接收方。
-    /// 有 raw 的线程不读。
+    /// 只读确认没有 raw 的线程：有 raw 的、登记满了能力未知的都不读。
     fn rollout_needed(&self) -> BTreeSet<String> {
         let mut needed = BTreeSet::new();
         for (key, wait) in &self.relations.aux.rollout.waits {
             needed.insert(key.parent_thread_id.clone());
-            if !self.raw_thread(&wait.child) {
-                needed.insert(wait.child.clone());
-            }
+            needed.insert(wait.child.clone());
         }
         for op in self.relations.operations.values() {
             if !self.rollout_strict_waiting(op) {
                 continue;
             }
             for r in &op.receivers {
-                if !op.rejected_receivers.contains_key(r) && !self.raw_thread(r) {
+                if !op.rejected_receivers.contains_key(r) {
                     needed.insert(r.clone());
                 }
             }
         }
-        needed.retain(|t| self.rollout_file_failed(t).is_none());
+        needed.retain(|t| self.file_allowed(t) && self.rollout_file_failed(t).is_none());
         needed
     }
 
@@ -737,7 +759,7 @@ impl Machine {
         } else {
             now.saturating_add(ROLLOUT_POLL_MS)
         };
-        let raw = self.raw_thread(thread);
+        let raw = !self.file_allowed(thread);
         let floor = self.rollout_floor(thread);
         let mut turn_lost = false;
         for entry in chunk.entries {
@@ -764,7 +786,7 @@ impl Machine {
                     );
                 }
                 RolloutRecord::Message { turn, item } => {
-                    // 有 raw 的线程只认 raw。
+                    // 有 raw 或能力未知的线程只认 raw。
                     let (false, Some(floor)) = (raw, floor) else {
                         continue;
                     };
