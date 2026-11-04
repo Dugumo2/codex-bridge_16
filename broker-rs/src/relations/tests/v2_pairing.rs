@@ -1,5 +1,6 @@
 //! 真实 v2 双通知晚于执行；只有当前代际中的唯一可核实承载轮才能消账。
 use super::*;
+use crate::store::StoreOp;
 
 fn fixture() -> (Machine, SubagentMock) {
     let (mut m, mut mock) = super::lineage_safety::machine();
@@ -237,6 +238,69 @@ fn v2配对运行中重启保留失联终态而不恢复授权或消账为成功
         .values()
         .any(|binding| binding.status == BindingStatus::Bound));
     assert_eq!(restored.runs.runs[R].state, crate::runs::RunState::Lost);
+}
+
+fn log_lines_with<'a>(actions: &'a [Action], text: &str) -> Vec<&'a String> {
+    actions
+        .iter()
+        .flat_map(|a| match a {
+            Action::Store(StoreOp::AppendLog { lines, .. }) => lines.iter().collect::<Vec<_>>(),
+            _ => vec![],
+        })
+        .filter(|line| line.contains(text))
+        .collect()
+}
+
+#[test]
+fn v2子代理向上发消息不记归属冲突而向下跟进非直接子仍拒绝() {
+    const GRANDCHILD: &str = "孙线程";
+    let (mut m, mut mock) = fixture();
+    begin(&mut m, &mut mock);
+    interact(&mut m, &mut mock);
+    let event = mock.turn_started(C, "子轮");
+    mock.inject(&mut m, event);
+    assert!(m.binding(C, "子轮").is_some(), "前置：子轮已受本运行管理");
+    mock.register(GRANDCHILD, Some(C), "v2", false, true);
+    let event = mock.thread_started(GRANDCHILD);
+    mock.inject(&mut m, event);
+    let (a, b) = SubagentMock::v2_activity("started", C, "子轮", "派生孙", GRANDCHILD);
+    let event = mock.turn_started(GRANDCHILD, "孙轮");
+    run(&mut m, &mut mock, vec![a, b, event]);
+    assert!(
+        m.binding(GRANDCHILD, "孙轮").is_some(),
+        "前置：孙轮已受本运行管理"
+    );
+
+    // 子向父、孙隔代向根：都是正常向上消息。
+    for (sender, turn, item) in [(C, "子轮", "子向上"), (GRANDCHILD, "孙轮", "孙向上")] {
+        let (a, b) = SubagentMock::v2_activity("interacted", sender, turn, item, P);
+        let actions = run(&mut m, &mut mock, vec![a, b]);
+        m.convergence_sync_facts(R);
+        let op = m
+            .relations
+            .operations
+            .values()
+            .find(|op| op.key.item_id == item)
+            .expect("前置：向上消息确实进入跟进判定");
+        assert!(op.rejected_receivers.contains_key(P), "{item} 不授予管理权");
+        assert!(log_lines_with(&actions, "归属冲突").is_empty(), "{item}");
+        assert!(
+            log_lines_with(&actions, "discoveryIncomplete").is_empty(),
+            "{item}"
+        );
+        assert!(!m.manage_context(R).unwrap().members.contains_key(P));
+    }
+    assert!(
+        m.convergences.ledgers[R].pending.is_empty(),
+        "向上消息不留待定操作"
+    );
+
+    // 父线程直接跟进孙代理不是向上，C 的直接父校验仍要拒绝并记冲突。
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T, "越级跟进", GRANDCHILD);
+    let actions = run(&mut m, &mut mock, vec![a, b]);
+    let conflicts = log_lines_with(&actions, "归属冲突");
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].contains("未核实为本父线程的子代理"));
 }
 
 #[test]
