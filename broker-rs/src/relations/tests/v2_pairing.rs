@@ -304,6 +304,72 @@ fn v2子代理向上发消息不记归属冲突而向下跟进非直接子仍拒
 }
 
 #[test]
+fn v2兄弟与隔房子代理互发不记归属冲突且不授管理权() {
+    const SIBLING: &str = "兄弟线程";
+    const NEPHEW: &str = "侄线程";
+    let (mut m, mut mock) = fixture();
+    begin(&mut m, &mut mock);
+    interact(&mut m, &mut mock);
+    let event = mock.turn_started(C, "子轮");
+    mock.inject(&mut m, event);
+    for (thread, parent, item, turn) in [
+        (SIBLING, P, "派生兄弟", "兄弟轮"),
+        (NEPHEW, SIBLING, "派生侄", "侄轮"),
+    ] {
+        mock.register(thread, Some(parent), "v2", false, true);
+        let event = mock.thread_started(thread);
+        mock.inject(&mut m, event);
+        let parent_turn = if parent == P { T } else { "兄弟轮" };
+        let (a, b) = SubagentMock::v2_activity("started", parent, parent_turn, item, thread);
+        let event = mock.turn_started(thread, turn);
+        run(&mut m, &mut mock, vec![a, b, event]);
+    }
+    for (item, target) in [("互发兄弟", SIBLING), ("互发侄", NEPHEW)] {
+        let (a, b) = SubagentMock::v2_activity("interacted", C, "子轮", item, target);
+        let actions = run(&mut m, &mut mock, vec![a, b]);
+        m.convergence_sync_facts(R);
+        let op = m
+            .relations
+            .operations
+            .values()
+            .find(|op| op.key.item_id == item)
+            .unwrap();
+        assert!(op.rejected_receivers[target].contains("平级"), "{item}");
+        assert!(log_lines_with(&actions, "归属冲突").is_empty(), "{item}");
+        assert!(
+            log_lines_with(&actions, "discoveryIncomplete").is_empty(),
+            "{item}"
+        );
+    }
+    assert!(m.convergences.ledgers[R].pending.is_empty());
+
+    // 关系不明的线程不是平级，仍要记冲突。
+    let (a, b) = SubagentMock::v2_activity("interacted", C, "子轮", "互发未知", "未知线程");
+    let actions = run(&mut m, &mut mock, vec![a, b]);
+    assert_eq!(log_lines_with(&actions, "归属冲突").len(), 1);
+
+    // 隔代下级也不是平级：跨过直接子代理跟进仍要拒绝并记冲突。
+    const GRAND_NEPHEW: &str = "侄孙线程";
+    mock.register(GRAND_NEPHEW, Some(NEPHEW), "v2", false, true);
+    let event = mock.thread_started(GRAND_NEPHEW);
+    mock.inject(&mut m, event);
+    let (a, b) = SubagentMock::v2_activity("started", NEPHEW, "侄轮", "派生侄孙", GRAND_NEPHEW);
+    let event = mock.turn_started(GRAND_NEPHEW, "侄孙轮");
+    run(&mut m, &mut mock, vec![a, b, event]);
+    let (a, b) = SubagentMock::v2_activity(
+        "interacted",
+        SIBLING,
+        "兄弟轮",
+        "越级跟进侄孙",
+        GRAND_NEPHEW,
+    );
+    let actions = run(&mut m, &mut mock, vec![a, b]);
+    let conflicts = log_lines_with(&actions, "归属冲突");
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].contains("未核实为本父线程的子代理"));
+}
+
+#[test]
 fn v2乱序消费暂存有界并按ttl清理() {
     let (mut m, _) = fixture();
     for index in 0..=MAX_OPERATIONS {

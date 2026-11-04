@@ -183,6 +183,158 @@ fn 因果隔离_忙碌旧轮有匹配输入才允许吸收并最终收敛() {
     }
 }
 
+/// 按真实调度走过证据期限：期限内应发生的到期扫描都要真正触发，否则测不到被判过期的路径。
+fn past_evidence_ttl(m: &mut Machine, mock: &mut SubagentMock) {
+    m.clock.mono_ms += EVIDENCE_TTL_MS + 1;
+    m.clock.now_ms += EVIDENCE_TTL_MS + 1;
+    let mut actions = vec![];
+    m.facts_expire(&mut actions);
+    m.convergence_sync_facts(R);
+    replies(m, mock, actions);
+}
+
+fn op<'a>(m: &'a Machine, id: &str) -> &'a EvidenceOperation {
+    m.relations
+        .operations
+        .values()
+        .find(|op| op.key.item_id == id)
+        .unwrap()
+}
+
+#[test]
+fn 忙碌子代理超过证据期限才读到跟进仍配对并最终收敛() {
+    for encrypted in [false, true] {
+        let (mut m, mut mock) = base();
+        raw(&mut m, "B", "唯一跟进输入");
+        interacted(&mut m, "B");
+        past_evidence_ttl(&mut m, &mut mock);
+        pending(&m, 1);
+        assert_eq!(op(&m, "B").outcome, EvidenceOutcome::Pending);
+        let diagnostic = m.convergence_diagnostics(R).unwrap();
+        let listed = &diagnostic["pendingOperations"][0];
+        assert_eq!(listed["pairingMode"], "strict");
+        assert_eq!(listed["expired"], false, "等待配对不算过期");
+        assert!(listed["expiresAt"].is_null());
+        delivery(&mut m, "旧轮", "实际输入", "唯一跟进输入", encrypted);
+        pending(&m, 0);
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        finish(&mut m, &mut mock);
+    }
+}
+
+#[test]
+fn 旧轮结束超过证据期限才开新轮仍配对并最终收敛() {
+    let (mut m, mut mock) = base();
+    raw(&mut m, "B", "新工作");
+    interacted(&mut m, "B");
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    past_evidence_ttl(&mut m, &mut mock);
+    pending(&m, 1);
+    assert_eq!(
+        m.has_managed_activity(R),
+        crate::relations::Activity::Some,
+        "跟进还在子代理队列里，自然结束门禁不能当成没有活动"
+    );
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    replies(&mut m, &mock, actions);
+    pending(&m, 0);
+    let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+    replies(&mut m, &mock, actions);
+    finish(&mut m, &mut mock);
+}
+
+#[test]
+fn 没有接收方的跟进事件不算等待配对() {
+    let (mut m, _mock) = base();
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T, "无接收方", "");
+    apply(&mut m, a);
+    apply(&mut m, b);
+    assert!(op(&m, "无接收方").receivers.is_empty());
+    assert!(!m.v2_awaits_pairing(op(&m, "无接收方")));
+    assert!(m.evidence_expirable(op(&m, "无接收方")));
+}
+
+#[test]
+fn 等待配对的跟进在连接换代后恢复按期限失效() {
+    let (mut m, mut mock) = base();
+    raw(&mut m, "B", "唯一跟进输入");
+    interacted(&mut m, "B");
+    assert!(m.v2_awaits_pairing(op(&m, "B")));
+    m.relations.conn_epoch += 1;
+    assert!(!m.v2_awaits_pairing(op(&m, "B")));
+    assert!(m.evidence_expirable(op(&m, "B")));
+    past_evidence_ttl(&mut m, &mut mock);
+    assert_eq!(op(&m, "B").outcome, EvidenceOutcome::Unproven);
+    assert!(
+        !m.relations
+            .aux
+            .followup_starts
+            .contains_key(&op(&m, "B").key),
+        "换代后不再保留开始记录"
+    );
+}
+
+#[test]
+fn 已配对跟进的开始记录仍按期限清理() {
+    let (mut m, mut mock) = base();
+    raw(&mut m, "B", "唯一跟进输入");
+    interacted(&mut m, "B");
+    delivery(&mut m, "旧轮", "实际输入", "唯一跟进输入", false);
+    pending(&m, 0);
+    past_evidence_ttl(&mut m, &mut mock);
+    assert!(m.relations.aux.followup_starts.is_empty());
+    assert_eq!(op(&m, "B").outcome, EvidenceOutcome::Proven);
+}
+
+fn raw_send_message(m: &mut Machine, id: &str, message: &str) {
+    notify(
+        m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T,"item":{
+        "type":"function_call","name":"send_message","call_id":id,
+        "arguments":json!({"target":C,"message":message}).to_string()}}),
+    );
+}
+
+fn send_message(m: &mut Machine, id: &str, message: &str) {
+    raw_send_message(m, id, message);
+    interacted(m, id);
+}
+
+#[test]
+fn 只入队消息不占待定账本且空闲子代理也能收敛() {
+    let (mut m, mut mock) = base();
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    let epoch = m.convergences.ledgers[R].work_epoch;
+    send_message(&mut m, "S", "顺带告知");
+    m.convergence_sync_facts(R);
+    pending(&m, 0);
+    assert_eq!(m.convergences.ledgers[R].work_epoch, epoch);
+    assert!(op(&m, "S").v2_queue_only && op(&m, "S").receivers.is_empty());
+    assert!(!m.v2_awaits_pairing(op(&m, "S")));
+    past_evidence_ttl(&mut m, &mut mock);
+    assert_eq!(op(&m, "S").outcome, EvidenceOutcome::Unproven);
+    finish(&mut m, &mut mock);
+}
+
+#[test]
+fn 只入队消息不干扰之后的跟进配对新轮() {
+    let (mut m, mut mock) = base();
+    complete(&mut m, &mut mock, C, "旧轮", "completed");
+    send_message(&mut m, "S", "顺带告知");
+    raw(&mut m, "B", "新工作");
+    interacted(&mut m, "B");
+    // 另一条只入队消息才到 raw、还没到 Interacted：它也不可能是新轮的原因。
+    raw_send_message(&mut m, "S2", "再告知一次");
+    pending(&m, 1);
+    let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+    replies(&mut m, &mock, actions);
+    pending(&m, 0);
+    let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+    replies(&mut m, &mock, actions);
+    finish(&mut m, &mut mock);
+}
+
 #[test]
 fn 观察恢复_缺口及未加载回查同轮后配对并最终收敛() {
     for not_loaded in [false, true] {

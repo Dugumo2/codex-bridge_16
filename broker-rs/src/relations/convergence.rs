@@ -251,6 +251,7 @@ impl Machine {
         }
         for op in self.relations.operations.values().filter(|o| {
             o.run_id == run
+                && !o.v2_queue_only
                 && matches!(
                     o.kind,
                     EvidenceKind::V1Spawn

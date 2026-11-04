@@ -670,6 +670,7 @@ impl Machine {
                     proven_turns: BTreeMap::new(),
                     baseline_turns,
                     v2_strict: begin.is_some(),
+                    v2_queue_only: begin.as_ref().is_some_and(|start| !start.trigger),
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
                         .as_ref()
@@ -713,11 +714,16 @@ impl Machine {
                 return;
             }
         }
-        let new_receivers: Vec<String> = receivers
-            .iter()
-            .filter(|r| op.receivers.insert((*r).clone()))
-            .cloned()
-            .collect();
+        // 只入队的消息不改变接收方的归属与工作归因，不登记接收方。
+        let new_receivers: Vec<String> = if op.v2_queue_only {
+            vec![]
+        } else {
+            receivers
+                .iter()
+                .filter(|r| op.receivers.insert((*r).clone()))
+                .cloned()
+                .collect()
+        };
         let confirmed = self.op_confirmed(&key);
         let run = self.relations.operations[&key].run_id.clone();
         match kind {
@@ -963,7 +969,7 @@ impl Machine {
     /// 配对只要求证据本身有效；运行确认（settling 定案、继承父轮）可以稍后到达。
     pub(super) fn evidence_valid_for_pairing(&self, op: &EvidenceOperation, now: u64) -> bool {
         (!op.parent_ended || (op.kind == EvidenceKind::V2Interacted && self.op_confirmed(&op.key)))
-            && now < op.expires_at_ms
+            && (now < op.expires_at_ms || self.v2_awaits_pairing(op))
             && op.conn_epoch == self.relations.conn_epoch
             && op.outcome == EvidenceOutcome::Pending
             && (!self.op_confirmed(&op.key) || self.operation_generation_current(op))
@@ -1059,8 +1065,11 @@ impl Machine {
             return true;
         }
         let upward = self.is_ancestor_thread(child, &key.parent_thread_id);
+        let peer = !upward && self.is_peer_thread(child, &key.parent_thread_id);
         let reason = if upward {
             "接收方是发起方的上级，不属于跟进"
+        } else if peer {
+            "接收方是发起方的平级，不属于跟进"
         } else if !self.thread_relation(child).is_some_and(|edge| {
             edge.kind == RelationKind::Subagent && edge.parent_thread_id == key.parent_thread_id
         }) {
@@ -1079,8 +1088,8 @@ impl Machine {
         let run = op.run_id.clone();
         // 拒绝发生在 bind 之前：按本次操作的候选运行记关系诊断，不能借已有绑定反查归属。
         // 跟进尚无被接纳的子轮，保留 null turnId，不把旧绑定轮次冒充成本次活动。
-        // 子代理向上发消息是正常协作：同样不授予管理权，但不是归属问题，不写冲突和覆盖缺口。
-        if !upward {
+        // 子代理向上或向平级发消息是正常协作：同样不授予管理权，但不是归属问题，不写冲突和覆盖缺口。
+        if !upward && !peer {
             self.runs.log_source(
                 &run,
                 child,
@@ -1133,6 +1142,12 @@ impl Machine {
             current = edge.parent_thread_id;
         }
         false
+    }
+
+    /// 同属一棵代理树，且接收方不是发起方的下级；关系未知的线程树根是它自己，不会被算作平级。
+    fn is_peer_thread(&self, thread: &str, sender: &str) -> bool {
+        !self.is_ancestor_thread(sender, thread)
+            && self.logical_root_of(thread) == self.logical_root_of(sender)
     }
 
     /// 已拒绝的跟进候选不能通过后续收敛发现重新入册；本运行已有合法管理证据时仍保留。
@@ -1518,13 +1533,10 @@ impl Machine {
     }
 
     /// 证据到期：未配对候选转 unbound；等待父轮绑定的操作不能再确认。
-    pub(super) fn facts_expire(&mut self, actions: &mut Vec<Action>) {
+    pub(crate) fn facts_expire(&mut self, actions: &mut Vec<Action>) {
         let now = self.clock.mono_ms;
         self.prune_v2_deliveries();
-        self.relations.aux.followup_starts.retain(|_, start| {
-            start.epoch == self.relations.conn_epoch
-                && now < start.at.saturating_add(EVIDENCE_TTL_MS)
-        });
+        self.prune_followup_starts();
         let expired: Vec<EvidenceKey> = self
             .relations
             .operations
@@ -1580,6 +1592,7 @@ impl Machine {
                 self.relations.aux.parent_waits.get(&op.key),
                 Some(ParentWait::Settle { .. })
             )
+            && !self.v2_awaits_pairing(op)
     }
 
     /// 插入前预留容量；全是未决操作时保守拒绝，避免淘汰当前键或无界增长。
