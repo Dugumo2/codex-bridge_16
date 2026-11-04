@@ -533,3 +533,113 @@ fn 观察有缺口时诊断不猜接收方空闲() {
         json!([{"threadId":C,"state":"unknown"}])
     );
 }
+
+/// 在同一父线程上开新运行：与 `setup` 相同的真实 turn/start 请求、回包与开始通知。
+fn start_run(m: &mut Machine, run: &str, turn: &str, id: u64) -> Vec<Action> {
+    let out = apply(
+        m,
+        Event::ClientRequest {
+            request: crate::claim::ClientRequest {
+                conn: 1,
+                id: json!(id),
+                method: "turn/start".into(),
+                params: Some(json!({"threadId":P,"input":[{"type":"text","text":"新任务"}]})),
+            },
+            run_id: Some(run.into()),
+        },
+    );
+    let context = out
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Request(c) if c.method == "turn/start" => Some(c),
+            _ => None,
+        })
+        .expect("新运行发出 turn/start");
+    let mut all = apply(
+        m,
+        Event::Reply {
+            context,
+            result: Ok(json!({"turn":{"id":turn}})),
+        },
+    );
+    all.extend(notify(
+        m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":turn,"status":"inProgress","items":[]}}),
+    ));
+    all
+}
+
+#[test]
+fn 根认领释放后再次发现同一向上候选仍按向上处理且新运行正常收敛() {
+    const R2: &str = "第二运行";
+    const T2: &str = "第二父轮";
+    let (mut m, mut mock) = base();
+    let (a, b) = SubagentMock::v2_activity("interacted", C, "旧轮", "首次向上", P);
+    let mut all = apply(&mut m, a);
+    all.extend(apply(&mut m, b));
+    assert!(op(&m, "首次向上").rejected_receivers[P].contains("上级"));
+    all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+    all.extend(finish(&mut m, &mut mock));
+    assert!(!m.claims.contains_key(P), "前置：根认领已释放");
+
+    // 同一父线程开新运行，父线程用 followup_task 再次接手 C：C 经新配对重新被发现为本运行成员。
+    all.extend(start_run(&mut m, R2, T2, 2));
+    all.extend(notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T2,"item":{
+        "type":"function_call","name":"followup_task","call_id":"再次跟进",
+        "arguments":json!({"target":C,"message":"继续"}).to_string()}}),
+    ));
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T2, "再次跟进", C);
+    all.extend(apply(&mut m, a));
+    all.extend(apply(&mut m, b));
+    let actions = apply(&mut m, mock.turn_started(C, "新运行轮"));
+    all.extend(replies(&mut m, &mock, actions));
+    assert!(
+        m.binding(C, "新运行轮")
+            .is_some_and(|b| b.run_id == R2 && b.status == BindingStatus::Bound),
+        "前置：C 的新轮归新运行管理"
+    );
+
+    // 同一个向上候选再次出现：仍是正常协作，不授管理权、不记冲突或缺口，也不留待定。
+    let (a, b) = SubagentMock::v2_activity("interacted", C, "新运行轮", "再次向上", P);
+    all.extend(apply(&mut m, a));
+    all.extend(apply(&mut m, b));
+    m.convergence_sync_facts(R2);
+    let again = op(&m, "再次向上");
+    assert_eq!(again.run_id, R2);
+    assert!(again.rejected_receivers[P].contains("上级"));
+    assert!(!m.manage_context(R2).unwrap().members.contains_key(P));
+    assert!(m.convergences.ledgers[R2].pending.is_empty());
+
+    // 新运行照常收敛，全程零误报。
+    let actions = complete(&mut m, &mut mock, C, "新运行轮", "completed");
+    all.extend(replies(&mut m, &mock, actions));
+    let actions = complete(&mut m, &mut mock, P, T2, "completed");
+    all.extend(replies(&mut m, &mock, actions));
+    for _ in 0..8 {
+        let progress = &m.convergences.progress[R2];
+        if progress.reading.is_some() || progress.retry_at.is_none() {
+            break;
+        }
+        let runtime = m.convergences.runs[R2].clone();
+        m.clock.mono_ms = progress.retry_at.unwrap();
+        let mut out = vec![];
+        m.convergence_timer(
+            TimerKind::ConvergeRetry {
+                token: runtime.token,
+                attempt: runtime.discovery_retry,
+            },
+            &mut out,
+        );
+        all.extend(replies(&mut m, &mock, out));
+    }
+    assert!(
+        m.convergences.progress[R2].reading.is_some(),
+        "新运行应进入汇总，不被向上候选挡住"
+    );
+    assert!(m.convergence_facts(R2).unwrap().conflicts.is_empty());
+    assert_no_alarm(&all);
+}
