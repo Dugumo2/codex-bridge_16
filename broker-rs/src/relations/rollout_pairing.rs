@@ -365,14 +365,23 @@ impl Machine {
         }
     }
 
-    /// 文件证据定为严格后接收方的文件读不了：降为宽松并立即按宽松规则重试配对，不让它卡到收敛期限。
-    fn rollout_downgrade(&mut self, key: &EvidenceKey, actions: &mut Vec<Action>) {
+    /// 文件证据定为严格后接收方的文件读不了或定位不到当前轮：降为宽松并立即按宽松规则重试配对，
+    /// 不让它卡到收敛期限。
+    fn rollout_downgrade(
+        &mut self,
+        key: &EvidenceKey,
+        reason: V2FallbackReason,
+        actions: &mut Vec<Action>,
+    ) {
         let Some(op) = self.relations.operations.get_mut(key) else {
             return;
         };
         op.v2_strict = false;
         op.v2_source = V2EvidenceSource::None;
-        op.v2_fallback = Some(V2FallbackReason::RolloutLost);
+        op.v2_fallback = Some(match reason {
+            V2FallbackReason::RolloutTurnUnknown => reason,
+            _ => V2FallbackReason::RolloutLost,
+        });
         let receivers: Vec<String> = op.receivers.iter().cloned().collect();
         let run = op.run_id.clone();
         for child in receivers {
@@ -410,22 +419,21 @@ impl Machine {
                 self.rollout_decide(&key, decision, actions);
             }
         }
-        let lost: Vec<EvidenceKey> = self
+        let lost: Vec<(EvidenceKey, V2FallbackReason)> = self
             .relations
             .operations
             .values()
-            .filter(|op| {
-                self.rollout_strict_waiting(op)
-                    && op.receivers.iter().any(|r| {
-                        !op.rejected_receivers.contains_key(r)
-                            && !self.raw_thread(r)
-                            && self.rollout_file_failed(r).is_some()
-                    })
+            .filter(|op| self.rollout_strict_waiting(op))
+            .filter_map(|op| {
+                op.receivers
+                    .iter()
+                    .filter(|r| !op.rejected_receivers.contains_key(*r) && !self.raw_thread(r))
+                    .find_map(|r| self.rollout_file_failed(r))
+                    .map(|reason| (op.key.clone(), reason))
             })
-            .map(|op| op.key.clone())
             .collect();
-        for key in lost {
-            self.rollout_downgrade(&key, actions);
+        for (key, reason) in lost {
+            self.rollout_downgrade(&key, reason, actions);
         }
         let needed = self.rollout_needed();
         let mut due: Option<u64> = self
@@ -671,6 +679,7 @@ impl Machine {
         };
         let raw = self.raw_thread(thread);
         let floor = self.rollout_floor(thread);
+        let mut turn_lost = false;
         for entry in chunk.entries {
             match entry.record {
                 RolloutRecord::Call { item } => {
@@ -695,14 +704,20 @@ impl Machine {
                     );
                 }
                 RolloutRecord::Message { turn, item } => {
-                    // 有 raw 的线程只认 raw；轮次不明的记录不能对应到任何轮。
-                    let (false, Some(turn), Some(floor)) = (raw, turn, floor) else {
+                    // 有 raw 的线程只认 raw。
+                    let (false, Some(floor)) = (raw, floor) else {
                         continue;
                     };
                     if entry.wall_ms < floor {
                         continue;
                     }
                     let Some(delivery) = parse_delivery(&item) else {
+                        continue;
+                    };
+                    // 轮次不明的记录对应不到任何轮。起点所在的轮定位不到（末尾窗口找到上限仍没有标记）时，
+                    // 它可能正是要等的消费记录：不能静默丢掉，这个文件明确降级，等它的操作按宽松规则配对。
+                    let Some(turn) = turn else {
+                        turn_lost |= entry.turn_lost;
                         continue;
                     };
                     self.prune_v2_deliveries();
@@ -715,6 +730,12 @@ impl Machine {
                         actions,
                     );
                 }
+            }
+        }
+        if turn_lost {
+            if let Some(file) = self.relations.aux.rollout.files.get_mut(thread) {
+                file.path = RolloutPathState::Failed(V2FallbackReason::RolloutTurnUnknown);
+                file.cursor = None;
             }
         }
     }

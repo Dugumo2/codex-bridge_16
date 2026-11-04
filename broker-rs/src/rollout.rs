@@ -4,7 +4,9 @@
 //!   文件名含该线程 ID（[`validate_path`]）。
 //! - 只读打开，每次读完即关闭句柄；Windows 上 std 默认共享读写删，不影响 Codex 追加写入。
 //! - 首次只读末尾窗口，之后按字节偏移只读新增内容；只处理到最后一个换行符，半行留到下次。
-//!   单次读取与单行都有上限，超长行整行跳过；窗口起点落在轮次中间时向前多读，直到能确定当前轮，也有上限。
+//!   单次读取与单行都有上限，超长行整行跳过；窗口里没有轮次标记、或窗口起点落在轮次中间时向前多读，
+//!   直到能确定当前轮，也有上限。到上限仍定位不到时，之后对不上轮次的消息标为「轮次丢失」交给状态机明确降级，
+//!   不静默丢弃。
 //! - 只挑出协作工具调用（`function_call` 的 followup_task／send_message）和收到的消息（`agent_message`），
 //!   原样交给状态机按 raw 的同一套规则解析；其余行只用来跟踪当前轮。这里不保存、不记录任何正文。
 //!
@@ -22,11 +24,13 @@ pub const MAX_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 读到哪里：`offset` 总在行首（跳过超长行时在行中间，`skipping` 为真）；`turn` 是 `offset` 处所在的轮。
+/// `lost`：末尾窗口向前找到上限仍没找到轮次标记，`offset` 处所在的轮未知（不是「还没开始任何轮」）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RolloutCursor {
     pub offset: u64,
     pub turn: Option<String>,
     pub skipping: bool,
+    pub lost: bool,
 }
 
 /// 状态机交给 IO 层的一次读取。
@@ -52,6 +56,8 @@ pub struct RolloutEntry {
     pub record: RolloutRecord,
     /// 行的写入时间（UTC 毫秒）。
     pub wall_ms: u64,
+    /// 消息的轮次为 None 是因为读取起点所在的轮定位不到（窗口没到文件头），而不是它前面确实没有任何轮。
+    pub turn_lost: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -159,7 +165,12 @@ fn is_collab_call(payload: &Value) -> bool {
 }
 
 /// 一行完整内容（不含换行符）。返回 Ok(None) 表示与配对无关的行；Err 表示坏行。
-fn parse_line(line: &[u8], turn: &mut Option<String>) -> Result<Option<RolloutEntry>, ()> {
+/// `lost`：读取起点所在的轮未知；遇到轮次标记后清除。
+fn parse_line(
+    line: &[u8],
+    turn: &mut Option<String>,
+    lost: &mut bool,
+) -> Result<Option<RolloutEntry>, ()> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.iter().all(u8::is_ascii_whitespace) {
         return Ok(None);
@@ -176,6 +187,7 @@ fn parse_line(line: &[u8], turn: &mut Option<String>) -> Result<Option<RolloutEn
             ) {
                 let id = payload.get("turn_id").and_then(Value::as_str).ok_or(())?;
                 *turn = Some(id.to_owned());
+                *lost = false;
             }
             Ok(None)
         }
@@ -185,6 +197,7 @@ fn parse_line(line: &[u8], turn: &mut Option<String>) -> Result<Option<RolloutEn
                 .and_then(Value::as_str)
             {
                 *turn = Some(id.to_owned());
+                *lost = false;
             }
             Ok(None)
         }
@@ -209,19 +222,28 @@ fn parse_line(line: &[u8], turn: &mut Option<String>) -> Result<Option<RolloutEn
                     item: payload.clone(),
                 }
             };
-            Ok(Some(RolloutEntry { record, wall_ms }))
+            Ok(Some(RolloutEntry {
+                record,
+                wall_ms,
+                turn_lost: message && turn.is_none() && *lost,
+            }))
         }
         _ => Ok(None),
     }
 }
 
 /// 只处理到最后一个换行符：返回解析出的条目与已消费的字节数（含最后的换行符）。
-fn parse_lines(buf: &[u8], turn: &mut Option<String>, chunk: &mut RolloutChunk) -> usize {
+fn parse_lines(
+    buf: &[u8],
+    turn: &mut Option<String>,
+    lost: &mut bool,
+    chunk: &mut RolloutChunk,
+) -> usize {
     let Some(last) = buf.iter().rposition(|&b| b == b'\n') else {
         return 0;
     };
     for line in buf[..last].split(|&b| b == b'\n') {
-        match parse_line(line, turn) {
+        match parse_line(line, turn, lost) {
             Ok(Some(entry)) => chunk.entries.push(entry),
             Ok(None) => {}
             Err(()) => chunk.bad_lines = chunk.bad_lines.saturating_add(1),
@@ -240,7 +262,9 @@ fn read_range(file: &mut std::fs::File, start: u64, len: u64) -> Result<Vec<u8>,
     Ok(buf)
 }
 
-/// 首次读取：末尾窗口里第一条消息之前没有轮次标记、窗口又没到文件头时，加倍向前多读，总量有上限。
+/// 首次读取：窗口里没有轮次标记、或第一条消息之前没有轮次标记，而窗口又没到文件头时，加倍向前多读，
+/// 总量有上限。只有工具输出、没有消息的窗口也要找：之后吸收跟进的消息要靠它带上轮次。
+/// 到上限仍找不到：游标标为 `lost`，消息标为 `turn_lost`，由状态机明确降级。
 fn read_tail(file: &mut std::fs::File, len: u64) -> Result<RolloutChunk, RolloutError> {
     let mut window = TAIL_BYTES.min(len);
     let mut bytes_read = 0u64;
@@ -260,12 +284,14 @@ fn read_tail(file: &mut std::fs::File, len: u64) -> Result<RolloutChunk, Rollout
         };
         let body = &buf[skip..];
         let mut turn = None;
+        let mut lost = start > 0;
         let mut chunk = RolloutChunk::default();
-        let consumed = parse_lines(body, &mut turn, &mut chunk);
-        let unanchored = chunk
-            .entries
-            .iter()
-            .any(|e| matches!(&e.record, RolloutRecord::Message { turn: None, .. }));
+        let consumed = parse_lines(body, &mut turn, &mut lost, &mut chunk);
+        let unanchored = turn.is_none()
+            || chunk
+                .entries
+                .iter()
+                .any(|e| matches!(&e.record, RolloutRecord::Message { turn: None, .. }));
         if unanchored && start > 0 && window < MAX_TAIL_BYTES {
             window = (window * 2).min(MAX_TAIL_BYTES).min(len);
             continue;
@@ -276,6 +302,7 @@ fn read_tail(file: &mut std::fs::File, len: u64) -> Result<RolloutChunk, Rollout
             offset,
             turn,
             skipping: false,
+            lost,
         };
         chunk.bytes_read = bytes_read;
         return Ok(chunk);
@@ -302,6 +329,7 @@ fn read_follow(
     chunk.bytes_read = buf.len() as u64;
     let mut pos = 0usize;
     let mut turn = cursor.turn.clone();
+    let mut lost = cursor.lost;
     if cursor.skipping {
         match buf.iter().position(|&b| b == b'\n') {
             Some(i) => {
@@ -316,7 +344,7 @@ fn read_follow(
             }
         }
     }
-    let consumed = parse_lines(&buf[pos..], &mut turn, &mut chunk);
+    let consumed = parse_lines(&buf[pos..], &mut turn, &mut lost, &mut chunk);
     if consumed == 0 && pos == 0 && buf.len() as u64 >= MAX_READ_BYTES {
         // 一整次读取都没有换行：这一行超过上限，跳过到下一个换行符。
         chunk.cursor.offset += buf.len() as u64;
@@ -325,6 +353,7 @@ fn read_follow(
         chunk.cursor.offset += (pos + consumed) as u64;
     }
     chunk.cursor.turn = turn;
+    chunk.cursor.lost = lost;
     // 还有完整的行没读到（本次读满了上限）时请调用方尽快再读；只剩半行时等下次轮询。
     chunk.more = buf.len() as u64 == want && want == MAX_READ_BYTES && chunk.cursor.offset < len;
     Ok(chunk)

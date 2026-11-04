@@ -115,6 +115,8 @@ pub enum V2FallbackReason {
     RolloutCancelled,
     /// 没有 raw，文件里找到了 followup_task，但发起方的代理路径未知，比对不了接收方的消费记录。
     RolloutSenderUnknown,
+    /// 没有 raw，接收方文件的末尾窗口向前找到上限仍定位不到当前轮，读到的消息对不上轮次。
+    RolloutTurnUnknown,
 }
 
 /// 跟进配对证据的来源，只供诊断。

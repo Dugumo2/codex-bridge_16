@@ -1047,3 +1047,82 @@ fn 子代理代理路径未知时_无raw跟进孙代理退回宽松且孙新轮�
     assert_no_alarm(&all);
     no_lingering_poll(&mut m, &mock);
 }
+
+// ─── 14. 末尾窗口里没有当前轮的标记 ────────────────────────────────
+
+/// 子线程当前轮（旧轮）的标记之后写了大量工具输出（不是消息），总量 `bytes`。
+fn tool_output(thread: &str, at: u64, bytes: usize) {
+    let chunk = "输".repeat(20 * 1024);
+    let mut written = 0;
+    while written < bytes {
+        fx::append_line(
+            thread,
+            at,
+            "response_item",
+            json!({"type":"function_call_output","call_id":"工具","output":chunk}),
+        );
+        written += chunk.len();
+    }
+}
+
+/// 忙碌轮的标记离末尾超过首个窗口、窗口里又只有工具输出：建立跟随时也要有界地往前找到当前轮，
+/// 之后吸收跟进的消息才带得上轮次。
+#[test]
+fn 无raw_轮次标记在末尾窗口之外时向前找到当前轮_吸收的跟进配到当前轮() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    tool_output(
+        C,
+        m.clock.now_ms - 4_000,
+        2 * crate::rollout::TAIL_BYTES as usize,
+    );
+    call_line(&m, "跟进", "followup_task", C, "补充要求");
+    let mut all = interacted_to(&mut m, "跟进", C);
+    assert!(op(&m, "跟进").v2_strict);
+    m.clock.now_ms += 1_000;
+    message_line(&m, C, "入站", "NEW_TASK", "补充要求");
+    all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
+    pending(&m, 0);
+    assert_eq!(op(&m, "跟进").proven_turns[C], ["旧轮".to_owned()].into());
+    let bytes = fx::with(|f| f.bytes);
+    assert!(
+        bytes <= 2 * crate::rollout::MAX_TAIL_BYTES + 64 * 1024,
+        "向前找当前轮有上限：{bytes}"
+    );
+    all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+    all.extend(finish(&mut m, &mut mock));
+    assert_no_alarm(&all);
+}
+
+/// 到上限仍找不到当前轮：之后读到的消息对不上轮次，不能静默丢掉，
+/// 必须明确降级（诊断带原因）并按原来的宽松规则配对，不卡到收敛期限。
+#[test]
+fn 无raw_向前找到上限仍不知当前轮时明确降级为宽松() {
+    let (mut m, mut mock) = base();
+    files(&m);
+    tool_output(
+        C,
+        m.clock.now_ms - 4_000,
+        crate::rollout::MAX_TAIL_BYTES as usize + 256 * 1024,
+    );
+    call_line(&m, "跟进", "followup_task", C, "补充要求");
+    let mut all = interacted_to(&mut m, "跟进", C);
+    assert!(op(&m, "跟进").v2_strict);
+    m.clock.now_ms += 1_000;
+    message_line(&m, C, "入站", "NEW_TASK", "补充要求");
+    all.extend(poll_for(&mut m, &mock, 2 * ROLLOUT_POLL_MS));
+    let o = op(&m, "跟进");
+    assert!(!o.v2_strict, "降为宽松");
+    assert_eq!(o.v2_fallback, Some(V2FallbackReason::RolloutTurnUnknown));
+    assert_eq!(
+        m.convergence_diagnostics(R)
+            .map(|d| d["counts"]["pendingOperations"].clone()),
+        Some(json!(0))
+    );
+    // 宽松规则：唯一的活动轮。
+    assert_eq!(op(&m, "跟进").proven_turns[C], ["旧轮".to_owned()].into());
+    all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+    all.extend(finish(&mut m, &mut mock));
+    assert_no_alarm(&all);
+    no_lingering_poll(&mut m, &mock);
+}

@@ -281,9 +281,14 @@ fn 大文件只读末尾窗口与新增内容_读取字节有界() {
         &chunk.entries[..],
         [RolloutEntry {
             record: RolloutRecord::Message { turn: None, .. },
+            turn_lost: true,
             ..
         }]
     ));
+    assert!(
+        chunk.cursor.lost,
+        "到上限仍找不到：起点所在的轮未知，交给状态机降级"
+    );
 
     // 从文件头跟随一个没有换行的巨大空洞：每次只读上限，按超长行跳过。
     let chunk = read_chunk(&path_str(&bare), Some(&RolloutCursor::default())).unwrap();
@@ -331,4 +336,31 @@ fn 读取期间文件可被追加写入() {
     assert_eq!(next.entries.len(), 1);
     drop(writer);
     std::fs::remove_file(&path).expect("读端不残留句柄，文件可以删除");
+}
+
+#[test]
+fn 窗口里只有工具输出没有消息时也向前找到当前轮() {
+    let path = temp_file("bare-output");
+    let mut text = task_started("2026-11-05T01:00:00.000Z", "忙碌轮");
+    let filler = line(
+        "2026-11-05T01:00:00.500Z",
+        "response_item",
+        json!({"type":"function_call_output","call_id":"工具","output":"z".repeat(1000)}),
+    );
+    while text.len() < TAIL_BYTES as usize + 4096 {
+        text += &filler;
+    }
+    append(&path, &text);
+    let chunk = read_chunk(&path_str(&path), None).unwrap();
+    assert!(chunk.entries.is_empty());
+    assert_eq!(chunk.cursor.turn.as_deref(), Some("忙碌轮"));
+    assert!(!chunk.cursor.lost);
+    assert!(chunk.bytes_read <= 3 * TAIL_BYTES + 2);
+    // 之后吸收的消息带上当前轮。
+    append(&path, &message("2026-11-05T01:00:01.000Z", "m", "正文"));
+    let next = read_chunk(&path_str(&path), Some(&chunk.cursor)).unwrap();
+    assert!(matches!(
+        &next.entries[..],
+        [RolloutEntry { record: RolloutRecord::Message { turn: Some(t), .. }, turn_lost: false, .. }] if t == "忙碌轮"
+    ));
 }
