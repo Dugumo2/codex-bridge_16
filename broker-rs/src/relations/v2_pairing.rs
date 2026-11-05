@@ -345,22 +345,36 @@ impl Machine {
         if stale.is_empty() {
             return;
         }
+        // 接收方已知就只认线程。未知时（还没等到操作）短名可能和别的运行重名，还要血缘属于发起线程。
+        let forgotten: BTreeSet<u64> = self
+            .relations
+            .aux
+            .v2_deliveries
+            .iter()
+            .filter(|d| {
+                stale.iter().any(|(_, start, receivers)| {
+                    start.message == Some(d.message)
+                        && start.trigger == d.trigger
+                        && if receivers.is_empty() {
+                            start.target.as_ref().is_some_and(|target| {
+                                target == &d.thread
+                                    || target == &d.recipient
+                                    || d.recipient.ends_with(&format!("/{target}"))
+                            }) && self
+                                .thread_relation(&d.thread)
+                                .is_some_and(|edge| edge.parent_thread_id == thread)
+                        } else {
+                            receivers.contains(&d.thread)
+                        }
+                })
+            })
+            .map(|d| d.seq)
+            .collect();
         let aux = &mut self.relations.aux;
         for (key, _, _) in &stale {
             aux.followup_starts.remove(key);
         }
-        aux.v2_deliveries.retain(|d| {
-            !stale.iter().any(|(_, start, receivers)| {
-                start.message == Some(d.message)
-                    && start.trigger == d.trigger
-                    && (receivers.contains(&d.thread)
-                        || start.target.as_ref().is_some_and(|target| {
-                            target == &d.thread
-                                || target == &d.recipient
-                                || d.recipient.ends_with(&format!("/{target}"))
-                        }))
-            })
-        });
+        aux.v2_deliveries.retain(|d| !forgotten.contains(&d.seq));
         aux.v2_index.rebuild_starts(&aux.followup_starts);
         aux.v2_index.rebuild_deliveries(&aux.v2_deliveries);
     }

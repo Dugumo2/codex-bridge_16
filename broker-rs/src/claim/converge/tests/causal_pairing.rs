@@ -1507,6 +1507,30 @@ fn 共享服务器定案为别人的轮后_同内容新跟进不认旧消费记�
         delivery(&mut m, "旧轮", "入站旧", "同一句", false);
         // 同样内容发给别的子代理的记录，不属于这条跟进，不能被一起清掉。
         delivery_to(&mut m, "别的子", "别的轮", "入站别", "/root", "同一句");
+        // 别的运行里恰好也有同短名的子代理、收到相同内容：路径一样，线程不同，同样不能清。
+        let other_tree = |m: &mut Machine, id: &str, message: &str| {
+            let text = format!(
+                "Message Type: NEW_TASK\nTask name: /root/{C}\nSender: /root\nPayload:\n{message}"
+            );
+            notify(
+                m,
+                "rawResponseItem/completed",
+                json!({"threadId":"别树的子","turnId":"别树的轮","item":{
+                "type":"agent_message","id":id,"author":"/root","recipient":format!("/root/{C}"),
+                "content":[{"type":"input_text","text":text}]}}),
+            );
+        };
+        other_tree(&mut m, "入站别树", "同一句");
+        // 只有开始记录、还没等到操作的跟进：接收方未知，靠短名加血缘认。
+        notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":P,"turnId":OTHER,"item":{
+            "type":"function_call","name":"followup_task","call_id":"只有开始记录",
+            "arguments":json!({"target":C,"message":"另一句"}).to_string()}}),
+        );
+        delivery(&mut m, "旧轮", "入站只有开始", "另一句", false);
+        other_tree(&mut m, "入站别树二", "另一句");
         m.settle(P, true, Some(OTHER.into()), &mut Vec::new());
         assert!(m.claims[P].joined(), "前置：定案为别人的轮");
         let ids: Vec<String> = m
@@ -1591,7 +1615,11 @@ fn 共享服务器定案为别人的轮后_同内容新跟进不认旧消费记�
             "晚到={late}：不能被旧记录挡住，配上真正的新轮"
         );
         // 定案后立刻清的范围：只清这条跟进对应的消费记录和开始记录。
-        assert_eq!(ids, ["入站别"], "只清这条跟进对应的消费记录");
+        assert_eq!(
+            ids,
+            ["入站别", "入站别树", "入站别树二"],
+            "只清这条跟进对应的消费记录"
+        );
         assert_eq!(starts_left, 0, "开始记录也清掉");
         assert!(m.v2_index_consistent());
     }
