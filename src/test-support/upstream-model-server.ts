@@ -29,7 +29,8 @@ export async function startUpstreamModel(scenario: UpstreamScenario, options: { 
   if (scenario === "connection") {
     // 独立 Node 进程先绑定再关闭临时端口，退出本身证明句柄已释放；避开 Bun 关监听的延迟。
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => ["PATH", "SYSTEMROOT", "WINDIR"].includes(key.toUpperCase())));
-    Object.assign(env, { HOME: (process.env.TEMP! + "\\ue-port-only"), USERPROFILE: (process.env.TEMP! + "\\ue-port-only"), TEMP: process.env.TEMP!, TMP: process.env.TEMP! });
+    const profile = `${process.env.TEMP}\\ue-port-only-${process.pid}-${randomUUID()}`;
+    Object.assign(env, { HOME: profile, USERPROFILE: profile, TEMP: process.env.TEMP!, TMP: process.env.TEMP! });
     const port = Number(execFileSync("node.exe", ["-e", 'const net=require("node:net"); const s=net.createServer(); s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close();});'],
       { cwd: import.meta.dir, env, windowsHide: true, timeout: 30_000, encoding: "utf8" }).trim());
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("无法取得本机连接拒绝端口");

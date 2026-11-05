@@ -24,6 +24,7 @@ cargo clippy --all-targets --manifest-path broker-rs\Cargo.toml -- -D warnings
 cargo test --manifest-path broker-rs\Cargo.toml
 bun run typecheck
 bun test                 # TS 全量，包含 Rust broker 的黑盒（src/broker-server.test.ts）与扩展用例（src/broker-ext*.test.ts）
+bun run test:shards      # CLI 全量按文件分成 3 份并行；可加 --shards 2、--update-timings、--log-dir 路径、--deadline-ms 1800000
 ```
 
 - 互不依赖的项可以并行跑；黑盒与扩展用例使用调试版 broker，`cargo test` 链接时若可执行文件被占用，等测试结束再跑或改用独立的 `CARGO_TARGET_DIR`。

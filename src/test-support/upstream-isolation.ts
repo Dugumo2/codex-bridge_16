@@ -7,7 +7,7 @@ import { createRequire } from "node:module";
 import { FAKE_KEY } from "./upstream-model-server";
 
 export const TEMP_ROOT = process.env.TEMP!;
-export const TRACE_ROOT = (process.env.TEMP! + "\\ue-traces");
+export const TRACE_ROOT = join((process.env.TEMP! + "\\ue-traces"), `process-${process.pid}`);
 export const CODEX_CMD = (Bun.which("codex.cmd") ?? "codex.cmd");
 export const CLEANUP_MS = 12_000;
 

@@ -26,6 +26,7 @@
   ],
   "scripts": {
     "test": "bun test",
+    "test:shards": "bun src/test-support/test-shards.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
