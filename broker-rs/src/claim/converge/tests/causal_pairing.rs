@@ -1368,58 +1368,190 @@ fn 共享服务器定案为别人的轮_定案前存下的开始记录不把跟�
     assert_eq!(o.outcome, EvidenceOutcome::Unproven);
     assert!(o.proven_turns.is_empty());
     assert!(
-        m.relations.aux.followup_starts.is_empty(),
-        "定案前按本运行存下的开始记录不再有用"
-    );
-    assert!(m.v2_index_consistent());
-    assert!(
         m.manage_context(R)
             .is_none_or(|c| !c.members.contains_key(C)),
         "接收方不归本运行管理"
     );
+    // 开始记录留到证据期限：它还要挡住同内容的后来者认领这段时间的消费记录。
+    m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
+    m.facts_expire(&mut Vec::new());
+    assert!(m.relations.aux.followup_starts.is_empty(), "过期后清掉");
+    assert!(m.v2_index_consistent());
 }
 
-/// 启动失败时认领走释放路径，不经过定案回调：等定案的操作和这段时间存下的开始记录也要结算，
-/// 否则操作永不到期、占着操作表，开始记录还会混进之后同内容的配对。
+/// 只有等证据等到期限才算「证明超时」（日志要留缺口）；上游 completed 这种只记事实的条目不算。
 #[test]
-fn 共享服务器定案前启动失败_等定案的跟进和开始记录都结算不残留() {
-    let (mut m, mut mock, context) = setup_pending_mode(true);
-    mock.register(C, Some(P), "v2", false, true);
-    raw(&mut m, "跟进", "新工作");
-    raw(&mut m, "只有开始记录", "还没等到 Interacted");
-    interacted(&mut m, "跟进");
-    assert!(m.claims[P].settling(), "前置：定案之前");
-    assert_eq!(
-        m.relations.aux.followup_starts.len(),
-        2,
-        "前置：开始记录已存下"
+fn 等归属的跟进到期才标证明超时_只记事实的条目不标() {
+    const G: &str = "孙";
+    let (mut m, mut mock) = base();
+    mock.register(G, Some(C), "v2", false, true);
+    // C 的这一轮还没绑定：转手跟进孙代理的操作在等绑定。
+    let (a, b) = SubagentMock::v2_activity("interacted", C, "未绑定轮", "转手", G);
+    apply(&mut m, a);
+    apply(&mut m, b);
+    let (a, b) = SubagentMock::v2_activity("completed", P, T, "已完成", C);
+    apply(&mut m, a);
+    apply(&mut m, b);
+    assert_eq!(op(&m, "转手").outcome, EvidenceOutcome::Pending, "前置");
+    assert_eq!(op(&m, "已完成").outcome, EvidenceOutcome::Unproven, "前置");
+    m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
+    m.facts_expire(&mut Vec::new());
+    assert_eq!(op(&m, "转手").outcome, EvidenceOutcome::Unproven);
+    assert!(op(&m, "转手").proof_expired, "等到期限才转未证明");
+    assert!(
+        !op(&m, "已完成").proof_expired,
+        "只记事实的条目不算证明超时"
     );
-    assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Pending, "前置");
-    let key = op(&m, "跟进").key.clone();
+}
+
+/// 定案是别人的轮之后，这段时间的消费记录还在。同一连接上新运行发出同内容的跟进时，
+/// 开始记录要还在，才能认出这条记录是别人的；否则新跟进会认定旧轮，运行可能提前收尾。
+#[test]
+fn 共享服务器定案为别人的轮后_同内容新跟进不能认定案前的旧消费记录() {
+    const OTHER: &str = "别人的轮";
+    const R2: &str = "第二运行";
+    const T2: &str = "第二父轮";
+    let (mut m, mut mock, _context) = setup_pending_mode(true);
+    mock.register(C, Some(P), "v2", false, true);
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":OTHER,"status":"inProgress","items":[]}}),
+    );
+    // 别人的轮派生了这个子代理：血缘属于这个父线程，运行归属待定。
+    let (a, b) = SubagentMock::v2_activity("started", P, OTHER, "别人的派生", C);
+    apply(&mut m, a);
+    apply(&mut m, b);
+    let actions = apply(&mut m, mock.turn_started(C, "旧轮"));
+    replies(&mut m, &mock, actions);
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":OTHER,"item":{
+        "type":"function_call","name":"followup_task","call_id":"别人的跟进",
+        "arguments":json!({"target":C,"message":"同一句"}).to_string()}}),
+    );
+    let (a, b) = SubagentMock::v2_activity("interacted", P, OTHER, "别人的跟进", C);
+    apply(&mut m, a);
+    apply(&mut m, b);
+    delivery(&mut m, "旧轮", "入站旧", "同一句", false);
+    m.settle(P, true, Some(OTHER.into()), &mut Vec::new());
+    assert!(m.claims[P].joined(), "前置：定案为别人的轮");
+    let actions = complete(&mut m, &mut mock, P, OTHER, "completed");
+    replies(&mut m, &mock, actions);
+    assert!(!m.claims.contains_key(P), "前置：认领已释放");
+
+    let out = apply(
+        &mut m,
+        Event::ClientRequest {
+            request: crate::claim::ClientRequest {
+                conn: 1,
+                id: json!(2),
+                method: "turn/start".into(),
+                params: Some(json!({"threadId":P,"input":[{"type":"text","text":"新任务"}]})),
+            },
+            run_id: Some(R2.into()),
+        },
+    );
+    let context = out
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Request(c) if c.method == "turn/start" => Some(c),
+            _ => None,
+        })
+        .expect("新运行发出 turn/start");
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":T2,"status":"inProgress","items":[]}}),
+    );
     let actions = apply(
         &mut m,
         Event::Reply {
             context,
-            result: Err(json!({"code":-32000,"message":"启动失败"})),
+            result: Ok(json!({"turn":{"id":T2}})),
         },
     );
     replies(&mut m, &mock, actions);
-    assert!(
-        !m.claims.get(P).is_some_and(|c| c.settling()),
-        "前置：认领已不在定案阶段"
+    assert!(!m.claims[P].settling(), "前置：新运行已定案");
+
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":T2,"item":{
+        "type":"function_call","name":"followup_task","call_id":"新跟进",
+        "arguments":json!({"target":C,"message":"同一句"}).to_string()}}),
     );
+    let (a, b) = SubagentMock::v2_activity("interacted", P, T2, "新跟进", C);
+    let actions = apply(&mut m, a);
+    replies(&mut m, &mock, actions);
+    let actions = apply(&mut m, b);
+    replies(&mut m, &mock, actions);
+    let o = op(&m, "新跟进");
+    assert!(o.v2_strict, "前置：新跟进走严格配对");
     assert!(
-        !m.relations.aux.parent_waits.contains_key(&key),
-        "等定案的记录要清掉"
+        o.rejected_receivers.is_empty(),
+        "前置：接收方是这个父线程的子代理：{:?}",
+        o.rejected_receivers
     );
-    assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Unproven);
-    assert!(!m.op_confirmed(&key), "不再占着待定");
-    assert!(
-        m.relations.aux.followup_starts.is_empty(),
-        "开始记录不能留给之后的运行：{:?}",
-        m.relations.aux.followup_starts.keys()
-    );
-    assert!(m.v2_index_consistent());
+    assert_eq!(o.proven_turns.get(C), None, "不能认定案前的旧消费记录");
+}
+
+/// 启动失败时认领走释放路径，不经过定案回调：等定案的操作也要结算，否则永不到期、占着操作表，
+/// 开始记录也跟着留下。先断开（有停止操作）再失败时，停止路径会先清掉 settling 标记，同样要结算。
+#[test]
+fn 共享服务器定案前启动失败_等定案的跟进和开始记录都结算不残留() {
+    for disconnect in [false, true] {
+        let (mut m, mut mock, context) = setup_pending_mode(true);
+        mock.register(C, Some(P), "v2", false, true);
+        raw(&mut m, "跟进", "新工作");
+        raw(&mut m, "只有开始记录", "还没等到 Interacted");
+        interacted(&mut m, "跟进");
+        assert!(m.claims[P].settling(), "前置：定案之前");
+        assert_eq!(
+            m.relations.aux.followup_starts.len(),
+            2,
+            "前置：开始记录已存下"
+        );
+        assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Pending, "前置");
+        let key = op(&m, "跟进").key.clone();
+        if disconnect {
+            let actions = apply(&mut m, Event::Disconnected { conn: 1 });
+            replies(&mut m, &mock, actions);
+        }
+        let actions = apply(
+            &mut m,
+            Event::Reply {
+                context,
+                result: Err(json!({"code":-32000,"message":"启动失败"})),
+            },
+        );
+        replies(&mut m, &mock, actions);
+        if disconnect {
+            // 断开时有停止操作：启动失败只把 settling 标记清掉，认领等停止确认后才释放。
+            assert!(m.stop_busy(P), "前置：有停止操作在进行");
+            assert!(!m.claims[P].settling(), "前置：settling 标记已被清掉");
+            m.release_with_kind(P, crate::runs::ReleaseKind::StopConfirmed, &mut Vec::new());
+        }
+        assert!(
+            !m.claims.contains_key(P),
+            "断开：{disconnect}：前置：认领已释放"
+        );
+        assert!(
+            !m.relations.aux.parent_waits.contains_key(&key),
+            "断开：{disconnect}：等定案的记录要清掉"
+        );
+        assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Unproven);
+        assert!(!m.op_confirmed(&key), "不再占着待定");
+        m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
+        m.facts_expire(&mut Vec::new());
+        assert!(
+            m.relations.aux.followup_starts.is_empty(),
+            "断开：{disconnect}：开始记录过期后清掉：{:?}",
+            m.relations.aux.followup_starts.keys()
+        );
+        assert!(m.v2_index_consistent());
+    }
 }
 
 /// raw 下非根发起方（子代理 C）跟进它的子代理 G，跟进被 G 的忙碌轮吸收、G 不再开新轮：

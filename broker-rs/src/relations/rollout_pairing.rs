@@ -417,8 +417,9 @@ impl Machine {
     /// 第一轮；那时就有多个候选的不猜（首轮身份不明）。等待期间新出现的轮次按观察先后排在后面。
     /// 到达时就有多个候选的不改动，仍按原规则判为身份不明。
     ///
-    /// 观察缓存只留有限轮：到达时的候选已被挤掉，或缓存已满（之后出现的第一轮也可能被挤掉）时，
+    /// 观察缓存只留有限轮、先进先出：到达时的候选已被挤掉，或之后出现的第一轮可能已被挤掉时，
     /// 旧版当时的结论还原不了。不能把「现在看不到」当成「当时没有」，全部并入基线，等之后新开的轮或收敛期限。
+    /// 到达时的轮还有一个在，后来的轮就一个也没被挤掉，缓存满了也能还原。
     fn rollout_fallback_baseline(&mut self, key: &EvidenceKey, child: &str, arrival: &[String]) {
         let Some(op) = self.relations.operations.get(key) else {
             return;
@@ -434,7 +435,12 @@ impl Machine {
             .flatten()
             .map(|o| o.turn.clone())
             .collect();
-        let unrecoverable = observed.len() >= MAX_OBSERVED_TURNS
+        let later_may_be_lost = if arrival.is_empty() {
+            observed.len() >= MAX_OBSERVED_TURNS
+        } else {
+            !arrival.iter().any(|turn| observed.contains(turn))
+        };
+        let unrecoverable = later_may_be_lost
             || arrival
                 .iter()
                 .any(|turn| is_new(turn) && !observed.contains(turn));

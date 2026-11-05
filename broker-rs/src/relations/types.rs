@@ -196,6 +196,9 @@ pub struct EvidenceOperation {
     /// 按会话文件定为严格时，接收方和它在 Interacted 到达时已观察到的轮次。
     /// 之后文件丢失、降为宽松时，据此还原旧版当时会配的那一轮（`rollout_fallback_baseline`）。
     pub rollout_arrival: Option<(String, Vec<String>)>,
+    /// 等证据等到期限才转未证明：归属没证明出来，不等于确定不归本运行（日志要留缺口）。
+    /// 只记事实的条目（如 completed）、定案不是自己的，也是未证明，但不算这种。
+    pub proof_expired: bool,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

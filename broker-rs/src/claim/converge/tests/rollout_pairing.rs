@@ -1351,6 +1351,52 @@ fn 无raw_严格定案后文件丢失且轮次已变_退回宽松结果与旧版
     }
 }
 
+/// 观察缓存满了不等于候选还原不了：缓存先进先出，到达时的轮还在，就没有任何后来的轮被挤掉。
+/// 子代理跑过很多轮是正常情况，不能因此把正确的轮排除、白等到期限。
+#[test]
+fn 无raw_观察缓存已满但候选还在_退回宽松仍配正确的轮() {
+    let max = crate::relations::MAX_OBSERVED_TURNS;
+    for idle in [false, true] {
+        let (mut m, mut mock) = base();
+        files(&m);
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        // 旧轮之外再跑若干轮，让缓存在文件丢失时正好是满的。
+        for i in 0..max - 2 {
+            let turn = format!("跑过的轮{i:02}");
+            let actions = apply(&mut m, mock.turn_started(C, &turn));
+            replies(&mut m, &mock, actions);
+            complete(&mut m, &mut mock, C, &turn, "completed");
+        }
+        if !idle {
+            let actions = apply(&mut m, mock.turn_started(C, "当前轮"));
+            replies(&mut m, &mock, actions);
+        }
+        call_line(&m, "跟进", "followup_task", C, "新工作");
+        let actions = interacted_to(&mut m, "跟进", C);
+        replies(&mut m, &mock, actions);
+        assert!(op(&m, "跟进").v2_strict, "前置：按文件定为严格");
+        if idle {
+            let actions = apply(&mut m, mock.turn_started(C, "当前轮"));
+            replies(&mut m, &mock, actions);
+        }
+        assert_eq!(m.relations.aux.observed[C].len(), max, "前置：缓存已满");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(fx::path(C))
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+        let o = op(&m, "跟进");
+        assert!(!o.v2_strict, "前置：文件丢失后降为宽松");
+        assert_eq!(
+            o.proven_turns.get(C),
+            Some(&["当前轮".to_owned()].into()),
+            "到达时空闲：{idle}：候选还在，仍配正确的轮"
+        );
+    }
+}
+
 /// Interacted 到达时的候选后来被观察缓存挤掉了（单线程只留有限轮）：当时会配哪一轮已经还原不了，
 /// 不能把「现在看不到」当成「当时没有」，去配后来的轮。不猜，等之后新开的轮或收敛期限。
 #[test]

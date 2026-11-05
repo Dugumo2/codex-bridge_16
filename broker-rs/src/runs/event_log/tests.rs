@@ -472,13 +472,15 @@ fn tree_log_摘要截断标记与长身份的json保持完整() {
     }
 }
 
-fn followup_to(
+fn evidence_to(
     m: &mut Machine,
     receiver: &str,
-    id: &str,
-    outcome: EvidenceOutcome,
+    kind: EvidenceKind,
+    proof_expired: bool,
     rejected: bool,
 ) {
+    let id = "条目";
+    let outcome = EvidenceOutcome::Unproven;
     let key = EvidenceKey {
         parent_thread_id: "发起方".into(),
         parent_turn_id: "发起轮".into(),
@@ -491,7 +493,7 @@ fn followup_to(
             run_id: String::new(),
             conn_epoch: m.relations.conn_epoch,
             authority_gen: 0,
-            kind: EvidenceKind::V2Interacted,
+            kind,
             started_seen: true,
             completed_seen: true,
             outcome,
@@ -508,6 +510,7 @@ fn followup_to(
             v2_source: V2EvidenceSource::None,
             v2_fallback: None,
             rollout_arrival: None,
+            proof_expired,
             first_seen_ms: 0,
             expires_at_ms: 1,
             parent_ended: false,
@@ -517,10 +520,16 @@ fn followup_to(
 }
 
 /// 有历史记录的线程收到过跟进，但证据过期转成了未证明：这只说明归属没证明出来，不等于确定不归本运行，
-/// 暂存到期时要留缺口。只有明确被拒绝（平级、向上）的才算明确不归本运行。
+/// 暂存到期时要留缺口。只记事实的未证明（上游 completed 通知）、定案不是自己的、明确被拒绝的（平级、向上）
+/// 都不算未决，否则历史子代理正常结束也会误报。
 #[test]
-fn tree_log_跟进证据过期未证明的历史线程仍写缺口_明确被拒绝的不写() {
-    for (rejected, expect_gap) in [(false, true), (true, false)] {
+fn tree_log_跟进证据过期未证明的历史线程仍写缺口_其余未证明不写() {
+    for (kind, expired, rejected, expect_gap) in [
+        (EvidenceKind::V2Interacted, true, false, true),
+        (EvidenceKind::V2Interacted, true, true, false),
+        (EvidenceKind::V2Interacted, false, false, false),
+        (EvidenceKind::V2Completed, false, false, false),
+    ] {
         let mut m = setup();
         candidate(&mut m, "历史线程", "root");
         m.runs.index.child_history = serde_json::from_value(json!({
@@ -528,13 +537,7 @@ fn tree_log_跟进证据过期未证明的历史线程仍写缺口_明确被拒�
             "entries":{"历史线程":{"run-old":{"rootThreadId":"root","observedAt":1}}}
         }))
         .unwrap();
-        followup_to(
-            &mut m,
-            "历史线程",
-            "跟进",
-            EvidenceOutcome::Unproven,
-            rejected,
-        );
+        evidence_to(&mut m, "历史线程", kind, expired, rejected);
         assert!(m.historical_subagent_for_run("run-a", "历史线程"), "前置");
         let mut a = vec![];
         m.buffer_child_event_log(
@@ -549,7 +552,10 @@ fn tree_log_跟进证据过期未证明的历史线程仍写缺口_明确被拒�
         a.clear();
         m.sweep_event_log(generation, &mut a);
         let gap = logs(&a).iter().any(|l| l.2 == "记录缺口");
-        assert_eq!(gap, expect_gap, "明确被拒绝：{rejected}");
+        assert_eq!(
+            gap, expect_gap,
+            "{kind:?} 证据过期：{expired}，明确被拒绝：{rejected}"
+        );
     }
 }
 

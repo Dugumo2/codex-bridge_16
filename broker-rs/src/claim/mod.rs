@@ -3415,9 +3415,7 @@ impl Machine {
         self.clear_held_accounting(thread_id, &mut claim);
         self.cancel_joined_check(thread_id, actions);
         self.cancel_reclaim(thread_id, actions);
-        if claim.settling() {
-            self.on_settling_released(thread_id, claim.claim_id, claim.run_id.as_deref(), actions);
-        }
+        self.on_claim_released(thread_id, claim.claim_id, actions);
         if let Some(run) = &claim.run_id {
             self.run_released_owned(run, kind, owner, actions);
         }

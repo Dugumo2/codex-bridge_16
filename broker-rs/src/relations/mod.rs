@@ -417,28 +417,20 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         self.facts_claim_settled(thread, claim_id, own, actions);
-        if !own {
-            if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
-                self.v2_drop_unowned_starts(thread, &run);
-            }
-        }
         self.reroute_held(thread, actions);
         self.ensure_sweep(actions);
     }
-    /// 认领还没定案就被释放（启动失败、取消）：不经过定案回调，等定案的证据在这里按「不是自己的」结算。
-    /// 否则操作永不到期、占着操作表，开始记录还会混进之后同内容的配对。
-    pub fn on_settling_released(
-        &mut self,
-        thread: &str,
-        claim_id: u64,
-        run: Option<&str>,
-        actions: &mut Vec<Action>,
-    ) {
-        self.facts_claim_settled(thread, claim_id, false, actions);
-        if let Some(run) = run {
-            self.v2_drop_unowned_starts(thread, run);
+    /// 认领释放时还有等它定案的证据（启动失败、取消；停止路径会先清掉 settling 标记，所以按认领编号查，
+    /// 不看标记）：不会再有定案回调，这里按「不是自己的」结算，否则操作永不到期、占着操作表。
+    /// 开始记录不删，留到证据期限：它要挡住同内容的后来者认领这段时间的消费记录。
+    pub fn on_claim_released(&mut self, thread: &str, claim_id: u64, actions: &mut Vec<Action>) {
+        let waiting = self.relations.aux.parent_waits.values().any(|w| {
+            matches!(w, ParentWait::Settle { thread: t, claim_id: c } if t == thread && *c == claim_id)
+        });
+        if waiting {
+            self.facts_claim_settled(thread, claim_id, false, actions);
+            self.ensure_sweep(actions);
         }
-        self.ensure_sweep(actions);
     }
     pub fn on_handoff(&mut self, run_id: &str, kind: HandoffKind, actions: &mut Vec<Action>) {
         if matches!(kind, HandoffKind::Joined | HandoffKind::External) {
