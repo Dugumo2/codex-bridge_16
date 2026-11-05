@@ -592,6 +592,70 @@ fn 修复1_settling证据过期不空转且定案后重新扫描() {
     );
 }
 
+/// 学到的代理路径表满了：还在用的线程（运行里已绑定的子代理、未决跟进的发起方和接收方）不能被挤出，
+/// 否则它之后发出的跟进比对不了消费记录。都在用时不登记新线程，表不超过上限。
+#[test]
+fn 学到的代理路径满额时不挤出还在用的线程() {
+    let (mut m, mut mock) = setup(false);
+    // 「子」按字典序排在「挤线程」之前，是最先被挤出的位置。
+    spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+    assert_eq!(bound(&m, C, "子轮1").as_deref(), Some(R));
+    m.v2_learn_agent_path(C, "/root/子");
+    for i in 0..MAX_OBSERVED_THREADS {
+        m.v2_learn_agent_path(&format!("挤线程{i:04}"), "/root/挤");
+    }
+    let paths = &m.relations.aux.v2_agent_paths;
+    assert_eq!(paths.len(), MAX_OBSERVED_THREADS, "表不超过上限");
+    assert_eq!(
+        paths.get(C).map(String::as_str),
+        Some("/root/子"),
+        "已绑定的子代理还在用，不能被挤出"
+    );
+    assert!(!paths.contains_key("挤线程0000"), "没人用的最先被挤出");
+
+    // 未决跟进的发起方和接收方也算在用，即使它们还没有绑定任何轮。
+    let (mut m, mut mock) = setup(false);
+    let key = EvidenceKey {
+        parent_thread_id: "发起方".into(),
+        parent_turn_id: "发起轮".into(),
+        item_id: "跟进".into(),
+    };
+    spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+    let mut pending_op = m.relations.operations.values().next().unwrap().clone();
+    pending_op.key = key.clone();
+    pending_op.kind = EvidenceKind::V2Interacted;
+    pending_op.outcome = EvidenceOutcome::Pending;
+    pending_op.receivers = ["接收方".to_owned()].into();
+    m.relations.operations.insert(key, pending_op);
+    m.v2_learn_agent_path("发起方", "/root/发起方");
+    m.v2_learn_agent_path("接收方", "/root/接收方");
+    for i in 0..MAX_OBSERVED_THREADS {
+        m.v2_learn_agent_path(&format!("挤线程{i:04}"), "/root/挤");
+    }
+    let paths = &m.relations.aux.v2_agent_paths;
+    assert!(paths.contains_key("发起方") && paths.contains_key("接收方"));
+    assert_eq!(paths.len(), MAX_OBSERVED_THREADS);
+
+    // 全都在用：不挤出，新线程不登记（发起方路径未知时由配对明确退回宽松）。
+    let (mut m, mut mock) = setup(false);
+    spawn_v1(&mut m, &mut mock, C, "派生1", "子轮1");
+    let template = m.relations.bindings.values().next().unwrap().clone();
+    for i in 0..MAX_OBSERVED_THREADS {
+        let thread = format!("在用{i:04}");
+        let mut binding = template.clone();
+        binding.thread_id = thread.clone();
+        m.relations
+            .bindings
+            .insert((thread.clone(), "轮".into()), binding);
+        m.v2_learn_agent_path(&thread, "/root/在用");
+    }
+    m.v2_learn_agent_path("新线程", "/root/新线程");
+    let paths = &m.relations.aux.v2_agent_paths;
+    assert!(!paths.contains_key("新线程"));
+    assert!(paths.contains_key("在用0000"));
+    assert_eq!(paths.len(), MAX_OBSERVED_THREADS);
+}
+
 #[test]
 fn 修复6_运行退役清理绑定与成员证据_等待写入及清理屏障() {
     let (mut m, mut mock) = setup(false);

@@ -235,6 +235,13 @@ impl Machine {
                     facts::ParentRun::AwaitBinding if self.lineage_owner(thread) != Some(false) => {
                         (String::new(), 0)
                     }
+                    // 共享服务器上这一轮还没定案是不是自己的：raw 不进 settling 缓冲，错过就没有了。
+                    // 代际取值与同时到达的 Interacted 相同；定案是自己的由 `adopt_settled_starts` 对齐，
+                    // 不是自己的，操作转未证明，这条记录没有操作能配上，随证据期限清理。
+                    facts::ParentRun::Settling { run, .. } => {
+                        let generation = self.relations.contexts.get(&run).map_or(0, |c| c.gen);
+                        (run, generation)
+                    }
                     _ => return false,
                 };
                 let wall_ms = self.clock.now_ms;
@@ -280,6 +287,36 @@ impl Machine {
         {
             if start.run.is_empty() && start.epoch == epoch {
                 start.run = run.into();
+                start.generation = generation;
+            }
+        }
+    }
+
+    /// settling 定案是自己的：这时才建运行上下文，定案前存下的开始记录对齐到它的代际。
+    /// 只动上下文建立前的那一代，已经因交接或撤权换代的记录不受影响。
+    pub(super) fn adopt_settled_starts(&mut self, thread: &str, run: &str) {
+        let before = self.relations.contexts.get(run).map_or(0, |c| c.gen);
+        if !self.ensure_context(run) {
+            return;
+        }
+        let generation = self.relations.contexts.get(run).map_or(0, |c| c.gen);
+        if generation == before {
+            return;
+        }
+        let epoch = self.relations.conn_epoch;
+        let from = EvidenceKey {
+            parent_thread_id: thread.into(),
+            parent_turn_id: String::new(),
+            item_id: String::new(),
+        };
+        for (_, start) in self
+            .relations
+            .aux
+            .followup_starts
+            .range_mut(from..)
+            .take_while(|(k, _)| k.parent_thread_id == thread)
+        {
+            if start.run == run && start.generation == before && start.epoch == epoch {
                 start.generation = generation;
             }
         }
@@ -433,20 +470,54 @@ impl Machine {
     /// 记下子代理的规范代理路径（上游 subAgentActivity 条目的 agentPath）。
     /// 不需要另外重试配对：非根发起方要先被这样的条目（派生或跟进）接纳、它的轮才会绑定，
     /// 它发出的跟进在绑定后才接纳接收方、开始配对，那时路径已经在了。
+    ///
+    /// 表满时只挤出没人在用的线程；都在用时不登记新线程，它发出的跟进由配对明确退回宽松。
     pub(super) fn v2_learn_agent_path(&mut self, thread: &str, path: &str) {
         if path.is_empty() || path.len() > 256 {
             return;
         }
-        let paths = &mut self.relations.aux.v2_agent_paths;
-        if paths.get(thread).map(String::as_str) == Some(path) {
+        let known = self.relations.aux.v2_agent_paths.get(thread);
+        if known.map(String::as_str) == Some(path) {
             return;
         }
-        if !paths.contains_key(thread) && paths.len() >= MAX_OBSERVED_THREADS {
-            if let Some(first) = paths.keys().next().cloned() {
-                paths.remove(&first);
-            }
+        if known.is_none() && self.relations.aux.v2_agent_paths.len() >= MAX_OBSERVED_THREADS {
+            let Some(victim) = self.v2_unused_agent_path() else {
+                return;
+            };
+            self.relations.aux.v2_agent_paths.remove(&victim);
         }
-        paths.insert(thread.into(), path.into());
+        self.relations
+            .aux
+            .v2_agent_paths
+            .insert(thread.into(), path.into());
+    }
+
+    /// 没人在用的线程：运行里没有已绑定的轮，也不是未决跟进的发起方或接收方。
+    fn v2_unused_agent_path(&self) -> Option<String> {
+        let bound = self
+            .relations
+            .bindings
+            .values()
+            .filter(|b| b.status == BindingStatus::Bound)
+            .map(|b| b.thread_id.as_str());
+        let pending = self
+            .relations
+            .operations
+            .values()
+            .filter(|op| {
+                op.kind == EvidenceKind::V2Interacted && op.outcome == EvidenceOutcome::Pending
+            })
+            .flat_map(|op| {
+                std::iter::once(op.key.parent_thread_id.as_str())
+                    .chain(op.receivers.iter().map(String::as_str))
+            });
+        let in_use: BTreeSet<&str> = bound.chain(pending).collect();
+        self.relations
+            .aux
+            .v2_agent_paths
+            .keys()
+            .find(|thread| !in_use.contains(thread.as_str()))
+            .cloned()
     }
 
     /// 发起方的规范代理路径：血缘边的来源摘要，其次是活动条目里学到的路径；运行的逻辑根是 `/root`。

@@ -193,6 +193,9 @@ pub struct EvidenceOperation {
     pub v2_source: V2EvidenceSource,
     /// 宽松配对的原因，与 `v2_strict` 同时固定；只供诊断，不参与配对、门禁或告警。
     pub v2_fallback: Option<V2FallbackReason>,
+    /// 按会话文件定为严格时，接收方和它在 Interacted 到达时已观察到的轮次。
+    /// 之后文件丢失、降为宽松时，据此还原旧版当时会配的那一轮（`rollout_fallback_baseline`）。
+    pub rollout_arrival: Option<(String, Vec<String>)>,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

@@ -480,6 +480,7 @@ mod tests {
                 v2_queue_only: false,
                 v2_source: crate::relations::V2EvidenceSource::None,
                 v2_fallback: Some(V2FallbackReason::ParentWithoutRaw),
+                rollout_arrival: None,
                 first_seen_ms: 0,
                 expires_at_ms: 1,
                 parent_ended: true,

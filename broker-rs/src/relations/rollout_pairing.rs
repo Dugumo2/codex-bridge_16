@@ -384,6 +384,7 @@ impl Machine {
                     op.v2_queue_only = !call.trigger;
                     op.v2_source = V2EvidenceSource::RolloutFile;
                     op.v2_fallback = None;
+                    op.rollout_arrival = Some((wait.child.clone(), wait.child_turns.clone()));
                 }
                 Decision::Fallback(reason) => {
                     op.v2_fallback = Some(*reason);
@@ -391,7 +392,7 @@ impl Machine {
             }
         }
         if matches!(decision, Decision::Fallback(_)) {
-            self.rollout_fallback_baseline(key, &wait);
+            self.rollout_fallback_baseline(key, &wait.child, &wait.child_turns);
         }
         for (item, completed) in &wait.events {
             self.item_evidence_replay(key, item, *completed, actions);
@@ -406,11 +407,10 @@ impl Machine {
     /// 旧版在 Interacted 到达时就按唯一候选配对：那时恰有一个未完成的候选就配它；一个都没有就配之后出现的
     /// 第一轮；那时就有多个候选的不猜（首轮身份不明）。等待期间新出现的轮次按观察先后排在后面。
     /// 到达时就有多个候选的不改动，仍按原规则判为身份不明。
-    fn rollout_fallback_baseline(&mut self, key: &EvidenceKey, wait: &RolloutWait) {
+    fn rollout_fallback_baseline(&mut self, key: &EvidenceKey, child: &str, arrival: &[String]) {
         let Some(op) = self.relations.operations.get(key) else {
             return;
         };
-        let child = &wait.child;
         let baseline = op.baseline_turns.get(child);
         let candidates: Vec<String> = self
             .relations
@@ -424,7 +424,7 @@ impl Machine {
             .collect();
         let (before, after): (Vec<String>, Vec<String>) = candidates
             .into_iter()
-            .partition(|turn| wait.child_turns.contains(turn));
+            .partition(|turn| arrival.contains(turn));
         let keep = match before.len() {
             0 => after.first().cloned(),
             1 => before.first().cloned(),
@@ -440,7 +440,7 @@ impl Machine {
         }
         if let Some(op) = self.relations.operations.get_mut(key) {
             op.baseline_turns
-                .entry(child.clone())
+                .entry(child.to_owned())
                 .or_default()
                 .extend(excluded);
         }
@@ -463,8 +463,12 @@ impl Machine {
             V2FallbackReason::RolloutTurnUnknown | V2FallbackReason::RawUnknown => reason,
             _ => V2FallbackReason::RolloutLost,
         });
+        let arrival = op.rollout_arrival.take();
         let receivers: Vec<String> = op.receivers.iter().cloned().collect();
         let run = op.run_id.clone();
+        if let Some((child, turns)) = arrival {
+            self.rollout_fallback_baseline(key, &child, &turns);
+        }
         for child in receivers {
             self.pair_first_turn(key, &child, actions);
         }

@@ -700,6 +700,7 @@ impl Machine {
                         V2EvidenceSource::None
                     },
                     v2_fallback,
+                    rollout_arrival: None,
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
                         .as_ref()
@@ -825,8 +826,9 @@ impl Machine {
             {
                 self.accept_followup_receivers(&key, new_receivers, actions);
             }
-            // 发起方这一轮的归属还没定（子代理刚被跟进就转手跟进孙代理）：不能当未证明丢掉，
-            // 接收方已登记，等发起方的轮绑定后由 confirm_waiting 接回。
+            // 发起方这一轮的归属还没定：子代理刚被跟进就转手跟进孙代理（等绑定），
+            // 或共享服务器上这一轮还没定案是不是自己的（等定案）。不能当未证明丢掉，
+            // 接收方已登记，归属确定后由 confirm_waiting 接回；定案不是自己的才转未证明。
             _ if self.convergence_enabled()
                 && !failed
                 && matches!(
@@ -837,7 +839,7 @@ impl Machine {
                 )
                 && matches!(
                     self.relations.aux.parent_waits.get(&key),
-                    Some(ParentWait::Binding { .. })
+                    Some(ParentWait::Binding { .. } | ParentWait::Settle { .. })
                 ) => {}
             _ => {
                 // sendInput、resumeAgent、v2 interacted/interrupted/completed：不证明新轮，只记事实。
@@ -1606,6 +1608,11 @@ impl Machine {
         own: bool,
         actions: &mut Vec<Action>,
     ) {
+        if own {
+            if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
+                self.adopt_settled_starts(thread, &run);
+            }
+        }
         let keys: Vec<EvidenceKey> = self
             .relations
             .aux

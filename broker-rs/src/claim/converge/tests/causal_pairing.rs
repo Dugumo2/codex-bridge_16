@@ -1285,6 +1285,95 @@ fn delivery_to(m: &mut Machine, thread: &str, turn: &str, id: &str, sender: &str
     );
 }
 
+/// 共享服务器上这一轮还没定案是不是自己的（settling）。raw 不进 settling 缓冲，当场交给配对：
+/// 这时发出的跟进也要留下开始记录。定案是自己的之后按严格配对，子代理的旧轮结束不算读到跟进，
+/// 否则运行会在子代理还没处理跟进时收尾。Interacted 早于或晚于定案到达都一样。
+#[test]
+fn 共享服务器定案前发出的跟进_定案后严格配对_旧轮结束不算读到() {
+    for interacted_after_settle in [false, true] {
+        let (mut m, mut mock, context) = setup_pending_mode(true);
+        assert!(m.claims[P].settling(), "前置：共享服务器上定案之前");
+        notify(
+            &mut m,
+            "turn/started",
+            json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
+        );
+        mock.register(C, Some(P), "v2", false, true);
+        let (a, b) = SubagentMock::v2_activity("started", P, T, "派生", C);
+        apply(&mut m, a);
+        apply(&mut m, b);
+        let actions = apply(&mut m, mock.turn_started(C, "旧轮"));
+        replies(&mut m, &mock, actions);
+        raw(&mut m, "跟进", "新工作");
+        if !interacted_after_settle {
+            interacted(&mut m, "跟进");
+        }
+        assert!(m.claims[P].settling(), "前置：这些事件都在定案之前到达");
+        let actions = apply(
+            &mut m,
+            Event::Reply {
+                context,
+                result: Ok(json!({"turn":{"id":T}})),
+            },
+        );
+        replies(&mut m, &mock, actions);
+        assert!(!m.claims[P].settling(), "前置：回包后定案为自己的轮");
+        if interacted_after_settle {
+            interacted(&mut m, "跟进");
+        }
+        let o = op(&m, "跟进");
+        assert!(
+            o.v2_strict,
+            "Interacted 晚于定案={interacted_after_settle}：开始记录没丢，走严格配对；回退原因 {:?}",
+            o.v2_fallback
+        );
+        assert_eq!(o.v2_fallback, None);
+        // 跟进还在队列里，旧轮就结束了：不能算子代理读到了跟进。
+        let actions = complete(&mut m, &mut mock, C, "旧轮", "completed");
+        replies(&mut m, &mock, actions);
+        pending(&m, 1);
+        let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+        replies(&mut m, &mock, actions);
+        pending(&m, 0);
+        let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+        replies(&mut m, &mock, actions);
+        finish(&mut m, &mut mock);
+    }
+}
+
+/// 定案为不是自己的（被别的客户端的轮吸收）：settling 期间存下的开始记录不能让跟进变成本运行的严格配对。
+#[test]
+fn 共享服务器定案为别人的轮_定案前存下的开始记录不把跟进归给本运行() {
+    let (mut m, mut mock, _context) = setup_pending_mode(true);
+    mock.register(C, Some(P), "v2", false, true);
+    notify(
+        &mut m,
+        "turn/started",
+        json!({"threadId":P,"turn":{"id":"别人的轮","status":"inProgress","items":[]}}),
+    );
+    notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":P,"turnId":"别人的轮","item":{
+        "type":"function_call","name":"followup_task","call_id":"别人的跟进",
+        "arguments":json!({"target":C,"message":"别人的工作"}).to_string()}}),
+    );
+    let (a, b) = SubagentMock::v2_activity("interacted", P, "别人的轮", "别人的跟进", C);
+    apply(&mut m, a);
+    apply(&mut m, b);
+    // 吸收判定的结果：这一轮是别的客户端的。
+    m.settle(P, true, Some("别人的轮".into()), &mut Vec::new());
+    assert!(m.claims[P].joined(), "前置：定案为别人的轮");
+    let o = op(&m, "别人的跟进");
+    assert_eq!(o.outcome, EvidenceOutcome::Unproven);
+    assert!(o.proven_turns.is_empty());
+    assert!(
+        m.manage_context(R)
+            .is_none_or(|c| !c.members.contains_key(C)),
+        "接收方不归本运行管理"
+    );
+}
+
 /// raw 下非根发起方（子代理 C）跟进它的子代理 G，跟进被 G 的忙碌轮吸收、G 不再开新轮：
 /// 只能靠消费记录配对，而消费记录按发起方的代理路径比对。C 的血缘边没有代理路径时，
 /// 从上游 subAgentActivity 条目给出的 agentPath（该子代理的规范路径）得到，不让运行卡到期限。

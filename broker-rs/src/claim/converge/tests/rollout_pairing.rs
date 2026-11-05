@@ -1304,6 +1304,53 @@ fn 无raw_等文件期间轮次变化后退回宽松_结果与旧版宽松一致
     );
 }
 
+/// 已按文件定为严格、还没读到，这期间接收方的轮次变了，然后文件丢了：
+/// 退回宽松的结果要和第 16 节一样，取旧版在 Interacted 到达时会配的那一轮，不能因为候选变多而认不出。
+#[test]
+fn 无raw_严格定案后文件丢失且轮次已变_退回宽松结果与旧版一致() {
+    for (case, turns, expected) in [
+        ("唯一活动轮", vec!["第二轮"], "旧轮"),
+        ("空闲后两轮", vec!["第一轮", "第二轮"], "第一轮"),
+    ] {
+        let (mut m, mut mock) = base();
+        files(&m);
+        if case == "空闲后两轮" {
+            complete(&mut m, &mut mock, C, "旧轮", "completed");
+        }
+        call_line(&m, "跟进", "followup_task", C, "新工作");
+        let actions = interacted_to(&mut m, "跟进", C);
+        replies(&mut m, &mock, actions);
+        assert!(op(&m, "跟进").v2_strict, "{case}：前置：按文件定为严格");
+        if case == "唯一活动轮" {
+            let actions = complete(&mut m, &mut mock, C, "旧轮", "completed");
+            replies(&mut m, &mock, actions);
+        }
+        for turn in turns {
+            let actions = apply(&mut m, mock.turn_started(C, turn));
+            replies(&mut m, &mock, actions);
+            let actions = complete(&mut m, &mut mock, C, turn, "completed");
+            replies(&mut m, &mock, actions);
+        }
+        pending(&m, 1);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(fx::path(C))
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+        let o = op(&m, "跟进");
+        assert!(!o.v2_strict, "{case}：前置：文件丢失后降为宽松");
+        assert_eq!(o.v2_fallback, Some(V2FallbackReason::RolloutLost));
+        assert_eq!(
+            o.proven_turns.get(C),
+            Some(&[expected.to_owned()].into()),
+            "{case}：取旧版当时会配的那一轮"
+        );
+        pending(&m, 0);
+    }
+}
+
 // ─── 17. raw 线程登记满额：能力未知时不读文件 ───────────────────────
 
 /// 本连接里另有 `count` 个线程送来过 raw（真实的 rawResponseItem 通知），把登记表占满。
