@@ -322,6 +322,35 @@ impl Machine {
         }
     }
 
+    /// settling 定案不是自己的，或认领还没定案就被释放：这段时间按本运行存下的开始记录不再有用。
+    /// 操作还有效（已归属确认）的留着；没等到操作、或操作已转未证明的删掉，不留给之后的运行。
+    pub(super) fn v2_drop_unowned_starts(&mut self, thread: &str, run: &str) {
+        let stale: Vec<EvidenceKey> = self
+            .relations
+            .aux
+            .followup_starts
+            .iter()
+            .filter(|(key, start)| {
+                key.parent_thread_id == thread
+                    && start.run == run
+                    && self
+                        .relations
+                        .operations
+                        .get(*key)
+                        .is_none_or(|op| op.outcome == EvidenceOutcome::Unproven)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let aux = &mut self.relations.aux;
+        for key in &stale {
+            aux.followup_starts.remove(key);
+        }
+        aux.v2_index.rebuild_starts(&aux.followup_starts);
+    }
+
     /// 登记开始记录；满额或已有同键记录时不登记。返回是否新登记。
     pub(super) fn v2_record_start(
         &mut self,

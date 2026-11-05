@@ -1368,10 +1368,58 @@ fn 共享服务器定案为别人的轮_定案前存下的开始记录不把跟�
     assert_eq!(o.outcome, EvidenceOutcome::Unproven);
     assert!(o.proven_turns.is_empty());
     assert!(
+        m.relations.aux.followup_starts.is_empty(),
+        "定案前按本运行存下的开始记录不再有用"
+    );
+    assert!(m.v2_index_consistent());
+    assert!(
         m.manage_context(R)
             .is_none_or(|c| !c.members.contains_key(C)),
         "接收方不归本运行管理"
     );
+}
+
+/// 启动失败时认领走释放路径，不经过定案回调：等定案的操作和这段时间存下的开始记录也要结算，
+/// 否则操作永不到期、占着操作表，开始记录还会混进之后同内容的配对。
+#[test]
+fn 共享服务器定案前启动失败_等定案的跟进和开始记录都结算不残留() {
+    let (mut m, mut mock, context) = setup_pending_mode(true);
+    mock.register(C, Some(P), "v2", false, true);
+    raw(&mut m, "跟进", "新工作");
+    raw(&mut m, "只有开始记录", "还没等到 Interacted");
+    interacted(&mut m, "跟进");
+    assert!(m.claims[P].settling(), "前置：定案之前");
+    assert_eq!(
+        m.relations.aux.followup_starts.len(),
+        2,
+        "前置：开始记录已存下"
+    );
+    assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Pending, "前置");
+    let key = op(&m, "跟进").key.clone();
+    let actions = apply(
+        &mut m,
+        Event::Reply {
+            context,
+            result: Err(json!({"code":-32000,"message":"启动失败"})),
+        },
+    );
+    replies(&mut m, &mock, actions);
+    assert!(
+        !m.claims.get(P).is_some_and(|c| c.settling()),
+        "前置：认领已不在定案阶段"
+    );
+    assert!(
+        !m.relations.aux.parent_waits.contains_key(&key),
+        "等定案的记录要清掉"
+    );
+    assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Unproven);
+    assert!(!m.op_confirmed(&key), "不再占着待定");
+    assert!(
+        m.relations.aux.followup_starts.is_empty(),
+        "开始记录不能留给之后的运行：{:?}",
+        m.relations.aux.followup_starts.keys()
+    );
+    assert!(m.v2_index_consistent());
 }
 
 /// raw 下非根发起方（子代理 C）跟进它的子代理 G，跟进被 G 的忙碌轮吸收、G 不再开新轮：

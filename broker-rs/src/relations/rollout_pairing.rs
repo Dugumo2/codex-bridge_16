@@ -270,6 +270,13 @@ impl Machine {
             && if op.run_id.is_empty() {
                 // 运行还不知道：只要还在等发起方这一轮的绑定就继续等。
                 self.awaiting_parent_binding(&op.key)
+            } else if matches!(
+                self.relations.aux.parent_waits.get(&op.key),
+                Some(ParentWait::Settle { .. })
+            ) {
+                // 共享服务器上这一轮还没定案是不是自己的，运行上下文这时还没建：这不是取消。
+                // 定案或认领释放都会清掉这条等待，定案不是自己的操作转未证明，由上面的结果判断收尾。
+                true
             } else {
                 (!self.op_confirmed(&op.key) || self.operation_generation_current(op))
                     && self.rollout_run_live(op)
@@ -409,25 +416,34 @@ impl Machine {
     /// 旧版在 Interacted 到达时就按唯一候选配对：那时恰有一个未完成的候选就配它；一个都没有就配之后出现的
     /// 第一轮；那时就有多个候选的不猜（首轮身份不明）。等待期间新出现的轮次按观察先后排在后面。
     /// 到达时就有多个候选的不改动，仍按原规则判为身份不明。
+    ///
+    /// 观察缓存只留有限轮：到达时的候选已被挤掉，或缓存已满（之后出现的第一轮也可能被挤掉）时，
+    /// 旧版当时的结论还原不了。不能把「现在看不到」当成「当时没有」，全部并入基线，等之后新开的轮或收敛期限。
     fn rollout_fallback_baseline(&mut self, key: &EvidenceKey, child: &str, arrival: &[String]) {
         let Some(op) = self.relations.operations.get(key) else {
             return;
         };
         let baseline = op.baseline_turns.get(child);
-        let candidates: Vec<String> = self
+        let is_new = |turn: &String| !baseline.is_some_and(|old| old.contains(turn));
+        let observed: Vec<String> = self
             .relations
             .aux
             .observed
             .get(child)
             .into_iter()
             .flatten()
-            .filter(|o| !baseline.is_some_and(|old| old.contains(&o.turn)))
             .map(|o| o.turn.clone())
             .collect();
+        let unrecoverable = observed.len() >= MAX_OBSERVED_TURNS
+            || arrival
+                .iter()
+                .any(|turn| is_new(turn) && !observed.contains(turn));
+        let candidates: Vec<String> = observed.iter().filter(|t| is_new(t)).cloned().collect();
         let (before, after): (Vec<String>, Vec<String>) = candidates
             .into_iter()
             .partition(|turn| arrival.contains(turn));
         let keep = match before.len() {
+            _ if unrecoverable => None,
             0 => after.first().cloned(),
             1 => before.first().cloned(),
             _ => return,

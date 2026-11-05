@@ -472,6 +472,112 @@ fn tree_log_摘要截断标记与长身份的json保持完整() {
     }
 }
 
+fn followup_to(
+    m: &mut Machine,
+    receiver: &str,
+    id: &str,
+    outcome: EvidenceOutcome,
+    rejected: bool,
+) {
+    let key = EvidenceKey {
+        parent_thread_id: "发起方".into(),
+        parent_turn_id: "发起轮".into(),
+        item_id: id.into(),
+    };
+    m.relations.operations.insert(
+        key.clone(),
+        EvidenceOperation {
+            key,
+            run_id: String::new(),
+            conn_epoch: m.relations.conn_epoch,
+            authority_gen: 0,
+            kind: EvidenceKind::V2Interacted,
+            started_seen: true,
+            completed_seen: true,
+            outcome,
+            receivers: [receiver.to_owned()].into(),
+            rejected_receivers: if rejected {
+                [(receiver.to_owned(), FollowupRejection::Peer)].into()
+            } else {
+                Default::default()
+            },
+            proven_turns: Default::default(),
+            baseline_turns: Default::default(),
+            v2_strict: false,
+            v2_queue_only: false,
+            v2_source: V2EvidenceSource::None,
+            v2_fallback: None,
+            rollout_arrival: None,
+            first_seen_ms: 0,
+            expires_at_ms: 1,
+            parent_ended: false,
+            failure: None,
+        },
+    );
+}
+
+/// 有历史记录的线程收到过跟进，但证据过期转成了未证明：这只说明归属没证明出来，不等于确定不归本运行，
+/// 暂存到期时要留缺口。只有明确被拒绝（平级、向上）的才算明确不归本运行。
+#[test]
+fn tree_log_跟进证据过期未证明的历史线程仍写缺口_明确被拒绝的不写() {
+    for (rejected, expect_gap) in [(false, true), (true, false)] {
+        let mut m = setup();
+        candidate(&mut m, "历史线程", "root");
+        m.runs.index.child_history = serde_json::from_value(json!({
+            "coverage":"verified","retainedAfter":0,
+            "entries":{"历史线程":{"run-old":{"rootThreadId":"root","observedAt":1}}}
+        }))
+        .unwrap();
+        followup_to(
+            &mut m,
+            "历史线程",
+            "跟进",
+            EvidenceOutcome::Unproven,
+            rejected,
+        );
+        assert!(m.historical_subagent_for_run("run-a", "历史线程"), "前置");
+        let mut a = vec![];
+        m.buffer_child_event_log(
+            "历史线程",
+            "item/completed",
+            &item("历史线程", "t"),
+            false,
+            &mut a,
+        );
+        let generation = m.runs.event_log.timer.unwrap();
+        m.clock.mono_ms = PENDING_MS;
+        a.clear();
+        m.sweep_event_log(generation, &mut a);
+        let gap = logs(&a).iter().any(|l| l.2 == "记录缺口");
+        assert_eq!(gap, expect_gap, "明确被拒绝：{rejected}");
+    }
+}
+
+/// 暂存超限的出口也用同一判定：明确不归本运行的历史兄弟输出再多，也不写缺口；归属未决的照常告警。
+#[test]
+fn tree_log_明确不归本运行的历史兄弟暂存超限不写缺口() {
+    let mut m = setup();
+    candidate(&mut m, "sibling", "root");
+    candidate(&mut m, "unknown", "root");
+    m.runs.index.child_history = serde_json::from_value(json!({
+        "coverage":"verified","retainedAfter":0,
+        "entries":{"sibling":{"run-old":{"rootThreadId":"root","observedAt":1}}}
+    }))
+    .unwrap();
+    let mut a = vec![];
+    for _ in 0..1000 {
+        for thread in ["sibling", "unknown"] {
+            m.buffer_child_event_log(thread, "item/completed", &item(thread, "t"), false, &mut a);
+        }
+    }
+    let gaps: std::collections::BTreeSet<String> = logs(&a)
+        .into_iter()
+        .filter(|l| l.2 == "记录缺口")
+        .map(|l| l.3["threadId"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(gaps, ["unknown".to_owned()].into());
+}
+
 /// 上一运行留下的历史兄弟：本运行对它没有任何管理证据，它被唤醒的轮次摘要按血缘暂存后，
 /// 到期或关闭清理时正常丢弃，不写「记录缺口」；同一时刻血缘不明的候选照常告警。
 #[test]

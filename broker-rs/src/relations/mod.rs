@@ -417,7 +417,27 @@ impl Machine {
         actions: &mut Vec<Action>,
     ) {
         self.facts_claim_settled(thread, claim_id, own, actions);
+        if !own {
+            if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
+                self.v2_drop_unowned_starts(thread, &run);
+            }
+        }
         self.reroute_held(thread, actions);
+        self.ensure_sweep(actions);
+    }
+    /// 认领还没定案就被释放（启动失败、取消）：不经过定案回调，等定案的证据在这里按「不是自己的」结算。
+    /// 否则操作永不到期、占着操作表，开始记录还会混进之后同内容的配对。
+    pub fn on_settling_released(
+        &mut self,
+        thread: &str,
+        claim_id: u64,
+        run: Option<&str>,
+        actions: &mut Vec<Action>,
+    ) {
+        self.facts_claim_settled(thread, claim_id, false, actions);
+        if let Some(run) = run {
+            self.v2_drop_unowned_starts(thread, run);
+        }
         self.ensure_sweep(actions);
     }
     pub fn on_handoff(&mut self, run_id: &str, kind: HandoffKind, actions: &mut Vec<Action>) {

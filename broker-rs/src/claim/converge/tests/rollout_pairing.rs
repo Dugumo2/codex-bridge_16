@@ -1351,6 +1351,128 @@ fn 无raw_严格定案后文件丢失且轮次已变_退回宽松结果与旧版
     }
 }
 
+/// Interacted 到达时的候选后来被观察缓存挤掉了（单线程只留有限轮）：当时会配哪一轮已经还原不了，
+/// 不能把「现在看不到」当成「当时没有」，去配后来的轮。不猜，等之后新开的轮或收敛期限。
+#[test]
+fn 无raw_严格定案后文件丢失且原候选已被挤出_不改配后来的轮() {
+    // 到达时忙碌：候选「旧轮」被挤掉。到达时空闲：之后出现的第一轮被挤掉，看到的第一轮已经不是它。
+    for idle in [false, true] {
+        let (mut m, mut mock) = base();
+        files(&m);
+        if idle {
+            let actions = complete(&mut m, &mut mock, C, "旧轮", "completed");
+            replies(&mut m, &mock, actions);
+        }
+        call_line(&m, "跟进", "followup_task", C, "新工作");
+        let actions = interacted_to(&mut m, "跟进", C);
+        replies(&mut m, &mock, actions);
+        assert!(op(&m, "跟进").v2_strict, "前置：按文件定为严格");
+        if !idle {
+            let actions = complete(&mut m, &mut mock, C, "旧轮", "completed");
+            replies(&mut m, &mock, actions);
+        }
+        for i in 0..=crate::relations::MAX_OBSERVED_TURNS {
+            let turn = format!("后来的轮{i:02}");
+            let actions = apply(&mut m, mock.turn_started(C, &turn));
+            replies(&mut m, &mock, actions);
+            let actions = complete(&mut m, &mut mock, C, &turn, "completed");
+            replies(&mut m, &mock, actions);
+        }
+        assert!(
+            !m.relations.aux.observed[C]
+                .iter()
+                .any(|o| o.turn == "旧轮" || o.turn == "后来的轮00"),
+            "前置：到达时的候选和之后的第一轮都已被挤出"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(fx::path(C))
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+        let o = op(&m, "跟进");
+        assert!(!o.v2_strict, "前置：文件丢失后降为宽松");
+        assert_eq!(
+            o.proven_turns.get(C),
+            None,
+            "空闲：{idle}：不能改配后来的轮"
+        );
+        pending(&m, 1);
+        let actions = apply(&mut m, mock.turn_started(C, "新开的轮"));
+        replies(&mut m, &mock, actions);
+        assert_eq!(
+            op(&m, "跟进").proven_turns.get(C),
+            Some(&["新开的轮".to_owned()].into()),
+            "之后新开的轮仍能配上"
+        );
+        pending(&m, 0);
+    }
+}
+
+/// 共享服务器上这一轮还没定案是不是自己的，又没有 raw：运行上下文还没建，但这不是取消，
+/// 要继续等文件。否则认不出留言（永远等不到新轮，卡到期限），跟进也可能认错轮次。
+#[test]
+fn 无raw_共享服务器定案前的留言和跟进_继续等文件_定案后按文件严格配对() {
+    for tool in ["send_message", "followup_task"] {
+        let (mut m, mut mock, context) = setup_pending_mode(true);
+        notify(
+            &mut m,
+            "turn/started",
+            json!({"threadId":P,"turn":{"id":T,"status":"inProgress","items":[]}}),
+        );
+        mock.register(C, Some(P), "v2", false, true);
+        let (a, b) = SubagentMock::v2_activity("started", P, T, "派生", C);
+        apply(&mut m, a);
+        apply(&mut m, b);
+        let actions = apply(&mut m, mock.turn_started(C, "旧轮"));
+        replies(&mut m, &mock, actions);
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        files(&m);
+        call_line(&m, "调用", tool, C, "内容");
+        interacted_to(&mut m, "调用", C);
+        assert!(m.claims[P].settling(), "{tool}：前置：定案之前");
+        assert_ne!(
+            op(&m, "调用").v2_fallback,
+            Some(V2FallbackReason::RolloutCancelled),
+            "{tool}：还没建上下文不等于取消"
+        );
+        let actions = apply(
+            &mut m,
+            Event::Reply {
+                context,
+                result: Ok(json!({"turn":{"id":T}})),
+            },
+        );
+        replies(&mut m, &mock, actions);
+        assert!(!m.claims[P].settling(), "{tool}：前置：已定案");
+        poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+        let o = op(&m, "调用");
+        assert!(
+            o.v2_strict,
+            "{tool}：按文件定为严格，回退原因 {:?}",
+            o.v2_fallback
+        );
+        assert_eq!(o.v2_source, V2EvidenceSource::RolloutFile);
+        assert_eq!(o.v2_queue_only, tool == "send_message", "{tool}");
+        if tool == "send_message" {
+            pending(&m, 0);
+        } else {
+            pending(&m, 1);
+            m.clock.now_ms += 20;
+            turn_marker(C, "新轮", m.clock.now_ms);
+            message_line(&m, C, "入站", "NEW_TASK", "内容");
+            let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+            replies(&mut m, &mock, actions);
+            poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+            pending(&m, 0);
+            let actions = complete(&mut m, &mut mock, C, "新轮", "completed");
+            replies(&mut m, &mock, actions);
+        }
+        finish(&mut m, &mut mock);
+    }
+}
+
 /// 文件暂时读不了（比如短暂被占用）不能让这条连接之后的跟进都失去严格配对：
 /// 失败只记一段时间，这段时间内不重读；过后遇到新跟进重新取路径、重新读。
 /// 已经定了模式的跟进不改模式。过后仍读不了，照样明确退回宽松。

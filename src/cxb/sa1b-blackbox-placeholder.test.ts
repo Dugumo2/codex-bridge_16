@@ -315,13 +315,18 @@ for (const source of ["raw", "rolloutFile"] as const) {
     try {
       if (source === "raw") await openAndStart(h); else await openWithoutRaw(h);
       const busy = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
-      await followup(h, CHILD, { message: "忙的时候到的跟进" });
+      // 先扣住消费记录：确认确实有一条严格待定的跟进，否则产品忽略这条跟进也能过。
+      await followup(h, CHILD, { message: "忙的时候到的跟进", holdConsume: true });
       expect((await h.state()).threads[CHILD].turns, "不开新轮").toHaveLength(1);
+      expect(await strictFollowup(h, source), "消费记录还没到，操作必须待定").toBeDefined();
+      await h.finish(ROOT, "父轮先交结论");
+      expect(h.ended()).toHaveLength(0);
+      expect(await strictFollowup(h, source), "父轮结束不能代替消费记录").toBeDefined();
+      await h.control("consumeRelease", { threadId: CHILD });
       await bounded(h.until(async () => {
         const left = await diagnostic(h);
         return !left || left.pendingOperations.filter((entry: any) => entry.kind === "v2Interacted").length === 0;
       }, 6000, "当前轮的消费记录必须配上跟进"), 8000);
-      await h.finish(ROOT, "父轮先交结论");
       await h.finish(CHILD, CURRENT_OUTPUT, "completed", busy);
       await finishReconciliation(h, CURRENT_OUTPUT);
       await assertCleanFinalViews(h, busy);

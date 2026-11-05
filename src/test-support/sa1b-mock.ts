@@ -50,6 +50,8 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   const queuedRawInputs = new Map<string, any[]>();
   // 跟进排到下一轮的子线程：当前轮结束后自动开下一轮，与上游一致（留言不会触发）。
   const autoNextTurn = new Set<string>();
+  // holdConsume 扣住的消费记录：跟进已被当前轮吸收，记录晚一点才落盘并通知，用来看清这段中间状态。
+  const heldConsumes = new Map<string, any[]>();
   let currentConnection = "broker";
   const broadcasts = new Set(["thread/started", "thread/status/changed", "thread/goal/updated", "thread/goal/cleared", "thread/closed",
     "thread/name/updated", "thread/archived", "thread/unarchived", "thread/deleted", "thread/reverted", "thread/attachment/updated", "thread/project/updated"]);
@@ -300,6 +302,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
               : [{ type: "input_text", text: header }, { type: "encrypted_content", encrypted_content: body }] };
           if (deferred) autoNextTurn.add(child.id);
           if (p.consumeOnNextTurn || deferred || (queueOnly && turn?.status !== "inProgress")) queuedRawInputs.set(child.id, [...queuedRawInputs.get(child.id) ?? [], input]);
+          else if (turn && p.holdConsume) heldConsumes.set(child.id, [...heldConsumes.get(child.id) ?? [], input]);
           else if (turn) {
             // 消费记录记在消费它的轮里（被忙碌轮吸收时记在当前轮）。
             writeRollout(child.id, "response_item", input);
@@ -307,6 +310,16 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
           }
         }
         reply(msg.id, { turnId: turn?.id }); break;
+      }
+      case "consumeRelease": {
+        const turn = t!.turns.at(-1);
+        if (!turn || turn.status !== "inProgress") { error(msg.id, "放行消费记录时子代理必须还在这一轮"); break; }
+        for (const value of heldConsumes.get(t!.id) ?? []) {
+          writeRollout(t!.id, "response_item", value);
+          notify("rawResponseItem/completed", { threadId: t!.id, turnId: turn.id, item: value });
+        }
+        heldConsumes.delete(t!.id);
+        reply(msg.id, { turnId: turn.id }); break;
       }
       case "turn": {
         if (!t) throw new Error("turn 缺 threadId");

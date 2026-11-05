@@ -401,6 +401,7 @@ impl Machine {
             if pending.bytes + thread_bytes > PER_THREAD_BYTES
                 || pending.bytes + self.runs.event_log.bytes > GLOBAL_BYTES
             {
+                self.settle_pending_candidates(&mut pending);
                 self.pending_gap(&pending, "归属确认前摘要暂存超限", actions);
                 continue;
             }
@@ -541,7 +542,8 @@ impl Machine {
     /// （[`historical_subagent_for_run`](Machine::historical_subagent_for_run)）——而且此刻也没有
     /// 任何还可能把它归给本运行的未决证据：等配对或等发起方绑定的跟进、等会话文件的跟进、等首轮的派生。
     /// 兄弟的轮次还在跑时分类会因活动而暂缓收尾，但那是收敛要等它，不是归属未定。
-    /// 其余候选（血缘或历史不明、证据未决）照常记缺口。
+    /// 跟进证据过期转成未证明，只说明归属没证明出来，不算明确排除；只有明确被拒绝（平级、向上）的才算。
+    /// 其余候选（血缘或历史不明、证据未决或过期）照常记缺口。
     fn settle_pending_candidates(&self, pending: &mut Pending) {
         let thread = pending.thread.clone();
         pending
@@ -554,8 +556,10 @@ impl Machine {
             return false;
         }
         let unresolved = self.relations.operations.values().any(|op| {
-            op.outcome == EvidenceOutcome::Pending
-                && (op.run_id == run || op.run_id.is_empty())
+            matches!(
+                op.outcome,
+                EvidenceOutcome::Pending | EvidenceOutcome::Unproven
+            ) && (op.run_id == run || op.run_id.is_empty())
                 && op.receivers.contains(thread)
                 && !op.rejected_receivers.contains_key(thread)
         }) || self
