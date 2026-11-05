@@ -11,9 +11,22 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// 夹具被卸下、被替换或测试线程退出（含断言失败展开）时删除目录，测试不在磁盘上留下任何东西。
+#[derive(Debug, Default)]
+struct DirCleanup(PathBuf);
+
+impl Drop for DirCleanup {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Fixture {
     pub dir: PathBuf,
+    cleanup: DirCleanup,
     /// 线程 → 会话文件路径（thread/read 回包里的 path）。
     pub paths: BTreeMap<String, String>,
     /// 线程 → 原样的 thread/read 回包（覆盖默认回包，测路径不合规或请求失败）。
@@ -44,6 +57,7 @@ pub(crate) fn install() -> PathBuf {
     FIXTURE.with(|f| {
         *f.borrow_mut() = Some(Fixture {
             dir: dir.clone(),
+            cleanup: DirCleanup(dir.clone()),
             ..Default::default()
         })
     });

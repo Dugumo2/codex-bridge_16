@@ -669,21 +669,48 @@ fn 无raw_配对后与运行结束后都停止跟随子线程文件() {
     no_lingering_poll(&mut m, &mock);
 }
 
-// ─── 11. 大文件 ────────────────────────────────────────────────────
+// ─── 11. 大文件与夹具清理 ──────────────────────────────────────────
+
+#[test]
+fn 夹具目录在卸下替换和测试线程退出时清理_失败时也清理() {
+    let uninstalled = fx::install();
+    assert!(uninstalled.exists());
+    fx::uninstall();
+    assert!(!uninstalled.exists(), "卸下后目录还在");
+
+    let replaced = fx::install();
+    let current = fx::install();
+    assert!(!replaced.exists(), "替换后旧目录还在");
+    fx::uninstall();
+    assert!(!current.exists(), "卸下后目录还在");
+
+    let finished = std::thread::spawn(fx::install).join().unwrap();
+    assert!(!finished.exists(), "线程退出后目录还在");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let panicked = std::thread::spawn(move || {
+        tx.send(fx::install()).unwrap();
+        panic!("模拟断言失败");
+    })
+    .join();
+    assert!(panicked.is_err());
+    let dir = rx.recv().unwrap();
+    assert!(!dir.exists(), "断言失败后目录还在");
+}
 
 #[test]
 fn 无raw_大文件只读末尾窗口与新增内容() {
     let (mut m, mut mock) = base();
     files(&m);
     complete(&mut m, &mut mock, C, "旧轮", "completed");
-    // 父线程文件前面是 1 GiB 的空洞（稀疏文件），末尾才是本轮内容。
+    // 文件前面是一大段全零，末尾才是本轮内容。`set_len` 在 NTFS 上真占磁盘，3 倍读取上限已经足以证明读取有界。
     for thread in [P, C] {
         let path = fx::path(thread);
         let len = std::fs::metadata(&path).unwrap().len();
         let content = std::fs::read(&path).unwrap();
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_len(0).unwrap();
-        f.set_len(1 << 30).unwrap();
+        f.set_len(3 * crate::rollout::MAX_TAIL_BYTES).unwrap();
         drop(f);
         fx::append_raw(thread, "\n");
         fx::append_raw(thread, std::str::from_utf8(&content).unwrap());

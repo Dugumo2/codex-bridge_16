@@ -6,7 +6,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const THREAD: &str = "019a0000-0000-7000-8000-00000000abcd";
 
-fn temp_file(tag: &str) -> std::path::PathBuf {
+/// 临时会话文件：值被丢弃时连目录一起删，断言失败展开时也一样。
+struct TempRollout {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+impl std::ops::Deref for TempRollout {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl AsRef<std::path::Path> for TempRollout {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRollout {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn temp_file(tag: &str) -> TempRollout {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "cxb-rollout-{}-{}",
@@ -14,7 +40,29 @@ fn temp_file(tag: &str) -> std::path::PathBuf {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    dir.join(format!("rollout-2026-11-05T01-02-03-{tag}-{THREAD}.jsonl"))
+    let path = dir.join(format!("rollout-2026-11-05T01-02-03-{tag}-{THREAD}.jsonl"));
+    TempRollout { dir, path }
+}
+
+#[test]
+fn 临时文件在值丢弃和断言失败时都连目录删除() {
+    let dropped = {
+        let file = temp_file("drop");
+        append(&file, "内容\n");
+        file.dir.clone()
+    };
+    assert!(!dropped.exists(), "值丢弃后目录还在：{dropped:?}");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let file = temp_file("panic");
+        append(&file, "内容\n");
+        tx.send(file.dir.clone()).unwrap();
+        panic!("模拟断言失败");
+    }));
+    assert!(unwound.is_err());
+    let dir = rx.recv().unwrap();
+    assert!(!dir.exists(), "断言失败后目录还在：{dir:?}");
 }
 
 fn line(ts: &str, kind: &str, payload: serde_json::Value) -> String {
@@ -239,11 +287,12 @@ fn 超长行整行跳过_之后的行照常读到() {
     );
 }
 
-/// 大文件用稀疏文件：前面是大段空洞，末尾才有内容；首次只读末尾窗口，跟随只读新增。
+/// 前面是一大段全零，末尾才有内容；首次只读末尾窗口，跟随只读新增。
+/// `set_len` 在 NTFS 上真占磁盘，所以不造 GiB 级文件：3 倍读取上限已经足够，整个读一遍就会超过下面的断言。
 #[test]
 fn 大文件只读末尾窗口与新增内容_读取字节有界() {
     let path = temp_file("sparse");
-    let hole = 1u64 << 30;
+    let hole = 3 * MAX_TAIL_BYTES;
     {
         let f = std::fs::File::create(&path).unwrap();
         f.set_len(hole).unwrap();

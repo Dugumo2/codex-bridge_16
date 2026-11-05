@@ -61,9 +61,17 @@ export interface ConvergenceDiagnostic {
     missingResults: number; activeGoals: number; unknownGoals: number;
   };
   pendingOperations: Array<{
-    kind: string; outcome: string; receivers: string[]; pairingMode: "strict" | "fallback" | null;
-    /** 宽松配对的原因：父线程没送过 raw（如 --resume 恢复）、缺这次调用的开始记录、开始记录已换代失效。 */
-    fallbackReason: "parentWithoutRaw" | "startMissing" | "startStale" | null;
+    kind: string; outcome: string; receivers: string[];
+    /** awaitingRollout 是等会话文件的中间状态，不算宽松，也不带来源和回退原因。 */
+    pairingMode: "strict" | "fallback" | "awaitingRollout" | null;
+    /** 严格配对的证据来自哪里：raw 事件、会话文件；宽松配对为 none。 */
+    pairingSource: "raw" | "rolloutFile" | "none" | null;
+    /** 宽松配对的原因。父线程没送过 raw 且会话文件帮不上忙时，这里写明为什么帮不上。 */
+    fallbackReason:
+      | "parentWithoutRaw" | "startMissing" | "startStale" | "rawUnknown"
+      | "rolloutPathUnavailable" | "rolloutUnreadable" | "rolloutCallMissing" | "rolloutLost" | "rolloutCancelled"
+      | "rolloutSenderUnknown" | "rolloutTurnUnknown"
+      | null;
     /** 跟进还在等子代理读到时的起始时刻；不在等配对为 null。只供排查，不代表异常。 */
     awaitingPairingSince: number | null;
     /** 等配对时各接收方此刻是否有在跑的轮次；观察有缺口时为 unknown。 */
