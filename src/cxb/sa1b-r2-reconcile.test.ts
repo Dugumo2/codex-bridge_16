@@ -79,7 +79,7 @@ for (const mode of ["新轮先到interacted后到", "sendInput并入旧线程活
         expect(reused.turnId).toBe(childTurn);
         expect((await h.state()).threads.C.turns).toHaveLength(count);
       }
-      await h.until(async () => (await h.record()).children.some((c: any) => c.threadId === "C" && c.turnIds.includes(reused.turnId)),
+      await h.until(async () => (await h.record()).children?.some((c: any) => c.threadId === "C" && c.turnIds.includes(reused.turnId)),
         3000, "实际承载轮未绑定到本次运行");
       const before = (await h.starts()).length;
       const marker = `本轮结果_${randomUUID()}`;

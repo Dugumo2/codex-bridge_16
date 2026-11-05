@@ -249,9 +249,11 @@ impl Machine {
             ledger.work_epoch = ledger.work_epoch.saturating_add(1);
             ledger.covered_epoch = None;
         }
+        // 等会话文件定模式的操作不进账本（它可能是只入队的消息），由 `pending_starts` 另行计入。
         for op in self.relations.operations.values().filter(|o| {
             o.run_id == run
                 && !o.v2_queue_only
+                && !self.relations.aux.rollout.waits.contains_key(&o.key)
                 && matches!(
                     o.kind,
                     EvidenceKind::V1Spawn
@@ -557,7 +559,8 @@ impl Machine {
             discovery: context.discovery.clone(),
             discovery_covered_epoch: ledger.covered_epoch,
             activities: ledger.activities.clone(),
-            pending_starts: ledger.pending.union(&context.in_flight_spawns).count(),
+            pending_starts: ledger.pending.union(&context.in_flight_spawns).count()
+                + self.rollout_awaiting_for_run(run_id),
             pending_requests,
             unresolved_lookups,
             unresolved_candidates: self

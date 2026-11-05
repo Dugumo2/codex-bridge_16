@@ -2,7 +2,9 @@
 use super::*;
 use std::collections::VecDeque;
 
-pub(super) fn replies(m: &mut Machine, mock: &SubagentMock, actions: Vec<Action>) {
+/// 按真实回包推进发现与结果读取；返回途中产生的全部动作，供零误报断言检查。
+pub(super) fn replies(m: &mut Machine, mock: &SubagentMock, actions: Vec<Action>) -> Vec<Action> {
+    let mut all = actions.clone();
     let mut queue: VecDeque<_> = actions.into();
     let mut count = 0;
     while let Some(action) = queue.pop_front() {
@@ -45,14 +47,17 @@ pub(super) fn replies(m: &mut Machine, mock: &SubagentMock, actions: Vec<Action>
         } else {
             continue;
         };
-        queue.extend(apply(
+        let next = apply(
             m,
             Event::Reply {
                 context,
                 result: Ok(value),
             },
-        ));
+        );
+        all.extend(next.iter().cloned());
+        queue.extend(next);
     }
+    all
 }
 
 #[test]

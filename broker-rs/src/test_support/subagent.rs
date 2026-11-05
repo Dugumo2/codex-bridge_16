@@ -26,8 +26,10 @@ fn key(id: &Value) -> String {
 
 impl SubagentMock {
     pub(crate) fn inject(&mut self, machine: &mut Machine, event: Event) -> Vec<Action> {
-        let (next, actions) = crate::claim::step(std::mem::take(machine), event);
+        let (next, mut actions) = crate::claim::step(std::mem::take(machine), event);
         *machine = next;
+        // 会话文件的路径请求与读取由夹具当场执行（未安装夹具时按 app-server 不给 path 回答）。
+        super::rollout::service(machine, &mut actions);
         self.observe(&actions);
         actions
     }

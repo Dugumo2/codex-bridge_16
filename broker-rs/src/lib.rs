@@ -20,6 +20,7 @@ pub mod proto;
 pub mod relations;
 pub mod requests;
 pub mod results;
+pub mod rollout;
 pub mod runs;
 pub mod sa1b;
 pub mod serve;

@@ -33,7 +33,8 @@ process.stdin.on("data", chunk => { buffer += chunk; let end; while ((end = buff
 process.stdin.on("end", () => process.exit(0));`);
   }
   async open(options: Sa1bOptions = {}) {
-    this.writeMock(options);
+    // 与真实 Codex 一样始终写会话文件；重启后同一目录、同一路径。
+    this.writeMock({ rolloutDir: join(this.tempDir, "codex-home"), ...options });
     await this.launch();
     this.owner = await this.connect();
     return this;

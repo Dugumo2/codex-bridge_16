@@ -1,6 +1,8 @@
 //! 在线诊断只读取事实；绝不重新发现、同步账本、绑定活动或推进 epoch。
 use super::*;
-use crate::relations::{EvidenceKind, EvidenceOutcome, MemberActivity};
+use crate::relations::{
+    EvidenceKind, EvidenceOutcome, MemberActivity, V2EvidenceSource, V2FallbackReason,
+};
 use serde_json::{json, Value};
 
 const MAX_ITEMS: usize = 32;
@@ -228,18 +230,67 @@ impl Machine {
         let omitted_gates = gates.len().saturating_sub(MAX_NESTED);
         gates.truncate(MAX_NESTED);
         let mut omitted_bytes = 0;
-        let pending_keys: Vec<_> = ledger.pending.union(&context.in_flight_spawns).collect();
+        // 等会话文件定模式的操作不在账本里，但同样阻止收敛，一并列出。
+        let awaiting_rollout: std::collections::BTreeSet<_> = self
+            .relations
+            .aux
+            .rollout
+            .waits
+            .keys()
+            .filter(|key| {
+                self.relations
+                    .operations
+                    .get(*key)
+                    .is_some_and(|op| op.run_id == run)
+            })
+            .cloned()
+            .collect();
+        let pending_keys: Vec<_> = ledger
+            .pending
+            .union(&context.in_flight_spawns)
+            .chain(awaiting_rollout.iter())
+            .collect();
         let pending: Vec<_> = pending_keys.iter().take(MAX_ITEMS).map(|key| {
             let op = self.relations.operations.get(*key);
             // 等待配对的操作没有期限；模式只供排查，不参与门禁、覆盖问题或告警。
             let deadline = op.filter(|o| !self.v2_awaits_pairing(o));
+            // 等会话文件是中间状态：不算宽松、不给回退原因，也不按终态报警。
+            let awaiting_file = op.is_some_and(|o| self.rollout_awaiting(&o.key));
             let pairing_mode = op.filter(|o| o.kind == EvidenceKind::V2Interacted)
-                .map(|o| if o.v2_strict { "strict" } else { "fallback" });
+                .map(|o| if awaiting_file { "awaitingRollout" } else if o.v2_strict { "strict" } else { "fallback" });
+            let pairing_source = op.filter(|o| o.kind == EvidenceKind::V2Interacted && !awaiting_file)
+                .map(|o| match o.v2_source {
+                    V2EvidenceSource::Raw => "raw",
+                    V2EvidenceSource::RolloutFile => "rolloutFile",
+                    V2EvidenceSource::None => "none",
+                });
+            let fallback_reason = op.filter(|o| o.kind == EvidenceKind::V2Interacted && !awaiting_file)
+                .and_then(|o| o.v2_fallback).map(|reason| match reason {
+                    V2FallbackReason::ParentWithoutRaw => "parentWithoutRaw",
+                    V2FallbackReason::StartMissing => "startMissing",
+                    V2FallbackReason::StartStale => "startStale",
+                    V2FallbackReason::RolloutPathUnavailable => "rolloutPathUnavailable",
+                    V2FallbackReason::RolloutUnreadable => "rolloutUnreadable",
+                    V2FallbackReason::RolloutCallMissing => "rolloutCallMissing",
+                    V2FallbackReason::RolloutLost => "rolloutLost",
+                    V2FallbackReason::RolloutCancelled => "rolloutCancelled",
+                    V2FallbackReason::RolloutSenderUnknown => "rolloutSenderUnknown",
+                    V2FallbackReason::RolloutTurnUnknown => "rolloutTurnUnknown",
+                    V2FallbackReason::RawUnknown => "rawUnknown",
+                });
             let receiver_ids: Vec<_> = if let Some(op) = op { op.receivers.iter().collect() } else {
                 ledger.placeholder_operations.iter().filter(|(_, reasons)| reasons.contains(*key)).map(|(thread, _)| thread).collect()
             };
             let receivers: Vec<_> = receiver_ids.iter().take(MAX_NESTED)
                 .map(|s| identifier(s, &mut omitted_bytes)).collect();
+            // 跟进还在子代理队列里：给出等了多久、接收方此刻忙还是闲，只供排查，不改收尾判定也不告警。
+            let awaiting = op.filter(|o| self.v2_awaits_pairing(o));
+            let awaiting_since = awaiting.map(|o| self.clock.now_ms.saturating_sub(self.clock.mono_ms.saturating_sub(o.first_seen_ms)));
+            let receiver_states: Vec<_> = awaiting.into_iter().flat_map(|o| o.receivers.iter())
+                .filter(|thread| !op.is_some_and(|o| o.rejected_receivers.contains_key(*thread)))
+                .take(MAX_NESTED)
+                .map(|thread| json!({"threadId":identifier(thread, &mut omitted_bytes),"state":self.receiver_state(thread)}))
+                .collect();
             let proven: Vec<_> = op.into_iter().flat_map(|o| o.proven_turns.iter()).take(MAX_NESTED).map(|(thread, turns)| {
                 json!({"threadId":identifier(thread, &mut omitted_bytes),
                     "turnIds":turns.iter().take(MAX_NESTED).map(|s| identifier(s, &mut omitted_bytes)).collect::<Vec<_>>(),
@@ -248,7 +299,8 @@ impl Machine {
             json!({"kind":op.map(|o| evidence_kind_label(o.kind)).unwrap_or("unknown"),
                 "outcome":op.map(|o| evidence_outcome_label(o.outcome)).unwrap_or("unknown"),
                 "receivers":receivers,"provenTurns":proven,
-                "pairingMode":pairing_mode,
+                "pairingMode":pairing_mode,"pairingSource":pairing_source,"fallbackReason":fallback_reason,
+                "awaitingPairingSince":awaiting_since,"receiverStates":receiver_states,
                 "expiresAt":deadline.map(|o| if o.expires_at_ms >= self.clock.mono_ms {
                     self.clock.now_ms.saturating_add(o.expires_at_ms - self.clock.mono_ms)
                 } else { self.clock.now_ms.saturating_sub(self.clock.mono_ms - o.expires_at_ms) }),
@@ -280,6 +332,36 @@ impl Machine {
     }
 }
 
+impl Machine {
+    /// 接收方此刻是否有在跑的轮次；观察有缺口（换代、notLoaded）时如实给 unknown，不猜空闲。
+    fn receiver_state(&self, thread: &str) -> &'static str {
+        let Some(turns) = self.relations.aux.observed.get(thread) else {
+            return "unknown";
+        };
+        let mut running = false;
+        for turn in turns {
+            let current = self
+                .convergences
+                .observations
+                .get(&(thread.to_owned(), turn.turn.clone()))
+                .filter(|fact| {
+                    fact.conn_epoch == self.relations.conn_epoch
+                        && fact.activity != MemberActivity::Unknown
+                });
+            match current {
+                None => return "unknown",
+                Some(_) if !turn.completed => running = true,
+                Some(_) => {}
+            }
+        }
+        if running {
+            "running"
+        } else {
+            "idle"
+        }
+    }
+}
+
 fn bound_snapshot(snapshot: &mut Value) {
     // JSON 转义也计入预算。逐项撤回保证 UTF-8 和 JSON 始终完整，计数保持真实。
     while serde_json::to_vec(snapshot).expect("诊断可序列化").len() > MAX_BYTES {
@@ -300,7 +382,9 @@ fn bound_snapshot(snapshot: &mut Value) {
 mod tests {
     use super::*;
     use crate::claim::{step, ClientRequest, Event};
-    use crate::relations::{EvidenceKey, EvidenceKind, EvidenceOperation, EvidenceOutcome};
+    use crate::relations::{
+        EvidenceKey, EvidenceKind, EvidenceOperation, EvidenceOutcome, V2FallbackReason,
+    };
     use crate::test_support::subagent::SubagentMock;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -386,11 +470,18 @@ mod tests {
                     .iter()
                     .map(|r| (r.clone(), turns.clone()))
                     .collect(),
-                rejected_receivers: BTreeMap::from([("rejected".into(), SENTINEL.into())]),
+                rejected_receivers: BTreeMap::from([(
+                    "rejected".into(),
+                    crate::relations::FollowupRejection::IndependentClaim,
+                )]),
                 receivers,
                 baseline_turns: BTreeMap::new(),
                 v2_strict: false,
                 v2_queue_only: false,
+                v2_source: crate::relations::V2EvidenceSource::None,
+                v2_fallback: Some(V2FallbackReason::ParentWithoutRaw),
+                rollout_arrival: None,
+                proof_expired: false,
                 first_seen_ms: 0,
                 expires_at_ms: 1,
                 parent_ended: true,

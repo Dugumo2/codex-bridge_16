@@ -75,6 +75,12 @@ pub enum CoreMsg {
         event: AppEvent,
         inflight: crate::watchdog::Inflight,
     },
+    /// 会话文件读取（[`claim::Action::ReadRollout`]）在阻塞线程上读完。
+    RolloutRead {
+        id: u64,
+        thread: String,
+        result: Result<crate::rollout::RolloutChunk, crate::rollout::RolloutError>,
+    },
 }
 
 /// 关闭第 2、3 步（共享专用）的等待阶段。
@@ -302,6 +308,9 @@ impl Core {
                 }
             }
             CoreMsg::Conn(ev) => self.on_conn_event(ev),
+            CoreMsg::RolloutRead { id, thread, result } => {
+                self.dispatch(Event::RolloutRead { id, thread, result });
+            }
             CoreMsg::BreakerProbeTimer { generation } => {
                 if self
                     .probe_timer

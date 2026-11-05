@@ -206,6 +206,19 @@ impl Core {
                         timer.abort();
                     }
                 }
+                Action::ReadRollout(request) => {
+                    // 文件读取是阻塞 IO：放到阻塞线程，读完把结果送回邮箱；状态机不碰文件。
+                    let mailbox = self.mailbox.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result =
+                            crate::rollout::read_chunk(&request.path, request.cursor.as_ref());
+                        let _ = mailbox.send(CoreMsg::RolloutRead {
+                            id: request.id,
+                            thread: request.thread,
+                            result,
+                        });
+                    });
+                }
                 Action::Warn(message) => tracing::warn!("{message}"),
                 Action::Debug(message) => tracing::debug!("{message}"),
             }

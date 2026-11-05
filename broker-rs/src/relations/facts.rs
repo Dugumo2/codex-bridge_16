@@ -579,6 +579,12 @@ impl Machine {
                     .filter(|t| !t.is_empty() && *t != parent)
                     .map(|t| BTreeSet::from([t.to_owned()]))
                     .unwrap_or_default();
+                if let (Some(thread), Some(path)) = (
+                    receivers.first(),
+                    item.get("agentPath").and_then(Value::as_str),
+                ) {
+                    self.v2_learn_agent_path(thread, path);
+                }
                 (kind, receivers, false)
             }
             _ => return,
@@ -590,6 +596,8 @@ impl Machine {
         };
         let now = self.clock.mono_ms;
         let first = !self.relations.operations.contains_key(&key);
+        // 父线程本连接内没有 raw：可以改从会话文件找开始记录（`rollout_pairing`）。
+        let mut parent_without_raw = false;
         if first {
             if !self.reserve_operation() {
                 actions.push(Action::Warn(format!(
@@ -639,7 +647,22 @@ impl Machine {
                     start.epoch == self.relations.conn_epoch
                         && start.run == run_id
                         && start.generation == authority_gen
+                        // 归属留空的开始记录只配给同样在等发起方绑定的操作。
+                        && (!run_id.is_empty() || parent_run == ParentRun::AwaitBinding)
                 });
+            let v2_fallback = (kind == EvidenceKind::V2Interacted && begin.is_none()).then(|| {
+                if self.relations.aux.followup_starts.contains_key(&key) {
+                    V2FallbackReason::StartStale
+                } else {
+                    match self.raw_capability(parent) {
+                        v2_pairing::RawCapability::Seen => V2FallbackReason::StartMissing,
+                        v2_pairing::RawCapability::NotSeen => V2FallbackReason::ParentWithoutRaw,
+                        // 登记表满了：不知道有没有 raw，不能据此去读会话文件。
+                        v2_pairing::RawCapability::Unknown => V2FallbackReason::RawUnknown,
+                    }
+                }
+            });
+            parent_without_raw = v2_fallback == Some(V2FallbackReason::ParentWithoutRaw);
             let baseline_turns = receivers
                 .iter()
                 .filter_map(|child| {
@@ -671,6 +694,14 @@ impl Machine {
                     baseline_turns,
                     v2_strict: begin.is_some(),
                     v2_queue_only: begin.as_ref().is_some_and(|start| !start.trigger),
+                    v2_source: if begin.is_some() {
+                        V2EvidenceSource::Raw
+                    } else {
+                        V2EvidenceSource::None
+                    },
+                    v2_fallback,
+                    rollout_arrival: None,
+                    proof_expired: false,
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
                         .as_ref()
@@ -692,6 +723,20 @@ impl Machine {
                     .v2_receiver_paths
                     .entry(key.clone())
                     .or_insert_with(|| path.into());
+            }
+            // 等会话文件定模式期间不配对：暂存通知，定案后由 `item_evidence_replay` 原样重放。
+            if parent_without_raw {
+                match self.rollout_try_wait(&key, item, completed) {
+                    Ok(true) => return,
+                    Ok(false) => {}
+                    Err(reason) => {
+                        if let Some(op) = self.relations.operations.get_mut(&key) {
+                            op.v2_fallback = Some(reason);
+                        }
+                    }
+                }
+            } else if self.rollout_hold(&key, item, completed) {
+                return;
             }
         }
         let op = self
@@ -780,30 +825,23 @@ impl Machine {
                         | EvidenceKind::V2Interacted
                 ) =>
             {
-                // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
-                // 原始调用开始序号优先；缺失时保守排除首次通知前的完成轮，双通知不重建基线。
-                for child in new_receivers {
-                    if self.reject_followup_receiver(&key, &child, actions) {
-                        continue;
-                    }
-                    // 基线只排除操作开始前已完成的轮次；不能在 Interacted 到达时把之后完成的真实轮次一并当成旧轮。
-                    let baseline = self.relations.operations[&key]
-                        .baseline_turns
-                        .get(&child)
-                        .cloned()
-                        .unwrap_or_default();
-                    self.convergences
-                        .reuse_candidates
-                        .entry((key.clone(), child.clone()))
-                        .or_insert(baseline);
-                    self.relations
-                        .aux
-                        .spawn_waits
-                        .insert(child.clone(), key.clone());
-                    self.pair_first_turn(&key, &child, actions);
-                    self.materialize(&key, actions);
-                }
+                self.accept_followup_receivers(&key, new_receivers, actions);
             }
+            // 发起方这一轮的归属还没定：子代理刚被跟进就转手跟进孙代理（等绑定），
+            // 或共享服务器上这一轮还没定案是不是自己的（等定案）。不能当未证明丢掉，
+            // 接收方已登记，归属确定后由 confirm_waiting 接回；定案不是自己的才转未证明。
+            _ if self.convergence_enabled()
+                && !failed
+                && matches!(
+                    kind,
+                    EvidenceKind::V1SendInput
+                        | EvidenceKind::V1ResumeAgent
+                        | EvidenceKind::V2Interacted
+                )
+                && matches!(
+                    self.relations.aux.parent_waits.get(&key),
+                    Some(ParentWait::Binding { .. } | ParentWait::Settle { .. })
+                ) => {}
             _ => {
                 // sendInput、resumeAgent、v2 interacted/interrupted/completed：不证明新轮，只记事实。
                 let op = self.relations.operations.get_mut(&key).expect("证据操作");
@@ -832,6 +870,50 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// 已确认的跟进接纳接收方：拒绝不合格的，其余进入配对并落实。
+    fn accept_followup_receivers(
+        &mut self,
+        key: &EvidenceKey,
+        children: Vec<String>,
+        actions: &mut Vec<Action>,
+    ) {
+        // 新轮可能早于 interacted，也可能是 sendInput 并入已有活动轮。
+        // 原始调用开始序号优先；缺失时保守排除首次通知前的完成轮，双通知不重建基线。
+        for child in children {
+            if self.reject_followup_receiver(key, &child, actions) {
+                continue;
+            }
+            // 基线只排除操作开始前已完成的轮次；不能在 Interacted 到达时把之后完成的真实轮次一并当成旧轮。
+            let baseline = self.relations.operations[key]
+                .baseline_turns
+                .get(&child)
+                .cloned()
+                .unwrap_or_default();
+            self.convergences
+                .reuse_candidates
+                .entry((key.clone(), child.clone()))
+                .or_insert(baseline);
+            self.relations
+                .aux
+                .spawn_waits
+                .insert(child.clone(), key.clone());
+            self.pair_first_turn(key, &child, actions);
+            self.materialize(key, actions);
+        }
+    }
+
+    /// 会话文件定案后重放暂存的 Interacted 通知；操作已登记，只走 started/completed 之后的处理。
+    pub(super) fn item_evidence_replay(
+        &mut self,
+        key: &EvidenceKey,
+        item: &Value,
+        completed: bool,
+        actions: &mut Vec<Action>,
+    ) {
+        let (parent, turn) = (key.parent_thread_id.clone(), key.parent_turn_id.clone());
+        self.item_evidence(&parent, &turn, item, completed, actions);
     }
 
     /// 运行已确认：有运行编号且不在等父轮结论。
@@ -1064,32 +1146,14 @@ impl Machine {
         if op.rejected_receivers.contains_key(child) {
             return true;
         }
-        let upward = self.is_ancestor_thread(child, &key.parent_thread_id);
-        let peer = !upward && self.is_peer_thread(child, &key.parent_thread_id);
-        let reason = if upward {
-            "接收方是发起方的上级，不属于跟进"
-        } else if peer {
-            "接收方是发起方的平级，不属于跟进"
-        } else if !self.thread_relation(child).is_some_and(|edge| {
-            edge.kind == RelationKind::Subagent && edge.parent_thread_id == key.parent_thread_id
-        }) {
-            "未核实为本父线程的子代理"
-        } else if self.claims.contains_key(child) {
-            "接收方已有独立认领"
-        } else if self.relations.bindings.values().any(|binding| {
-            binding.thread_id == child
-                && binding.run_id != op.run_id
-                && binding.status == BindingStatus::Bound
-        }) {
-            "接收方已绑定其他运行"
-        } else {
+        let Some(rejection) = self.followup_rejection(key, child, &op.run_id) else {
             return false;
         };
         let run = op.run_id.clone();
         // 拒绝发生在 bind 之前：按本次操作的候选运行记关系诊断，不能借已有绑定反查归属。
         // 跟进尚无被接纳的子轮，保留 null turnId，不把旧绑定轮次冒充成本次活动。
         // 子代理向上或向平级发消息是正常协作：同样不授予管理权，但不是归属问题，不写冲突和覆盖缺口。
-        if !upward && !peer {
+        if !rejection.is_collaboration() {
             self.runs.log_source(
                 &run,
                 child,
@@ -1099,7 +1163,7 @@ impl Machine {
                 Some(&key.item_id),
                 self.clock.now_ms,
                 "归属冲突",
-                reason,
+                rejection.reason(),
                 false,
                 false,
                 Some("discoveryIncomplete"),
@@ -1111,7 +1175,7 @@ impl Machine {
             .operations
             .get_mut(key)
             .expect("跟进操作存在");
-        op.rejected_receivers.insert(child.into(), reason.into());
+        op.rejected_receivers.insert(child.into(), rejection);
         op.proven_turns.remove(child);
         if op
             .receivers
@@ -1127,6 +1191,39 @@ impl Machine {
             .reuse_candidates
             .remove(&(key.clone(), child.into()));
         true
+    }
+
+    /// 跟进接收方此刻是否必须拒绝纳管；None 表示可以作为本父线程的子代理候选。
+    pub(super) fn followup_rejection(
+        &self,
+        key: &EvidenceKey,
+        child: &str,
+        run: &str,
+    ) -> Option<FollowupRejection> {
+        let upward = self.is_ancestor_thread(child, &key.parent_thread_id);
+        let peer = !upward && self.is_peer_thread(child, &key.parent_thread_id);
+        if upward {
+            Some(FollowupRejection::Upward)
+        } else if peer {
+            Some(FollowupRejection::Peer)
+        } else if !self.thread_relation(child).is_some_and(|edge| {
+            edge.kind == RelationKind::Subagent && edge.parent_thread_id == key.parent_thread_id
+        }) {
+            Some(FollowupRejection::NotOwnChild)
+        } else if self.claims.contains_key(child) {
+            Some(FollowupRejection::IndependentClaim)
+        } else if !run.is_empty()
+            // 发起方归属未定时无从比较；等定案后由 confirm_waiting 重新判定。
+            && self.relations.bindings.values().any(|binding| {
+                binding.thread_id == child
+                    && binding.run_id != run
+                    && binding.status == BindingStatus::Bound
+            })
+        {
+            Some(FollowupRejection::OtherRunBinding)
+        } else {
+            None
+        }
     }
 
     /// 沿可核实的父关系向上查 `ancestor` 是否是 `thread` 的上级；关系未知时不算。
@@ -1151,14 +1248,19 @@ impl Machine {
     }
 
     /// 已拒绝的跟进候选不能通过后续收敛发现重新入册；本运行已有合法管理证据时仍保留。
-    pub(super) fn rejected_followup_for_run(&self, run: &str, child: &str) -> bool {
+    /// 子代理向上或向平级（含上一运行留下的兄弟）发消息不是跟进，不算跟进被拒；
+    /// 那样的候选按其余事实分类（例如兄弟被唤醒的新轮仍按活动轮阻塞收敛）。
+    pub(crate) fn rejected_followup_for_run(&self, run: &str, child: &str) -> bool {
         if self.current_management_evidence(run, child) {
             return false;
         }
-        self.relations
-            .operations
-            .values()
-            .any(|op| op.run_id == run && op.rejected_receivers.contains_key(child))
+        self.relations.operations.values().any(|op| {
+            op.run_id == run
+                && op
+                    .rejected_receivers
+                    .get(child)
+                    .is_some_and(|rejection| !rejection.is_collaboration())
+        })
     }
 
     /// 写入绑定；独立认领或已有其他运行绑定构成冲突，不覆盖。
@@ -1266,6 +1368,8 @@ impl Machine {
             .map(|(k, _)| k.clone())
             .collect();
         self.refresh_member(run, child, MemberChange::Binding, actions);
+        // 先恢复这一轮存下的调用证据，再接回等它的操作：模式由证据定，接纳接收方在后。
+        self.adopt_pending_starts(child, turn, run);
         for waiting_key in waiting {
             self.relations.aux.parent_waits.remove(&waiting_key);
             if let Some(op) = self.relations.operations.get_mut(&waiting_key) {
@@ -1295,6 +1399,17 @@ impl Machine {
         }
         if matches!(op.kind, EvidenceKind::V1Spawn | EvidenceKind::V2Started) {
             self.materialize(key, actions);
+        }
+        // 等发起方绑定期间到达的跟进：现在才能接纳接收方。还在等会话文件定模式的，
+        // 由定案时的重放接纳（等文件期间接收方尚未登记）。
+        if matches!(
+            op.kind,
+            EvidenceKind::V1SendInput | EvidenceKind::V1ResumeAgent | EvidenceKind::V2Interacted
+        ) && op.outcome == EvidenceOutcome::Pending
+            && self.convergence_enabled()
+            && !self.rollout_awaiting(key)
+        {
+            self.accept_followup_receivers(key, op.receivers.into_iter().collect(), actions);
         }
     }
 
@@ -1494,6 +1609,11 @@ impl Machine {
         own: bool,
         actions: &mut Vec<Action>,
     ) {
+        if own {
+            if let Some(run) = self.claims.get(thread).and_then(|c| c.run_id.clone()) {
+                self.adopt_settled_starts(thread, &run);
+            }
+        }
         let keys: Vec<EvidenceKey> = self
             .relations
             .aux
@@ -1553,6 +1673,7 @@ impl Machine {
                 self.relations.aux.parent_waits.remove(&key);
                 if let Some(op) = self.relations.operations.get_mut(&key) {
                     op.outcome = EvidenceOutcome::Unproven;
+                    op.proof_expired = true;
                     op.proven_turns.clear();
                 }
             }
@@ -1574,7 +1695,8 @@ impl Machine {
             }
             if let Some(op) = self.relations.operations.get_mut(&key) {
                 if op.outcome == EvidenceOutcome::Pending {
-                    op.outcome = if op.proven_turns.is_empty() {
+                    op.proof_expired = op.proven_turns.is_empty();
+                    op.outcome = if op.proof_expired {
                         EvidenceOutcome::Unproven
                     } else {
                         EvidenceOutcome::Proven

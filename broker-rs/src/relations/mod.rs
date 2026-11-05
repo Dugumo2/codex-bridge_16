@@ -17,10 +17,12 @@ mod notify;
 mod release;
 pub(crate) use release::{ChildBarrier, ChildWaiter, Released};
 pub mod results;
+pub mod rollout_pairing;
 mod routing;
 #[cfg(test)]
 mod tests;
 mod v2_pairing;
+pub use v2_pairing::EvidenceSource;
 
 use crate::claim::{Action, ClaimToken, HeldNotification, HeldRequest, Machine, RequestContext};
 use crate::claim::{Operation, TimerKind};
@@ -148,7 +150,18 @@ pub struct RelationsAux {
     /// 仅真实 turn/started 登记；发现或迟到 completed 不能伪造轮次开始。
     pub live_turn_starts: BTreeMap<(String, String), (u64, u64)>,
     pub v2_receiver_paths: BTreeMap<EvidenceKey, String>,
+    /// 线程 → 规范代理路径，取自上游 subAgentActivity 条目（agentPath 是 agentThreadId 那个子代理的路径）。
+    /// 血缘边没有代理路径时（运行中 v2 派生、冷恢复的旧子代理），作为发起方路径比对消费记录。有界。
+    pub v2_agent_paths: BTreeMap<String, String>,
     pub v2_deliveries: VecDeque<v2_pairing::DeliveryFact>,
+    /// 与开始记录、消费记录同步增删的索引，配对时不必全表扫描。
+    pub v2_index: v2_pairing::V2Index,
+    /// 送来过 raw 事件的线程及其连接代际；用于诊断宽松配对的原因，也决定是否改用会话文件。
+    pub v2_raw_threads: BTreeMap<String, u64>,
+    /// 某连接代际里登记表满过、有线程没登记上：该代际里没登记的线程是否有 raw 未知（不是「没有」）。
+    pub v2_raw_overflow: Option<u64>,
+    /// 没有 raw 时从会话文件补证据：等文件的操作、跟随中的文件、读到的调用。
+    pub rollout: rollout_pairing::RolloutState,
     /// 子线程 → 等它首轮的派生操作。
     pub spawn_waits: BTreeMap<String, EvidenceKey>,
     pub parent_waits: BTreeMap<EvidenceKey, ParentWait>,
@@ -305,7 +318,7 @@ impl Machine {
         };
         let now = self.clock.mono_ms;
         let mut unknown = self.run_has_candidates(run_id);
-        if !context.in_flight_spawns.is_empty() {
+        if !context.in_flight_spawns.is_empty() || self.rollout_awaiting_for_run(run_id) > 0 {
             return Activity::Some;
         }
         for (thread, member) in &context.members {
@@ -406,6 +419,18 @@ impl Machine {
         self.facts_claim_settled(thread, claim_id, own, actions);
         self.reroute_held(thread, actions);
         self.ensure_sweep(actions);
+    }
+    /// 认领释放时还有等它定案的证据（启动失败、取消；停止路径会先清掉 settling 标记，所以按认领编号查，
+    /// 不看标记）：不会再有定案回调，这里按「不是自己的」结算，否则操作永不到期、占着操作表。
+    /// 开始记录不删，留到证据期限：它要挡住同内容的后来者认领这段时间的消费记录。
+    pub fn on_claim_released(&mut self, thread: &str, claim_id: u64, actions: &mut Vec<Action>) {
+        let waiting = self.relations.aux.parent_waits.values().any(|w| {
+            matches!(w, ParentWait::Settle { thread: t, claim_id: c } if t == thread && *c == claim_id)
+        });
+        if waiting {
+            self.facts_claim_settled(thread, claim_id, false, actions);
+            self.ensure_sweep(actions);
+        }
     }
     pub fn on_handoff(&mut self, run_id: &str, kind: HandoffKind, actions: &mut Vec<Action>) {
         if matches!(kind, HandoffKind::Joined | HandoffKind::External) {

@@ -94,6 +94,77 @@ pub enum EvidenceOutcome {
     Failed,
     Revoked,
 }
+/// v2 跟进为什么只能宽松配对；在 Interacted 首次到达时按当时已知事实判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2FallbackReason {
+    /// 本连接内还没收到过父线程的任何 raw 事件；典型是跨重启 `--resume` 的线程，上游只有 thread/start 有 raw 开关。
+    ParentWithoutRaw,
+    /// 父线程送过 raw，但这次调用的开始记录没有先于 Interacted 到达（迟到或因上限未登记）。
+    StartMissing,
+    /// 有开始记录，但连接、运行或授权代际已不符，不能沿用。
+    StartStale,
+    /// 没有 raw，会话文件的路径拿不到或不合规（thread/read 失败、没有 path、不是本线程的 .jsonl 绝对路径）。
+    RolloutPathUnavailable,
+    /// 没有 raw，会话文件不存在或读不了（含 app-server 在别的机器上）。
+    RolloutUnreadable,
+    /// 没有 raw，等文件的窗口内没在父线程文件里找到这次调用（例如嵌套调用不落 function_call）。
+    RolloutCallMissing,
+    /// 曾按会话文件严格配对，之后文件被截断或读不了，降为宽松。
+    RolloutLost,
+    /// 等文件期间操作已失效（运行结束、停止、连接或授权换代），不再等。
+    RolloutCancelled,
+    /// 没有 raw，文件里找到了 followup_task，但发起方的代理路径未知，比对不了接收方的消费记录。
+    RolloutSenderUnknown,
+    /// 没有 raw，接收方文件的末尾窗口向前找到上限仍定位不到当前轮，读到的消息对不上轮次。
+    RolloutTurnUnknown,
+    /// raw 线程登记表已满，线程是否送过 raw 未知：容量不足不能当成「没有 raw」去读会话文件。
+    RawUnknown,
+}
+
+/// 跟进配对证据的来源，只供诊断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2EvidenceSource {
+    /// 本连接的 raw 事件。
+    Raw,
+    /// 会话文件（没有 raw 时）。
+    RolloutFile,
+    /// 没有证据，宽松配对。
+    None,
+}
+
+/// 跟进接收方不纳管的理由。向上与平级是子代理之间的正常协作，不是跟进，不能当「跟进被拒」统计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowupRejection {
+    /// 接收方是发起方的上级。
+    Upward,
+    /// 接收方与发起方同属一棵代理树、又不是它的下级。
+    Peer,
+    /// 未核实为本父线程的子代理（含越级跟进孙代理）。
+    NotOwnChild,
+    /// 接收方已有独立认领。
+    IndependentClaim,
+    /// 接收方已绑定其他运行。
+    OtherRunBinding,
+}
+
+impl FollowupRejection {
+    /// 运行记录与诊断用的说明文字。
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Upward => "接收方是发起方的上级，不属于跟进",
+            Self::Peer => "接收方是发起方的平级，不属于跟进",
+            Self::NotOwnChild => "未核实为本父线程的子代理",
+            Self::IndependentClaim => "接收方已有独立认领",
+            Self::OtherRunBinding => "接收方已绑定其他运行",
+        }
+    }
+
+    /// 向上或平级消息：不授予管理权，也不是归属问题。
+    pub fn is_collaboration(self) -> bool {
+        matches!(self, Self::Upward | Self::Peer)
+    }
+}
+
 /// v1 completed 的代理状态不等于发送成功；v2 双通知只登记一次。
 /// 证据最迟于父轮结束、授权撤销、连接换代失效；已绑定轮次保留历史。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,14 +179,26 @@ pub struct EvidenceOperation {
     pub outcome: EvidenceOutcome,
     pub receivers: BTreeSet<String>,
     /// 跟进接收方的拒绝纳管理由；保留上游接收事实，不把拒绝误记成发送失败。
-    pub rejected_receivers: BTreeMap<String, String>,
+    pub rejected_receivers: BTreeMap<String, FollowupRejection>,
     pub proven_turns: BTreeMap<String, BTreeSet<String>>,
     /// 操作登记瞬间每个接收方已完成轮次的基线；配对只排除这些轮次。
+    /// 等会话文件后退回宽松时，还并入旧版宽松当时不会配的轮次（`rollout_fallback_baseline`）。
     pub baseline_turns: BTreeMap<String, BTreeSet<String>>,
-    /// 在 Interacted 首次到达时固定；缺 raw 的旧线程回退，不因迟到 raw 改写模式。
+    /// 在 Interacted 首次到达时固定；缺 raw 的旧线程可等会话文件定案（见 `rollout_pairing`），
+    /// 定案后不因迟到的 raw 或文件行改写模式。
     pub v2_strict: bool,
     /// 由 raw 认出是 `send_message`：上游只入队不开新轮，可能永远等不到承载轮，不授予管理权也不进待定账本。
     pub v2_queue_only: bool,
+    /// 严格配对的证据来源；与 `v2_strict` 同时固定，只供诊断。
+    pub v2_source: V2EvidenceSource,
+    /// 宽松配对的原因，与 `v2_strict` 同时固定；只供诊断，不参与配对、门禁或告警。
+    pub v2_fallback: Option<V2FallbackReason>,
+    /// 按会话文件定为严格时，接收方和它在 Interacted 到达时已观察到的轮次。
+    /// 之后文件丢失、降为宽松时，据此还原旧版当时会配的那一轮（`rollout_fallback_baseline`）。
+    pub rollout_arrival: Option<(String, Vec<String>)>,
+    /// 等证据等到期限才转未证明：归属没证明出来，不等于确定不归本运行（日志要留缺口）。
+    /// 只记事实的条目（如 completed）、定案不是自己的，也是未证明，但不算这种。
+    pub proof_expired: bool,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

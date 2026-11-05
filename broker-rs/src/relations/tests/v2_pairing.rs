@@ -334,7 +334,10 @@ fn v2兄弟与隔房子代理互发不记归属冲突且不授管理权() {
             .values()
             .find(|op| op.key.item_id == item)
             .unwrap();
-        assert!(op.rejected_receivers[target].contains("平级"), "{item}");
+        assert!(
+            op.rejected_receivers[target].reason().contains("平级"),
+            "{item}"
+        );
         assert!(log_lines_with(&actions, "归属冲突").is_empty(), "{item}");
         assert!(
             log_lines_with(&actions, "discoveryIncomplete").is_empty(),
@@ -381,4 +384,44 @@ fn v2乱序消费暂存有界并按ttl清理() {
     m.clock.mono_ms += EVIDENCE_TTL_MS;
     m.prune_v2_deliveries();
     assert!(m.relations.aux.v2_deliveries.is_empty());
+}
+
+#[test]
+fn v2配对索引与原表始终一致且挤出后同号可再登记() {
+    let (mut m, mut mock) = fixture();
+    let delivery = |index: usize| {
+        json!({"type":"agent_message","id":format!("input-{index}"),"author":"/root","recipient":format!("/root/{C}"),
+            "content":[{"type":"input_text","text":format!("Message Type: NEW_TASK\nTask name: /root/{C}\nSender: /root\nPayload:\n输入{}", index % 3)}]})
+    };
+    begin(&mut m, &mut mock);
+    for index in 0..=MAX_OPERATIONS {
+        m.v2_observe_raw(C, "先到轮", &delivery(index), &mut vec![]);
+        assert!(m.v2_index_consistent(), "第 {index} 条后索引失配");
+    }
+    // 最早一条已被挤出：同号再到是新事实，不能被旧索引当成重复丢弃。
+    assert!(!m
+        .relations
+        .aux
+        .v2_deliveries
+        .iter()
+        .any(|d| d.id == "input-0"));
+    m.v2_observe_raw(C, "先到轮", &delivery(0), &mut vec![]);
+    assert!(m
+        .relations
+        .aux
+        .v2_deliveries
+        .iter()
+        .any(|d| d.id == "input-0"));
+    // 重复到达的同号输入仍只登记一次。
+    let before = m.relations.aux.v2_deliveries.len();
+    m.v2_observe_raw(C, "先到轮", &delivery(0), &mut vec![]);
+    assert_eq!(m.relations.aux.v2_deliveries.len(), before);
+    assert!(m.v2_index_consistent());
+    m.clock.mono_ms += EVIDENCE_TTL_MS;
+    m.prune_v2_deliveries();
+    m.prune_followup_starts();
+    assert!(m.relations.aux.v2_deliveries.is_empty());
+    assert!(m.relations.aux.followup_starts.is_empty());
+    assert!(m.v2_index_consistent());
+    assert_eq!(m.relations.aux.v2_index, Default::default());
 }
