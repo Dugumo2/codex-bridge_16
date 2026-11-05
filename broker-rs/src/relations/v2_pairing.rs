@@ -322,6 +322,49 @@ impl Machine {
         }
     }
 
+    /// 定案不是自己的，或认领没定案就被释放：这段时间按这个运行存下的开始记录和它们对应的消费记录一起清掉。
+    /// 只清一半都不行：只留开始记录，同内容的新跟进会被它挡住；只留消费记录，新跟进会认领它。
+    /// 操作还有效的不动；别的子代理收到的同内容消息不动。
+    /// 消费记录在清理之后才到、又碰上同内容的新跟进时仍可能被认领（已知局限，只在不加密时才有同内容）。
+    pub(super) fn v2_forget_unowned(&mut self, thread: &str, run: &str) {
+        let stale: Vec<(EvidenceKey, FollowupStart, BTreeSet<String>)> = self
+            .relations
+            .aux
+            .followup_starts
+            .iter()
+            .filter(|(key, start)| key.parent_thread_id == thread && start.run == run)
+            .filter_map(|(key, start)| {
+                let op = self.relations.operations.get(key);
+                op.is_none_or(|op| op.outcome == EvidenceOutcome::Unproven)
+                    .then(|| {
+                        let receivers = op.map(|op| op.receivers.clone()).unwrap_or_default();
+                        (key.clone(), start.clone(), receivers)
+                    })
+            })
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let aux = &mut self.relations.aux;
+        for (key, _, _) in &stale {
+            aux.followup_starts.remove(key);
+        }
+        aux.v2_deliveries.retain(|d| {
+            !stale.iter().any(|(_, start, receivers)| {
+                start.message == Some(d.message)
+                    && start.trigger == d.trigger
+                    && (receivers.contains(&d.thread)
+                        || start.target.as_ref().is_some_and(|target| {
+                            target == &d.thread
+                                || target == &d.recipient
+                                || d.recipient.ends_with(&format!("/{target}"))
+                        }))
+            })
+        });
+        aux.v2_index.rebuild_starts(&aux.followup_starts);
+        aux.v2_index.rebuild_deliveries(&aux.v2_deliveries);
+    }
+
     /// 登记开始记录；满额或已有同键记录时不登记。返回是否新登记。
     pub(super) fn v2_record_start(
         &mut self,

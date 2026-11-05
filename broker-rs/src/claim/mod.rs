@@ -2210,7 +2210,13 @@ impl Machine {
                     reuse = Some(claim.claim_id);
                 } else {
                     // 运行转到子线程，父认领不走普通释放，等它定案的证据在这里结算。
-                    self.on_claim_released(parent, claim.claim_id, actions);
+                    self.on_claim_released(
+                        parent,
+                        claim.claim_id,
+                        claim.run_id.as_deref(),
+                        claim.owned_turns.is_empty(),
+                        actions,
+                    );
                     self.schedule_unsubscribe(token.clone(), actions);
                 }
             } else {
@@ -3417,7 +3423,13 @@ impl Machine {
         self.clear_held_accounting(thread_id, &mut claim);
         self.cancel_joined_check(thread_id, actions);
         self.cancel_reclaim(thread_id, actions);
-        self.on_claim_released(thread_id, claim.claim_id, actions);
+        self.on_claim_released(
+            thread_id,
+            claim.claim_id,
+            claim.run_id.as_deref(),
+            claim.owned_turns.is_empty(),
+            actions,
+        );
         if let Some(run) = &claim.run_id {
             self.run_released_owned(run, kind, owner, actions);
         }

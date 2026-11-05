@@ -1372,10 +1372,7 @@ fn 共享服务器定案为别人的轮_定案前存下的开始记录不把跟�
             .is_none_or(|c| !c.members.contains_key(C)),
         "接收方不归本运行管理"
     );
-    // 开始记录留到证据期限：它还要挡住同内容的后来者认领这段时间的消费记录。
-    m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
-    m.facts_expire(&mut Vec::new());
-    assert!(m.relations.aux.followup_starts.is_empty(), "过期后清掉");
+    assert!(m.relations.aux.followup_starts.is_empty(), "开始记录已清掉");
     assert!(m.v2_index_consistent());
 }
 
@@ -1472,97 +1469,132 @@ fn 等归属的跟进到期才标证明超时_只记事实的条目不标() {
     );
 }
 
-/// 定案是别人的轮之后，这段时间的消费记录还在。同一连接上新运行发出同内容的跟进时，
-/// 开始记录要还在，才能认出这条记录是别人的；否则新跟进会认定旧轮，运行可能提前收尾。
+/// 定案是别人的轮时，这段时间的开始记录和它对应的消费记录一起清掉。同一连接上新运行发出同内容的跟进时，
+/// 既不会认定旧轮（否则运行可能提前收尾），也不会被旧记录挡住（否则卡到期限）；过了开始记录的期限也一样。
 #[test]
-fn 共享服务器定案为别人的轮后_同内容新跟进不能认定案前的旧消费记录() {
+fn 共享服务器定案为别人的轮后_同内容新跟进不认旧消费记录也不被挡住() {
     const OTHER: &str = "别人的轮";
     const R2: &str = "第二运行";
     const T2: &str = "第二父轮";
-    let (mut m, mut mock, _context) = setup_pending_mode(true);
-    mock.register(C, Some(P), "v2", false, true);
-    notify(
-        &mut m,
-        "turn/started",
-        json!({"threadId":P,"turn":{"id":OTHER,"status":"inProgress","items":[]}}),
-    );
-    // 别人的轮派生了这个子代理：血缘属于这个父线程，运行归属待定。
-    let (a, b) = SubagentMock::v2_activity("started", P, OTHER, "别人的派生", C);
-    apply(&mut m, a);
-    apply(&mut m, b);
-    let actions = apply(&mut m, mock.turn_started(C, "旧轮"));
-    replies(&mut m, &mock, actions);
-    notify(
-        &mut m,
-        "rawResponseItem/completed",
-        json!({"threadId":P,"turnId":OTHER,"item":{
+    for late in [false, true] {
+        let (mut m, mut mock, _context) = setup_pending_mode(true);
+        mock.register(C, Some(P), "v2", false, true);
+        notify(
+            &mut m,
+            "turn/started",
+            json!({"threadId":P,"turn":{"id":OTHER,"status":"inProgress","items":[]}}),
+        );
+        // 别人的轮派生了这个子代理：血缘属于这个父线程，运行归属待定。
+        let (a, b) = SubagentMock::v2_activity("started", P, OTHER, "别人的派生", C);
+        apply(&mut m, a);
+        apply(&mut m, b);
+        let actions = apply(&mut m, mock.turn_started(C, "旧轮"));
+        replies(&mut m, &mock, actions);
+        notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":P,"turnId":OTHER,"item":{
         "type":"function_call","name":"followup_task","call_id":"别人的跟进",
         "arguments":json!({"target":C,"message":"同一句"}).to_string()}}),
-    );
-    let (a, b) = SubagentMock::v2_activity("interacted", P, OTHER, "别人的跟进", C);
-    apply(&mut m, a);
-    apply(&mut m, b);
-    delivery(&mut m, "旧轮", "入站旧", "同一句", false);
-    m.settle(P, true, Some(OTHER.into()), &mut Vec::new());
-    assert!(m.claims[P].joined(), "前置：定案为别人的轮");
-    let actions = complete(&mut m, &mut mock, P, OTHER, "completed");
-    replies(&mut m, &mock, actions);
-    assert!(!m.claims.contains_key(P), "前置：认领已释放");
+        );
+        let (a, b) = SubagentMock::v2_activity("interacted", P, OTHER, "别人的跟进", C);
+        apply(&mut m, a);
+        apply(&mut m, b);
+        if late {
+            // 消费记录比开始记录晚 10 秒：开始记录过期时，消费记录还在。
+            m.clock.mono_ms += 10_000;
+        }
+        delivery(&mut m, "旧轮", "入站旧", "同一句", false);
+        // 同样内容发给别的子代理的记录，不属于这条跟进，不能被一起清掉。
+        delivery_to(&mut m, "别的子", "别的轮", "入站别", "/root", "同一句");
+        m.settle(P, true, Some(OTHER.into()), &mut Vec::new());
+        assert!(m.claims[P].joined(), "前置：定案为别人的轮");
+        let ids: Vec<String> = m
+            .relations
+            .aux
+            .v2_deliveries
+            .iter()
+            .map(|d| d.id.clone())
+            .collect();
+        let starts_left = m.relations.aux.followup_starts.len();
+        let actions = complete(&mut m, &mut mock, P, OTHER, "completed");
+        replies(&mut m, &mock, actions);
+        assert!(!m.claims.contains_key(P), "前置：认领已释放");
 
-    let out = apply(
-        &mut m,
-        Event::ClientRequest {
-            request: crate::claim::ClientRequest {
-                conn: 1,
-                id: json!(2),
-                method: "turn/start".into(),
-                params: Some(json!({"threadId":P,"input":[{"type":"text","text":"新任务"}]})),
+        let out = apply(
+            &mut m,
+            Event::ClientRequest {
+                request: crate::claim::ClientRequest {
+                    conn: 1,
+                    id: json!(2),
+                    method: "turn/start".into(),
+                    params: Some(json!({"threadId":P,"input":[{"type":"text","text":"新任务"}]})),
+                },
+                run_id: Some(R2.into()),
             },
-            run_id: Some(R2.into()),
-        },
-    );
-    let context = out
-        .into_iter()
-        .find_map(|a| match a {
-            Action::Request(c) if c.method == "turn/start" => Some(c),
-            _ => None,
-        })
-        .expect("新运行发出 turn/start");
-    notify(
-        &mut m,
-        "turn/started",
-        json!({"threadId":P,"turn":{"id":T2,"status":"inProgress","items":[]}}),
-    );
-    let actions = apply(
-        &mut m,
-        Event::Reply {
-            context,
-            result: Ok(json!({"turn":{"id":T2}})),
-        },
-    );
-    replies(&mut m, &mock, actions);
-    assert!(!m.claims[P].settling(), "前置：新运行已定案");
+        );
+        let context = out
+            .into_iter()
+            .find_map(|a| match a {
+                Action::Request(c) if c.method == "turn/start" => Some(c),
+                _ => None,
+            })
+            .expect("新运行发出 turn/start");
+        notify(
+            &mut m,
+            "turn/started",
+            json!({"threadId":P,"turn":{"id":T2,"status":"inProgress","items":[]}}),
+        );
+        let actions = apply(
+            &mut m,
+            Event::Reply {
+                context,
+                result: Ok(json!({"turn":{"id":T2}})),
+            },
+        );
+        replies(&mut m, &mock, actions);
+        assert!(!m.claims[P].settling(), "前置：新运行已定案");
+        if late {
+            m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS - 9_000;
+        }
 
-    notify(
-        &mut m,
-        "rawResponseItem/completed",
-        json!({"threadId":P,"turnId":T2,"item":{
+        notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":P,"turnId":T2,"item":{
         "type":"function_call","name":"followup_task","call_id":"新跟进",
         "arguments":json!({"target":C,"message":"同一句"}).to_string()}}),
-    );
-    let (a, b) = SubagentMock::v2_activity("interacted", P, T2, "新跟进", C);
-    let actions = apply(&mut m, a);
-    replies(&mut m, &mock, actions);
-    let actions = apply(&mut m, b);
-    replies(&mut m, &mock, actions);
-    let o = op(&m, "新跟进");
-    assert!(o.v2_strict, "前置：新跟进走严格配对");
-    assert!(
-        o.rejected_receivers.is_empty(),
-        "前置：接收方是这个父线程的子代理：{:?}",
-        o.rejected_receivers
-    );
-    assert_eq!(o.proven_turns.get(C), None, "不能认定案前的旧消费记录");
+        );
+        let (a, b) = SubagentMock::v2_activity("interacted", P, T2, "新跟进", C);
+        let actions = apply(&mut m, a);
+        replies(&mut m, &mock, actions);
+        let actions = apply(&mut m, b);
+        replies(&mut m, &mock, actions);
+        let o = op(&m, "新跟进");
+        assert!(o.v2_strict, "前置：新跟进走严格配对");
+        assert!(
+            o.rejected_receivers.is_empty(),
+            "前置：接收方是这个父线程的子代理：{:?}",
+            o.rejected_receivers
+        );
+        assert_eq!(
+            o.proven_turns.get(C),
+            None,
+            "晚到={late}：不能认定案前的旧消费记录"
+        );
+        let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+        replies(&mut m, &mock, actions);
+        delivery(&mut m, "新轮", "入站新", "同一句", false);
+        assert_eq!(
+            op(&m, "新跟进").proven_turns.get(C),
+            Some(&["新轮".to_owned()].into()),
+            "晚到={late}：不能被旧记录挡住，配上真正的新轮"
+        );
+        // 定案后立刻清的范围：只清这条跟进对应的消费记录和开始记录。
+        assert_eq!(ids, ["入站别"], "只清这条跟进对应的消费记录");
+        assert_eq!(starts_left, 0, "开始记录也清掉");
+        assert!(m.v2_index_consistent());
+    }
 }
 
 /// 启动失败时认领走释放路径，不经过定案回调：等定案的操作也要结算，否则永不到期、占着操作表，
@@ -1611,11 +1643,9 @@ fn 共享服务器定案前启动失败_等定案的跟进和开始记录都结�
         );
         assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Unproven);
         assert!(!m.op_confirmed(&key), "不再占着待定");
-        m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
-        m.facts_expire(&mut Vec::new());
         assert!(
             m.relations.aux.followup_starts.is_empty(),
-            "断开：{disconnect}：开始记录过期后清掉：{:?}",
+            "断开：{disconnect}：开始记录要清掉：{:?}",
             m.relations.aux.followup_starts.keys()
         );
         assert!(m.v2_index_consistent());
