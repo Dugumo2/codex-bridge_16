@@ -1392,12 +1392,20 @@ fn 等归属的跟进到期才标证明超时_只记事实的条目不标() {
     let (a, b) = SubagentMock::v2_activity("completed", P, T, "已完成", C);
     apply(&mut m, a);
     apply(&mut m, b);
+    // 普通到期：派生了子代理，一直没等到它的首轮。
+    mock.register("迟子", Some(P), "v1", false, true);
+    let (a, b) = SubagentMock::v1_spawn(P, T, "迟派生", "迟子", false);
+    apply(&mut m, a);
+    apply(&mut m, b);
     assert_eq!(op(&m, "转手").outcome, EvidenceOutcome::Pending, "前置");
+    assert_eq!(op(&m, "迟派生").outcome, EvidenceOutcome::Pending, "前置");
     assert_eq!(op(&m, "已完成").outcome, EvidenceOutcome::Unproven, "前置");
     m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
     m.facts_expire(&mut Vec::new());
     assert_eq!(op(&m, "转手").outcome, EvidenceOutcome::Unproven);
     assert!(op(&m, "转手").proof_expired, "等到期限才转未证明");
+    assert_eq!(op(&m, "迟派生").outcome, EvidenceOutcome::Unproven);
+    assert!(op(&m, "迟派生").proof_expired, "普通到期同样算证明超时");
     assert!(
         !op(&m, "已完成").proof_expired,
         "只记事实的条目不算证明超时"
