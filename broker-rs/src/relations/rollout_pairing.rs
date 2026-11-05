@@ -311,9 +311,11 @@ impl Machine {
             if call.trigger && call.message.is_none() {
                 return Some(Decision::Fallback(V2FallbackReason::RolloutCallMissing));
             }
-            // 文件证据只按消费记录配对，消费记录按发起方的代理路径比对；路径未知时同样只会卡到期限。
+            // 文件证据只按消费记录配对，消费记录按发起方的代理路径比对。路径可能稍后才从父线程的活动条目学到
+            // （父子事件由不同监听器送来，到达顺序会交错），窗口内继续等；到期仍未知才退回宽松，免得卡到期限。
             if call.trigger && self.v2_sender_path(op).is_none() {
-                return Some(Decision::Fallback(V2FallbackReason::RolloutSenderUnknown));
+                return expired
+                    .then_some(Decision::Fallback(V2FallbackReason::RolloutSenderUnknown));
             }
             match self.raw_capability(&wait.child) {
                 _ if !call.trigger => return Some(Decision::Strict(call.clone())),
@@ -787,9 +789,9 @@ impl Machine {
                 }
                 RolloutRecord::Message { turn, item } => {
                     // 有 raw 或能力未知的线程只认 raw。
-                    let (false, Some(floor)) = (raw, floor) else {
+                    if raw {
                         continue;
-                    };
+                    }
                     if entry.wall_ms < floor {
                         continue;
                     }
@@ -823,7 +825,17 @@ impl Machine {
     }
 
     /// 接收方文件里的消息至少要晚到这里才可能属于等它的操作。
-    fn rollout_floor(&self, thread: &str) -> Option<u64> {
+    ///
+    /// 还没有操作在等它时（例如它先作为父线程文件被读来找调用），取读取时刻往前同样的余量：
+    /// 父子事件由不同监听器送来，跟进它的 Interacted 可能晚于它的消费记录被读到；游标已经越过的
+    /// 近期消息不能就此丢掉。更早的旧消息照旧不登记。
+    fn rollout_floor(&self, thread: &str) -> u64 {
+        let fallback = self.clock.now_ms.saturating_sub(ROLLOUT_FLOOR_SLACK_MS);
+        self.rollout_waiting_floor(thread)
+            .map_or(fallback, |floor| floor.min(fallback))
+    }
+
+    fn rollout_waiting_floor(&self, thread: &str) -> Option<u64> {
         let waits = self
             .relations
             .aux

@@ -430,9 +430,36 @@ impl Machine {
             })
     }
 
+    /// 记下子代理的规范代理路径（上游 subAgentActivity 条目的 agentPath）。
+    /// 不需要另外重试配对：非根发起方要先被这样的条目（派生或跟进）接纳、它的轮才会绑定，
+    /// 它发出的跟进在绑定后才接纳接收方、开始配对，那时路径已经在了。
+    pub(super) fn v2_learn_agent_path(&mut self, thread: &str, path: &str) {
+        if path.is_empty() || path.len() > 256 {
+            return;
+        }
+        let paths = &mut self.relations.aux.v2_agent_paths;
+        if paths.get(thread).map(String::as_str) == Some(path) {
+            return;
+        }
+        if !paths.contains_key(thread) && paths.len() >= MAX_OBSERVED_THREADS {
+            if let Some(first) = paths.keys().next().cloned() {
+                paths.remove(&first);
+            }
+        }
+        paths.insert(thread.into(), path.into());
+    }
+
+    /// 发起方的规范代理路径：血缘边的来源摘要，其次是活动条目里学到的路径；运行的逻辑根是 `/root`。
     pub(super) fn v2_sender_path(&self, op: &EvidenceOperation) -> Option<String> {
         self.thread_relation(&op.key.parent_thread_id)
             .and_then(|edge| edge.source_summary["agentPath"].as_str().map(str::to_owned))
+            .or_else(|| {
+                self.relations
+                    .aux
+                    .v2_agent_paths
+                    .get(&op.key.parent_thread_id)
+                    .cloned()
+            })
             .or_else(|| {
                 self.manage_context(&op.run_id)
                     .filter(|c| c.identity.logical_root_thread_id == op.key.parent_thread_id)

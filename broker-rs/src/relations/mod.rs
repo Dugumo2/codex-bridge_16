@@ -150,6 +150,9 @@ pub struct RelationsAux {
     /// 仅真实 turn/started 登记；发现或迟到 completed 不能伪造轮次开始。
     pub live_turn_starts: BTreeMap<(String, String), (u64, u64)>,
     pub v2_receiver_paths: BTreeMap<EvidenceKey, String>,
+    /// 线程 → 规范代理路径，取自上游 subAgentActivity 条目（agentPath 是 agentThreadId 那个子代理的路径）。
+    /// 血缘边没有代理路径时（运行中 v2 派生、冷恢复的旧子代理），作为发起方路径比对消费记录。有界。
+    pub v2_agent_paths: BTreeMap<String, String>,
     pub v2_deliveries: VecDeque<v2_pairing::DeliveryFact>,
     /// 与开始记录、消费记录同步增删的索引，配对时不必全表扫描。
     pub v2_index: v2_pairing::V2Index,

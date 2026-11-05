@@ -1270,3 +1270,97 @@ fn 撤权与换连接后开始记录不随之迁移_跟进不再配对() {
         );
     }
 }
+
+/// 任意接收方线程上收到的消息（raw 的 agent_message），发送方与接收方都给出代理路径。
+fn delivery_to(m: &mut Machine, thread: &str, turn: &str, id: &str, sender: &str, message: &str) {
+    let text = format!(
+        "Message Type: NEW_TASK\nTask name: /root/{thread}\nSender: {sender}\nPayload:\n{message}"
+    );
+    notify(
+        m,
+        "rawResponseItem/completed",
+        json!({"threadId":thread,"turnId":turn,"item":{
+        "type":"agent_message","id":id,"author":sender,"recipient":format!("/root/{thread}"),
+        "content":[{"type":"input_text","text":text}]}}),
+    );
+}
+
+/// raw 下非根发起方（子代理 C）跟进它的子代理 G，跟进被 G 的忙碌轮吸收、G 不再开新轮：
+/// 只能靠消费记录配对，而消费记录按发起方的代理路径比对。C 的血缘边没有代理路径时，
+/// 从上游 subAgentActivity 条目给出的 agentPath（该子代理的规范路径）得到，不让运行卡到期限。
+#[test]
+fn raw下非根发起方的代理路径来自活动条目_孙代理忙碌轮吸收的跟进按消费记录配对并收敛() {
+    const G: &str = "孙";
+    for source in ["父线程跟进", "派生"] {
+        let (mut m, mut mock) = base();
+        let mut all = vec![];
+        let sender = if source == "派生" {
+            // C 由 v2 派生：started 条目给出它的代理路径；C 的首轮由派生绑定。
+            const C2: &str = "子二";
+            mock.register(C2, Some(P), "v2", false, true);
+            let (a, b) = SubagentMock::v2_activity("started", P, T, "派生二", C2);
+            all.extend(apply(&mut m, a));
+            all.extend(apply(&mut m, b));
+            let actions = apply(&mut m, mock.turn_started(C2, "二轮"));
+            all.extend(replies(&mut m, &mock, actions));
+            (C2, "二轮")
+        } else {
+            // C 是冷恢复或 v1 派生的旧子代理，父线程跟进它：Interacted 条目给出它的代理路径。
+            all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+            raw(&mut m, "跟进子", "交给你");
+            interacted(&mut m, "跟进子");
+            let actions = apply(&mut m, mock.turn_started(C, "新轮"));
+            all.extend(replies(&mut m, &mock, actions));
+            delivery(&mut m, "新轮", "入站", "交给你", false);
+            (C, "新轮")
+        };
+        let (c, c_turn) = sender;
+        assert!(
+            m.thread_relation(c)
+                .is_none_or(|e| e.source_summary["agentPath"].is_null()),
+            "前置：血缘边上没有 C 的代理路径"
+        );
+        assert!(m
+            .binding(c, c_turn)
+            .is_some_and(|b| b.run_id == R && b.status == BindingStatus::Bound));
+        // G 是 C 的子代理，正在跑一轮。
+        spawn(&mut m, &mut mock, c, c_turn, G, "派生孙", "孙忙碌轮");
+        all.extend(raw_call(
+            &mut m,
+            c,
+            c_turn,
+            "followup_task",
+            "跟进孙",
+            G,
+            "补充要求",
+        ));
+        let (a, b) = SubagentMock::v2_activity("interacted", c, c_turn, "跟进孙", G);
+        all.extend(apply(&mut m, a));
+        all.extend(apply(&mut m, b));
+        assert!(op(&m, "跟进孙").v2_strict);
+        // G 的忙碌轮吸收了跟进：留下消费记录，不开新轮。
+        delivery_to(
+            &mut m,
+            G,
+            "孙忙碌轮",
+            "入站孙",
+            &format!("/root/{c}"),
+            "补充要求",
+        );
+        assert_eq!(
+            op(&m, "跟进孙").proven_turns.get(G),
+            Some(&["孙忙碌轮".to_owned()].into()),
+            "{source}：按消费记录配到吸收它的忙碌轮"
+        );
+        pending(&m, 0);
+        let actions = complete(&mut m, &mut mock, G, "孙忙碌轮", "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        let actions = complete(&mut m, &mut mock, c, c_turn, "completed");
+        all.extend(replies(&mut m, &mock, actions));
+        if source == "派生" {
+            all.extend(complete(&mut m, &mut mock, C, "旧轮", "completed"));
+        }
+        all.extend(finish(&mut m, &mut mock));
+        assert_no_alarm(&all);
+    }
+}

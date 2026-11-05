@@ -1025,18 +1025,51 @@ fn 子代理归属未定时跟进孙代理_无raw_按会话文件严格配对且
     }
 }
 
-/// 文件证据只按消费记录配对，而消费记录按发起方的代理路径比对：C 的代理路径未知时，
-/// 按严格配对只会卡到收敛期限，必须明确退回宽松（诊断带原因），结果与原来的宽松相同。
+/// C 的血缘边与线程索引里都没有代理路径：从父线程跟进 C 的 Interacted 条目学到（上游 agentPath 是 C 的规范路径），
+/// C 对孙代理的跟进照样按会话文件严格配对。
 #[test]
-fn 子代理代理路径未知时_无raw跟进孙代理退回宽松且孙新轮仍收敛() {
+fn 无raw_非根发起方血缘边没有代理路径时取自活动条目_跟进孙代理按文件严格配对() {
     let (mut m, mut mock) = resumed_tree(false);
     let mut all =
         followup_child_then_call_grandchild(&mut m, &mock, "followup_task", "跟进孙", "孙任务");
     all.extend(bind_child(&mut m, &mut mock));
     let o = op(&m, "跟进孙");
-    assert!(!o.v2_strict);
-    assert_eq!(o.v2_fallback, Some(V2FallbackReason::RolloutSenderUnknown));
+    assert!(o.v2_strict);
+    assert_eq!(o.v2_fallback, None);
     pending(&m, 1);
+    all.extend(grandchild_turn(&mut m, &mut mock));
+    pending(&m, 0);
+    assert_eq!(
+        op(&m, "跟进孙").proven_turns[G],
+        ["孙新轮".to_owned()].into()
+    );
+    all.extend(wrap_up(&mut m, &mut mock, true));
+    assert_no_alarm(&all);
+    no_lingering_poll(&mut m, &mock);
+}
+
+/// 父子事件交错：C 对孙代理的跟进先到、P 跟进 C 的 Interacted 后到。定案时还不知道 C 的代理路径，
+/// 不能当场退回宽松；窗口内学到路径后按会话文件严格配对。
+#[test]
+fn 无raw_父线程跟进事件晚到时等学到发起方路径再定案_跟进孙代理按文件严格配对() {
+    let (mut m, mut mock) = resumed_tree(false);
+    call_in(&m, P, "跟进子", "followup_task", C, "交给你");
+    m.clock.now_ms += 20;
+    turn_marker(C, "新轮", m.clock.now_ms);
+    message_from(&m, C, "/root", "入站子", "交给你");
+    m.clock.now_ms += 5;
+    call_in(&m, C, "跟进孙", "followup_task", G, "孙任务");
+    let (a, b) = SubagentMock::v2_activity("interacted", C, "新轮", "跟进孙", G);
+    let mut all = apply(&mut m, a);
+    all.extend(apply(&mut m, b));
+    all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
+    assert!(awaiting(&m, "跟进孙"), "调用已找到但发起方路径未知：继续等");
+    all.extend(interacted_to(&mut m, "跟进子", C));
+    all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
+    let o = op(&m, "跟进孙");
+    assert!(o.v2_strict, "学到路径后按文件严格配对");
+    assert_eq!(o.v2_fallback, None);
+    all.extend(bind_child(&mut m, &mut mock));
     all.extend(grandchild_turn(&mut m, &mut mock));
     pending(&m, 0);
     assert_eq!(

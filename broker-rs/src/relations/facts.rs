@@ -579,6 +579,12 @@ impl Machine {
                     .filter(|t| !t.is_empty() && *t != parent)
                     .map(|t| BTreeSet::from([t.to_owned()]))
                     .unwrap_or_default();
+                if let (Some(thread), Some(path)) = (
+                    receivers.first(),
+                    item.get("agentPath").and_then(Value::as_str),
+                ) {
+                    self.v2_learn_agent_path(thread, path);
+                }
                 (kind, receivers, false)
             }
             _ => return,
