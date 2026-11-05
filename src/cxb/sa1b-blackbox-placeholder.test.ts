@@ -259,6 +259,76 @@ for (const sameTurn of [false, true]) test(`v2 跟进忙碌子代理：${sameTur
   } finally { await bounded(h.close(), 12_000); }
 }, 90_000);
 
+/** 冷恢复：broker 重开线程后没有 raw，只能靠会话文件。 */
+async function openWithoutRaw(h: Sa1bHarness) {
+  await bounded(h.open(), 20_000);
+  await h.owner.request("thread/start", {}, 6000);
+  await h.control("unload", { threadId: ROOT });
+  await h.owner.request("thread/resume", { threadId: ROOT }, 6000);
+  await bounded(h.start({ cxbConvergence: convergence }), 20_000);
+  expect((await h.state()).threads.root.experimentalRawEvents).toBe(false);
+}
+
+async function strictFollowup(h: Sa1bHarness, source: "raw" | "rolloutFile"): Promise<any> {
+  let op: any;
+  await bounded(h.until(async () => {
+    op = (await diagnostic(h)).pendingOperations.find((entry: any) => entry.kind === "v2Interacted");
+    return !op || op.pairingMode !== "awaitingRollout";
+  }, 6000, "等会话文件定案"), 8000);
+  if (op) {
+    expect(op.pairingMode, "这次有证据，必须走严格配对").toBe("strict");
+    expect(op.pairingSource).toBe(source);
+    expect(op.fallbackReason).toBeNull();
+  }
+  return op;
+}
+
+for (const source of ["raw", "rolloutFile"] as const) {
+  test(`v2 跟进已答完的子代理（${source}）：旧轮结束不算读到，自动开的下一轮承载后才收敛`, async () => {
+    const h = new Sa1bHarness();
+    try {
+      if (source === "raw") await openAndStart(h); else await openWithoutRaw(h);
+      const old = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+      await h.control("item", { threadId: CHILD, turnId: old, item: { id: "早答", type: "agentMessage", text: "旧轮答完了", phase: "final_answer" } });
+      await followup(h, CHILD, { message: "答完之后才到的跟进" });
+      expect((await h.state()).threads[CHILD].turns).toHaveLength(1);
+      expect(await strictFollowup(h, source), "跟进还没被读到，操作必须待定").toBeDefined();
+      await h.finish(ROOT, "父轮先交结论");
+      await h.finish(CHILD, "旧轮结果", "completed", old);
+      const turns = (await h.state()).threads[CHILD].turns;
+      expect(turns, "旧轮结束后自动开下一轮").toHaveLength(2);
+      const next = turns[1].id;
+      expect(h.ended(), "下一轮还没结束，不能收尾").toHaveLength(0);
+      await bounded(h.until(async () => {
+        const left = await diagnostic(h);
+        return !left || left.pendingOperations.filter((entry: any) => entry.kind === "v2Interacted").length === 0;
+      }, 6000, "下一轮的消费记录必须配上跟进"), 8000);
+      await h.finish(CHILD, CURRENT_OUTPUT, "completed", next);
+      const { run } = await finishReconciliation(h, CURRENT_OUTPUT);
+      expect(run.children[0].turnIds).toEqual([old, next]);
+      await assertCleanFinalViews(h, next);
+    } finally { await bounded(h.close(), 12_000); }
+  }, 90_000);
+
+  test(`v2 跟进没答完的子代理（${source}）：被当前轮吸收，不开新轮也能收敛`, async () => {
+    const h = new Sa1bHarness();
+    try {
+      if (source === "raw") await openAndStart(h); else await openWithoutRaw(h);
+      const busy = await h.spawn(CHILD, ROOT, h.firstTurn, { version: "v2" });
+      await followup(h, CHILD, { message: "忙的时候到的跟进" });
+      expect((await h.state()).threads[CHILD].turns, "不开新轮").toHaveLength(1);
+      await bounded(h.until(async () => {
+        const left = await diagnostic(h);
+        return !left || left.pendingOperations.filter((entry: any) => entry.kind === "v2Interacted").length === 0;
+      }, 6000, "当前轮的消费记录必须配上跟进"), 8000);
+      await h.finish(ROOT, "父轮先交结论");
+      await h.finish(CHILD, CURRENT_OUTPUT, "completed", busy);
+      await finishReconciliation(h, CURRENT_OUTPUT);
+      await assertCleanFinalViews(h, busy);
+    } finally { await bounded(h.close(), 12_000); }
+  }, 90_000);
+}
+
 test("v2 只入队消息给空闲子代理：不占待定操作、不开新轮也能收敛", async () => {
   const h = new Sa1bHarness();
   try {

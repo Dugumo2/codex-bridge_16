@@ -48,6 +48,8 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   const responseContexts = new Map<string, { method: string; threadId?: string; connectionId: string }>();
   // 只扣放 raw 消费回执，轮次推进仍由现有 turn/reuse 入口控制。
   const queuedRawInputs = new Map<string, any[]>();
+  // 跟进排到下一轮的子线程：当前轮结束后自动开下一轮，与上游一致（留言不会触发）。
+  const autoNextTurn = new Set<string>();
   let currentConnection = "broker";
   const broadcasts = new Set(["thread/started", "thread/status/changed", "thread/goal/updated", "thread/goal/cleared", "thread/closed",
     "thread/name/updated", "thread/archived", "thread/unarchived", "thread/deleted", "thread/reverted", "thread/attachment/updated", "thread/project/updated"]);
@@ -151,6 +153,10 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
     if (announce) notify("item/completed", { threadId: t.id, turnId: turn.id, item: value });
   }
   function finish(t: MockThread, turn: MockTurn, status: string, output?: string, announce = true) {
+    finishTurn(t, turn, status, output, announce);
+    if (autoNextTurn.delete(t.id) && status !== "shutdown") start(t);
+  }
+  function finishTurn(t: MockThread, turn: MockTurn, status: string, output?: string, announce = true) {
     if (output !== undefined) item(t, turn, { id: `answer-${turn.id}`, type: "agentMessage", text: output, phase: "final_answer" }, announce);
     // errored/shutdown 是 CollabAgentStatus，不是协议 TurnStatus。
     turn.status = status === "errored" ? "failed" : status === "shutdown" ? "interrupted" : status;
@@ -266,25 +272,34 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
           ? { type: "collabAgentToolCall", id: `reuse-${++serial}`, tool: "sendInput", status: "completed", senderThreadId: parent.id, receiverThreadIds: [child.id], agentsStates: {} }
           : { type: "subAgentActivity", id: `reuse-${++serial}`, kind: "interacted", agentThreadId: child.id, agentPath: agentPath(child) };
         const message = p.message ?? `跟进:${value.id}`;
-        // 与真实探针一致：工具参数和接收方输入里的正文是同一段密文；send_message 只入队，不开新轮。
+        // 与真实探针一致：工具参数和接收方输入里的正文是同一段密文，同一明文每次调用密文不同；
+        // plaintext 对应不加密的模型（探针二），同一明文的正文相同。send_message 只入队，不开新轮。
         const queueOnly = p.tool === "send_message";
-        const cipher = `gAAAAA${Buffer.from(message).toString("base64")}`;
+        const body = p.plaintext ? message : `gAAAAA${Buffer.from(`${value.id}:${message}`).toString("base64")}`;
+        // 与探针二一致，由子代理当时的状态决定：空闲开新轮；忙且没答完，被当前轮吸收；已答完，排到下一轮，
+        // 当前轮结束后自动开。显式的 open、consumeOnNextTurn 只用来拉开时序。
+        const current = child.turns.at(-1);
+        const decides = child.version === "v2" && !queueOnly && p.open === undefined && p.consumeOnNextTurn === undefined && current?.status === "inProgress";
+        const answered = decides && current!.items.some(x => x.phase === "final_answer");
+        const absorbed = decides && !answered, deferred = decides && answered;
         if (child.version === "v2") {
           const call = { type: "function_call", call_id: value.id, name: queueOnly ? "send_message" : "followup_task", namespace: "collaboration",
-            arguments: JSON.stringify({ target: agentName(child), message: cipher }) };
+            arguments: JSON.stringify({ target: agentName(child), message: body }) };
           // 工具调用先进写入队列并落盘，工具才执行；raw 关闭时会话文件照写。
           writeRollout(parent.id, "response_item", call);
           notify("rawResponseItem/completed", { threadId: parent.id, turnId: pt.id, item: call });
         }
         // 上游先提交消息后通知 interacted；也支持 sendInput 并入既有轮、不再开轮。
-        let turn = p.open === false || queueOnly ? child.turns.at(-1) : p.order === "turnFirst" ? start(child) : undefined;
+        let turn = p.open === false || queueOnly || decides ? current : p.order === "turnFirst" ? start(child) : undefined;
         notify("item/started", { threadId: parent.id, turnId: pt.id, item: value }); item(parent, pt, value);
-        if (!queueOnly && p.open !== false && !turn) turn = start(child);
+        if (!queueOnly && !decides && p.open !== false && !turn) turn = start(child);
         if (child.version === "v2") {
+          const header = `Message Type: ${queueOnly ? "MESSAGE" : "NEW_TASK"}\nTask name: ${agentPath(child)}\nSender: ${agentPath(parent)}\nPayload:\n`;
           const input = { type: "agent_message", id: `delivery-${value.id}`, author: agentPath(parent), recipient: agentPath(child),
-            content: [{ type: "input_text", text: `Message Type: ${queueOnly ? "MESSAGE" : "NEW_TASK"}\nTask name: ${agentPath(child)}\nSender: ${agentPath(parent)}\nPayload:\n` },
-              { type: "encrypted_content", encrypted_content: cipher }] };
-          if (p.consumeOnNextTurn || (queueOnly && turn?.status !== "inProgress")) queuedRawInputs.set(child.id, [...queuedRawInputs.get(child.id) ?? [], input]);
+            content: p.plaintext ? [{ type: "input_text", text: `${header}${body}` }]
+              : [{ type: "input_text", text: header }, { type: "encrypted_content", encrypted_content: body }] };
+          if (deferred) autoNextTurn.add(child.id);
+          if (p.consumeOnNextTurn || deferred || (queueOnly && turn?.status !== "inProgress")) queuedRawInputs.set(child.id, [...queuedRawInputs.get(child.id) ?? [], input]);
           else if (turn) {
             // 消费记录记在消费它的轮里（被忙碌轮吸收时记在当前轮）。
             writeRollout(child.id, "response_item", input);
