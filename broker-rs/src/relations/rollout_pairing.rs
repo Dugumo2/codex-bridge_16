@@ -31,13 +31,15 @@ pub const ROLLOUT_POLL_MS: u64 = 150;
 pub const ROLLOUT_FLOOR_SLACK_MS: u64 = 10_000;
 /// 同时跟随的文件数上限。
 pub const MAX_ROLLOUT_FILES: usize = 64;
+/// 文件读取或路径请求失败后，这么久内不重试；过后遇到新跟进重新取路径、重新读。
+pub const ROLLOUT_RETRY_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RolloutPathState {
     /// thread/read 在途（请求代号）。
     Requested(u64),
     Ready(String),
-    /// 本连接内不再尝试；原因进诊断。
+    /// 到 `next_at` 之前不重试，过后遇到新跟进重新取路径、重新读；原因进诊断。
     Failed(V2FallbackReason),
 }
 
@@ -123,7 +125,7 @@ impl Machine {
             .get(thread)
             .filter(|f| f.epoch == self.relations.conn_epoch)
             .and_then(|f| match f.path {
-                RolloutPathState::Failed(reason) => Some(reason),
+                RolloutPathState::Failed(reason) if self.clock.mono_ms < f.next_at => Some(reason),
                 _ => None,
             })
     }
@@ -540,6 +542,10 @@ impl Machine {
             if f.epoch != epoch {
                 return false;
             }
+            // 失败已过期：丢掉这条记录，还需要这个文件时从取路径重新开始。
+            if matches!(f.path, RolloutPathState::Failed(_)) && now >= f.next_at {
+                return false;
+            }
             if !needed.contains(thread) && f.reading.is_none() {
                 f.cursor = None;
                 f.reads = 0;
@@ -715,11 +721,14 @@ impl Machine {
             .and_then(|t| t.get("path"))
             .and_then(Value::as_str)
             .filter(|p| crate::rollout::validate_path(p, thread));
-        file.path = match path {
-            Some(path) => RolloutPathState::Ready(path.into()),
-            None => RolloutPathState::Failed(V2FallbackReason::RolloutPathUnavailable),
+        let now = self.clock.mono_ms;
+        (file.path, file.next_at) = match path {
+            Some(path) => (RolloutPathState::Ready(path.into()), now),
+            None => (
+                RolloutPathState::Failed(V2FallbackReason::RolloutPathUnavailable),
+                now.saturating_add(ROLLOUT_RETRY_MS),
+            ),
         };
-        file.next_at = self.clock.mono_ms;
     }
 
     /// 一次读取的结果：调用进缓存，消息按 raw 的规则登记消费记录；读不了就记失败原因。
@@ -743,6 +752,7 @@ impl Machine {
             Ok(chunk) => chunk,
             Err(error) => {
                 file.path = RolloutPathState::Failed(read_failure(error));
+                file.next_at = now.saturating_add(ROLLOUT_RETRY_MS);
                 file.cursor = None;
                 return;
             }
@@ -823,6 +833,7 @@ impl Machine {
         if turn_lost {
             if let Some(file) = self.relations.aux.rollout.files.get_mut(thread) {
                 file.path = RolloutPathState::Failed(V2FallbackReason::RolloutTurnUnknown);
+                file.next_at = now.saturating_add(ROLLOUT_RETRY_MS);
                 file.cursor = None;
             }
         }

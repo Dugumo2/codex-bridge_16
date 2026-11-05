@@ -1351,6 +1351,77 @@ fn 无raw_严格定案后文件丢失且轮次已变_退回宽松结果与旧版
     }
 }
 
+/// 文件暂时读不了（比如短暂被占用）不能让这条连接之后的跟进都失去严格配对：
+/// 失败只记一段时间，这段时间内不重读；过后遇到新跟进重新取路径、重新读。
+/// 已经定了模式的跟进不改模式。过后仍读不了，照样明确退回宽松。
+#[test]
+fn 无raw_读取失败只记一段时间_过后的新跟进重新读文件() {
+    use crate::relations::rollout_pairing::ROLLOUT_RETRY_MS;
+    for recovered in [true, false] {
+        let (mut m, mut mock) = base();
+        files(&m);
+        complete(&mut m, &mut mock, C, "旧轮", "completed");
+        let path = fx::path(P);
+        let hidden = format!("{path}.藏起来");
+        std::fs::rename(&path, &hidden).unwrap();
+        interacted_to(&mut m, "第一次", C);
+        poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+        let o = op(&m, "第一次");
+        assert!(!o.v2_strict, "前置：文件读不了时退回宽松");
+        assert_eq!(o.v2_fallback, Some(V2FallbackReason::RolloutUnreadable));
+        let actions = apply(&mut m, mock.turn_started(C, "第一轮"));
+        replies(&mut m, &mock, actions);
+        complete(&mut m, &mut mock, C, "第一轮", "completed");
+        pending(&m, 0);
+
+        // 还在记失败的时间内：文件其实恢复了，也不重读。
+        std::fs::rename(&hidden, &path).unwrap();
+        let reads = fx::with(|f| f.reads);
+        call_line(&m, "第二次", "followup_task", C, "第二件事");
+        interacted_to(&mut m, "第二次", C);
+        assert!(!awaiting(&m, "第二次"), "记失败期间不等文件");
+        assert!(!op(&m, "第二次").v2_strict);
+        assert_eq!(fx::with(|f| f.reads), reads, "记失败期间不重读");
+        let actions = apply(&mut m, mock.turn_started(C, "第二轮"));
+        replies(&mut m, &mock, actions);
+        complete(&mut m, &mut mock, C, "第二轮", "completed");
+        pending(&m, 0);
+
+        m.clock.mono_ms += ROLLOUT_RETRY_MS;
+        m.clock.now_ms += ROLLOUT_RETRY_MS;
+        if !recovered {
+            std::fs::rename(&path, &hidden).unwrap();
+        } else {
+            call_line(&m, "第三次", "followup_task", C, "第三件事");
+        }
+        interacted_to(&mut m, "第三次", C);
+        poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+        let o = op(&m, "第三次");
+        if recovered {
+            assert!(o.v2_strict, "过了记失败的时间，新跟进重新读到文件");
+            assert_eq!(o.v2_source, V2EvidenceSource::RolloutFile);
+            assert_eq!(o.v2_fallback, None);
+            pending(&m, 1);
+            m.clock.now_ms += 20;
+            turn_marker(C, "第三轮", m.clock.now_ms);
+            message_line(&m, C, "入站三", "NEW_TASK", "第三件事");
+            let actions = apply(&mut m, mock.turn_started(C, "第三轮"));
+            replies(&mut m, &mock, actions);
+            poll_for(&mut m, &mock, ROLLOUT_POLL_MS);
+            pending(&m, 0);
+            assert_eq!(
+                op(&m, "第三次").proven_turns.get(C),
+                Some(&["第三轮".to_owned()].into())
+            );
+        } else {
+            assert!(!o.v2_strict, "过后仍读不了：明确退回宽松");
+            assert_eq!(o.v2_fallback, Some(V2FallbackReason::RolloutUnreadable));
+        }
+        // 第一次、第二次已经定了宽松，不因为文件恢复而改模式。
+        assert!(!op(&m, "第一次").v2_strict && !op(&m, "第二次").v2_strict);
+    }
+}
+
 // ─── 17. raw 线程登记满额：能力未知时不读文件 ───────────────────────
 
 /// 本连接里另有 `count` 个线程送来过 raw（真实的 rawResponseItem 通知），把登记表占满。
