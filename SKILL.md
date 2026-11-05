@@ -64,7 +64,7 @@ cxb 是 Claude 与 Codex 之间的桥：每个工作区（git 顶层目录或当
 - 每运行最多新开 5 次汇总轮，明确未提交的启动额外重试最多 2 次；启动结果不明仅核实，不盲重发。`run/review --converge-timeout <秒>` 或 `cxb config converge-timeout <秒>` 设置独立收敛总期限（默认 3600 秒），首次需要收敛起算，跨汇总、detach 和待答不重置。`--timeout` 仍是命令等待期限；wait 超时只结束等待，未 detach 的前台 run 断开可能触发停止。
 - 期限、次数、预算、发现或归属核实异常会停止已确认自有范围，并在 `subagentJoin.terminalReason` 说明原因；停止未确认不能当作已清理。`cxb stop` 沿用整树停止及受管后台命令核验。结果截断、不可用和省略会明确列入结果覆盖；收敛不代表所有子任务成功。重启只恢复历史，不恢复旧运行的自动汇总权。
 - 曾派过子代理的父线程可以直接 `--resume`、`--continue`，不必新开线程：旧子代理只算历史，不进本次等待和汇总。cxb 会在提示词里附「子代理交接单」（来源运行、层级、agentPath、受管轮结果摘要），Codex 据此判断复用还是重派，简报不用再抄这些信息。根线程只能唤醒直接子代理，更深后代要逐级续派，越级跟进会被判归属冲突。
-- 判断是否卡住：运行中 `cxb show <线程> --json` 的 `convergenceDiagnostic` 给出第一道未通过的门和待定操作（只读）。跟进已排队、子代理还没读到时显示 `pending` 且 `expired` 为 false，属于正常等待；子代理一直不读，要到收敛期限才结束。`pairingMode` 为 `fallback` 表示线程跨重启恢复、没有 raw 事件：不要用 `send_message` 给空闲子代理留言，会等到收敛期限。
+- 判断是否卡住：运行中 `cxb show <线程> --json` 的 `convergenceDiagnostic` 给出第一道未通过的门和待定操作（只读）。跟进已排队、子代理还没读到时显示 `pending` 且 `expired` 为 false，属于正常等待；子代理一直不读，要到收敛期限才结束。`pairingMode` 为 `strict` 是正常情况，跨重启恢复的线程也一样（`pairingSource` 为 `rolloutFile`，靠会话文件配对），`send_message` 留言不会卡；`awaitingRollout` 是约 2 秒的中间状态。`fallback` 表示拿不到配对证据，原因见 `fallbackReason`：这时 broker 只能猜跟进落在哪一轮，运行可能提前收尾，结果可能缺这条跟进的内容，要核对；也不要用 `send_message` 给空闲子代理留言，会等到收敛期限。
 
 每次 run 写清：要做什么；已定的设计决定；要改哪些文件、为什么；参考哪个既有实现（「照 `path/X` 里的 Y 写」）；约束与不许做的事；验证命令与完成标准。
 
