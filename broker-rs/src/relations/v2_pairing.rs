@@ -326,7 +326,7 @@ impl Machine {
     /// 只清一半都不行：只留开始记录，同内容的新跟进会被它挡住；只留消费记录，新跟进会认领它。
     /// 操作还有效的不动；别的子代理收到的同内容消息不动。
     /// 消费记录在清理之后才到、又碰上同内容的新跟进时仍可能被认领（已知局限，只在不加密时才有同内容）。
-    pub(super) fn v2_forget_unowned(&mut self, thread: &str, run: &str) {
+    pub(crate) fn v2_forget_unowned(&mut self, thread: &str, run: &str) {
         let stale: Vec<(EvidenceKey, FollowupStart, BTreeSet<String>)> = self
             .relations
             .aux

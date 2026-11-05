@@ -1597,6 +1597,29 @@ fn 共享服务器定案为别人的轮后_同内容新跟进不认旧消费记�
     }
 }
 
+/// 清理未归属的证据时，操作还有效的不动：它的开始记录还要用来配对。
+#[test]
+fn 清理未归属证据时操作还有效的开始记录不动() {
+    let (mut m, mut mock) = base();
+    let actions = complete(&mut m, &mut mock, C, "旧轮", "completed");
+    replies(&mut m, &mock, actions);
+    raw(&mut m, "跟进", "新工作");
+    interacted(&mut m, "跟进");
+    let key = op(&m, "跟进").key.clone();
+    assert_eq!(
+        op(&m, "跟进").outcome,
+        EvidenceOutcome::Pending,
+        "前置：操作还在等配对"
+    );
+    assert!(m.relations.aux.followup_starts.contains_key(&key), "前置");
+    m.v2_forget_unowned(P, R);
+    assert!(
+        m.relations.aux.followup_starts.contains_key(&key),
+        "操作还有效，开始记录不能清"
+    );
+    assert!(m.v2_index_consistent());
+}
+
 /// 启动失败时认领走释放路径，不经过定案回调：等定案的操作也要结算，否则永不到期、占着操作表，
 /// 开始记录也跟着留下。先断开（有停止操作）再失败时，停止路径会先清掉 settling 标记，同样要结算。
 #[test]
