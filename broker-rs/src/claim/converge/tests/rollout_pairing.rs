@@ -1445,6 +1445,19 @@ fn 无raw_严格定案后文件丢失且原候选已被挤出_不改配后来的
             "空闲：{idle}：不能改配后来的轮"
         );
         pending(&m, 1);
+        // 之后又看到被挤掉的历史轮（读完整历史或迟到的结束通知）：它不是新轮，不能配。
+        let history = if idle { "后来的轮00" } else { "旧轮" };
+        notify(
+            &mut m,
+            "turn/completed",
+            json!({"threadId":C,"turn":{"id":history,"status":"completed","items":[]}}),
+        );
+        assert_eq!(
+            op(&m, "跟进").proven_turns.get(C),
+            None,
+            "空闲：{idle}：历史回填不算新轮"
+        );
+        pending(&m, 1);
         let actions = apply(&mut m, mock.turn_started(C, "新开的轮"));
         replies(&mut m, &mock, actions);
         assert_eq!(

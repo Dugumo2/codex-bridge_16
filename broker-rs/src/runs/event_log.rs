@@ -557,7 +557,8 @@ impl Machine {
             return false;
         }
         let unresolved = self.relations.operations.values().any(|op| {
-            (op.outcome == EvidenceOutcome::Pending || op.proof_expired)
+            (op.outcome == EvidenceOutcome::Pending
+                || (op.outcome == EvidenceOutcome::Unproven && op.proof_expired))
                 && (op.run_id == run || op.run_id.is_empty())
                 && op.receivers.contains(thread)
                 && !op.rejected_receivers.contains_key(thread)
