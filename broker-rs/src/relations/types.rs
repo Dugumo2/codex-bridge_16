@@ -199,6 +199,9 @@ pub struct EvidenceOperation {
     /// 等证据等到期限才转未证明：归属没证明出来，不等于确定不归本运行（日志要留缺口）。
     /// 只记事实的条目（如 completed）、定案不是自己的，也是未证明，但不算这种。
     pub proof_expired: bool,
+    /// 宽松配对只接受这个观察序号之后真实开始的轮（`live_turn_starts`）。当时会配哪一轮还原不了时设置：
+    /// 之后读到的历史轮不是新轮，不能凭「不在基线里」获得资格。
+    pub lenient_floor: Option<u64>,
     pub first_seen_ms: u64,
     pub expires_at_ms: u64,
     pub parent_ended: bool,

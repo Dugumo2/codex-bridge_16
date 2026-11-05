@@ -418,8 +418,8 @@ impl Machine {
     /// 到达时就有多个候选的不改动，仍按原规则判为身份不明。
     ///
     /// 观察缓存只留有限轮、先进先出：到达时的候选已被挤掉，或之后出现的第一轮可能已被挤掉时，
-    /// 旧版当时的结论还原不了。不能把「现在看不到」当成「当时没有」，全部并入基线，等之后新开的轮或收敛期限。
-    /// 到达时的轮还有一个在，后来的轮就一个也没被挤掉，缓存满了也能还原。
+    /// 旧版当时的结论还原不了。不能把「现在看不到」当成「当时没有」，只接受此后真实开始的轮（`lenient_floor`），
+    /// 否则等到收敛期限。到达时的轮还有一个在，后来的轮就一个也没被挤掉，缓存满了也能还原。
     fn rollout_fallback_baseline(&mut self, key: &EvidenceKey, child: &str, arrival: &[String]) {
         let Some(op) = self.relations.operations.get(key) else {
             return;
@@ -444,12 +444,18 @@ impl Machine {
             || arrival
                 .iter()
                 .any(|turn| is_new(turn) && !observed.contains(turn));
+        if unrecoverable {
+            let floor = self.relations.aux.observation_seq;
+            if let Some(op) = self.relations.operations.get_mut(key) {
+                op.lenient_floor = Some(floor);
+            }
+            return;
+        }
         let candidates: Vec<String> = observed.iter().filter(|t| is_new(t)).cloned().collect();
         let (before, after): (Vec<String>, Vec<String>) = candidates
             .into_iter()
             .partition(|turn| arrival.contains(turn));
         let keep = match before.len() {
-            _ if unrecoverable => None,
             0 => after.first().cloned(),
             1 => before.first().cloned(),
             _ => return,

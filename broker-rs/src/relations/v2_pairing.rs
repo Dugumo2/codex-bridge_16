@@ -725,6 +725,18 @@ impl Machine {
                         .get(child)
                         .is_some_and(|old| old.contains(&o.turn))
                 })
+                .filter(|o| {
+                    // 当时会配哪一轮还原不了时，只认此后真实开始的轮；读到的历史轮没有开始记录。
+                    op.lenient_floor.is_none_or(|floor| {
+                        self.relations
+                            .aux
+                            .live_turn_starts
+                            .get(&(child.to_owned(), o.turn.clone()))
+                            .is_some_and(|(epoch, seq)| {
+                                *epoch == self.relations.conn_epoch && *seq > floor
+                            })
+                    })
+                })
                 .map(|o| o.turn.clone())
                 .collect();
         }

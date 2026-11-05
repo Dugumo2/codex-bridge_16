@@ -702,6 +702,7 @@ impl Machine {
                     v2_fallback,
                     rollout_arrival: None,
                     proof_expired: false,
+                    lenient_floor: None,
                     first_seen_ms: begin.as_ref().map_or(now, |start| start.at),
                     expires_at_ms: begin
                         .as_ref()

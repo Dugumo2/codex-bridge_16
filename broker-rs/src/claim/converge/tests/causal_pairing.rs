@@ -1379,6 +1379,66 @@ fn 共享服务器定案为别人的轮_定案前存下的开始记录不把跟�
     assert!(m.v2_index_consistent());
 }
 
+/// 共享服务器上的 detached review 溢出、回包给出别的子线程：父认领被放弃后直接移走，不经过定案回调，
+/// 也不走普通释放。等它定案的证据同样要结算，否则永不到期、占着操作表。
+#[test]
+fn 共享服务器review溢出迁移到子线程_等定案的跟进要结算不残留() {
+    let mut m = Machine {
+        shared: true,
+        ..Machine::default()
+    };
+    m.clock.mono_ms = 1_000;
+    m.clock.now_ms = 100_000;
+    assert!(m.enable_convergence(ready()));
+    apply(&mut m, Event::Connected { conn: 1 });
+    apply(&mut m, Event::Initialized { conn: 1, cxb: true });
+    m.record(P).subscribed = true;
+    let out = apply(
+        &mut m,
+        Event::ClientRequest {
+            request: crate::claim::ClientRequest {
+                conn: 1,
+                id: json!(1),
+                method: "review/start".into(),
+                params: Some(json!({"threadId":P,"delivery":"detached"})),
+            },
+            run_id: Some(R.into()),
+        },
+    );
+    let context = out
+        .into_iter()
+        .find_map(|a| match a {
+            Action::Request(c) if c.method == "review/start" => Some(c),
+            _ => None,
+        })
+        .expect("发出 review/start");
+    let mut mock = SubagentMock::default();
+    mock.register(P, None, "v2", false, true);
+    mock.register(C, Some(P), "v2", false, true);
+    raw(&mut m, "跟进", "新工作");
+    interacted(&mut m, "跟进");
+    assert!(m.claims[P].settling(), "前置：定案之前");
+    let key = op(&m, "跟进").key.clone();
+    assert!(m.relations.aux.parent_waits.contains_key(&key), "前置");
+    m.settling_overflow(P, &mut Vec::new());
+    let actions = apply(
+        &mut m,
+        Event::Reply {
+            context,
+            result: Ok(
+                json!({"reviewThreadId":"审查子线程","turn":{"id":"审查轮","status":"inProgress","items":[]}}),
+            ),
+        },
+    );
+    replies(&mut m, &mock, actions);
+    assert!(!m.claims.contains_key(P), "前置：父认领已移走");
+    assert!(
+        !m.relations.aux.parent_waits.contains_key(&key),
+        "等定案的记录要清掉"
+    );
+    assert_eq!(op(&m, "跟进").outcome, EvidenceOutcome::Unproven);
+}
+
 /// 只有等证据等到期限才算「证明超时」（日志要留缺口）；上游 completed 这种只记事实的条目不算。
 #[test]
 fn 等归属的跟进到期才标证明超时_只记事实的条目不标() {

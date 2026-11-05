@@ -2209,6 +2209,8 @@ impl Machine {
                 if child == parent {
                     reuse = Some(claim.claim_id);
                 } else {
+                    // 运行转到子线程，父认领不走普通释放，等它定案的证据在这里结算。
+                    self.on_claim_released(parent, claim.claim_id, actions);
                     self.schedule_unsubscribe(token.clone(), actions);
                 }
             } else {
