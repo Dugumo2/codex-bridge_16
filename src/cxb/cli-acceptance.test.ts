@@ -53,11 +53,10 @@ describe("cxb 黑盒验收（N1）", () => {
     expect(r.stderr).toBe("");
   }, TEST_LIMIT_MS);
 
-  test("--help：列出 11 个命令、不含已取消的 peer 系，退出 0", async () => {
+  test("--help：列出 11 个命令，退出 0", async () => {
     const r = await cxb("--help");
     expect(r.code).toBe(0);
     for (const name of COMMANDS) expect(r.stdout).toContain(name);
-    for (const gone of ["peer", "send", "update"]) expect(r.stdout).not.toMatch(new RegExp(`^\\s*${gone}\\b`, "m"));
   }, TEST_LIMIT_MS);
 
   test.each(COMMANDS)("%s 的 --help 退出 0 并写到 stdout", async (name) => {
@@ -68,25 +67,6 @@ describe("cxb 黑盒验收（N1）", () => {
 
   test("未知命令：退出 1，stdout 为空，stderr 以 `cxb: error:` 开头", async () => {
     const r = await cxb("frobnicate");
-    expect(r.code).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr.startsWith("cxb: error:")).toBe(true);
-  }, TEST_LIMIT_MS);
-
-  const replacements: Array<[string, string]> = [
-    ["threads", "ls"], ["jobs", "ls"], ["kill", "stop"], ["follow", "show"], ["output", "show"],
-    ["progress", "show"], ["peek", "show"], ["approve", "reply"], ["decline", "reply"], ["answer", "reply"],
-    ["questions", "inbox"], ["next", "wait"], ["delete", "rm"], ["health", "doctor"], ["models", "doctor"],
-    ["templates", "config templates"], ["version", "--version"],
-  ];
-  test.each(replacements)("旧名 %s 退出 1，并提示 %s", async (old, replacement) => {
-    const r = await cxb(old);
-    expect(r.code).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).toContain(replacement);
-  }, TEST_LIMIT_MS);
-  test.each(["update", "skill", "clean", "ask", "peer", "peers", "send", "task", "tasks"])("已删除命令 %s 退出 1", async (gone) => {
-    const r = await cxb(gone);
     expect(r.code).toBe(1);
     expect(r.stdout).toBe("");
     expect(r.stderr.startsWith("cxb: error:")).toBe(true);
@@ -135,7 +115,6 @@ describe("cxb 黑盒验收（N1）", () => {
     { args: ["--model", "run"], command: null },
     { args: ["--timeout=5", "run", "--timeout=0"], command: "run" },
     { args: ["--timeout", "5", "run", "--timeout=0"], command: "run" },
-    { args: ["-d", "目录", "threads"], command: "threads" },
     { args: ["完全无法识别"], command: null },
     { args: ["run", "--timeout", "--json"], command: "run" },
   ])("参数错误预扫描只报告已知命令：%j", async ({ args, command }) => {

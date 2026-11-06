@@ -346,26 +346,6 @@ export const COMMANDS: Readonly<Record<CommandName, CommandSpec>> = {
   },
 };
 
-export const REMOVED_COMMANDS: Readonly<Record<string, string>> = {
-  update: "更新请使用安装流程；环境检查请用 cxb doctor。",
-  skill: "请用 cxb config templates 查看模板；技能同步已取消。",
-  clean: "过期文件由 broker 回收；归档线程请用 cxb rm <线程ID>。",
-  jobs: "请用 cxb ls 或 cxb show <线程ID>。",
-  templates: "请用 cxb config templates。", threads: "请用 cxb ls。", kill: "请用 cxb stop <线程ID>。",
-  follow: "请用 cxb show <线程ID> --follow。", output: "请用 cxb show <线程ID>。",
-  progress: "请用 cxb show <线程ID> --tail。", peek: "请用 cxb show <线程ID> --server。",
-  approve: "请用 cxb inbox 查看事项，再用 cxb reply <事项ID> yes。",
-  decline: "请用 cxb inbox 查看事项，再用 cxb reply <事项ID> no。",
-  answer: "请用 cxb inbox 和 cxb reply <事项ID> <回复>。", questions: "请用 cxb inbox --kind question，再用 cxb reply 回答。",
-  next: "请用 cxb wait。", delete: "请用 cxb rm <线程ID>。",
-  health: "请用 cxb doctor。", models: "请用 cxb doctor。", version: "请用 cxb --version。",
-  ask: "ask 通道已取消；请用 cxb inbox、cxb reply 和 cxb run --resume <线程ID> <回复>。",
-  peer: "peer 通道已取消；请用 cxb inbox、cxb reply 和 cxb wait。",
-  peers: "peer 通道已取消；请用 cxb inbox、cxb reply 和 cxb wait。",
-  send: "peer 通道已取消；新任务请用 cxb run，回答请用 cxb reply。",
-  task: "peer 任务已取消；请用 cxb run。", tasks: "peer 任务已取消；请用 cxb ls。",
-};
-
 function positionCount(p: ParsedCommand, min: number, max: number): void {
   if (p.positional.length < min || p.positional.length > max) usage(`${p.command} 需要 ${min === max ? min : `${min} 至 ${max}`} 个位置参数。`);
   if (max === 1 && p.positional[0] !== undefined) id(p.positional[0], "线程 ID");
@@ -481,7 +461,7 @@ export function prescanArgv(argv: string[]): { json: boolean; verbose: boolean; 
     }
     if (!sawCommandPosition) {
       sawCommandPosition = true;
-      if (Object.hasOwn(COMMANDS, token) || Object.hasOwn(REMOVED_COMMANDS, token)) command = token;
+      if (Object.hasOwn(COMMANDS, token)) command = token;
     }
   }
   return { json, verbose, command };
@@ -525,7 +505,6 @@ export function parseArgv(argv: string[]): ParsedCommand {
       continue;
     }
     if (!command) {
-      if (Object.hasOwn(REMOVED_COMMANDS, token)) usage(`命令 ${token} 已删除。${REMOVED_COMMANDS[token]}`);
       if (!Object.hasOwn(COMMANDS, token)) usage("未知命令；请用 cxb --help 查看可用命令。");
       command = token as CommandName;
       Object.assign(options, defaults(COMMANDS[command].options));

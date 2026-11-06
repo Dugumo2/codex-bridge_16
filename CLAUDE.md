@@ -21,7 +21,7 @@ pwsh -File install.ps1 -Prefix <目录>    # 打包安装到并行目录试用
 | 位置 | 作用 |
 |---|---|
 | `src/cxb/main.ts` | CLI 入口：参数解析、工作区、连接 broker、命令分发（`HANDLERS`）、输出与清理 |
-| `src/cxb/args.ts`、`help.ts` | 11 个命令的参数规格、帮助、已删除命令的提示 |
+| `src/cxb/args.ts`、`help.ts` | 11 个命令的参数规格、帮助 |
 | `src/cxb/contracts.ts` | 共用类型、退出码、`CxbError` |
 | `src/cxb/broker-conn.ts` | 拉起与连接 broker、版本握手 |
 | `src/cxb/run.ts`、`review.ts` | 派任务与审查；`continue-prompt.ts` 续跑；`ask-instructions.ts` 提问开关与开发者指令 |

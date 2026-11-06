@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 import { config } from "../config";
-import { COMMANDS, GLOBAL_OPTIONS, REMOVED_COMMANDS, parseArgv, prescanArgv, type CommandName } from "./args";
+import { COMMANDS, GLOBAL_OPTIONS, parseArgv, prescanArgv, type CommandName } from "./args";
 import { CxbError } from "./contracts";
 import { renderHelp } from "./help";
 
@@ -202,7 +202,7 @@ describe("参数错误上下文预扫描", () => {
     expect(input).toEqual(original);
   });
 
-  test.each(Object.keys(COMMANDS).concat(Object.keys(REMOVED_COMMANDS)))("只从已知表识别命令：%s", (command) => {
+  test.each(Object.keys(COMMANDS))("只从已知表识别命令：%s", (command) => {
     expect(prescanArgv(["--json", "-d", "目录", command])).toEqual({ command, json: true, verbose: false });
   });
 
@@ -317,19 +317,6 @@ describe("十一条命令的语法与取值", () => {
   });
 });
 
-describe("旧命令不作为隐藏别名", () => {
-  test.each([
-    ["update", "doctor"], ["skill", "config templates"], ["clean", "rm"], ["jobs", "ls"], ["templates", "config templates"],
-    ["threads", "ls"], ["kill", "stop"], ["follow", "show"], ["output", "show"], ["progress", "show"], ["peek", "show"],
-    ["approve", "reply"], ["decline", "reply"], ["answer", "reply"], ["questions", "inbox"], ["next", "wait"], ["delete", "rm"],
-    ["health", "doctor"], ["models", "doctor"], ["version", "--version"], ["ask", "取消"], ["peer", "取消"], ["peers", "取消"],
-    ["send", "取消"], ["task", "取消"], ["tasks", "取消"],
-  ])("%s 返回替代操作", (old, alternative) => {
-    expectUsage([old], alternative);
-    expectUsage(["--help", old], alternative);
-  });
-});
-
 describe("子代理树选项（第二期）", () => {
   test("wait --tree 只接受线程 ID", () => {
     expect(parseArgv(["wait", "t1", "--tree"]).options.tree).toBe(true);
@@ -405,6 +392,6 @@ describe("帮助与选项表", () => {
     expect(renderHelp("review")).toContain("告警并忽略");
     expectUsage(["run", "--help", "--不存在"]);
     expectUsage(["run", "--help", "--timeout=0"]);
-    expect(() => renderHelp("ask" as CommandName)).toThrow(CxbError);
+    expect(() => renderHelp("frobnicate" as CommandName)).toThrow(CxbError);
   });
 });
