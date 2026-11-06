@@ -2807,7 +2807,7 @@ process.stdin.on("end", () => process.exit(0));
     const proxyLog = join(tempDir, "proxy.log");
     const missing = join(tempDir, "missing.sock");
     const { sockPath, proc, fake, codexSock } = await startSharedBroker({}, {
-      CXB_SERVER: "auto",CXB_SERVER_SOCKET: missing,
+      CXB_SERVER: "auto", CXB_SERVER_SOCKET: missing,
       MOCK_PROXY_TARGET: join(tempDir, "cx.sock"), MOCK_PROXY_LOG: proxyLog,
     });
     const { client, server } = await initServer(sockPath);
