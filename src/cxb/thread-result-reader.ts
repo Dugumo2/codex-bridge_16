@@ -27,17 +27,11 @@ function clip(text: string, bytes: number): string {
   return result;
 }
 
-/**
- * 总窗口。计时器可能比 performance.now 算出的时刻早几毫秒触发（Windows 实测最多约 15 毫秒），
- * 所以窗口计时器一响就记为已关，排队的子线程不再看表，免得又发一轮注定超时的请求。
- */
-interface ReadWindow { readonly deadline: number; closed: boolean }
-
 /** 传输只有请求期限；本地取消解除等待，迟到回包不得再写结果。 */
-async function boundedRequest(rpc: BrokerRpc, method: string, params: unknown, readWindow: ReadWindow, signal?: AbortSignal): Promise<unknown> {
+async function boundedRequest(rpc: BrokerRpc, method: string, params: unknown, deadline: number, signal?: AbortSignal): Promise<unknown> {
   if (signal?.aborted) throw new ReadFailure("结果补读已取消");
-  const remaining = readWindow.deadline - performance.now();
-  if (readWindow.closed || remaining <= 0) throw new ReadFailure("结果补读期限已到");
+  const remaining = deadline - performance.now();
+  if (remaining <= 0) throw new ReadFailure("结果补读期限已到");
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abort: (() => void) | undefined;
   try {
@@ -45,13 +39,17 @@ async function boundedRequest(rpc: BrokerRpc, method: string, params: unknown, r
       const fail = (reason: string) => { reject(new ReadFailure(reason)); };
       abort = () => fail("结果补读已取消");
       signal?.addEventListener("abort", abort, { once: true });
-      timer = setTimeout(() => {
-        if (remaining <= 2000) readWindow.closed = true;
+      // 计时器可能比 performance.now 算出的时刻早几毫秒触发（Windows 实测最多约 15 毫秒）。
+      // 总期限要等真正到点才算到期：既不提前放弃，排队的子线程也不会看到「还剩几毫秒」又发一轮注定超时的请求。
+      const expire = () => {
+        const left = deadline - performance.now();
+        if (remaining <= 2000 && left > 0) { timer = setTimeout(expire, Math.ceil(left)); return; }
         fail(remaining <= 2000 ? "结果补读期限已到" : "结果读取请求超时");
-      }, Math.min(2000, remaining));
+      };
+      timer = setTimeout(expire, Math.min(2000, remaining));
     });
     const result = await Promise.race([rpc.request(method, params, { timeoutMs: Math.max(1, Math.ceil(Math.min(2000, remaining))) }), boundary]);
-    if (signal?.aborted || performance.now() >= readWindow.deadline) throw new ReadFailure("结果补读期限已到或已取消");
+    if (signal?.aborted || performance.now() >= deadline) throw new ReadFailure("结果补读期限已到或已取消");
     return result;
   } finally {
     clearTimeout(timer);
@@ -71,7 +69,7 @@ function page(value: unknown, threadId: string, seen: Set<string>): { data: unkn
   return { data: value.data, nextCursor: next };
 }
 
-async function readOne(rpc: BrokerRpc, node: TreeNode, readWindow: ReadWindow, signal?: AbortSignal): Promise<TreeNodeResult> {
+async function readOne(rpc: BrokerRpc, node: TreeNode, deadline: number, signal?: AbortSignal): Promise<TreeNodeResult> {
   const bound = new Set(node.turnIds);
   if (!bound.size) return unavailable("没有可定位的受管轮次");
   let turn: Turn | undefined;
@@ -79,7 +77,7 @@ async function readOne(rpc: BrokerRpc, node: TreeNode, readWindow: ReadWindow, s
   const request = async (method: string, params: unknown) => {
     if (pages >= 64) throw new ReadFailure("每线程分页上限为 64 页，读取未完成");
     pages++;
-    return boundedRequest(rpc, method, params, readWindow, signal);
+    return boundedRequest(rpc, method, params, deadline, signal);
   };
   try {
     let cursor: string | null = null;
@@ -126,7 +124,7 @@ async function readOne(rpc: BrokerRpc, node: TreeNode, readWindow: ReadWindow, s
 
 /** 只读本运行绑定轮次；子结果失败不能影响父运行已经选定的出口。 */
 export async function readThreadResults(rpc: BrokerRpc, nodes: readonly TreeNode[], options: { deadline: number; signal?: AbortSignal }): Promise<Map<string, TreeNodeResult>> {
-  const readWindow: ReadWindow = { deadline: Math.min(options.deadline, performance.now() + 5000), closed: false };
+  const deadline = Math.min(options.deadline, performance.now() + 5000);
   const children = [...new Map(nodes.filter((node) => node.relationKind === "subagent").map((node) => [node.threadId, node])).values()];
   const results = new Map<string, TreeNodeResult>();
   const selected = children.slice(0, 32);
@@ -134,7 +132,7 @@ export async function readThreadResults(rpc: BrokerRpc, nodes: readonly TreeNode
   await Promise.all(Array.from({ length: Math.min(4, selected.length) }, async () => {
     while (next < selected.length) {
       const node = selected[next++]!;
-      results.set(node.threadId, await readOne(rpc, node, readWindow, options.signal));
+      results.set(node.threadId, await readOne(rpc, node, deadline, options.signal));
     }
   }));
   let remainingBytes = TOTAL_BYTES;
