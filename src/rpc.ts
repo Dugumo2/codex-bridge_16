@@ -197,9 +197,6 @@ export interface RpcEndpoint {
   isClosed(): boolean;
 }
 
-/** 请求期限到了仍没有回包；调用方可以据此把「等不到了」和服务器报错区分开。 */
-export class RpcTimeoutError extends Error {}
-
 /**
  * Create a JSON-RPC endpoint over an arbitrary line-oriented transport.
  * The transport supplies raw writes and liveness; the endpoint owns request
@@ -387,7 +384,7 @@ export function createRpcEndpoint(opts: RpcEndpointOptions): RpcEndpoint {
 
       const timer = setTimeout(() => {
         pending.delete(id);
-        reject(new RpcTimeoutError(`Request ${method} (id=${id}) timed out after ${limit}ms`));
+        reject(new Error(`Request ${method} (id=${id}) timed out after ${limit}ms`));
       }, limit);
 
       pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });

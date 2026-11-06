@@ -376,7 +376,7 @@ describe("来源运行受管轮结果与降级", () => {
       expect(text).toContain("结果正文：不可用");
       expect(text).toContain("结果读取请求超时");
       expect(fake.calls).toHaveLength(1);
-      expect(fake.calls[0]!.options.timeoutMs).toBe(2000);
+      expect(fake.calls[0]!.options.timeoutMs).toBe(2100);
     } finally { gate.resolve({ data: [], nextCursor: null }); }
   });
 

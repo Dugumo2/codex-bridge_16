@@ -1,6 +1,9 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { RpcTimeoutError } from "../rpc";
+import { createRpcEndpoint, type RpcEndpoint } from "../rpc";
 import { createStatusHistory, type StatusHistoryTurn } from "../test-support/status-history";
+import { commandSession } from "./command-session";
+import { CxbError, type BrokerRpc } from "./contracts";
+import type { CommandContext } from "./main";
 import { readThreadResults } from "./thread-result-reader";
 import type { TreeNode } from "./tree-contracts";
 import { FakeRpc } from "./test-fixtures/run-fakes";
@@ -194,7 +197,8 @@ describe("补读限额、期限与资源", () => {
     const started = performance.now();
     const results = await read(fake, [node()], started + 40);
     expect(results.get("child")).toMatchObject({ availability: "unavailable", output: "" });
-    expect(fake.calls[0]!.options.timeoutMs).toBeLessThanOrEqual(40);
+    // 传输层比本地期限多给 100 毫秒，到期仍由本地计时器判定，命令不会多等（受控时钟用例卡死到 5000 毫秒）。
+    expect(fake.calls[0]!.options.timeoutMs).toBeLessThanOrEqual(140);
     expect(performance.now() - started).toBeLessThan(1500);
     gate.resolve({ data: [], nextCursor: null });
   });
@@ -205,7 +209,7 @@ describe("补读限额、期限与资源", () => {
     fake.handle = () => gate.promise;
     const result = await read(fake);
     expect(result.get("child")?.availability).toBe("unavailable");
-    expect(fake.calls[0]!.options.timeoutMs).toBe(2000);
+    expect(fake.calls[0]!.options.timeoutMs).toBe(2100);
     gate.resolve({ data: [], nextCursor: null });
     const before = fake.calls.length;
     expect((await read(fake, [node()], performance.now() - 1)).get("child")?.availability).toBe("unavailable");
@@ -282,23 +286,68 @@ describe("补读限额、期限与资源", () => {
     } finally { clock.restore(); }
   });
 
-  test("传输层的超时计时器也早响时，仍等到真正到点，不多发请求，提示仍是期限已到", async () => {
-    const fake = new FakeRpc();
+  /** 真实的 rpc.ts 端点，只是对端不回包：请求期限由它自己的计时器判定。 */
+  function silentEndpoint() {
+    const sent: number[] = [];
+    const endpoint = createRpcEndpoint({ label: "补读测试", requestTimeout: 1000, send: (data) => { sent.push(JSON.parse(data).id); },
+      downReason: () => null, overflowReason: "overflow", onOverflow: () => {}, writeFailedPrefix: "write failed: " });
+    return { endpoint, sent };
+  }
+  /** 与 broker-conn.ts 的 publicRpc 相同：传输层的超时被改写成 CxbError，原错误只留在 cause。 */
+  function publicLike(endpoint: RpcEndpoint): BrokerRpc {
+    return { ...endpoint, async request<T>(method: string, params?: unknown, options?: { timeoutMs?: number }): Promise<T> {
+      try { return await endpoint.request<T>(method, params, options); }
+      catch (error) { throw new CxbError("BROKER_UNAVAILABLE", `broker 请求 ${method} 失败`, { cause: error }); }
+    } };
+  }
+  /** 补读实际经过的两条路径：run 的交接直接用连接层，wait --tree 再套一层同期限计时器的命令会话。 */
+  const paths: Array<[string, (endpoint: RpcEndpoint) => Promise<BrokerRpc>]> = [
+    ["run 的交接", async (endpoint) => publicLike(endpoint)],
+    ["wait --tree", (endpoint) => commandSession({ connect: async () => ({ rpc: publicLike(endpoint) }), registerCleanup: () => () => {},
+      out: { progress() {} } } as unknown as CommandContext).connect()],
+  ];
+
+  test.each(paths)("传输层的计时器也早响时（%s）：等到真正到点，不多发请求，提示仍是期限已到", async (_, wrap) => {
+    const { endpoint, sent } = silentEndpoint();
     const clock = controlledClock(30);
     try {
-      // 与真实传输一样：请求期限一到就拒绝，不等本地窗口。
-      const rpc: typeof fake.rpc = { ...fake.rpc, request: <T>(method: string, params?: unknown, options?: { timeoutMs?: number }) => new Promise<T>((_, reject) => {
-        fake.calls.push({ method, params, options });
-        setTimeout(() => reject(new RpcTimeoutError(`Request ${method} timed out`)), options?.timeoutMs);
-      }) };
+      const rpc = await wrap(endpoint);
       const started = clock.now();
       const results = await clock.run(readThreadResults(rpc, Array.from({ length: 16 }, (_, i) => node(`child-${i}`)), { deadline: started + 60_000 }));
       expect(clock.now() - started).toBe(5000);
-      expect(fake.calls).toHaveLength(12);
+      expect(sent).toHaveLength(12);
       // 第三轮的请求（第 9～12 个子线程）撞上总窗口，上层靠这句提示判断命令期限。
       expect(results.get("child-8")?.reason).toContain("期限已到");
       expect(results.get("child-0")?.reason).toContain("请求超时");
-    } finally { clock.restore(); }
+    } finally { endpoint.markClosed(); clock.restore(); }
+  });
+
+  test.each(paths)("传输层的计时器早响时（%s）：真正到点前回来的结果不丢", async (_, wrap) => {
+    const { endpoint, sent } = silentEndpoint();
+    const clock = controlledClock(30);
+    try {
+      const rpc = await wrap(endpoint);
+      const started = clock.now();
+      clock.schedule(started + 990, () => { endpoint.feed(JSON.stringify({ id: sent[0], result: { data: [], nextCursor: null } }) + "\n"); });
+      const results = await clock.run(readThreadResults(rpc, [node()], { deadline: started + 1000 }));
+      // 回包被接受才会走到「分页里没有绑定轮」；被传输层抢先判死时是「读取失败」。
+      expect(results.get("child")?.reason).toContain("未找到本次运行的绑定轮次");
+    } finally { endpoint.markClosed(); clock.restore(); }
+  });
+
+  test.each(paths)("无命令期限压力，真实计时器（%s）：到点才结束，排队子线程不多发请求", async (_, wrap) => {
+    const { endpoint, sent } = silentEndpoint();
+    try {
+      const rpc = await wrap(endpoint);
+      const started = performance.now();
+      const results = await watchdog(readThreadResults(rpc, Array.from({ length: 16 }, (_, i) => node(`child-${i}`)), { deadline: started + 60_000 }), 8000, "子结果补读未结束");
+      const elapsed = performance.now() - started;
+      expect(results.size).toBe(16);
+      expect(elapsed).toBeGreaterThanOrEqual(4900);
+      expect(elapsed).toBeLessThan(6500);
+      expect(sent.length).toBeLessThanOrEqual(12);
+      expect([...results.values()].some((result) => result.reason?.includes("期限已到"))).toBe(true);
+    } finally { endpoint.markClosed(); }
   });
 
   test("传输层报的不是超时：立刻作为失败返回，不等到期限", async () => {

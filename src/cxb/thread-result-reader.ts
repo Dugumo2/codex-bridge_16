@@ -1,4 +1,3 @@
-import { RpcTimeoutError } from "../rpc";
 import type { BrokerRpc } from "./contracts";
 import { serverOutput } from "./show";
 import type { TreeNode, TreeNodeResult } from "./tree-contracts";
@@ -6,6 +5,11 @@ import type { TreeNode, TreeNodeResult } from "./tree-contracts";
 const TURN_STATUSES = new Set(["inProgress", "completed", "failed", "interrupted"]);
 const THREAD_BYTES = 8 * 1024;
 const TOTAL_BYTES = 64 * 1024;
+/**
+ * 传输路径上的计时器（rpc.ts、命令会话）比本地期限晚这么久。它们同样会早响（Windows 实测最多约 15 毫秒），
+ * 而且一响就直接判失败、不看表；只有晚于本地计时器，到期才总由本地计时器按真实时刻判定。
+ */
+const TRANSPORT_GRACE_MS = 100;
 type Item = Parameters<typeof serverOutput>[0][number];
 type Turn = { id: string; status: NonNullable<TreeNodeResult["status"]> };
 
@@ -49,12 +53,7 @@ async function boundedRequest(rpc: BrokerRpc, method: string, params: unknown, d
       };
       timer = setTimeout(expire, Math.min(2000, remaining));
     });
-    // 传输层的超时计时器同样会早响，它只说明「等不到回包了」，不能替本地计时器判定到期；本地计时器一定会响，不会卡住。
-    const answer = rpc.request(method, params, { timeoutMs: Math.max(1, Math.ceil(Math.min(2000, remaining))) }).catch((error: unknown) => {
-      if (error instanceof RpcTimeoutError) return new Promise<never>(() => {});
-      throw error;
-    });
-    const result = await Promise.race([answer, boundary]);
+    const result = await Promise.race([rpc.request(method, params, { timeoutMs: Math.max(1, Math.ceil(Math.min(2000, remaining))) + TRANSPORT_GRACE_MS }), boundary]);
     if (signal?.aborted || performance.now() >= deadline) throw new ReadFailure("结果补读期限已到或已取消");
     return result;
   } finally {

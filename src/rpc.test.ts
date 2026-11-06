@@ -1,6 +1,6 @@
 // Tests for rpc.ts — the JSON-RPC endpoint shared by every transport.
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { createRpcEndpoint, MAX_BUFFER_SIZE, NO_RESPONSE, parseMessage, RpcTimeoutError, type RpcEndpoint, type RpcEndpointOptions } from "./rpc";
+import { createRpcEndpoint, MAX_BUFFER_SIZE, NO_RESPONSE, parseMessage, type RpcEndpoint, type RpcEndpointOptions } from "./rpc";
 
 const endpoints = new Set<RpcEndpoint>();
 afterEach(() => {
@@ -132,17 +132,6 @@ describe("底层逐请求期限校验", () => {
     const pending = ep.request("测试请求", {}, { timeoutMs: 2_147_483_647 });
     ep.feed(JSON.stringify({ id: writes[0].id, result: "完成" }) + "\n");
     expect(await pending).toBe("完成");
-  });
-
-  test("请求超时抛 RpcTimeoutError，调用方能和服务器报错区分开，错误文字不变", async () => {
-    const { ep, writes } = endpoint();
-    const error = await ep.request("测试请求", {}, { timeoutMs: 1 }).catch((reason: unknown) => reason);
-    expect(error).toBeInstanceOf(RpcTimeoutError);
-    expect((error as Error).message).toBe(`Request 测试请求 (id=${writes[0].id}) timed out after 1ms`);
-
-    const answered = ep.request("报错请求", {}, { timeoutMs: 1000 }).catch((reason: unknown) => reason);
-    ep.feed(JSON.stringify({ id: writes[1].id, error: { code: -1, message: "服务器报错" } }) + "\n");
-    expect(await answered).not.toBeInstanceOf(RpcTimeoutError);
   });
 
   test("默认期限也校验，合法的逐请求值可覆盖非法默认值", async () => {
