@@ -609,7 +609,7 @@ fn 释放后转发仍保留且原连接仍可作答() {
 
 #[test]
 fn 启动失败释放认领后人工请求仍等待并可回答() {
-    // astra 指出的路径：start 尚未宣布 turn 就先来了人工请求，随后 start 失败（#10）释放认领。
+    // start 尚未宣布 turn 就先来了人工请求，随后 start 失败（#10）释放认领。
     let mut machine = Machine::new(false);
     machine.live_conns.insert(1);
     machine.records.entry("线程".into()).or_default().subscribed = true;

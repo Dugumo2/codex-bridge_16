@@ -1121,7 +1121,7 @@ impl Machine {
     }
 
     /// `broker/run/started{threadId, runId, shortId, requestId}`：认领建立（#2）或续跑核实通过（#2d）的那一刻、
-    /// 在把流式请求转发给 app-server 之前，发给发起连接（只发 cxb 连接；astra T1）。须在 `run_opened` 之后调用。
+    /// 在把流式请求转发给 app-server 之前，发给发起连接（只发 cxb 连接）。须在 `run_opened` 之后调用。
     pub(crate) fn send_run_started(
         &self,
         thread_id: &str,

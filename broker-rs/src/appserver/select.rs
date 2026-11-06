@@ -1,9 +1,9 @@
 //! 选档（详细设计 6.1 节、第 8 节「每档接入超时」）。
 //!
-//! - 模式：`CXB_SERVER` → `CXB_SERVER` → 数据根目录 config.json 的 `server` 字段 → `auto`。
+//! - 模式：`CXB_SERVER` → 数据根目录 config.json 的 `server` 字段 → `auto`。
 //!   取值只认 `auto`、`shared`、`private`，其他值跳过、看下一个来源（与上游 shared-server.ts:61–77 一致）。
 //!   broker 只读 config.json，不写（7.1 节：config.json 只由 CLI 写）。
-//! - 控制 socket：`CXB_SERVER_SOCKET` → `CXB_SERVER_SOCKET`（相对路径按 broker 的工作目录解析）
+//! - 控制 socket：`CXB_SERVER_SOCKET`（相对路径按 broker 的工作目录解析）
 //!   → `<CODEX_HOME>\app-server-control\app-server-control.sock`（上游 shared-server.ts:50–55）。
 //! - auto：1 → 2 → 3，第 1、2 档各最多 3 秒；shared：只试 1、2，都失败就报错退出；private：只用 3。
 //! - 第 3 档启动前持有 CODEX_HOME 初始化互斥量（0.1 节），握手结束即释放。
@@ -40,11 +40,9 @@ impl ServerMode {
 #[derive(Debug, Clone, Default)]
 pub struct ServerEnv {
     pub cxb_server: Option<String>,
-    pub legacy_server: Option<String>,
     /// config.json 的 `server` 字段（读不到、不是字符串都为 None）。
     pub config_server: Option<String>,
     pub cxb_server_socket: Option<String>,
-    pub legacy_server_socket: Option<String>,
     pub codex_home: Option<String>,
     /// 主目录：Windows 取 USERPROFILE，其他平台取 HOME。
     pub home: Option<String>,
@@ -62,10 +60,8 @@ impl ServerEnv {
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
         Self {
             cxb_server: var("CXB_SERVER"),
-            legacy_server: var("CXB_SERVER"),
             config_server: None,
             cxb_server_socket: var("CXB_SERVER_SOCKET"),
-            legacy_server_socket: var("CXB_SERVER_SOCKET"),
             codex_home: var("CODEX_HOME"),
             home: var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -74,10 +70,10 @@ impl ServerEnv {
 
     /// 环境变量已给出有效模式时不读 config.json。
     pub fn needs_config(&self) -> bool {
-        [&self.cxb_server, &self.legacy_server]
-            .into_iter()
-            .flatten()
-            .all(|value| ServerMode::parse(value).is_none())
+        self.cxb_server
+            .as_deref()
+            .and_then(ServerMode::parse)
+            .is_none()
     }
 
     /// 读 `<data_root>\config.json` 的 `server` 字段：最多 [`CONFIG_READ_LIMIT`] 字节、[`CONFIG_READ_TIMEOUT`]，
@@ -122,15 +118,11 @@ pub struct Resolved {
 }
 
 pub fn resolve(env: &ServerEnv) -> Resolved {
-    let candidates = [
-        ("CXB_SERVER", env.cxb_server.as_deref()),
-        ("CXB_SERVER", env.legacy_server.as_deref()),
-    ];
-    let (mode, source) = candidates
-        .into_iter()
-        .find_map(|(name, value)| {
-            let value = value?;
-            ServerMode::parse(value).map(|mode| (mode, format!("{name}={}", value.trim())))
+    let (mode, source) = env
+        .cxb_server
+        .as_deref()
+        .and_then(|value| {
+            ServerMode::parse(value).map(|mode| (mode, format!("CXB_SERVER={}", value.trim())))
         })
         .or_else(|| {
             let value = env.config_server.as_deref()?;
@@ -153,7 +145,6 @@ pub fn resolve(env: &ServerEnv) -> Resolved {
     let socket_path = env
         .cxb_server_socket
         .as_deref()
-        .or(env.legacy_server_socket.as_deref())
         .map(absolute)
         .unwrap_or_else(|| {
             codex_home
@@ -321,14 +312,12 @@ mod tests {
         let mut e = env();
         e.config_server = Some("private".into());
         assert_eq!(resolve(&e).source, "config server private");
-        e.legacy_server = Some("shared".into());
-        assert_eq!(resolve(&e).mode, ServerMode::Shared);
         e.cxb_server = Some("bogus".into());
-        assert_eq!(resolve(&e).source, "CXB_SERVER=shared");
-        e.cxb_server = Some(" private ".into());
+        assert_eq!(resolve(&e).source, "config server private");
+        e.cxb_server = Some(" shared ".into());
         let resolved = resolve(&e);
-        assert_eq!(resolved.mode, ServerMode::Private);
-        assert_eq!(resolved.source, "CXB_SERVER=private");
+        assert_eq!(resolved.mode, ServerMode::Shared);
+        assert_eq!(resolved.source, "CXB_SERVER=shared");
     }
 
     #[test]
@@ -337,7 +326,7 @@ mod tests {
         assert!(e.needs_config());
         e.cxb_server = Some("bogus".into());
         assert!(e.needs_config());
-        e.legacy_server = Some("private".into());
+        e.cxb_server = Some("private".into());
         assert!(!e.needs_config());
     }
 
@@ -345,7 +334,7 @@ mod tests {
     fn socket_变量按优先级且相对路径按工作目录() {
         let mut e = env();
         e.codex_home = Some(r"E:\codex".into());
-        e.legacy_server_socket = Some("cx.sock".into());
+        e.cxb_server_socket = Some("cx.sock".into());
         assert_eq!(
             resolve(&e).socket_path,
             PathBuf::from(r"D:\work").join("cx.sock")
