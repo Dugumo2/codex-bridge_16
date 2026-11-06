@@ -321,32 +321,39 @@ describe("测试分片：主流程", () => {
     // 子进程必须 detached：普通子进程会随父进程一起退出，测不出 taskkill /T 是否结束了整棵树。
     const slow = (name: string) => `import { test } from "bun:test"; import { spawn } from "node:child_process"; import { writeFileSync } from "node:fs"; test("睡", async () => { const leaf = spawn(process.execPath, [${leafScript}], { detached: true, stdio: "ignore", windowsHide: true }); leaf.unref(); writeFileSync(${JSON.stringify(join(root, `${name}.pids`))}, process.pid + "," + leaf.pid); await Bun.sleep(60000); }, 90000);\n`;
     writeFiles(root, { "leaf.js": "setTimeout(() => {}, 60000);\n", "a.test.ts": slow("a"), "b.test.ts": slow("b") });
-    const { code, summary } = await runMain(root, "--shards", "2", "--deadline-ms", "8000", "--leftover-grace-ms", "3000");
-    expect(code).toBe(124);
-    expect(summary.interrupted).toBe(124);
-    // 前置条件：两份分片都起了子进程才到期，否则证明不了「整棵树」。
-    const pids = ["a", "b"].flatMap(name => readFileSync(join(root, `${name}.pids`), "utf8").split(",").map(Number));
-    expect(pids).toHaveLength(4);
-    sleepers.push(...pids);
-    expect(pids.filter(isAlive)).toEqual([]);
-    expect(summary.leftovers).toEqual([]);
+    // 断言失败也要登记已写出的 PID，否则 detached 子进程要活到自己的 60 秒定时器结束。
+    const readPids = (name: string) => {
+      const file = join(root, `${name}.pids`);
+      return existsSync(file) ? readFileSync(file, "utf8").split(",").map(Number) : [];
+    };
+    try {
+      const { code, summary } = await runMain(root, "--shards", "2", "--deadline-ms", "8000", "--leftover-grace-ms", "3000");
+      expect(code).toBe(124);
+      expect(summary.interrupted).toBe(124);
+      // 前置条件：两份分片都起了子进程才到期，否则证明不了「整棵树」。
+      const pids = ["a", "b"].flatMap(readPids);
+      expect(pids).toHaveLength(4);
+      expect(pids.filter(isAlive)).toEqual([]);
+      expect(summary.leftovers).toEqual([]);
+    } finally { sleepers.push(...["a", "b"].flatMap(readPids)); }
+  }, 60_000);
+
+  test("创建进程跟踪失败：此时还没注册定时器和信号监听，不留下任何东西", async () => {
+    const root = tempDir("cxb-shards-nowatcher-");
+    writeFiles(root, { "ok.test.ts": PASSING });
+    const logDir = tempDir("cxb-shards-log-");
+    const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+    await expect(main([root, "--log-dir", logDir, "--timings-file", join(logDir, "timings.json")], {
+      writeManifest: (path, text) => writeFileSync(path, text),
+      createWatcher: () => { throw new Error("跟踪不可用"); },
+    })).rejects.toThrow("跟踪不可用");
+    expect([process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")]).toEqual(listeners);
   }, 60_000);
 
   test("刷新耗时：每文件单独量墙钟（含钩子），同时运行正好 2 份，清理已删文件的记录", async () => {
     const root = tempDir("cxb-shards-timing-");
-    const spans = join(root, "spans");
-    mkdirSync(spans);
-    // 屏障：至少两个文件都开始后才继续，串行实现会在这里超时失败；钩子再睡 1.2 秒，并发超过 2 时区间必然重叠。
-    const hooked = (name: string) => `import { beforeAll, test } from "bun:test"; import { readdirSync, writeFileSync } from "node:fs"; import { join } from "node:path";
-const dir = ${JSON.stringify(spans)};
-beforeAll(async () => {
-  writeFileSync(join(dir, "${name}.start"), String(Date.now()));
-  const until = Date.now() + 30000;
-  while (readdirSync(dir).filter(file => file.endsWith(".start")).length < 2) { if (Date.now() > until) throw new Error("同时运行的文件不足 2 个"); await Bun.sleep(20); }
-  await Bun.sleep(1200);
-}, 60000);
-test("断言", () => { writeFileSync(join(dir, "${name}.end"), String(Date.now())); });\n`;
-    writeFiles(root, { "a.test.ts": hooked("a"), "b.test.ts": hooked("b"), "c.test.ts": hooked("c") });
+    const hooked = 'import { beforeAll, test } from "bun:test"; beforeAll(() => Bun.sleep(1200)); test("断言", () => {});\n';
+    writeFiles(root, { "a.test.ts": hooked, "b.test.ts": hooked, "c.test.ts": hooked });
     const file = join(root, "timings.json");
     const gone = "src/cxb/已删除的文件.test.ts";
     writeFileSync(file, JSON.stringify({ [gone]: 99 }));
@@ -359,8 +366,10 @@ test("断言", () => { writeFileSync(join(dir, "${name}.end"), String(Date.now()
     expect(values).toHaveLength(3);
     // beforeAll 的 1.2 秒要算进去；只统计用例耗时的话这里接近 0。
     for (const seconds of values) expect(seconds).toBeGreaterThanOrEqual(1.1);
-    const read = (name: string) => Number(readFileSync(join(spans, name), "utf8"));
-    const events = ["a", "b", "c"].flatMap(name => [{ at: read(`${name}.start`), delta: 1 }, { at: read(`${name}.end`), delta: -1 }]).sort((x, y) => x.at - y.at || x.delta - y.delta);
+    // 用主流程记录的进程起止时刻算并发：分片进程一启动就算，不依赖它加载快慢。
+    const events = summary.shards.flatMap((shard: { startedAt: number; finishedAt: number }) => [{ at: shard.startedAt, delta: 1 }, { at: shard.finishedAt, delta: -1 }])
+      .sort((x: { at: number; delta: number }, y: { at: number; delta: number }) => x.at - y.at || x.delta - y.delta);
+    expect(events).toHaveLength(6);
     let running = 0, peak = 0;
     for (const event of events) { running += event.delta; peak = Math.max(peak, running); }
     expect(peak).toBe(2);

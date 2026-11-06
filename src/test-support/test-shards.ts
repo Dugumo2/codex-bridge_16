@@ -163,7 +163,7 @@ function bounded<T>(promise: Promise<T>, ms: number, label: string): Promise<T> 
     .finally(() => clearTimeout(timer));
 }
 
-interface Running { child: ChildProcess; done: Promise<number>; index: number; files: string[]; log: string; xml: string; started: number; seconds: number; code: number | null }
+interface Running { child: ChildProcess; done: Promise<number>; index: number; files: string[]; log: string; xml: string; started: number; finishedAt: number | null; seconds: number; code: number | null }
 
 async function stopTree(run: Running): Promise<void> {
   const pid = run.child.pid;
@@ -204,6 +204,8 @@ export async function main(args = process.argv.slice(2), dependencies: MainDepen
   const parent = options.logDir ?? tmpdir(); mkdirSync(parent, { recursive: true });
   const logDir = mkdtempSync(join(parent, "cxb-test-shards-"));
   const started = Date.now(), running: Running[] = [];
+  // 先于信号监听和总期限计时器创建：这里抛错时不用清理任何东西。
+  const watcher = dependencies.createWatcher();
   let interrupted = 0, cleanup: Promise<void> | undefined;
   let cancelled!: () => void;
   const cancellation = new Promise<void>(done => { cancelled = done; });
@@ -222,7 +224,6 @@ export async function main(args = process.argv.slice(2), dependencies: MainDepen
   process.on("SIGINT", onInt); process.on("SIGTERM", onTerm);
   const timer = setTimeout(() => { void cancel(124, `超过总期限 ${options.deadlineMs} 毫秒`); }, options.deadlineMs);
   console.log(`收集 ${files.length} 个文件，共 ${groups.length} 份，同时最多 ${concurrency} 份；日志：${logDir}`);
-  const watcher = dependencies.createWatcher();
   let watchError: string | undefined;
   const sample = (action: () => void = () => watcher.sample()) => {
     if (watchError) return;
@@ -240,9 +241,9 @@ export async function main(args = process.argv.slice(2), dependencies: MainDepen
       child = spawn(process.execPath, ["test", ...group.files, "--timeout", "90000", "--reporter=junit", `--reporter-outfile=${xml}`],
         { cwd: REPO, env: { ...process.env }, detached: process.platform !== "win32", windowsHide: true, stdio: ["ignore", fd, fd] });
     } finally { closeSync(fd); }
-    const run: Running = { child, done: undefined!, index: i + 1, files: group.files, log, xml, started: Date.now(), seconds: 0, code: null };
+    const run: Running = { child, done: undefined!, index: i + 1, files: group.files, log, xml, started: Date.now(), finishedAt: null, seconds: 0, code: null };
     run.done = new Promise<number>(done => {
-      const finish = (code: number) => { run.code = code; run.seconds = (Date.now() - run.started) / 1000; done(code); };
+      const finish = (code: number) => { run.code = code; run.finishedAt = Date.now(); run.seconds = (run.finishedAt - run.started) / 1000; done(code); };
       child.once("error", error => { console.error(`分片 ${run.index} 启动失败：${error.message}`); finish(1); });
       child.once("exit", code => finish(code ?? 1));
     });
@@ -293,7 +294,7 @@ export async function main(args = process.argv.slice(2), dependencies: MainDepen
         if (!names.length) console.error("  无失败用例节点，请查看日志中的启动／钩子／进程错误。");
       }
     }
-    results.push({ index: run.index, files: run.files.length, seconds: run.seconds, passed: counts.passed, failed: counts.failed, skipped: counts.skipped,
+    results.push({ index: run.index, files: run.files.length, startedAt: run.started, finishedAt: run.finishedAt, seconds: run.seconds, passed: counts.passed, failed: counts.failed, skipped: counts.skipped,
       failures: report?.failures ?? [], code: run.code, problem, log: run.log, xml: run.xml });
   }
   for (const error of cleanupErrors) console.error(`进程回收错误：${error}`);
