@@ -9,14 +9,14 @@ cxb 由两部分组成：
 - **`cxb` 命令行**（TypeScript，bun 运行）：11 个命令，结果写 stdout、过程写 stderr，`--json` 输出可解析的对象，退出码统一。
 - **工作区 broker**（Rust，`cxb-broker`）：每个工作区一个，经 JSON-RPC 连接 `codex app-server`，托管运行、待回应事项和本地记录；`cxb run` 断开时立即让 Codex 停下，`--detach` 的任务由它托管到结束；空闲 5 分钟自动退出。
 
-本项目源自 [Kevin7Qi/codex-collab](https://github.com/Kevin7Qi/codex-collab)（MIT），命令层与 broker 已重写。**只支持 Windows。**
+**只支持 Windows。** 已用 codex-cli 0.160.0 测试。
 
 ## 安装
 
 前置条件：Windows、PowerShell 7、[Bun](https://bun.sh/)、[Rust](https://rustup.rs/)（cargo）、[Codex CLI](https://github.com/openai/codex)（`npm install -g @openai/codex`，并 `codex login`）。
 
 ```powershell
-git clone <本仓库地址> codex-bridge
+git clone https://github.com/Dugumo2/codex-bridge.git
 cd codex-bridge
 pwsh -File install.ps1                       # 默认装到 %USERPROFILE%\.cxb
 pwsh -File install.ps1 -Prefix D:\tools\cxb  # 或指定目录
@@ -79,6 +79,16 @@ cxb config templates             # 列出内置与用户模板
 ## 开发
 
 见 [CONTRIBUTING.md](CONTRIBUTING.md)。所有验证在本机进行。
+
+## 致谢与来源
+
+本项目起步于 [Kevin7Qi/codex-collab](https://github.com/Kevin7Qi/codex-collab)（MIT）。
+
+- broker 用 Rust 完全重写，不含原项目代码。
+- 命令层参考原项目重写，少量模块沿用并做了修改（`rpc`、`config`、`guardian`、`models`、`git`）。
+- [LICENSE](LICENSE) 保留了原版权声明，这是 MIT 协议的要求。
+
+本项目与原作者、OpenAI、Anthropic 均无隶属关系。
 
 ## 许可
 
