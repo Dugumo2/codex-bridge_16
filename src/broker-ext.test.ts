@@ -159,7 +159,7 @@ for await (const chunk of Bun.stdin.stream()) {
     }
   }, 30_000);
 
-  // ─── M2：同一连接上的请求流水化（详细设计 1.2 节，有意偏离上游；astra T6） ───
+  // ─── M2：同一连接上的请求流水化（详细设计 1.2 节，有意偏离上游） ───
   // 上游每个连接一个 Promise 队列，前一个请求等到 app-server 回包才处理下一个；
   // Rust 按顺序处理、但不等回包。下面三个用例分别精确断言两种实现，记录这处语义变化。
 
@@ -963,7 +963,7 @@ process.stdin.on("end", () => process.exit(0));
       const first = sendRaw(client, "broker/threads/stop", { threadId: "thread-s6" });
       await waitFor(() => recvs(readStopLog(logPath), "turn/interrupt").length === 1);
       const second = sendRaw(client, "broker/threads/stop", { threadId: "thread-s6" });
-      // 中断回包成功不等于停下，第二次 stop 要真正再发一次（astra 留给 M4 的事项）。
+      // 中断回包成功不等于停下，第二次 stop 要真正再发一次。
       await waitFor(() => recvs(readStopLog(logPath), "turn/interrupt").length === 2);
       expect(recvs(readStopLog(logPath), "turn/interrupt").map((e) => e.params)).toEqual([
         { threadId: "thread-s6", turnId: "turn-1" },
