@@ -1,3 +1,4 @@
+import type { Subprocess } from "bun";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -223,7 +224,6 @@ test("TS/Rust 对照：目录 junction", async () => {
   const result = runTool("cmd.exe", ["/d", "/c", "mklink", "/J", junction, target]);
   if (result.error || result.status !== 0) {
     console.warn(`跳过 junction 对照：mklink /J 失败，退出码 ${result.status}，错误码 ${result.error?.message ?? "未提供"}`);
-    test.skip("当前系统不能创建 junction", () => {});
     return;
   }
   expect(await compareRust(junction)).toBe(await compareRust(target));
@@ -236,7 +236,6 @@ test("TS/Rust 对照：目录符号链接（mklink /D）", async () => {
   if (result.error || result.status !== 0) {
     const reason = `mklink /D 不可用（需开发者模式或管理员权限），退出码 ${result.status}，错误码 ${(result.error as NodeJS.ErrnoException | undefined)?.code ?? "无"}`;
     console.warn(`跳过目录符号链接对照：${reason}`);
-    test.skip(`目录符号链接对照未验证：${reason}`, () => {});
     return;
   }
   expect(await compareRust(link)).toBe(await compareRust(target));
@@ -247,14 +246,12 @@ test("TS/Rust 对照：SUBST 映射盘符，结束后移除映射", async () => 
   const drive = [..."ZYXWVUTSRQPONMLKJI"].map((letter) => `${letter}:`).find((candidate) => !existsSync(`${candidate}\\`));
   if (!drive) {
     console.warn("跳过 SUBST 对照：没有可用的测试盘符。");
-    test.skip("SUBST 对照未验证：没有可用的测试盘符", () => {});
     return;
   }
   const result = runTool("subst.exe", [drive, target]);
   if (result.error || result.status !== 0) {
     const reason = `无法创建 ${drive} 映射，退出码 ${result.status}，错误码 ${(result.error as NodeJS.ErrnoException | undefined)?.code ?? "无"}`;
     console.warn(`跳过 SUBST 对照：${reason}`);
-    test.skip(`SUBST 对照未验证：${reason}`, () => {});
     return;
   }
   substMappings.add(drive);
@@ -285,7 +282,6 @@ test("TS/Rust 对照：Windows 短文件名", async () => {
   await bounded(stderr, 1000, "读取短路径错误输出超时");
   if (short.toLowerCase() === target.toLowerCase()) {
     console.warn("跳过短文件名对照：测试卷未为目录分配 8.3 别名。");
-    test.skip("测试卷没有可用的短文件名", () => {});
     return;
   }
   expect(await compareRust(short)).toBe(await compareRust(target));
@@ -300,7 +296,6 @@ test("TS/Rust 对照：本机可访问的 UNC 共享", async () => {
   const code = await processes.exited(child);
   if (code === 2) {
     console.warn("跳过真实 UNC 对照：当前用户无法访问本机测试卷的管理共享；纯字符串前缀用例仍会执行。");
-    test.skip("本机 UNC 管理共享不可访问", () => {});
     return;
   }
   expect(code).toBe(0);
@@ -308,3 +303,19 @@ test("TS/Rust 对照：本机可访问的 UNC 共享", async () => {
   await compareRust(unc);
   await compareRust(`\\\\?\\UNC\\${unc.slice(2)}`);
 }, 45000);
+
+test("子进程已退出时，即使它的 PID 又被别的进程占用也不算遗留；没退出的照常上报", async () => {
+  // 用本进程的 PID 模拟 PID 复用：这个 PID 上确实有活进程，但已经不是那个子进程了。
+  let kills = 0;
+  const fake = (exitCode: number | null) => ({ pid: process.pid, exitCode, exited: Promise.resolve(0), kill() { kills++; } }) as unknown as Subprocess;
+  const reused = new ProcessTracker();
+  reused.add(fake(0));
+  await reused.cleanup();
+  expect(kills).toBe(0);
+
+  const leaked = new ProcessTracker();
+  leaked.add(fake(null));
+  const error = await leaked.cleanup().then(() => null, (reason: AggregateError) => reason);
+  expect(kills).toBe(1);
+  expect(String(error?.errors?.[0])).toContain("测试遗留进程已强制结束");
+});

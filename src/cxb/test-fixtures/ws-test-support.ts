@@ -51,10 +51,9 @@ export class ProcessTracker {
     return child;
   }
 
+  /** 以子进程句柄的退出状态为准：PID 退出后可能马上被别的进程占用，按 PID 判活会误报。 */
   async exited(child: Subprocess, timeoutMs = 5000): Promise<number> {
-    const code = await bounded(child.exited, timeoutMs, `进程 ${child.pid} 未按时退出`);
-    await eventually(() => !isAlive(child.pid), timeoutMs);
-    return code;
+    return bounded(child.exited, timeoutMs, `进程 ${child.pid} 未按时退出`);
   }
 
   async cleanup(): Promise<void> {
@@ -62,7 +61,7 @@ export class ProcessTracker {
     const errors: unknown[] = [];
     await Promise.all([...this.children].map(async ([pid, child]) => {
       try {
-        if (isAlive(pid)) { leaked.push(pid); child.kill(); }
+        if (child.exitCode === null) { leaked.push(pid); child.kill(); }
         await this.exited(child);
       } catch (error) { errors.push(error); }
     }));
