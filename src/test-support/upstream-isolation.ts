@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import { FAKE_KEY } from "./upstream-model-server";
+import { waitForProcessGone } from "./process-identity";
 
 export const TEMP_ROOT = resolve(tmpdir());
 export const TRACE_ROOT = join(tmpdir(), "cxb-ue-traces", `process-${process.pid}`);
@@ -105,19 +106,21 @@ export async function stopManaged(proc: ManagedProcess): Promise<void> {
     proc.child.kill("SIGKILL");
     await within(proc.closeStreams(), 2000, "本地 stdio 句柄回收");
     await within(proc.child.exited, 3000, "进程树退出");
-    if (alive(pid)) throw new Error(`本路进程 ${pid} 未退出`);
+    await waitForProcessGone(pid, 1000, `本路进程 ${pid} 未退出`);
     return;
   }
   proc.child.stdin.end();
   try { await within(proc.closed, 2000, "关闭 stdin 后退出"); }
   catch {
-    if (process.platform === "win32" && alive(pid)) {
+    // 这里等过 2 秒，要再看句柄：进程已退出时这个号可能已被别的程序占用，/T 会连带结束它的整棵树。
+    const stillRunning = proc.child.exitCode === null && proc.child.signalCode === null;
+    if (process.platform === "win32" && stillRunning && alive(pid)) {
       const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
       await within(new Promise<void>((resolveResult, reject) => { killer.once("error", reject); killer.once("close", () => resolveResult()); }), 5000, "指定进程树回收");
-    } else if (alive(pid)) proc.child.kill("SIGKILL");
+    } else if (stillRunning && alive(pid)) proc.child.kill("SIGKILL");
     await within(proc.closed, 3000, "强制回收后退出");
   }
-  if (alive(pid)) throw new Error(`本路进程 ${pid} 未退出`);
+  await waitForProcessGone(pid, 1000, `本路进程 ${pid} 未退出`);
 }
 export async function removeIsolation(root: string): Promise<void> {
   const rel = relative(resolve(TEMP_ROOT), resolve(root));

@@ -9,7 +9,7 @@ import { config } from "../config";
 import {
   BROKER_BIN, createMockCodex, envWithPathPrefix, removeDirWithRetry,
 } from "../test-support/broker-harness";
-import { reapTestProcess } from "../test-support/process-identity";
+import { processGone, reapTestProcess, waitForProcessGone } from "../test-support/process-identity";
 import { brokerVersionOf, connectBroker, resolveBrokerBin } from "./broker-conn";
 import { CxbError, type BrokerConnection, type ConnectOptions, type WorkspaceInfo } from "./contracts";
 import { createOutput } from "./output";
@@ -202,7 +202,7 @@ function startClient(mode: string, overrides: Partial<ConnectOptions> = {}, gate
     child, events,
     async finish() {
       await bounded(exited, 15_000);
-      expect(alive(child.pid!)).toBe(false);
+      expect(await processGone(child.pid!)).toBe(true);
       const result = events.find((event) => event.result);
       expect(result).toBeDefined();
       return result!;
@@ -219,7 +219,7 @@ async function connect(overrides: Partial<ConnectOptions> = {}): Promise<BrokerC
 async function stop(connection: BrokerConnection): Promise<void> {
   await bounded(connection.rpc.request("broker/shutdown", { ifIdle: true }));
   await connection.close();
-  for (const pid of pids) await until(() => !alive(pid), 8000);
+  for (const pid of pids) await waitForProcessGone(pid, 8000, `进程 ${pid} 没有退出`);
 }
 
 type Message = { id?: number | string; method: string; params?: any; result?: unknown };

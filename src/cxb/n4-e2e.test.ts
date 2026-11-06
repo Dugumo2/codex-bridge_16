@@ -13,6 +13,7 @@ import { BROKER_BIN, writeMockCodexScript } from "../test-support/broker-harness
 import { brokerVersionOf, connectBroker } from "./broker-conn";
 import type { BrokerConnection } from "./contracts";
 import { Processes, alive, bounded, privateEnv, removeTemp, until, type Ran } from "./test-fixtures/main-test-support";
+import { reapTestProcess } from "../test-support/process-identity";
 import { resolveWorkspace } from "./workspace";
 
 const MAIN = join(import.meta.dir, "main.ts");
@@ -166,8 +167,7 @@ describe("N4 端到端：跨命令链路", () => {
     const pid = brokerPid();
     processes.add(pid);
     registerMockPids();
-    process.kill(pid, "SIGKILL");
-    await until(() => !alive(pid), 10_000, "broker 强杀后仍存活");
+    expect(await reapTestProcess(pid, 10_000)).toBe("killed");
 
     const inbox = await cxb("ask", "inbox", "--json");
     expect(inbox.code).toBe(0);

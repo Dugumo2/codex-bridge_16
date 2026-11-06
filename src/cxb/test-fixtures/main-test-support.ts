@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { resolve, sep } from "node:path";
-import { reapTestProcess } from "../../test-support/process-identity";
+import { reapTestProcess, waitForProcessGone } from "../../test-support/process-identity";
 
 export async function bounded<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -92,7 +92,7 @@ export class Processes {
     try {
       const result = await bounded(completed, opts.limitMs ?? 20_000, "子进程退出或输出 EOF 超过期限");
       if (failure) throw failure;
-      if (child.pid !== undefined) await until(() => !alive(child.pid!), 5000, "子进程退出后 PID 仍存活");
+      if (child.pid !== undefined) await waitForProcessGone(child.pid, 5000, "子进程退出后 PID 仍存活");
       // 已按句柄收到 close 并确认退出，不把旧 PID 留到长时间 stop 之后再检查。
       if (child.pid !== undefined) { this.pids.delete(child.pid); this.children.delete(child.pid); }
       return result;
@@ -101,7 +101,7 @@ export class Processes {
       try {
         if (child.pid !== undefined && alive(child.pid)) child.kill("SIGKILL");
         await bounded(exited, 5000, "强制结束后未收到退出事件");
-        if (child.pid !== undefined) await until(() => !alive(child.pid!), 5000, "强制结束后 PID 仍存活");
+        if (child.pid !== undefined) await waitForProcessGone(child.pid, 5000, "强制结束后 PID 仍存活");
       } catch (cleanupError) { errors.push(cleanupError); }
       finally {
         // 后代仍持有写端时，本地读端也必须主动关闭。

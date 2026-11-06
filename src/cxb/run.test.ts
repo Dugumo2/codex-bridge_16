@@ -15,6 +15,7 @@ import { bounded, waitRun } from "./wait-run";
 import { deferred, messageBarrier, watchdog } from "./test-fixtures/test-watchdog";
 import { attachServerRequests, handover, renderPending } from "./server-requests";
 import { CLEANUP_BUDGET, TEST_BUDGET, RunHarness, fakeServerRequests, until, alive } from "./test-fixtures/run-harness";
+import { processGone } from "../test-support/process-identity";
 import { upstreamError } from "./test-fixtures/upstream-errors";
 
 let h: RunHarness;
@@ -240,7 +241,7 @@ test("大于 64 KiB 的中文 JSON 经独立进程管道完整输出并自然退
     { ...h.env, RUN_FIXTURE_WORKSPACE: JSON.stringify(h.workspace) });
   child.child.stdin!.end();
   expect(await bounded(child.closed, 20_000)).toBe(0);
-  expect(alive(child.child.pid!)).toBe(false);
+  expect(await processGone(child.child.pid!)).toBe(true);
   expect(JSON.parse(child.output().stdout).result).toBe(output);
   expect(child.output().stderr).toContain("运行结束");
 }, TEST_BUDGET);
@@ -261,7 +262,7 @@ for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]] as const) test(
   expect(await bounded(child.closed, 15_000)).toBe(code);
   const state = await observer.rpc.request<any>("fixture/state");
   expect(state.calls.some((call: any) => call.method === "turn/interrupt")).toBe(true);
-  expect(alive(child.child.pid!)).toBe(false);
+  expect(await processGone(child.child.pid!)).toBe(true);
 }, TEST_BUDGET);
 
 test("真实 broker 断开唤醒 WaitRun", async () => {

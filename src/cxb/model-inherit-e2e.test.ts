@@ -12,6 +12,7 @@ import type { Model } from "../types";
 import { brokerVersionOf, connectBroker } from "./broker-conn";
 import { EXIT, type BrokerConnection } from "./contracts";
 import { Processes, alive, bounded, privateEnv, removeTemp, until, type Ran } from "./test-fixtures/main-test-support";
+import { waitForProcessGone } from "../test-support/process-identity";
 import { resolveWorkspace } from "./workspace";
 
 const ASTRA = "gpt-6-astra";
@@ -109,9 +110,9 @@ describe("模型沿用 Windows 黑盒（真 broker）", () => {
     const upstreamPids = [...processes.pids].filter((item) => knownBoots.has(item));
     try {
       await current.rpc.request("broker/shutdown", {}, { timeoutMs: 5000 });
-      if (pid) await until(() => !alive(pid), 10_000, "broker 关闭后未退出");
+      if (pid) await waitForProcessGone(pid, 10_000, "broker 关闭后未退出");
       for (const item of upstreamPids) {
-        await until(() => !alive(item), 5000, "模拟上游关闭后未退出");
+        await waitForProcessGone(item, 5000, "模拟上游关闭后未退出");
         processes.pids.delete(item);
       }
       if (pid) processes.pids.delete(pid);

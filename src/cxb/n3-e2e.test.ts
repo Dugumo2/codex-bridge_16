@@ -12,6 +12,7 @@ import { BROKER_BIN, writeMockCodexScript } from "../test-support/broker-harness
 import { brokerVersionOf, connectBroker } from "./broker-conn";
 import { ASK_FEATURE_KEY, type BrokerConnection, type RunResult } from "./contracts";
 import { Processes, alive, bounded, privateEnv, removeTemp, until, type Ran } from "./test-fixtures/main-test-support";
+import { reapTestProcess } from "../test-support/process-identity";
 import { resolveWorkspace } from "./workspace";
 
 const MAIN = join(import.meta.dir, "main.ts");
@@ -171,8 +172,7 @@ describe("N3 端到端：--continue 续跑", () => {
     const pid = brokerPid();
     processes.add(pid);
     registerMockPids();
-    process.kill(pid, "SIGKILL");
-    await until(() => !alive(pid), 10_000, "broker 强杀后仍存活");
+    expect(await reapTestProcess(pid, 10_000)).toBe("killed");
 
     writeFileSync(join(sandbox, "busy.flag"), "仍在运行");
     const refused = await cxbRun("complete", "--resume", first.shortId, "--continue");

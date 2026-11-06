@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import { CxbError, ERROR_CODES, EXIT, type ErrorCode, type ExitCode } from "./contracts";
 import { createOutput, registerSignalHandlers, runMain, toErrorJson } from "./output";
 import { NOTICE, PRIVATE_ERROR_MESSAGE, PROGRESS, RESULT } from "./test-fixtures/out-data";
-import { reapTestProcess } from "../test-support/process-identity";
+import { processGone, reapTestProcess, waitForProcessGone } from "../test-support/process-identity";
 
 const fixture = fileURLToPath(new URL("./test-fixtures/out-main.ts", import.meta.url));
 const CHILD_TIMEOUT_MS = 8_000;
@@ -93,7 +93,7 @@ async function reapTrackedProcesses(): Promise<{ killed: number[]; errors: unkno
         const outcome = await reapTestProcess(child.pid);
         if (outcome === "killed") killed.push(child.pid);
         if (outcome === "reused") return;
-      } else if (isAlive(child.pid)) {
+      } else if (!await processGone(child.pid)) {
         killed.push(child.pid);
         child.kill();
       }
@@ -102,7 +102,7 @@ async function reapTrackedProcesses(): Promise<{ killed: number[]; errors: unkno
       try { await deadline(child.done, 4_000); } catch (err) { errors.push(err); }
     }
     // 不能把 kill() 成功或包装进程退出当成后代已经退出。
-    try { await waitUntil(() => !isAlive(child.pid), 4_000); } catch (err) { errors.push(err); }
+    try { await waitForProcessGone(child.pid, 4_000, `进程 ${child.pid} 没有退出`); } catch (err) { errors.push(err); }
   };
   await Promise.all([...children.values()].map(reap));
   // 先收束包装进程，再重读持久登记，覆盖其退出前最后一刻创建的后代。
@@ -438,7 +438,7 @@ describe("真实子进程的输出保证", () => {
       expect(result.stderr.length).toBe(0);
       expect(result.descendantPid).toBeDefined();
       expect(children.has(result.descendantPid!)).toBe(true);
-      expect(isAlive(result.descendantPid!)).toBe(false);
+      expect(await processGone(result.descendantPid!)).toBe(true);
     }, TEST_TIMEOUT_MS);
   }
 
@@ -452,7 +452,7 @@ describe("真实子进程的输出保证", () => {
     const reaped = await reapTrackedProcesses();
     expect(reaped.errors).toEqual([]);
     expect(reaped.killed).toEqual([pid]);
-    expect(isAlive(pid)).toBe(false);
+    expect(await processGone(pid)).toBe(true);
   }, TEST_TIMEOUT_MS);
 
   for (const [mode, code] of [["injected-blocked", 1], ["injected-blocked-held", 8]] as const) {

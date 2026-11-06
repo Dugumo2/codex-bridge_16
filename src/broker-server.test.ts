@@ -18,7 +18,7 @@ import {
   serveMockOverSocket as serveMockOverSocketWithContext,
   spawnBroker as spawnBrokerWithContext,
 } from "./test-support/broker-harness";
-import { reapTestProcess } from "./test-support/process-identity";
+import { reapTestProcess, waitForProcessGone } from "./test-support/process-identity";
 
 console.log(`[broker 黑盒测试] 被测可执行文件=${BROKER_BIN}`);
 
@@ -681,12 +681,7 @@ setInterval(() => {}, 1000);
 
       try {
         proc.kill("SIGTERM");
-        let stillAlive = true;
-        for (let i = 0; i < 60 && stillAlive; i++) {
-          stillAlive = alive(appPid);
-          if (stillAlive) await new Promise((r) => setTimeout(r, 100));
-        }
-        expect(stillAlive).toBe(false);
+        await waitForProcessGone(appPid, 6000, "broker 退出后模拟上游仍存活");
       } finally {
         await reapTestProcess(appPid).catch(() => undefined);
         try { proc.kill("SIGKILL"); } catch {}

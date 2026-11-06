@@ -14,6 +14,7 @@ import {
   createMockCodex, endpointFor, exitsWithin, removeDirWithRetry, TestClient, testSocketPath, writeMockCodexScript,
   waitFor, waitForSocket, spawnBroker as spawnBrokerWithContext, serveMockOverSocket as serveMockOverSocketWithContext,
 } from "./test-support/broker-harness";
+import { waitForProcessGone } from "./test-support/process-identity";
 
 console.log(`[broker 扩展测试] 被测可执行文件=${BROKER_BIN}`);
 
@@ -2845,8 +2846,7 @@ process.stdin.on("end", () => process.exit(0));
       expect(elapsed).toBeLessThan(9_000);
       // 回退后 broker 继续运行，挂住的 proxy 进程树仍要在有界时间内被回收（任务说明 7.3 第 2 条）。
       const pid = Number(/pid=(\d+)/.exec(lines[0])![1]);
-      const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-      await waitFor(() => !alive(), 12_000);
+      await waitForProcessGone(pid, 12_000, "挂住的 proxy 进程树没有被回收");
       expect(proc.exitCode).toBeNull();
     } finally {
       await client.close();

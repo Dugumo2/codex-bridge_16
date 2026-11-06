@@ -15,13 +15,6 @@ async function bounded<T>(work: Promise<T>, ms: number, description: string): Pr
   } finally { clearTimeout(timer); }
 }
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    throw error;
-  }
-}
-
 async function until(check: () => boolean, ms: number): Promise<void> {
   const deadline = performance.now() + ms;
   while (!check()) {
@@ -137,9 +130,10 @@ export class SrHost {
       socket.destroy();
       await bounded(new Promise<void>((resolve) => { if (socket.closed) resolve(); else socket.once("close", () => resolve()); }), 1000, "关闭连接");
     });
-    // 先给 broker 的 Job 清理留出窗口，失败才强杀进程树。
-    if (this.broker?.pid && alive(this.broker.pid)) {
-      try { await until(() => !alive(this.broker!.pid!), 5000); } catch {
+    // 先给 broker 的 Job 清理留出窗口，失败才强杀进程树；是否退出只看句柄，进程号可能已被别的程序占用。
+    const brokerExited = () => this.broker!.exitCode !== null || this.broker!.signalCode !== null;
+    if (this.broker?.pid && !brokerExited()) {
+      try { await until(brokerExited, 5000); } catch {
         await attempt(async () => {
           if (process.platform === "win32") {
             const killer = this.child("taskkill", ["/PID", String(this.broker!.pid), "/T", "/F"]);

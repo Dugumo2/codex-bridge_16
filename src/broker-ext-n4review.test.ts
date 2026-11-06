@@ -5,7 +5,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BROKER_BIN, createMockCodex, endpointFor, envWithPathPrefix, testSocketPath } from "./test-support/broker-harness";
-import { reapTestProcess } from "./test-support/process-identity";
+import { processGone, reapTestProcess } from "./test-support/process-identity";
 
 type Frame = { id?: number; method?: string; params?: Record<string, unknown>; result?: any; error?: { code: number; message: string; data?: { reason?: string } } };
 let dir: string;
@@ -120,7 +120,7 @@ afterEach(async () => {
   await Promise.all(children.map(({ child, exited }) => clean("回收 broker", async () => {
     if (child.pid && alive(child.pid)) child.kill("SIGKILL");
     await bounded(exited, 8000);
-    if (child.pid) expect(alive(child.pid)).toBe(false);
+    if (child.pid) expect(await processGone(child.pid)).toBe(true);
   })));
   await Promise.all([...pids].map(pid => clean("核实子进程退出", async () => {
     await reapTestProcess(pid);

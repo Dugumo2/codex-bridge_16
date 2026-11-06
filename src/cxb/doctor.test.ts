@@ -8,7 +8,7 @@ import { HANDLERS } from "./main";
 import { N5Harness } from "./test-fixtures/n5a-support";
 import { FakeRpc } from "./test-fixtures/run-fakes";
 import { alive, until } from "./test-fixtures/main-test-support";
-import { reapTestProcess } from "../test-support/process-identity";
+import { processGone, reapTestProcess, waitForProcessGone } from "../test-support/process-identity";
 import { bounded } from "./wait-run";
 import { writeUserConfig } from "./user-config";
 
@@ -346,7 +346,7 @@ for (const cancel of [false, true]) test(`直接运行的不退出子进程${can
   expect(alive(pid)).toBe(true);
   if (cancel) control.abort();
   await expect(bounded(work, 6000)).rejects.toBeInstanceOf(CxbError);
-  expect(alive(pid)).toBe(false);
+  expect(await processGone(pid)).toBe(true);
 }, 10_000);
 
 /** 用 diag-exec 替身当 broker：.cmd 包装把模式与记录文件放在参数最前面。 */
@@ -416,7 +416,7 @@ test("经真 diag-exec 运行：诊断程序先退出、后代占着输出时，
   const pid = Number(readFileSync(file, "utf8")); children.add(pid);
   expect(output).toContain("父程序退出");
   expect(performance.now() - started).toBeLessThan(8000);
-  await until(() => !alive(pid), 3000, "后代没有被 Job 结束");
+  await waitForProcessGone(pid, 3000, "后代没有被 Job 结束");
   children.delete(pid);
 }, 15_000);
 test("经真 diag-exec 运行：诊断程序超时，整棵树被结束并报超时", async () => {
@@ -426,7 +426,7 @@ test("经真 diag-exec 运行：诊断程序超时，整棵树被结束并报超
   await until(() => existsSync(file), 5000, "子进程没有登记 PID");
   const pid = Number(readFileSync(file, "utf8")); children.add(pid);
   await expect(bounded(work, 9000)).rejects.toMatchObject({ code: "TIMEOUT" });
-  await until(() => !alive(pid), 3000, "超时后子进程没有被结束");
+  await waitForProcessGone(pid, 3000, "超时后子进程没有被结束");
   children.delete(pid);
 }, 15_000);
 
@@ -448,8 +448,7 @@ test("直接运行的诊断程序先退出、后代仍占着输出管道时，�
   expect(outcome).toBeInstanceOf(CxbError);
   expect(performance.now() - started).toBeLessThan(timeoutMs + 1000);
   // 已知限制：后代残留，由本用例结束并确认退出。
-  process.kill(pid, "SIGKILL");
-  await until(() => !alive(pid), 3000, "残留后代未能结束");
+  await reapTestProcess(pid, 3000);
   children.delete(pid);
 }, 15_000);
 
@@ -468,7 +467,6 @@ for (const mode of ["both", "stdout-only"] as const) test(`诊断程序先退出
   expect(existsSync(doneFile)).toBe(true);
   expect(exited).toBe(true);
   children.delete(runner.pid);
-  process.kill(pid, "SIGKILL");
-  await until(() => !alive(pid), 3000, "残留后代未能结束");
+  await reapTestProcess(pid, 3000);
   children.delete(pid);
 }, 20_000);

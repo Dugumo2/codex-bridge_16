@@ -12,6 +12,7 @@ import { BROKER_BIN, writeMockCodexScript } from "../test-support/broker-harness
 import { brokerVersionOf, connectBroker } from "./broker-conn";
 import type { BrokerConnection } from "./contracts";
 import { Processes, alive, bounded, privateEnv, removeTemp, until, type Ran } from "./test-fixtures/main-test-support";
+import { reapTestProcess } from "../test-support/process-identity";
 import { resolveWorkspace } from "./workspace";
 
 const MAIN = join(import.meta.dir, "main.ts");
@@ -229,8 +230,7 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     await until(() => existsSync(join(workspaceDir(), "runs", `${childRunId}.json`)), 10_000, "review 运行记录未落盘");
     writeFileSync(join(sandbox, "busy.flag"), "失联后仍在运行\n", "utf8");
     const oldPid = brokerPid(); processes.add(oldPid); registerMockPids();
-    process.kill(oldPid, "SIGKILL");
-    await until(() => !alive(oldPid), 10_000, "强杀 broker 后仍存活");
+    expect(await reapTestProcess(oldPid, 10_000)).toBe("killed");
 
     await connection?.close();
     connection = null;
@@ -265,8 +265,8 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     const first = await completedRun("unknown");
     const pending = cxb("unknown", "rm", "--json", first.shortId);
     await until(() => mockLog().some((entry) => entry.kind === "request" && entry.method === "thread/archive"), 10_000, "归档请求未发出");
-    const oldPid = brokerPid(); processes.add(oldPid); registerMockPids(); process.kill(oldPid, "SIGKILL");
-    await until(() => !alive(oldPid), 10_000, "强杀 broker 后仍存活");
+    const oldPid = brokerPid(); processes.add(oldPid); registerMockPids();
+    expect(await reapTestProcess(oldPid, 10_000)).toBe("killed");
     writeFileSync(join(workspaceDir(), "lifecycle.json"), JSON.stringify({ epoch: 1, revision: 1, payload: { records: {
       [first.threadId]: { operationId: "shared-outcome-unknown", kind: "archive", threadId: first.threadId,
         shortId: first.shortId, preview: "", phase: "forwarded", attempts: [{ attempt: 1, settled: false, serverKind: "shared", instance: null }],
@@ -290,8 +290,8 @@ describe("N7-A 辛路：日志与生命周期真实入口", () => {
     const first = await completedRun("restart-unknown");
     const pending = cxb("restart-unknown", "rm", "--json", first.shortId);
     await until(() => mockLog().some((entry) => entry.kind === "request" && entry.method === "thread/archive"), 10_000, "归档请求未发出");
-    const pid = brokerPid(); processes.add(pid); registerMockPids(); process.kill(pid, "SIGKILL");
-    await until(() => !alive(pid), 10_000, "强杀 broker 后仍存活");
+    const pid = brokerPid(); processes.add(pid); registerMockPids();
+    expect(await reapTestProcess(pid, 10_000)).toBe("killed");
     const unknown = await pending;
     expect(unknown.code).toBe(6);
     writeFileSync(join(workspaceDir(), "lifecycle.json"), JSON.stringify({ epoch: 1, revision: 1, payload: { records: {

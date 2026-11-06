@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Processes, alive, privateEnv, removeTemp, until, type Ran } from "./test-fixtures/main-test-support";
+import { waitForProcessGone } from "../test-support/process-identity";
 
 const MAIN = join(import.meta.dir, "main.ts");
 /** 单个子进程的期限：到期结束它并让用例失败。 */
@@ -156,7 +157,7 @@ describe("cxb 黑盒验收（N1）", () => {
       await until(() => existsSync(registry), 5000, "输出持有者没有登记 PID");
       processes.readRegistry(registry);
       const [parent, holder] = readFileSync(registry, "utf8").trim().split(/\r?\n/).map(Number);
-      await until(() => !alive(parent), 5000, "夹具父进程没有自然退出");
+      await waitForProcessGone(parent, 5000, "夹具父进程没有自然退出");
       expect(alive(holder)).toBe(true);
       expect(await result).toBeInstanceOf(AggregateError);
     } finally {

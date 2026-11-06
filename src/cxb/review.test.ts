@@ -8,6 +8,7 @@ import { listThreadRuns } from "./ledger";
 import { resolveWorkspace } from "./workspace";
 import { bounded } from "./wait-run";
 import { RunHarness, fakeServerRequests, CLEANUP_BUDGET, TEST_BUDGET, alive, until } from "./test-fixtures/run-harness";
+import { processGone } from "../test-support/process-identity";
 
 let h: RunHarness;
 let oldHome: string | undefined;
@@ -177,7 +178,7 @@ test("review 大中文 JSON 管道完整且自然退出", async () => {
     { ...h.env, RUN_FIXTURE_WORKSPACE: JSON.stringify(h.workspace) });
   child.child.stdin!.end();
   expect(await bounded(child.closed, 20_000)).toBe(0);
-  expect(alive(child.child.pid!)).toBe(false);
+  expect(await processGone(child.child.pid!)).toBe(true);
   expect(JSON.parse(child.output().stdout).result).toBe(output);
 }, TEST_BUDGET);
 

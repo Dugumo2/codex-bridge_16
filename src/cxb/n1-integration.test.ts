@@ -10,6 +10,7 @@ import { CxbError, type BrokerConnection, type WorkspaceInfo } from "./contracts
 import { brokerVersionOf, connectBroker } from "./broker-conn";
 import { resolveWorkspace } from "./workspace";
 import { Processes, alive, bounded, privateEnv, removeTemp, until } from "./test-fixtures/main-test-support";
+import { waitForProcessGone } from "../test-support/process-identity";
 
 const CONNECT_LIMIT_MS = 30_000;
 const TEST_LIMIT_MS = 65_000;
@@ -268,7 +269,7 @@ describe("工作区与 broker 连接联调（N1）", () => {
     expect(candidates.get(candidatePid)?.workspace.endpoint).toBe(ws.endpoint);
     expect(alive(candidatePid)).toBe(true);
     expect(await shutdownUnownedCandidates()).toContain(candidatePid);
-    await until(() => !alive(candidatePid), 10_000, "候选收到 shutdown 后没有退出");
+    await waitForProcessGone(candidatePid, 10_000, "候选收到 shutdown 后没有退出");
     expect(shutdownEndpoints.has(ws.endpoint)).toBe(true);
     expect(await shutdownUnownedCandidates()).toEqual([]);
   }, TEST_LIMIT_MS);
