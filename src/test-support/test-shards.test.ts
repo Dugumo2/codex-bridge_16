@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { processCreated, snapshotProcesses, updateDescendants } from "./process-tree";
+import { checkSnapshot, processCreated, snapshotProcesses, updateDescendants } from "./process-tree";
 import { collectTests, groupTests, main, parseArgs, parseJunit } from "./test-shards";
 
 const REPO = resolve(import.meta.dir, "../..");
@@ -136,6 +136,8 @@ describe("测试分片：JUnit 判定", () => {
       ["CDATA 未结束", XML.replace("]]>", "")],
       ["根后还有内容", `${XML}<testsuites tests="0" failures="0" skipped="0"></testsuites>`],
       ["根后有文本", `${XML} 垃圾`],
+      ["结束标签带属性", XML.replace("</testsuite></testsuite>", '</testsuite broken="1"></testsuite>')],
+      ["结束标签自闭合", XML.replace("</testsuite></testsuite>", "</testsuite/></testsuite>")],
       ["空文件", ""],
     ];
     expect(() => parseJunit(XML)).not.toThrow();
@@ -163,23 +165,44 @@ describe("测试分片：JUnit 判定", () => {
 });
 
 describe("测试分片：进程树跟踪", () => {
-  test("孙进程按快照顺序无关地纳入；父进程退出后孙进程仍跟踪；PID 复用不误纳", () => {
-    const createdAt = new Map<number, bigint>([[10, 100n], [20, 110n], [30, 120n], [40, 50n], [50, 130n]]);
-    const createdOf = (pid: number) => createdAt.get(pid);
+  test("孙进程按快照顺序无关地纳入；PID 复用留下的旧父 PID 不误纳", () => {
+    const createdAt = new Map<number, bigint>([[10, 100n], [20, 110n], [30, 120n], [40, 50n]]);
     const tracked = new Map<number, { created: bigint; name: string }>([[10, { created: 100n, name: "bun.exe" }]]);
     // 孙（30）排在子（20）前面；40 的父 PID 恰好是 10，但比 10 更早创建，只能是 PID 复用留下的旧记录。
     updateDescendants(tracked, [
       { pid: 30, parent: 20, name: "leaf.exe" }, { pid: 20, parent: 10, name: "mid.exe" },
       { pid: 10, parent: 1, name: "bun.exe" }, { pid: 40, parent: 10, name: "old.exe" }, { pid: 99, parent: 1, name: "other.exe" },
-    ], createdOf);
+    ], (pid) => createdAt.get(pid));
     expect([...tracked.keys()].sort((a, b) => a - b)).toEqual([10, 20, 30]);
-    // 10、20 都退出后 30 仍在跟踪；父进程已退出的新进程不会再被纳入（20 不在了）。
-    updateDescendants(tracked, [{ pid: 30, parent: 20, name: "leaf.exe" }, { pid: 50, parent: 20, name: "new.exe" }], createdOf);
-    expect([...tracked.keys()]).toEqual([30]);
-    // 同一 PID 换了进程（创建时间变了）视为原进程已退出。
-    createdAt.set(30, 999n);
-    updateDescendants(tracked, [{ pid: 30, parent: 1, name: "reused.exe" }], createdOf);
+  });
+
+  test("已跟踪的父进程在两次采样之间退出：它新起的子进程仍纳入，比它早的不纳入，随后父进程才移除", () => {
+    const createdAt = new Map<number, bigint>([[60, 130n], [70, 50n]]);
+    const tracked = new Map<number, { created: bigint; name: string }>([[10, { created: 100n, name: "bun.exe" }]]);
+    updateDescendants(tracked, [{ pid: 60, parent: 10, name: "leaf.exe" }, { pid: 70, parent: 10, name: "old.exe" }], (pid) => createdAt.get(pid));
+    expect([...tracked.keys()]).toEqual([60]);
+  });
+
+  test("同一 PID 换了进程视为原进程已退出，新进程的子进程不算后代", () => {
+    const createdAt = new Map<number, bigint>([[10, 999n], [80, 1000n]]);
+    const tracked = new Map<number, { created: bigint; name: string }>([[10, { created: 100n, name: "bun.exe" }]]);
+    updateDescendants(tracked, [{ pid: 10, parent: 1, name: "reused.exe" }, { pid: 80, parent: 10, name: "child.exe" }], (pid) => createdAt.get(pid));
     expect(tracked.size).toBe(0);
+  });
+
+  test("还在快照里但查询失败的进程继续跟踪，不当成已退出；真正消失后才移除", () => {
+    const tracked = new Map<number, { created: bigint; name: string }>([[30, { created: 120n, name: "leaf.exe" }]]);
+    updateDescendants(tracked, [{ pid: 30, parent: 1, name: "leaf.exe" }], () => undefined);
+    expect([...tracked.keys()]).toEqual([30]);
+    updateDescendants(tracked, [], () => undefined);
+    expect(tracked.size).toBe(0);
+  });
+
+  test("快照里没有本进程说明枚举不完整，报错而不是当成进程都退出了", () => {
+    const entries = [{ pid: 5, parent: 1, name: "a.exe" }];
+    expect(checkSnapshot(entries, 5)).toEqual(entries);
+    expect(() => checkSnapshot(entries, 6)).toThrow("不完整");
+    expect(() => checkSnapshot([], 6)).toThrow("不完整");
   });
 
   test("真实快照能看到本进程及其父进程", () => {
@@ -215,7 +238,7 @@ describe("测试分片：主流程", () => {
     const pidFile = join(root, "leaf.pid");
     writeFiles(root, {
       "leaf.js": "setTimeout(() => {}, 30000);\n",
-      "mid.js": `const { spawn } = require("node:child_process"); const leaf = spawn(process.execPath, [${JSON.stringify(join(root, "leaf.js"))}], { detached: true, stdio: "ignore", windowsHide: true }); leaf.unref(); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(leaf.pid)); setTimeout(() => {}, 2500);\n`,
+      "mid.js": `const { spawn } = require("node:child_process"); const leaf = spawn(process.execPath, [${JSON.stringify(join(root, "leaf.js"))}], { detached: true, stdio: "ignore", windowsHide: true }); leaf.unref(); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(leaf.pid)); setTimeout(() => {}, 4000);\n`,
       "left.test.ts": `import { test } from "bun:test"; test("留下孙进程", async () => { const p = Bun.spawn([process.execPath, ${JSON.stringify(join(root, "mid.js"))}], { stdio: ["ignore", "ignore", "ignore"], windowsHide: true }); await p.exited; }, 20000);\n`,
     });
     const { code, summary } = await runMain(root, "--leftover-grace-ms", "500");
@@ -226,6 +249,58 @@ describe("测试分片：主流程", () => {
     expect(isAlive(leaf)).toBe(true);
     expect(code).toBe(0);
     expect(summary.leftovers.map((item: { pid: number }) => item.pid)).toEqual([leaf]);
+  }, 60_000);
+
+  test("分片起了子进程就立刻退出，两次采样之间来不及看到父子同在：子进程仍要报告", async () => {
+    const root = tempDir("cxb-shards-fast-");
+    const pidFile = join(root, "leaf.pid");
+    writeFiles(root, {
+      "leaf.js": "setTimeout(() => {}, 30000);\n",
+      "fast.test.ts": `import { test } from "bun:test"; import { spawn } from "node:child_process"; import { writeFileSync } from "node:fs"; test("起了就走", () => { const leaf = spawn(process.execPath, [${JSON.stringify(join(root, "leaf.js"))}], { detached: true, stdio: "ignore", windowsHide: true }); leaf.unref(); writeFileSync(${JSON.stringify(pidFile)}, String(leaf.pid)); });\n`,
+    });
+    const { code, summary } = await runMain(root, "--leftover-grace-ms", "500");
+    expect(existsSync(pidFile)).toBe(true);
+    const leaf = Number(readFileSync(pidFile, "utf8"));
+    sleepers.push(leaf);
+    expect(isAlive(leaf)).toBe(true);
+    expect(code).toBe(0);
+    expect(summary.leftovers.map((item: { pid: number }) => item.pid)).toEqual([leaf]);
+  }, 60_000);
+
+  test("进程快照失败：明确提示无法检查，summary 里是 null 而不是残留 0，不影响退出码", async () => {
+    const root = tempDir("cxb-shards-nowatch-");
+    writeFiles(root, { "ok.test.ts": PASSING });
+    const logDir = tempDir("cxb-shards-log-");
+    const warn = spyOn(console, "warn");
+    try {
+      const code = await main([root, "--log-dir", logDir, "--timings-file", join(logDir, "timings.json"), "--min-memory-mb", "1"], {
+        writeManifest: (path, text) => writeFileSync(path, text),
+        createWatcher: () => ({ tracked: new Map(), addRoot() {}, sample() { throw new Error("快照失败"); } }),
+      });
+      expect(code).toBe(0);
+      const runDir = readdirSync(logDir, { withFileTypes: true }).find(entry => entry.isDirectory())!;
+      expect(JSON.parse(readFileSync(join(logDir, runDir.name, "summary.json"), "utf8")).leftovers).toBeNull();
+      expect(warn.mock.calls.some(call => String(call[0]).includes("无法检查残留进程"))).toBe(true);
+    } finally { warn.mockRestore(); }
+  }, 60_000);
+
+  test("写清单失败：不抛出、不挂住，定时器和信号监听都已清理，退出 1", async () => {
+    const root = tempDir("cxb-shards-manifest-");
+    writeFiles(root, { "ok.test.ts": PASSING });
+    const logDir = tempDir("cxb-shards-log-");
+    const intervals = spyOn(globalThis, "clearInterval");
+    const listeners = [process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")];
+    try {
+      const code = await main([root, "--log-dir", logDir, "--timings-file", join(logDir, "timings.json")], {
+        writeManifest: () => { throw new Error("磁盘已满"); },
+        createWatcher: () => ({ tracked: new Map(), addRoot() {}, sample() {} }),
+      });
+      expect(code).toBe(1);
+      expect(intervals).toHaveBeenCalled();
+    } finally {
+      intervals.mockRestore();
+      expect([process.listenerCount("SIGINT"), process.listenerCount("SIGTERM")]).toEqual(listeners);
+    }
   }, 60_000);
 
   test("失败用例和加载失败都让整体退出 1", async () => {
@@ -240,21 +315,38 @@ describe("测试分片：主流程", () => {
     expect(load.code).toBe(1);
   }, 60_000);
 
-  test("总期限到达：退出 124，进程树已结束", async () => {
+  test("总期限到达：退出 124，每份分片和它起的子进程都已结束", async () => {
     const root = tempDir("cxb-shards-deadline-");
-    const pidFile = join(root, "bun.pid");
-    writeFiles(root, { "slow.test.ts": `import { test } from "bun:test"; import { writeFileSync } from "node:fs"; test("睡", async () => { writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); await Bun.sleep(60000); }, 90000);\n` });
-    const { code, summary } = await runMain(root, "--deadline-ms", "2500");
+    const leafScript = JSON.stringify(join(root, "leaf.js"));
+    // 子进程必须 detached：普通子进程会随父进程一起退出，测不出 taskkill /T 是否结束了整棵树。
+    const slow = (name: string) => `import { test } from "bun:test"; import { spawn } from "node:child_process"; import { writeFileSync } from "node:fs"; test("睡", async () => { const leaf = spawn(process.execPath, [${leafScript}], { detached: true, stdio: "ignore", windowsHide: true }); leaf.unref(); writeFileSync(${JSON.stringify(join(root, `${name}.pids`))}, process.pid + "," + leaf.pid); await Bun.sleep(60000); }, 90000);\n`;
+    writeFiles(root, { "leaf.js": "setTimeout(() => {}, 60000);\n", "a.test.ts": slow("a"), "b.test.ts": slow("b") });
+    const { code, summary } = await runMain(root, "--shards", "2", "--deadline-ms", "8000", "--leftover-grace-ms", "3000");
     expect(code).toBe(124);
     expect(summary.interrupted).toBe(124);
-    expect(existsSync(pidFile)).toBe(true);
-    expect(isAlive(Number(readFileSync(pidFile, "utf8")))).toBe(false);
+    // 前置条件：两份分片都起了子进程才到期，否则证明不了「整棵树」。
+    const pids = ["a", "b"].flatMap(name => readFileSync(join(root, `${name}.pids`), "utf8").split(",").map(Number));
+    expect(pids).toHaveLength(4);
+    sleepers.push(...pids);
+    expect(pids.filter(isAlive)).toEqual([]);
+    expect(summary.leftovers).toEqual([]);
   }, 60_000);
 
-  test("刷新耗时：每文件单独量墙钟（含钩子），限制同时份数，清理已删文件的记录", async () => {
+  test("刷新耗时：每文件单独量墙钟（含钩子），同时运行正好 2 份，清理已删文件的记录", async () => {
     const root = tempDir("cxb-shards-timing-");
-    const hooked = 'import { beforeAll, test } from "bun:test"; beforeAll(() => Bun.sleep(1200)); test("断言", () => {});\n';
-    writeFiles(root, { "a.test.ts": hooked, "b.test.ts": hooked, "c.test.ts": hooked });
+    const spans = join(root, "spans");
+    mkdirSync(spans);
+    // 屏障：至少两个文件都开始后才继续，串行实现会在这里超时失败；钩子再睡 1.2 秒，并发超过 2 时区间必然重叠。
+    const hooked = (name: string) => `import { beforeAll, test } from "bun:test"; import { readdirSync, writeFileSync } from "node:fs"; import { join } from "node:path";
+const dir = ${JSON.stringify(spans)};
+beforeAll(async () => {
+  writeFileSync(join(dir, "${name}.start"), String(Date.now()));
+  const until = Date.now() + 30000;
+  while (readdirSync(dir).filter(file => file.endsWith(".start")).length < 2) { if (Date.now() > until) throw new Error("同时运行的文件不足 2 个"); await Bun.sleep(20); }
+  await Bun.sleep(1200);
+}, 60000);
+test("断言", () => { writeFileSync(join(dir, "${name}.end"), String(Date.now())); });\n`;
+    writeFiles(root, { "a.test.ts": hooked("a"), "b.test.ts": hooked("b"), "c.test.ts": hooked("c") });
     const file = join(root, "timings.json");
     const gone = "src/cxb/已删除的文件.test.ts";
     writeFileSync(file, JSON.stringify({ [gone]: 99 }));
@@ -267,9 +359,12 @@ describe("测试分片：主流程", () => {
     expect(values).toHaveLength(3);
     // beforeAll 的 1.2 秒要算进去；只统计用例耗时的话这里接近 0。
     for (const seconds of values) expect(seconds).toBeGreaterThanOrEqual(1.1);
-    // 3 个文件、同时 2 份，至少排成两批。
-    expect(summary.seconds).toBeGreaterThanOrEqual(2.2);
-  }, 60_000);
+    const read = (name: string) => Number(readFileSync(join(spans, name), "utf8"));
+    const events = ["a", "b", "c"].flatMap(name => [{ at: read(`${name}.start`), delta: 1 }, { at: read(`${name}.end`), delta: -1 }]).sort((x, y) => x.at - y.at || x.delta - y.delta);
+    let running = 0, peak = 0;
+    for (const event of events) { running += event.delta; peak = Math.max(peak, running); }
+    expect(peak).toBe(2);
+  }, 90_000);
 
   test("刷新耗时被期限打断：不再启动后面的文件，也不覆盖原记录", async () => {
     const root = tempDir("cxb-shards-timing-stop-");

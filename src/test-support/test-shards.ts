@@ -121,6 +121,7 @@ export function parseJunit(xml: string): Report {
     position = tag.lastIndex;
     const [, closing, name, text, selfClosing] = match;
     if (closing) {
+      if (text || selfClosing) throw incomplete(`结束标签 ${name} 不合法`);
       if (stack.pop() !== name) throw incomplete(`结束标签 ${name} 没有配对`);
       if (name === "testcase") finishCase();
       continue;
@@ -180,7 +181,14 @@ async function stopTree(run: Running): Promise<void> {
   await bounded(run.done, 5000, "进程树退出确认");
 }
 
-export async function main(args = process.argv.slice(2)): Promise<number> {
+/** 只替换真机上难以稳定触发失败的两处：写清单、进程快照。 */
+export interface MainDependencies {
+  writeManifest: (path: string, text: string) => void;
+  createWatcher: () => Pick<DescendantWatcher, "tracked" | "addRoot" | "sample">;
+}
+const defaultDependencies: MainDependencies = { writeManifest: (path, text) => writeFileSync(path, text), createWatcher: () => new DescendantWatcher() };
+
+export async function main(args = process.argv.slice(2), dependencies: MainDependencies = defaultDependencies): Promise<number> {
   const options = parseArgs(args);
   if (options.help) {
     console.log("用法：bun run test:shards [目录，默认 src/cxb] [--shards 3] [--log-dir 日志父目录] [--deadline-ms 1800000] [--min-memory-mb 1500] [--leftover-grace-ms 15000] [--update-timings] [--timings-file 路径]\n日志父目录下每次新建唯一目录；耗时记录以仓库相对路径保存，单位为秒。分片数超过文件数时只启动非空分片。\n--update-timings 让每个文件单独一个进程、最多同时 --shards 个，量到的是含钩子和加载的实际用时；全部通过才写回，并清掉已删文件的记录。\n分片结束后等待 --leftover-grace-ms，还活着的后代进程只报告，不结束，也不影响退出码。");
@@ -214,7 +222,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   process.on("SIGINT", onInt); process.on("SIGTERM", onTerm);
   const timer = setTimeout(() => { void cancel(124, `超过总期限 ${options.deadlineMs} 毫秒`); }, options.deadlineMs);
   console.log(`收集 ${files.length} 个文件，共 ${groups.length} 份，同时最多 ${concurrency} 份；日志：${logDir}`);
-  const watcher = new DescendantWatcher();
+  const watcher = dependencies.createWatcher();
   let watchError: string | undefined;
   const sample = (action: () => void = () => watcher.sample()) => {
     if (watchError) return;
@@ -222,8 +230,6 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   };
   const sampler = setInterval(sample, SAMPLE_INTERVAL_MS);
   const planFile = (index: number, extension: string) => join(logDir, `shard-${index + 1}.${extension}`);
-  writeFileSync(join(logDir, "manifest.json"), JSON.stringify({ startedAt: new Date(started).toISOString(), freeMb, deadlineMs: options.deadlineMs, concurrency,
-    shards: groups.map((group, index) => ({ index: index + 1, files: group.files.map(keyOf), log: planFile(index, "log"), xml: planFile(index, "xml") })) }, null, 2) + "\n");
   const start = (i: number): Running => {
     const group = groups[i], log = planFile(i, "log"), xml = planFile(i, "xml");
     const fd = openSync(log, "w");
@@ -246,6 +252,9 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     return run;
   };
   try {
+    // 放在 try 里：写失败时定时器和信号监听也要清理，否则报错后进程退不出来。
+    dependencies.writeManifest(join(logDir, "manifest.json"), JSON.stringify({ startedAt: new Date(started).toISOString(), freeMb, deadlineMs: options.deadlineMs, concurrency,
+      shards: groups.map((group, index) => ({ index: index + 1, files: group.files.map(keyOf), log: planFile(index, "log"), xml: planFile(index, "xml") })) }, null, 2) + "\n");
     let next = 0;
     const worker = async () => { while (next < groups.length && !cleanup) await start(next++).done; };
     await Promise.race([Promise.all(Array.from({ length: Math.min(concurrency, groups.length) }, worker)), cancellation]);

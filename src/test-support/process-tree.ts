@@ -9,13 +9,17 @@ export interface ProcessEntry { pid: number; parent: number; name: string }
 export interface TrackedProcess { created: bigint; name: string }
 
 /**
- * 用一次快照更新跟踪表：退出的移除；父进程在表内的新进程纳入。
- * 父 PID 不会随父进程退出而更新，比父进程还早创建的只能是 PID 复用的巧合，不算后代。
+ * 用一次快照更新跟踪表：父进程在表内的新进程纳入，退出的移除。
+ * 父 PID 不会随父进程退出而更新，所以要先纳入、后移除：父进程在两次采样之间退出时，它新起的子进程还认得出来。
+ * 比父进程还早创建的只能是 PID 复用的巧合，不算后代。
  */
 export function updateDescendants(tracked: Map<number, TrackedProcess>, snapshot: ProcessEntry[], createdOf: (pid: number) => bigint | undefined): void {
   const present = new Set(snapshot.map(entry => entry.pid));
+  // 同一 PID 换了进程：原进程已退出，这个 PID 不能再当父进程用。查询失败时无法确认，继续跟踪，不当成已退出。
   for (const [pid, info] of tracked) {
-    if (!present.has(pid) || createdOf(pid) !== info.created) tracked.delete(pid);
+    if (!present.has(pid)) continue;
+    const created = createdOf(pid);
+    if (created !== undefined && created !== info.created) tracked.delete(pid);
   }
   // 快照顺序与父子关系无关，纳入到不再增长为止。
   for (let grew = true; grew;) {
@@ -30,6 +34,15 @@ export function updateDescendants(tracked: Map<number, TrackedProcess>, snapshot
       grew = true;
     }
   }
+  for (const pid of tracked.keys()) {
+    if (!present.has(pid)) tracked.delete(pid);
+  }
+}
+
+/** 枚举中途失败和枚举结束都表现为 Process32 返回 0；快照里连本进程都没有，就不能当成别的进程都退出了。 */
+export function checkSnapshot(entries: ProcessEntry[], selfPid: number): ProcessEntry[] {
+  if (!entries.some(entry => entry.pid === selfPid)) throw new Error("进程快照不完整：没有本进程");
+  return entries;
 }
 
 const TH32CS_SNAPPROCESS = 2;
@@ -70,7 +83,7 @@ export function snapshotProcesses(): ProcessEntry[] {
       }
       entries.push({ pid: view.getUint32(PID_OFFSET, true), parent: view.getUint32(PARENT_OFFSET, true), name });
     }
-    return entries;
+    return checkSnapshot(entries, process.pid);
   } finally { k.CloseHandle(snapshot); }
 }
 

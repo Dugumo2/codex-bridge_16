@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createStatusHistory, type StatusHistoryTurn } from "../test-support/status-history";
 import { readThreadResults } from "./thread-result-reader";
 import type { TreeNode } from "./tree-contracts";
@@ -229,28 +229,69 @@ describe("补读限额、期限与资源", () => {
     gate.resolve({ data: [], nextCursor: null });
   });
 
-  test("计时器比总期限早触发时，排队子线程不再发注定超时的请求", async () => {
+  /**
+   * 受控时钟：performance.now 与定时器都由用例推进，结果不受机器负载影响。
+   * earlyMs 让长定时器提前触发，模拟 Windows 上实测到的早响（最多约 15 毫秒）。
+   */
+  function controlledClock(earlyMs: number) {
+    let now = 1000, nextId = 1;
+    const timers = new Map<number, { at: number; callback: () => void }>();
+    const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+    const nowSpy = spyOn(performance, "now").mockImplementation(() => now);
+    globalThis.setTimeout = ((callback: () => void, delay = 0) => {
+      const id = nextId++;
+      timers.set(id, { at: now + (delay > earlyMs ? delay - earlyMs : delay), callback });
+      return id;
+    }) as unknown as typeof setTimeout;
+    globalThis.clearTimeout = ((id: number) => { timers.delete(id); }) as unknown as typeof clearTimeout;
+    return {
+      now: () => now,
+      schedule(at: number, callback: () => void) { timers.set(nextId++, { at, callback }); },
+      /** 每步先放行全部异步回调，再触发最早的定时器，直到 work 结束。 */
+      async run<T>(work: Promise<T>): Promise<T> {
+        let settled = false;
+        void work.finally(() => { settled = true; }).catch(() => {});
+        for (let step = 0; step < 1000; step++) {
+          await new Promise<void>((done) => setImmediate(done));
+          if (settled) return work;
+          const [id, timer] = [...timers.entries()].sort((a, b) => a[1].at - b[1].at)[0] ?? [];
+          if (id === undefined || !timer) throw new Error("定时器已耗尽，补读仍未结束");
+          timers.delete(id);
+          now = Math.max(now, timer.at);
+          timer.callback();
+        }
+        throw new Error("受控时钟推进次数超限");
+      },
+      restore() { nowSpy.mockRestore(); globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; },
+    };
+  }
+
+  test("计时器早响时等到真正到点才算到期，排队子线程不再发注定超时的请求", async () => {
     const fake = new FakeRpc();
-    const gate = deferred<unknown>();
-    fake.handle = () => gate.promise;
-    // Windows 上实测计时器会比 performance.now 算出的时刻早 1～15 毫秒；固定早 30 毫秒，让偶发变成必现。
-    const realSetTimeout = globalThis.setTimeout;
-    let shortened = 0;
-    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
-      if (typeof delay === "number" && delay > 30 && delay <= 2000) { shortened++; delay -= 30; }
-      return realSetTimeout(callback, delay, ...args);
-    }) as typeof setTimeout;
-    let results: Awaited<ReturnType<typeof read>>;
+    fake.handle = () => new Promise(() => {});
+    const clock = controlledClock(30);
     try {
-      results = await read(fake, Array.from({ length: 16 }, (_, i) => node(`child-${i}`)), performance.now() + 60_000);
-    } finally {
-      globalThis.setTimeout = realSetTimeout;
-      gate.resolve({ data: [], nextCursor: null });
-    }
-    // 前置条件：三轮请求的计时器都确实被提前了，第三轮结束时总期限还没到。
-    expect(shortened).toBeGreaterThanOrEqual(12);
-    expect(results.size).toBe(16);
-    expect([...results.values()].every((r) => r.availability === "unavailable")).toBe(true);
-    expect(fake.calls).toHaveLength(12);
+      const started = clock.now();
+      const results = await clock.run(readThreadResults(fake.rpc, Array.from({ length: 16 }, (_, i) => node(`child-${i}`)), { deadline: started + 60_000 }));
+      expect(results.size).toBe(16);
+      expect([...results.values()].every((r) => r.availability === "unavailable")).toBe(true);
+      // 前两轮单次超时各早 30 毫秒，第三轮窗口计时器在 4970 毫秒早响：不能提前放弃，也不能多发一轮。
+      expect(clock.now() - started).toBe(5000);
+      expect(fake.calls).toHaveLength(12);
+    } finally { clock.restore(); }
+  });
+
+  test("计时器早响之后、真正到点之前回来的结果仍然算数", async () => {
+    const fake = fixture([turn("bound", "最后时刻的结果")]);
+    const answer = fake.handle;
+    const clock = controlledClock(30);
+    try {
+      const started = clock.now();
+      fake.handle = (method, params) => method === "thread/turns/list"
+        ? new Promise((done) => clock.schedule(started + 990, () => done(answer(method, params))))
+        : answer(method, params);
+      const results = await clock.run(readThreadResults(fake.rpc, [node()], { deadline: started + 1000 }));
+      expect(results.get("child")).toMatchObject({ availability: "available", output: "最后时刻的结果" });
+    } finally { clock.restore(); }
   });
 });
