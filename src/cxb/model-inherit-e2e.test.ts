@@ -3,6 +3,7 @@
  * 先完整执行六步再分别断言，使骨架上的预期失败不会遮住后续步骤。
  * 只观察请求、输出与落盘记录；不调用待测模型解析函数，也不伪造 broker 账本。
  */
+import { tmpdir } from "node:os";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
@@ -167,7 +168,7 @@ describe("模型沿用 Windows 黑盒（真 broker）", () => {
   }
 
   beforeAll(async () => {
-    sandbox = mkdtempSync(join(process.env.TEMP!, "cxb-model-inherit-"));
+    sandbox = mkdtempSync(join(tmpdir(), "cxb-model-inherit-"));
     for (const sub of ["profile", "cxb-home", "codex-home", "mock", "ws"]) mkdirSync(join(sandbox, sub));
     writeMockCodexScript(join(sandbox, "mock"), readFileSync(MOCK, "utf8"));
     observer = setInterval(() => { try { registerProcesses(); } catch (error) { observerErrors.push(error); } }, 50);

@@ -16,7 +16,7 @@ const args = process.argv.slice(2);
 const arg = (name: string) => args[args.indexOf(name) + 1];
 const binary = args.includes("--app-server") ? arg("--app-server") : "codex-app-server.exe";
 const codexCli = args.includes("--codex-cli");
-const reportFile = args.includes("--report") ? arg("--report") : (process.env.TEMP! + "\\sa1b-e-real-protocol.json");
+const reportFile = args.includes("--report") ? arg("--report") : join(tmpdir(), "sa1b-e-real-protocol.json");
 const results: any[] = [];
 
 async function run(name: string, options: ScriptedOptions, resume?: "cold" | "loaded") {

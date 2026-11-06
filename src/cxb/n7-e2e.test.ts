@@ -2,6 +2,7 @@
  * N7-A 辛路：经真实 broker、模拟 Codex 和 cxb CLI 真实入口的生命周期与日志端到端验收。
  * 本文件只写测试和测试夹具；所有等待都有期限，所有子进程按句柄登记并在收尾回收。
  */
+import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { NO_RESPONSE } from "../rpc";
 import { until as untilAsync } from "./test-fixtures/run-harness";
@@ -29,7 +30,7 @@ let innerReview = false;
 beforeEach(() => {
   legacyReview = false;
   innerReview = false;
-  sandbox = mkdtempSync(join(process.env.TEMP ?? process.env.TEMP!, "cxb-n7e2e-"));
+  sandbox = mkdtempSync(join(tmpdir(), "cxb-n7e2e-"));
   gateDir = join(sandbox, "gates");
   deleteModeFile = join(gateDir, "delete-mode");
   processes = new Processes();

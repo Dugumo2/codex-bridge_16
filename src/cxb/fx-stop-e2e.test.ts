@@ -1,4 +1,5 @@
 /** Windows 真 broker + CLI 入口：后台命令清理与显式放弃树清理。 */
+import { tmpdir } from "node:os";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
@@ -24,7 +25,7 @@ let brokerClosed: Promise<void> | undefined;
 
 describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
   beforeEach(() => {
-    dir = mkdtempSync((process.env.TEMP! + "/cxb-fx-stop-"));
+    dir = mkdtempSync(join(tmpdir(), "cxb-fx-stop-"));
     processes = new Processes();
     connection = undefined;
     broker = undefined;
@@ -35,7 +36,7 @@ describe.skipIf(!windows)("fx-stop Windows 后台命令黑盒", () => {
       !/^(MOCK_.*|CXB_HOME|CODEX_HOME|HOME|USERPROFILE|CXB_SERVER.*)$/i.test(key)));
     Object.assign(env, { CXB_HOME: join(dir, "cxb-home"), CODEX_HOME: join(dir, "codex-home"),
       HOME: join(dir, "profile"), USERPROFILE: join(dir, "profile"), CXB_SERVER: "private",
-      CXB_BROKER_BIN: harness!.BROKER_BIN, TEMP: process.env.TEMP!, TMP: process.env.TEMP!,
+      CXB_BROKER_BIN: harness!.BROKER_BIN, TEMP: tmpdir(), TMP: tmpdir(),
       MOCK_SUBAGENTS: JSON.stringify({ enabled: true }), MOCK_STATUS_READ: JSON.stringify({ historyMode: "paged" }),
       MOCK_E2E_SCENARIO: "hold", MOCK_E2E_LOG: join(dir, "mock.log") });
   });

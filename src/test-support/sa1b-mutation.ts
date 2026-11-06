@@ -8,7 +8,7 @@ const support = join(base, "src", "test-support"), tests = join(base, "src", "cx
 mkdirSync(support, { recursive: true }); mkdirSync(tests, { recursive: true });
 for (const file of ["sa1b-mock.ts", "sa1b-scripted-model.ts", "background-terminals-mock.ts"]) copyFileSync(join(import.meta.dir, file), join(support, file));
 for (const file of ["sa1b-fixture.test.ts", "sa1b-scripted-model.test.ts"]) copyFileSync(join(import.meta.dir, "../cxb", file), join(tests, file));
-const output = process.argv[2] ?? (process.env.TEMP! + "\\sa1b-e-mutation.json");
+const output = process.argv[2] ?? join(tmpdir(), "sa1b-e-mutation.json");
 const mutations = [
   { name: "历史证据包补齐本次缺项", file: "sa1b-scripted-model.ts", from: "findLast(text => text.includes(EVIDENCE_HEAD))", to: "find(text => text.includes(EVIDENCE_HEAD))", test: "历史证据包有标记、本次缺" },
   ...["提示头后只有通知含标记", "提示头后只有缺失说明含标记"].map(test => ({ name: test, file: "sa1b-scripted-model.ts", from: "if (!current) return false;", to: "if (!current) return false; return current.includes(marker);", test })),

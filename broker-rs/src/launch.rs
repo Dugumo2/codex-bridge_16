@@ -11,7 +11,7 @@
 //!   `--launched-breakaway` 传给 serve，只作检测依据，存活判定由 serve 自查（[`crate::job`]）。
 //! - 成功时 stdout 打一行 `{"pid":<候选 serve 的进程号>,"breakaway":<bool>}`。这个进程号只是刚创建的
 //!   候选：它可能抢不到管道名而退出 0，也可能握手失败退出 1；调用方仍要连管道判断就绪（0.1 节）。
-//! - 转义与创建方式沿用 S3 环境探测 内部探针（`lib.rs` 的 `command_line`、
+//! - 转义与创建方式沿用 S3 环境探测（`lib.rs` 的 `command_line`、
 //!   `job_breakaway.rs` 的 `launch`），那里已在本机实测过。
 
 use std::ffi::OsStr;

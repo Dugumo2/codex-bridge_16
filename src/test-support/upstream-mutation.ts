@@ -1,4 +1,5 @@
 /** 可回滚的本路关键变异检查；每次失败后还原并重跑对应真实／安全用例。 */
+import { tmpdir } from "node:os";
 import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -6,7 +7,7 @@ import { TRACE_ROOT, isolatedEnvironment, startManaged, stopManaged, within } fr
 
 if (import.meta.main) {
   const worktree = join(import.meta.dir, "../..");
-  const env = isolatedEnvironment(join(process.env.TEMP!, "ue-mutation-only"));
+  const env = isolatedEnvironment(join(tmpdir(), "ue-mutation-only"));
   env.CXB_UPSTREAM_REAL = "1";
   const cases = [
     { name: "凭证白名单误放行", file: "upstream-isolation.ts", before: 'new Set(["PATH",', after: 'new Set(["OPENAI_API_KEY", "PATH",',

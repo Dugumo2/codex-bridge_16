@@ -1,4 +1,5 @@
 // 只供乙路 M6 用例使用；句柄立即登记，所有等待有期限，清理失败必须报错。
+import { tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, rmSync, watch, type FSWatcher } from "node:fs";
 import net from "node:net";
@@ -153,7 +154,7 @@ export class SrHost {
     for (const { exited } of this.children) await attempt(() => bounded(exited, 1000, "确认子进程退出"));
     await attempt(async () => {
       const dir = resolve(this.dir);
-      const root = resolve(process.env.TEMP ?? process.env.TMP ?? process.env.TEMP!);
+      const root = resolve(process.env.TEMP ?? process.env.TMP ?? tmpdir());
       if (!dir.startsWith(root + sep)) throw new Error("拒绝删除测试临时根目录以外的路径");
       for (let i = 0; i < 40 && existsSync(dir); i++) {
         try { rmSync(dir, { recursive: true, force: true }); } catch (error) { if (i === 39) throw error; await Bun.sleep(50); }

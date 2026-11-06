@@ -1,4 +1,5 @@
 // 戊路测试专用：截止等待、子进程登记、严格清理与环境隔离。
+import { tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { resolve, sep } from "node:path";
@@ -140,7 +141,7 @@ export class Processes {
 
 export async function removeTemp(path: string): Promise<void> {
   const target = resolve(path);
-  const allowed = resolve(process.env.TEMP!) + sep;
+  const allowed = resolve(tmpdir()) + sep;
   if (!target.toLowerCase().startsWith(allowed.toLowerCase())) throw new Error("拒绝删除测试临时目录以外的路径");
   const end = Date.now() + 5000;
   for (;;) {

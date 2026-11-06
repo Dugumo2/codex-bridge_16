@@ -16,7 +16,7 @@ Requires Windows, PowerShell 7, Bun, Rust (cargo) and the Codex CLI.
 
 ```powershell
 pwsh -File install.ps1                 # installs to %USERPROFILE%\.cxb
-pwsh -File install.ps1 -Prefix D:\cxb  # or a directory of your choice
+pwsh -File install.ps1 -Prefix D:\tools\cxb  # or a directory of your choice
 ```
 
 The installer does not modify PATH, does not register the skill unless `-SkillDir` is given. Run `cxb doctor` afterwards.

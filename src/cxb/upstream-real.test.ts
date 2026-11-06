@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import type { RealTrace } from "../test-support/upstream-real";
 import type { UpstreamScenario } from "../test-support/upstream-model-server";
@@ -78,7 +80,8 @@ export const REAL_CATEGORY_EXPECTATIONS = [
 suite("真实 0.160.0 上游报错（全流量本地隔离）", () => {
   test("环境采用白名单，凭证、代理和共享选择不继承", async () => {
     const { isolatedEnvironment } = await import("../test-support/upstream-isolation");
-    const env = isolatedEnvironment((process.env.TEMP! + "\\ue-white-list-test"), {
+    const root = join(tmpdir(), "ue-white-list-test");
+    const env = isolatedEnvironment(root, {
       PATH: "path", SYSTEMROOT: "system", OPENAI_API_KEY: "must-not-inherit", CODEX_AUTH_TOKEN: "must-not-inherit",
       CODEX_HOME: "must-not-inherit", CODEX_REFRESH_TOKEN_URL_OVERRIDE: "must-not-inherit", HTTP_PROXY: "must-not-inherit",
       HTTPS_PROXY: "must-not-inherit", ALL_PROXY: "must-not-inherit", NO_PROXY: "must-not-inherit",
@@ -87,7 +90,7 @@ suite("真实 0.160.0 上游报错（全流量本地隔离）", () => {
     for (const key of ["OPENAI_API_KEY", "CODEX_AUTH_TOKEN", "CODEX_REFRESH_TOKEN_URL_OVERRIDE", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "CXB_SERVER", "UNRELATED_SECRET"]) expect(env[key]).toBeUndefined();
     expect(env.NO_PROXY).toBe("*");
     expect(env.PATH).toBe("path"); expect(env.CXB_UE_FAKE_KEY).toBe("ue-local-fixed-fake-key");
-    expect(env.CODEX_HOME).toBe((process.env.TEMP! + "\\ue-white-list-test\\codex-home"));
+    expect(env.CODEX_HOME).toBe(join(root, "codex-home"));
     expect(env.CXB_SERVER).toBe("private");
   });
 

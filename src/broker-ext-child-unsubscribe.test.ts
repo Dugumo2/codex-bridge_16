@@ -8,6 +8,7 @@
  * 未启用 SA1b 的整树停止与清理结束再扫由 Rust 单测 `claim::tests::child_unsub` 覆盖。
  * broker 只支持 Windows：其他平台整组跳过（不加载夹具）。
  */
+import { tmpdir } from "node:os";
 import { describe, expect, test } from "bun:test";
 import { createSa1bMock, type RpcMessage } from "./test-support/sa1b-mock";
 
@@ -40,7 +41,7 @@ async function approvalAndFinish(s: InstanceType<NonNullable<typeof sa1b>["Sa1bH
   const reused = await s.control("reuse", { parentThreadId: root, parentTurnId: parentTurn, childThreadId: CHILD });
   const requestId = `审批-${runId}`;
   await s.control("inject", { message: { id: requestId, method: APPROVAL,
-    params: { threadId: CHILD, turnId: reused.turnId, itemId: requestId, command: "echo 子线程", cwd: process.env.TEMP! } } });
+    params: { threadId: CHILD, turnId: reused.turnId, itemId: requestId, command: "echo 子线程", cwd: tmpdir() } } });
   const forwarded = () => s.owner.messages.find((m: any) => m.method === APPROVAL && m.params?.itemId === requestId);
   await s.until(async () => !!forwarded(), 5_000, "挂回后子线程审批实际送达 owner");
   expect((forwarded() as any).params.cxbOrigin.runId).toBe(runId);

@@ -84,16 +84,12 @@ export class ProcessTracker {
 }
 
 export function makeTemp(prefix: string): string {
-  const expected = resolve(process.env.TEMP!);
-  if (resolve(tmpdir()).toLowerCase() !== expected.toLowerCase()) {
-    throw new Error("测试前必须把 TEMP、TMP 设为同一个目录。");
-  }
-  return mkdtempSync(join(expected, prefix));
+  return mkdtempSync(join(resolve(tmpdir()), prefix));
 }
 
 export async function removeTemp(path: string): Promise<void> {
   const absolute = resolve(path);
-  const allowed = resolve(process.env.TEMP!) + sep;
+  const allowed = resolve(tmpdir()) + sep;
   if (!absolute.toLowerCase().startsWith(allowed.toLowerCase())) throw new Error("拒绝清理测试临时目录以外的路径");
   const deadline = Date.now() + 5000;
   for (;;) {

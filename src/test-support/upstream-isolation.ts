@@ -1,4 +1,5 @@
 /** 真实上游测试专用隔离、期限与进程回收；不使用继承环境的 broker-harness。 */
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import type { Subprocess } from "bun";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -6,9 +7,10 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import { FAKE_KEY } from "./upstream-model-server";
 
-export const TEMP_ROOT = process.env.TEMP!;
-export const TRACE_ROOT = join((process.env.TEMP! + "\\ue-traces"), `process-${process.pid}`);
-export const CODEX_CMD = (Bun.which("codex.cmd") ?? "codex.cmd");
+export const TEMP_ROOT = resolve(tmpdir());
+export const TRACE_ROOT = join(tmpdir(), "cxb-ue-traces", `process-${process.pid}`);
+/** 真实上游测试用的 Codex 入口：可用 CXB_CODEX_CMD 指定，否则从 PATH 找。 */
+export const CODEX_CMD = process.env.CXB_CODEX_CMD ?? Bun.which("codex.cmd") ?? "codex.cmd";
 export const CLEANUP_MS = 12_000;
 
 export function isolatedEnvironment(root: string, inherited: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {

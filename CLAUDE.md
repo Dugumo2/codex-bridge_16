@@ -41,5 +41,5 @@ pwsh -File install.ps1 -Prefix <目录>    # 打包安装到并行目录试用
 - 数据根 `CXB_HOME`，默认 `%USERPROFILE%\.codex-bridge`：`config.json`（CLI 写、broker 只读 `server`）、`templates\`、`workspaces\<键>\`（broker 写的线程索引、运行记录、日志，CLI 只读）。
 - 工作区根取 git 顶层目录；工作区键是规范路径的 sha256 前 16 位，管道名 `\\.\pipe\cxb-<键>`。
 - broker 每个工作区一个，空闲 5 分钟退出；CLI 版本与 broker 不符时，在 broker 空闲时替换它。
-- 退出码见 `src/cxb/contracts.ts` 的 `EXIT`；设计文档在 内部文档（命令面规格、详细设计）。
+- 退出码见 `src/cxb/contracts.ts` 的 `EXIT`。
 - 只用 bun 运行 TypeScript，不用 npm、yarn、pnpm。

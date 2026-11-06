@@ -15,12 +15,12 @@
 .PARAMETER SkillDir
     技能根目录（例如 %USERPROFILE%\.claude\skills）。给出时把 SKILL.md 装到 <SkillDir>\cxb\SKILL.md；默认不注册。
 .PARAMETER CargoTargetDir
-    cargo 编译目录，默认在仓库内的 target-release。
+    cargo 编译目录，默认用环境变量 CARGO_TARGET_DIR，没设时用仓库里的 broker-rs\target。
 #>
 param(
     [string]$Prefix = (Join-Path $env:USERPROFILE ".cxb"),
     [string]$SkillDir = "",
-    [string]$CargoTargetDir = "target-release",
+    [string]$CargoTargetDir = "",
     [switch]$Help
 )
 
@@ -87,6 +87,9 @@ if (Test-Path -LiteralPath $broker) {
 Push-Location $RepoDir
 try {
     Invoke-Step "安装依赖" { bun install --frozen-lockfile }
+    if (-not $CargoTargetDir) {
+        $CargoTargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $RepoDir "broker-rs\target" }
+    }
     $env:CARGO_TARGET_DIR = $CargoTargetDir
     Invoke-Step "构建 cxb-broker 正式版" { cargo build --release --manifest-path (Join-Path $RepoDir "broker-rs\Cargo.toml") }
 

@@ -49,7 +49,7 @@ export class N5Harness {
     for (const key of Object.keys(process.env)) delete process.env[key];
     Object.assign(process.env, this.original);
     try {
-      const allowed = resolve(process.env.TEMP!) + sep;
+      const allowed = resolve(tmpdir()) + sep;
       if (!resolve(this.dir).toLowerCase().startsWith(allowed.toLowerCase())) throw new Error("拒绝清理指定临时根以外的目录");
       rmSync(this.dir, { recursive: true, force: true });
       if (existsSync(this.dir)) throw new Error("临时目录未清除");

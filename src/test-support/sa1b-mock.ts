@@ -1,4 +1,5 @@
 /** SA1b 独立模拟上游；只用于测试，不推断或替 broker 实现收敛。 */
+import { tmpdir } from "node:os";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createBackgroundTerminalsMock } from "./background-terminals-mock";
@@ -71,7 +72,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   };
   const ensureRollout = (id: string) => {
     const path = rolloutPath(id);
-    if (path && !existsSync(path)) writeRollout(id, "session_meta", { id, cwd: process.env.TEMP!, originator: "sa1b-mock", cli_version: "0.160.0" });
+    if (path && !existsSync(path)) writeRollout(id, "session_meta", { id, cwd: tmpdir(), originator: "sa1b-mock", cli_version: "0.160.0" });
   };
   if (options.snapshot) {
     if (options.snapshot.version !== 1 || !Number.isSafeInteger(serial) || serial < 0) throw new Error("历史快照版本或编号状态无效");
@@ -123,7 +124,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   const agentPath = (t: MockThread): string => t.parentThreadId === null ? "/root" : `/root/${agentName(t)}`;
   const meta = (t: MockThread, includeTurns = false) => ({
     id: t.id, parentThreadId: t.parentThreadId, forkedFromId: null, preview: "", ephemeral: false,
-    modelProvider: "openai", createdAt: 1, updatedAt: 1, path: rolloutPath(t.id), cwd: process.env.TEMP!, cliVersion: "0.160.0",
+    modelProvider: "openai", createdAt: 1, updatedAt: 1, path: rolloutPath(t.id), cwd: tmpdir(), cliVersion: "0.160.0",
     status: { type: !t.loaded ? "notLoaded" : t.pendingInit ? "active" : t.turns.some(x => x.status === "inProgress") ? "active" : "idle", activeFlags: [] },
     source: t.parentThreadId ? { subAgent: { thread_spawn: { parent_thread_id: t.parentThreadId,
       depth: ancestors(t).length, agent_path: t.version === "v2" ? agentPath(t) : null,
@@ -140,7 +141,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
   function start(t: MockThread, id?: string, announce = true): MockTurn {
     const turn: MockTurn = { id: id ?? `${t.id}-turn-${++serial}`, status: "inProgress", items: [], error: null };
     t.pendingInit = false; t.turns.push(turn);
-    writeRollout(t.id, "turn_context", { turn_id: turn.id, cwd: process.env.TEMP! });
+    writeRollout(t.id, "turn_context", { turn_id: turn.id, cwd: tmpdir() });
     writeRollout(t.id, "event_msg", { type: "task_started", turn_id: turn.id });
     // 排队的消息在下一轮开始时才记入，记在这一轮里。
     for (const value of queuedRawInputs.get(t.id) ?? []) writeRollout(t.id, "response_item", value);
@@ -413,7 +414,7 @@ export function createSa1bMock(send: (message: RpcMessage, connectionId?: string
           notify("thread/started", { thread: meta(t!) });
         }
         subscriptions.get(currentConnection)!.add(t!.id);
-        reply(msg.id, { thread: meta(t!), model: p.model ?? "mock-model", cwd: process.env.TEMP!, approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }); break;
+        reply(msg.id, { thread: meta(t!), model: p.model ?? "mock-model", cwd: tmpdir(), approvalPolicy: "never", sandbox: { type: "dangerFullAccess" } }); break;
       }
       case "thread/read":
         if (!t!.stored && !t!.loaded) error(msg.id, `thread not loaded: ${t!.id}`);
