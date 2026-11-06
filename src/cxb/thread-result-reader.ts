@@ -1,3 +1,4 @@
+import { RpcTimeoutError } from "../rpc";
 import type { BrokerRpc } from "./contracts";
 import { serverOutput } from "./show";
 import type { TreeNode, TreeNodeResult } from "./tree-contracts";
@@ -48,7 +49,12 @@ async function boundedRequest(rpc: BrokerRpc, method: string, params: unknown, d
       };
       timer = setTimeout(expire, Math.min(2000, remaining));
     });
-    const result = await Promise.race([rpc.request(method, params, { timeoutMs: Math.max(1, Math.ceil(Math.min(2000, remaining))) }), boundary]);
+    // 传输层的超时计时器同样会早响，它只说明「等不到回包了」，不能替本地计时器判定到期；本地计时器一定会响，不会卡住。
+    const answer = rpc.request(method, params, { timeoutMs: Math.max(1, Math.ceil(Math.min(2000, remaining))) }).catch((error: unknown) => {
+      if (error instanceof RpcTimeoutError) return new Promise<never>(() => {});
+      throw error;
+    });
+    const result = await Promise.race([answer, boundary]);
     if (signal?.aborted || performance.now() >= deadline) throw new ReadFailure("结果补读期限已到或已取消");
     return result;
   } finally {

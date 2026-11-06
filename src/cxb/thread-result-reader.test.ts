@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { RpcTimeoutError } from "../rpc";
 import { createStatusHistory, type StatusHistoryTurn } from "../test-support/status-history";
 import { readThreadResults } from "./thread-result-reader";
 import type { TreeNode } from "./tree-contracts";
@@ -278,6 +279,37 @@ describe("补读限额、期限与资源", () => {
       // 前两轮单次超时各早 30 毫秒，第三轮窗口计时器在 4970 毫秒早响：不能提前放弃，也不能多发一轮。
       expect(clock.now() - started).toBe(5000);
       expect(fake.calls).toHaveLength(12);
+    } finally { clock.restore(); }
+  });
+
+  test("传输层的超时计时器也早响时，仍等到真正到点，不多发请求，提示仍是期限已到", async () => {
+    const fake = new FakeRpc();
+    const clock = controlledClock(30);
+    try {
+      // 与真实传输一样：请求期限一到就拒绝，不等本地窗口。
+      const rpc: typeof fake.rpc = { ...fake.rpc, request: <T>(method: string, params?: unknown, options?: { timeoutMs?: number }) => new Promise<T>((_, reject) => {
+        fake.calls.push({ method, params, options });
+        setTimeout(() => reject(new RpcTimeoutError(`Request ${method} timed out`)), options?.timeoutMs);
+      }) };
+      const started = clock.now();
+      const results = await clock.run(readThreadResults(rpc, Array.from({ length: 16 }, (_, i) => node(`child-${i}`)), { deadline: started + 60_000 }));
+      expect(clock.now() - started).toBe(5000);
+      expect(fake.calls).toHaveLength(12);
+      // 第三轮的请求（第 9～12 个子线程）撞上总窗口，上层靠这句提示判断命令期限。
+      expect(results.get("child-8")?.reason).toContain("期限已到");
+      expect(results.get("child-0")?.reason).toContain("请求超时");
+    } finally { clock.restore(); }
+  });
+
+  test("传输层报的不是超时：立刻作为失败返回，不等到期限", async () => {
+    const fake = new FakeRpc();
+    fake.handle = () => { throw new Error("服务器报错"); };
+    const clock = controlledClock(30);
+    try {
+      const started = clock.now();
+      const results = await clock.run(readThreadResults(fake.rpc, [node()], { deadline: started + 60_000 }));
+      expect(clock.now()).toBe(started);
+      expect(results.get("child")?.availability).toBe("unavailable");
     } finally { clock.restore(); }
   });
 
