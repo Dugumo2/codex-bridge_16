@@ -228,4 +228,29 @@ describe("补读限额、期限与资源", () => {
     expect(fake.calls[8]!.options.timeoutMs).toBeLessThan(1500);
     gate.resolve({ data: [], nextCursor: null });
   });
+
+  test("计时器比总期限早触发时，排队子线程不再发注定超时的请求", async () => {
+    const fake = new FakeRpc();
+    const gate = deferred<unknown>();
+    fake.handle = () => gate.promise;
+    // Windows 上实测计时器会比 performance.now 算出的时刻早 1～15 毫秒；固定早 30 毫秒，让偶发变成必现。
+    const realSetTimeout = globalThis.setTimeout;
+    let shortened = 0;
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      if (typeof delay === "number" && delay > 30 && delay <= 2000) { shortened++; delay -= 30; }
+      return realSetTimeout(callback, delay, ...args);
+    }) as typeof setTimeout;
+    let results: Awaited<ReturnType<typeof read>>;
+    try {
+      results = await read(fake, Array.from({ length: 16 }, (_, i) => node(`child-${i}`)), performance.now() + 60_000);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      gate.resolve({ data: [], nextCursor: null });
+    }
+    // 前置条件：三轮请求的计时器都确实被提前了，第三轮结束时总期限还没到。
+    expect(shortened).toBeGreaterThanOrEqual(12);
+    expect(results.size).toBe(16);
+    expect([...results.values()].every((r) => r.availability === "unavailable")).toBe(true);
+    expect(fake.calls).toHaveLength(12);
+  });
 });
