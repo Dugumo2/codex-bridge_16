@@ -6,6 +6,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { BROKER_BIN, envWithPathPrefix, testSocketPath, endpointFor, writeMockCodexScript } from "./test-support/broker-harness";
+import { reapTestProcess } from "./test-support/process-identity";
 
 let dir: string;
 let children: Array<{ child: ChildProcess; exited: Promise<number | null> }>;
@@ -58,11 +59,7 @@ afterEach(async () => {
   await Promise.all(children.map(({ exited }) => clean("确认 broker 退出", () => bounded(exited, 8000, "broker 退出"))));
   await Promise.all([...pids].map((pid) => clean(`回收进程 ${pid}`, async () => {
     try { await until(() => !alive(pid), 3000, "子进程退出"); }
-    catch {
-      if (alive(pid)) process.kill(pid, "SIGKILL");
-      await until(() => !alive(pid), 5000, "强杀后确认退出");
-    }
-    expect(alive(pid)).toBe(false);
+    catch { await reapTestProcess(pid); }
   })));
   for (const watcher of watchers) await clean("关闭目录监测", () => watcher.close());
   for (const { child } of children) {

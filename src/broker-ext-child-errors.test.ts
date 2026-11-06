@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Subprocess } from "bun";
 import type { TestClient as Client } from "./test-support/broker-harness";
+import { reapTestProcess } from "./test-support/process-identity";
 
 const RUNNABLE = process.platform === "win32";
 const harness = RUNNABLE ? await import("./test-support/broker-harness") : null;
@@ -38,13 +39,6 @@ beforeEach(() => {
   mkdirSync(home);
 });
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    throw error;
-  }
-}
-
 function registerMockPids(): void {
   const path = join(tempDir, "mock-pids.txt");
   if (existsSync(path)) {
@@ -62,8 +56,7 @@ afterEach(async () => {
   spawnedProcesses.length = 0;
   for (const pid of mockPids) {
     try {
-      if (alive(pid)) process.kill(pid, "SIGKILL");
-      await harness!.waitFor(() => !alive(pid), 5_000);
+      await reapTestProcess(pid);
     } catch (error) { failures.push(error); }
   }
   mockPids.clear();

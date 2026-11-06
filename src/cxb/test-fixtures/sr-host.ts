@@ -6,6 +6,7 @@ import net from "node:net";
 import { join, resolve, sep } from "node:path";
 import { createRpcEndpoint, NO_RESPONSE, type RpcEndpoint } from "../../rpc";
 import { BROKER_BIN, createMockCodex, envWithPathPrefix, endpointFor, testSocketPath, writeMockCodexScript } from "../../test-support/broker-harness";
+import { reapTestProcess } from "../../test-support/process-identity";
 
 async function bounded<T>(work: Promise<T>, ms: number, description: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -148,8 +149,7 @@ export class SrHost {
       }
     }
     for (const pid of this.pids) await attempt(async () => {
-      if (alive(pid)) process.kill(pid, "SIGKILL");
-      await until(() => !alive(pid), 3000);
+      await reapTestProcess(pid, 3000);
     });
     for (const { exited } of this.children) await attempt(() => bounded(exited, 1000, "确认子进程退出"));
     await attempt(async () => {

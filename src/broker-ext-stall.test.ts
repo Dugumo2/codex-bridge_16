@@ -7,6 +7,7 @@ import {
   createMockCodex, endpointFor, exitsWithin, spawnBroker, TestClient, testSocketPath,
   waitFor, waitForSocket,
 } from "./test-support/broker-harness";
+import { reapTestProcess } from "./test-support/process-identity";
 
 // 上游报错第二批 C1：真实 broker 的无进展期限、访问报错即停与停止诊断（契约第 2、3、4.3、6 节）。
 
@@ -42,13 +43,6 @@ beforeEach(() => {
   mockPids = new Set();
 });
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    throw error;
-  }
-}
-
 afterEach(async () => {
   const failures: unknown[] = [];
   registerMockPids();
@@ -61,8 +55,7 @@ afterEach(async () => {
   }
   for (const pid of mockPids) {
     try {
-      if (alive(pid)) process.kill(pid, "SIGKILL");
-      await waitFor(() => !alive(pid), 5_000);
+      await reapTestProcess(pid);
     } catch (error) { failures.push(error); }
   }
   const deadline = performance.now() + 5_000;

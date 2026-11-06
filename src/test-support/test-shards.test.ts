@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { checkSnapshot, processCreated, snapshotProcesses, updateDescendants } from "./process-tree";
 import { collectTests, groupTests, main, parseArgs, parseJunit } from "./test-shards";
+import { reapTestProcess } from "./process-identity";
 
 const REPO = resolve(import.meta.dir, "../..");
 const created: string[] = [];
@@ -29,13 +30,13 @@ function isAlive(pid: number): boolean {
   catch { return false; }
 }
 
-afterEach(() => {
-  for (const pid of sleepers.splice(0)) if (isAlive(pid)) process.kill(pid);
+afterEach(async () => {
+  await Promise.all(sleepers.splice(0).map((pid) => reapTestProcess(pid)));
   for (const root of created.splice(0)) {
     if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("拒绝删除越界目录");
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 20_000);
 
 /** 真实运行分片主流程；耗时记录指向临时文件，不碰仓库里的记录。 */
 async function runMain(target: string, ...args: string[]) {

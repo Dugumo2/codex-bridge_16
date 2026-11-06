@@ -2,10 +2,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import type { Subprocess } from "bun";
+import { reapTestProcess } from "../../test-support/process-identity";
 
-// 各组进程并行回收：直接子进程最多 5+5 秒，后代最多 3+5 秒，目录重试 5 秒；
-// 工作区用例还可能回收一个 SUBST 映射（5 秒），另留 7 秒调度余量，合计 35 秒。
-export const CLEANUP_HOOK_TIMEOUT_MS = 35_000;
+// 各组进程并行回收：直接子进程最多 5+5 秒，后代最多 3+5 秒（核实身份另加最多 5 秒），目录重试 5 秒；
+// 工作区用例还可能回收一个 SUBST 映射（5 秒），另留 7 秒调度余量，合计 40 秒。
+export const CLEANUP_HOOK_TIMEOUT_MS = 40_000;
 
 /** 清除大小写形式的两套服务选择变量，再明确隔离到私有模拟服务。 */
 export function privateTestEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -69,9 +70,7 @@ export class ProcessTracker {
       try { await eventually(() => !isAlive(pid), 3000); }
       catch {
         try {
-          leaked.push(pid);
-          process.kill(pid, "SIGKILL");
-          await eventually(() => !isAlive(pid));
+          if (await reapTestProcess(pid) !== "reused") leaked.push(pid);
         } catch (error) { errors.push(error); }
       }
     }));

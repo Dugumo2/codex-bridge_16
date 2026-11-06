@@ -5,6 +5,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BROKER_BIN, createMockCodex, endpointFor, envWithPathPrefix, testSocketPath } from "./test-support/broker-harness";
+import { reapTestProcess } from "./test-support/process-identity";
 
 type Frame = { id?: number; method?: string; params?: Record<string, unknown>; result?: any; error?: { code: number; message: string; data?: { reason?: string } } };
 let dir: string;
@@ -18,12 +19,6 @@ let observerErrors: unknown[];
 let traceOffset: number;
 let baseObserver: string;
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    throw error;
-  }
-}
 async function bounded<T>(promise: Promise<T>, ms = 10_000, cancel: () => void = () => {}): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -124,8 +119,7 @@ afterEach(async () => {
   const brokerPids = new Set(children.map(({ child }) => child.pid));
   // 其余登记的是 broker 拉起的模拟 codex（与 broker 同一 Job，broker 退出即随之结束），没有句柄只能按 PID 核实。
   await Promise.all([...pids].filter((pid) => !brokerPids.has(pid)).map(pid => clean("核实子进程退出", async () => {
-    if (alive(pid)) process.kill(pid, "SIGKILL");
-    await until(() => !alive(pid), 5000);
+    await reapTestProcess(pid);
   })));
   await clean("删除测试目录", async () => {
     const deadline = performance.now() + 5000;

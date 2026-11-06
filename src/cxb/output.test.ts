@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { CxbError, ERROR_CODES, EXIT, type ErrorCode, type ExitCode } from "./contracts";
 import { createOutput, registerSignalHandlers, runMain, toErrorJson } from "./output";
 import { NOTICE, PRIVATE_ERROR_MESSAGE, PROGRESS, RESULT } from "./test-fixtures/out-data";
+import { reapTestProcess } from "../test-support/process-identity";
 
 const fixture = fileURLToPath(new URL("./test-fixtures/out-main.ts", import.meta.url));
 const CHILD_TIMEOUT_MS = 8_000;
@@ -21,7 +22,7 @@ let savedExitCode: typeof process.exitCode;
 interface TrackedProcess {
   pid: number;
   done?: Promise<unknown>;
-  kill(): void;
+  kill?(): void;
 }
 const children = new Map<number, TrackedProcess>();
 const registrations = new Set<string>();
@@ -75,7 +76,7 @@ function readRegistration(file: string): number | undefined {
     throw new CxbError("LOCAL_ERROR", "子进程登记 PID 无效");
   }
   if (!children.has(pid as number)) {
-    children.set(pid as number, { pid: pid as number, kill: () => { process.kill(pid as number, "SIGKILL"); } });
+    children.set(pid as number, { pid: pid as number });
   }
   return pid as number;
 }
@@ -87,7 +88,12 @@ async function reapTrackedProcesses(): Promise<{ killed: number[]; errors: unkno
   const reap = async (child: TrackedProcess) => {
     processed.add(child.pid);
     try {
-      if (isAlive(child.pid)) {
+      // 没有 kill 的是只从登记文件读到进程号的后代，强杀前要核实身份。
+      if (!child.kill) {
+        const outcome = await reapTestProcess(child.pid);
+        if (outcome === "killed") killed.push(child.pid);
+        if (outcome === "reused") return;
+      } else if (isAlive(child.pid)) {
         killed.push(child.pid);
         child.kill();
       }

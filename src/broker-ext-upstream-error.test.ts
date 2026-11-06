@@ -7,6 +7,7 @@ import {
   createMockCodex, endpointFor, exitsWithin, spawnBroker, TestClient, testSocketPath,
   waitFor, waitForSocket,
 } from "./test-support/broker-harness";
+import { reapTestProcess } from "./test-support/process-identity";
 
 type Diagnostic = {
   count: number; willRetry: boolean | null; category: string; httpStatusCode: number | null;
@@ -33,13 +34,6 @@ beforeEach(() => {
   mockPids = new Set();
 });
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    throw error;
-  }
-}
-
 afterEach(async () => {
   const failures: unknown[] = [];
   for (const client of clients) {
@@ -51,8 +45,7 @@ afterEach(async () => {
   }
   for (const pid of mockPids) {
     try {
-      if (alive(pid)) process.kill(pid, "SIGKILL");
-      await waitFor(() => !alive(pid), 5_000);
+      await reapTestProcess(pid);
     } catch (error) { failures.push(error); }
   }
   const deadline = performance.now() + 5_000;

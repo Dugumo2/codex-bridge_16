@@ -9,6 +9,7 @@ import { config } from "../config";
 import {
   BROKER_BIN, createMockCodex, envWithPathPrefix, removeDirWithRetry,
 } from "../test-support/broker-harness";
+import { reapTestProcess } from "../test-support/process-identity";
 import { brokerVersionOf, connectBroker, resolveBrokerBin } from "./broker-conn";
 import { CxbError, type BrokerConnection, type ConnectOptions, type WorkspaceInfo } from "./contracts";
 import { createOutput } from "./output";
@@ -141,15 +142,8 @@ afterEach(async () => {
   });
   await Promise.all([...pids].map((pid) => clean(`回收进程 ${pid}`, async () => {
     try { await until(() => !alive(pid), PID_GRACE_MS); } catch {
-      failures.push(`进程 ${pid} 未按时退出，需强制结束`);
-      await clean(`结束进程 ${pid}`, () => {
-        try { if (alive(pid)) process.kill(pid, "SIGKILL"); } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-        }
-      });
-      await until(() => !alive(pid), PID_KILL_MS);
+      if (await reapTestProcess(pid, PID_KILL_MS) !== "reused") failures.push(`进程 ${pid} 未按时退出，需强制结束`);
     }
-    expect(alive(pid)).toBe(false);
   })));
   for (const child of children) {
     await clean("关闭子进程输入流", () => child.stdin?.destroy());

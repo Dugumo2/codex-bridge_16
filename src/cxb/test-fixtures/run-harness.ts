@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { BROKER_BIN, envWithPathPrefix, testSocketPath, endpointFor, writeMockCodexScript } from "../../test-support/broker-harness";
+import { reapTestProcess } from "../../test-support/process-identity";
 import { createRpcEndpoint, NO_RESPONSE } from "../../rpc";
 import { CxbError, type BrokerConnection, type BrokerRpc, type ExitCode, type ServerRequestDeps, type WorkspaceInfo } from "../contracts";
 import { parseArgv } from "../args";
@@ -139,11 +140,7 @@ export class RunHarness {
       await bounded(closed, 8000);
     })));
     await Promise.all([...this.pids].map((pid) => clean(async () => {
-      try { await until(() => !alive(pid), 3000); } catch {
-        if (alive(pid)) process.kill(pid, "SIGKILL");
-        await until(() => !alive(pid), 5000);
-      }
-      if (alive(pid)) throw new Error(`进程 ${pid} 未退出`);
+      try { await until(() => !alive(pid), 3000); } catch { await reapTestProcess(pid); }
     })));
     for (const { child } of this.children) for (const stream of [child.stdin, child.stdout, child.stderr]) await clean(() => stream?.destroy());
     for (const stream of this.streams) await clean(() => stream.destroy());

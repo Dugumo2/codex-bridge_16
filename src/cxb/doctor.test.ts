@@ -8,6 +8,7 @@ import { HANDLERS } from "./main";
 import { N5Harness } from "./test-fixtures/n5a-support";
 import { FakeRpc } from "./test-fixtures/run-fakes";
 import { alive, until } from "./test-fixtures/main-test-support";
+import { reapTestProcess } from "../test-support/process-identity";
 import { bounded } from "./wait-run";
 import { writeUserConfig } from "./user-config";
 
@@ -37,7 +38,7 @@ afterEach(async () => {
   const errors: unknown[] = [];
   for (const pid of children) {
     try {
-      if (alive(pid)) { process.kill(pid, "SIGKILL"); await until(() => !alive(pid), 2000, "诊断子进程未退出"); throw new Error("诊断子进程遗留，已强制回收"); }
+      if (await reapTestProcess(pid, 2000) === "killed") throw new Error("诊断子进程遗留，已强制回收");
     } catch (error) { errors.push(error); }
   }
   try { await h.cleanup(); } catch (error) { errors.push(error); }
@@ -402,7 +403,7 @@ for (const cancel of [false, true]) test(`经 diag-exec 运行：${cancel ? "取
   expect(error.code).toBe(cancel ? "INTERRUPTED" : "TIMEOUT");
   expect(performance.now() - started).toBeLessThan(cancel ? 4000 : 7000);
   // .cmd 包装下 diag-exec 替身是孙进程：结束包装进程不一定结束它；真 diag-exec 由 Job 保证（合并后经真 broker 验证）。
-  if (alive(pid)) { process.kill(pid, "SIGKILL"); await until(() => !alive(pid), 3000, "替身未能结束"); }
+  await reapTestProcess(pid, 3000);
   children.delete(pid);
 }, 15_000);
 

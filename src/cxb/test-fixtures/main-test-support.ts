@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { resolve, sep } from "node:path";
+import { reapTestProcess } from "../../test-support/process-identity";
 
 export async function bounded<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -123,8 +124,8 @@ export class Processes {
       catch (error) {
         const errors = [error];
         try {
-          if (alive(pid)) process.kill(pid, "SIGKILL");
-          await until(() => !alive(pid), 5000, `进程 ${pid} 强杀后仍存活`);
+          // 进程号已被无关程序占用：登记的进程其实早已退出，不算遗留。
+          if (await reapTestProcess(pid) === "reused") { this.pids.delete(pid); return; }
         } catch (killError) { errors.push(killError); }
         throw new AggregateError(errors, `遗留进程 ${pid} 已尝试强制回收`);
       } finally {
