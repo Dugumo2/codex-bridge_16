@@ -232,7 +232,7 @@ describe("补读限额、期限与资源", () => {
     expect(fake.calls.length).toBeLessThanOrEqual(12);
     expect(fake.calls[8]!.options.timeoutMs).toBeLessThan(1500);
     gate.resolve({ data: [], nextCursor: null });
-  });
+  }, 15_000); // 要等满五秒窗口，而 bun test 默认每条只给五秒。
 
   /**
    * 受控时钟：performance.now 与定时器都由用例推进，结果不受机器负载影响。
@@ -307,6 +307,19 @@ describe("补读限额、期限与资源", () => {
       out: { progress() {} } } as unknown as CommandContext).connect()],
   ];
 
+  test("单个请求挂起、命令期限充足：本地在 2000 毫秒结束，不等传输层多给的 100 毫秒", async () => {
+    const fake = new FakeRpc();
+    fake.handle = () => new Promise(() => {});
+    const clock = controlledClock(0);
+    try {
+      const started = clock.now();
+      const results = await clock.run(readThreadResults(fake.rpc, [node()], { deadline: started + 60_000 }));
+      expect(clock.now() - started).toBe(2000);
+      expect(fake.calls[0]!.options.timeoutMs).toBe(2100);
+      expect(results.get("child")?.reason).toContain("请求超时");
+    } finally { clock.restore(); }
+  });
+
   test.each(paths)("传输层的计时器也早响时（%s）：等到真正到点，不多发请求，提示仍是期限已到", async (_, wrap) => {
     const { endpoint, sent } = silentEndpoint();
     const clock = controlledClock(30);
@@ -341,14 +354,13 @@ describe("补读限额、期限与资源", () => {
       const rpc = await wrap(endpoint);
       const started = performance.now();
       const results = await watchdog(readThreadResults(rpc, Array.from({ length: 16 }, (_, i) => node(`child-${i}`)), { deadline: started + 60_000 }), 8000, "子结果补读未结束");
-      const elapsed = performance.now() - started;
+      // 精确时刻由受控时钟用例卡住；这里是真实计时器，上限交给看门狗，机器忙时不误报。
+      expect(performance.now() - started).toBeGreaterThanOrEqual(4900);
       expect(results.size).toBe(16);
-      expect(elapsed).toBeGreaterThanOrEqual(4900);
-      expect(elapsed).toBeLessThan(6500);
       expect(sent.length).toBeLessThanOrEqual(12);
       expect([...results.values()].some((result) => result.reason?.includes("期限已到"))).toBe(true);
     } finally { endpoint.markClosed(); }
-  });
+  }, 15_000); // 要等满五秒窗口，而 bun test 默认每条只给五秒。
 
   test("传输层报的不是超时：立刻作为失败返回，不等到期限", async () => {
     const fake = new FakeRpc();
