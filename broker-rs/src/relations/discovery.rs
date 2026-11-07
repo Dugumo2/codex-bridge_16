@@ -229,7 +229,6 @@ impl Machine {
                 return;
             }
         }
-        self.discovery_note_progress(op_id);
         let check_thread = context
             .params
             .as_ref()
@@ -361,10 +360,20 @@ impl Machine {
     }
 
     /// 上游还在回话就不算卡住：请求数有上限（页数、成员数、重查一次），慢但健康的发现总能走完。
-    /// 错误回包也算回话，错误本身由后面记入不完整原因。总期限仍是上限，这里只记时间，不重设定时器。
-    fn discovery_note_progress(&mut self, op_id: u64) {
+    /// 只在收到上游回包时调用（上游返回的错误也算回话）：本地超时和连接失败不能说明上游还活着，
+    /// 否则上游完全不回时，排队的请求一个个本地超时，期限会被一直往后推。
+    /// 总期限仍是上限。这里只记时间，不重设定时器。
+    pub(crate) fn discovery_upstream_replied(&mut self, context: &RequestContext) {
+        let Operation::Discovery { op_id, generation } = context.operation else {
+            return;
+        };
         let now = self.clock.mono_ms;
-        let Some(op) = self.relations.discoveries.get(&op_id) else {
+        let Some(op) = self
+            .relations
+            .discoveries
+            .get(&op_id)
+            .filter(|o| !o.completed && o.generation == generation)
+        else {
             return;
         };
         let (Some(idle), DiscoveryCaller::Converge { token, .. }) =
@@ -372,6 +381,9 @@ impl Machine {
         else {
             return;
         };
+        if !self.convergence_token_current(token) {
+            return;
+        }
         let limit = self
             .convergences
             .runs

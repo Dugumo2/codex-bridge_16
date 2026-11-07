@@ -969,6 +969,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
         }
         Event::Reply { context, result } => {
             state.observe_app_response(&mut actions);
+            state.discovery_upstream_replied(&context);
             state.apply_reply(context, result, &mut actions);
         }
         Event::Notification { method, params } => state.arrive_notification(

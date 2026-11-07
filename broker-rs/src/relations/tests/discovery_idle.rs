@@ -155,6 +155,195 @@ fn 一直有回包时超过二十秒也不算超时并能完成() {
         "总用时要明显超过单次期限"
     );
     assert!(!timed_out(&m, op), "慢但一直有回包不算超时");
+    assert!(
+        m.discovery_outcome(op).unwrap().state.complete,
+        "走完的发现必须是完整的"
+    );
+}
+
+#[test]
+fn 本地超时和连接失败不算进展() {
+    for local in ["timeout", "transport"] {
+        let (mut m, mut mock) = machine();
+        let t0 = m.clock.mono_ms;
+        let (op, actions) = begin_converge(&mut m);
+        let context = request(&actions, "thread/list", Some(false));
+        let error = json!({"code": -32603, "message": "本地失败"});
+        m.clock.mono_ms = t0 + 15_000;
+        let event = if local == "timeout" {
+            Event::TimedOut {
+                tag: 1,
+                deadline: std::time::Instant::now(),
+                context,
+                error,
+            }
+        } else {
+            Event::TransportFailed { context, error }
+        };
+        mock.inject(&mut m, event);
+        assert_eq!(
+            m.relations.discoveries[&op].deadline_ms,
+            t0 + DISCOVERY_MS,
+            "{local} 不能延后期限"
+        );
+        m.clock.mono_ms = t0 + DISCOVERY_MS;
+        let timer = fire(&mut m, &mut mock, op);
+        assert_eq!(rescheduled(&timer, op), None);
+        assert!(timed_out(&m, op), "{local} 之后上游仍没有回话，按期超时");
+    }
+}
+
+#[test]
+fn 重查换代后旧定时器不影响新期限() {
+    let (mut m, mut mock) = machine();
+    let t0 = m.clock.mono_ms;
+    let (op, actions) = begin_converge(&mut m);
+    let old_generation = m.relations.discoveries[&op].generation;
+    m.relations.aux.version += 1;
+    m.clock.mono_ms = t0 + 5_000;
+    let mut queue: VecDeque<Action> = actions.into_iter().collect();
+    let mut calls = 0;
+    while m.relations.discoveries[&op].generation == old_generation {
+        let action = queue.pop_front().expect("应走到重查");
+        let Action::Request(context) = action else {
+            continue;
+        };
+        let thread = context
+            .params
+            .as_ref()
+            .and_then(|p| p["threadId"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let result = match context.method.as_str() {
+            "thread/list" | "thread/loaded/list" => json!({"data": [], "nextCursor": null}),
+            "thread/read" => {
+                let mut info = mock.thread_info(&thread).expect("线程已登记");
+                info["status"] = json!({"type": "idle"});
+                info["turns"] = json!([]);
+                json!({"thread": info})
+            }
+            "thread/goal/get" => json!({"goal": null}),
+            _ => continue,
+        };
+        calls += 1;
+        assert!(calls < 64, "发现请求必须有界完成");
+        queue.extend(answer(&mut m, &mut mock, context, Ok(result)));
+    }
+    let deadline = m.relations.discoveries[&op].deadline_ms;
+    assert_eq!(deadline, t0 + 5_000 + DISCOVERY_MS, "重查不重置期限");
+
+    // 旧代际的定时器到点：不结束，也不重新定时。
+    m.clock.mono_ms = t0 + DISCOVERY_MS;
+    let stale = mock.inject(
+        &mut m,
+        Event::Timer {
+            token: Machine::relation_token(),
+            kind: TimerKind::DiscoveryDeadline {
+                op_id: op,
+                generation: old_generation,
+            },
+        },
+    );
+    assert_eq!(rescheduled(&stale, op), None);
+    assert!(m.discovery_outcome(op).is_none());
+    assert_eq!(m.relations.discoveries[&op].deadline_ms, deadline);
+
+    // 新一代的回包继续算进展；之后不再回话，按新期限超时。
+    let requests: Vec<_> = queue
+        .into_iter()
+        .filter_map(|a| match a {
+            Action::Request(c) if c.method == "thread/list" => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert!(!requests.is_empty(), "重查应重新遍历来源");
+    m.clock.mono_ms = t0 + 21_000;
+    answer(&mut m, &mut mock, requests[0].clone(), empty_page());
+    assert_eq!(
+        m.relations.discoveries[&op].deadline_ms,
+        t0 + 21_000 + DISCOVERY_MS
+    );
+    m.clock.mono_ms = t0 + 21_000 + DISCOVERY_MS;
+    fire(&mut m, &mut mock, op);
+    assert!(timed_out(&m, op));
+}
+
+#[test]
+fn 旧连接的回包不算进展() {
+    let (mut m, mut mock) = machine();
+    let t0 = m.clock.mono_ms;
+    let (op, actions) = begin_converge(&mut m);
+    m.relations.conn_epoch += 1;
+    m.clock.mono_ms = t0 + 15_000;
+    answer(
+        &mut m,
+        &mut mock,
+        request(&actions, "thread/list", Some(false)),
+        empty_page(),
+    );
+    assert_eq!(m.relations.discoveries[&op].deadline_ms, t0 + DISCOVERY_MS);
+}
+
+#[test]
+fn 续期后关闭时静默取消() {
+    let (mut m, mut mock) = machine();
+    let t0 = m.clock.mono_ms;
+    let (op, actions) = begin_converge(&mut m);
+    let generation = m.relations.discoveries[&op].generation;
+    m.clock.mono_ms = t0 + 15_000;
+    answer(
+        &mut m,
+        &mut mock,
+        request(&actions, "thread/list", Some(false)),
+        empty_page(),
+    );
+    mock.inject(&mut m, Event::Shutdown);
+    assert!(m.discovery_outcome(op).is_none(), "关闭不产生结果");
+    assert!(m.relations.aux.work.is_empty());
+    // 已登记的定时器到点也不会把它救活。
+    m.clock.mono_ms = t0 + 20_000;
+    let late = mock.inject(
+        &mut m,
+        Event::Timer {
+            token: Machine::relation_token(),
+            kind: TimerKind::DiscoveryDeadline {
+                op_id: op,
+                generation,
+            },
+        },
+    );
+    assert_eq!(rescheduled(&late, op), None);
+    assert!(m.discovery_outcome(op).is_none());
+}
+
+#[test]
+fn 发现在途时总期限到达如实异常收尾() {
+    let (mut m, mut mock) = machine();
+    let t0 = m.clock.mono_ms;
+    m.convergences.runs.get_mut(R).unwrap().deadline_mono_ms = t0 + 25_000;
+    let (_op, actions) = begin_converge(&mut m);
+    m.clock.mono_ms = t0 + 15_000;
+    answer(
+        &mut m,
+        &mut mock,
+        request(&actions, "thread/list", Some(false)),
+        empty_page(),
+    );
+    m.clock.mono_ms = t0 + 25_000;
+    let token = m.convergences.runs[R].token.clone();
+    mock.inject(
+        &mut m,
+        Event::Timer {
+            token: token.claim.clone(),
+            kind: TimerKind::ConvergeDeadline { token },
+        },
+    );
+    let join = m.runs.runs[R].subagent_join.as_ref().unwrap();
+    assert_eq!(
+        join.terminal_reason,
+        Some(crate::sa1b::TerminalReason::DiscoveryIncomplete),
+        "发现没走完就到总期限，如实报发现不完整"
+    );
 }
 
 #[test]
