@@ -188,13 +188,12 @@ describe.skipIf(process.platform !== "win32")("按进程号回收前核实身份
     }));
   }, 40_000);
 
-  test("查询已退出的进程号返回空", async () => {
-    const child = spawnSleeper();
-    child.kill();
-    await child.exited;
-    expect(await readProcessIdentity(child.pid)).toBeNull();
-    expect(await reapTestProcess(child.pid)).toBe("exited");
-    expect(await processGone(child.pid)).toBe(true);
+  test("查询不存在的进程号返回空", async () => {
+    // 不用刚退出的进程：它的号几秒内就可能被别的程序占用，并行时甚至可能是别的测试进程，回收会误杀它。
+    const missing = 0x7ffffffc;
+    expect(await readProcessIdentity(missing)).toBeNull();
+    expect(await reapTestProcess(missing)).toBe("exited");
+    expect(await processGone(missing)).toBe(true);
   }, 40_000);
 
   test("同名但比测试开始得早的程序不结束", async () => {
