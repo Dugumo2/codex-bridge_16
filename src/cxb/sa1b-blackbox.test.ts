@@ -18,7 +18,7 @@ function scenario(id: string, name: string, body: (h: H) => Promise<void>, timeo
     const h = new Sa1bHarness(); let setup = false, error: unknown;
     try {
       await h.open({ pageSize: 16 });
-      await h.start({ cxbConvergence: { timeoutMs: ["E05", "E06", "E19"].includes(id) ? 1500 : id === "E09" ? 180000 : 20000, discoveryTimeoutMs: id === "E09" ? 20000 : 400, wakeVerifyTimeoutMs: 600 } });
+      await h.start({ cxbConvergence: { timeoutMs: ["E05", "E06", "E19"].includes(id) ? 1500 : id === "E09" ? 180000 : 20000, discoveryTimeoutMs: id === "E09" ? 20000 : 400, wakeVerifyTimeoutMs: name.startsWith("超大批次") ? 20000 : 600 } });
       setup = true; await body(h);
     }
     catch (e) { error = e; throw e; }
@@ -156,7 +156,9 @@ for (const size of ["多字节8KiB", "总64KiB", "超大批次", "输出不可�
   if (size === "多字节8KiB") expect(coverage.truncated).toBeGreaterThan(0);
   if (size === "超大批次") expect(coverage.omitted).toBeGreaterThan(0);
   if (size === "输出不可读") expect(coverage.unavailable).toBe(1);
-  await h.finish(P, "已核实缺失与截断", "completed", turn.id); await terminal(h, 120000); expect((await h.starts()).length).toBe(2);
+  await h.finish(P, "已核实缺失与截断", "completed", turn.id); const run = await terminal(h, 120000); expect((await h.starts()).length).toBe(2);
+  // 期限太短时偶尔确认不了唤醒，运行会走异常收尾、照样结束；这里用产品默认的 20 秒，并确认真的走到了正常结束。
+  if (size === "超大批次") expect(run.status).toBe("completed");
 }, 300000);
 for (const mode of ["replyLost", "transportError", "通知先到"] as const) scenario("E10", `${mode} clientId 核实不重发`, async h => {
   await h.spawn(); await h.finish("child", mark());
