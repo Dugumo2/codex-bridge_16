@@ -77,9 +77,12 @@ fn replies_with_hold(
                 } else {
                     let mut info = mock.thread_info(thread).unwrap();
                     info["status"] = json!({"type": if history && OLD.contains(&thread) { "notLoaded" } else { "idle" }});
-                    info["turns"] = json!([{"id":format!("{thread}轮"),"status":"completed"}]);
                     json!({"thread":info})
                 }
+            }
+            "thread/turns/list" => {
+                let thread = params["threadId"].as_str().unwrap();
+                json!({"data":[{"id":format!("{thread}轮"),"status":"completed"}],"nextCursor":null})
             }
             method => panic!("未预期发现方法 {method}"),
         };
@@ -386,23 +389,29 @@ fn 最终核实已完成历史候选收到活动通知后不得释放() {
             m.run_has_candidate(R, OLD[0]),
             "最终核实期间活动通知立即撤销排除：{status}"
         );
-        for context in held {
+        let mut pending: std::collections::VecDeque<_> = held.into_iter().collect();
+        while let Some(context) = pending.pop_front() {
             let value = if context.method == "thread/goal/get" {
                 json!({"goal":null})
+            } else if context.method == "thread/turns/list" {
+                json!({"data":[{"id":format!("{}轮", OLD[2]),"status":"completed"}],"nextCursor":null})
             } else {
                 let mut info = mock.thread_info(OLD[2]).unwrap();
                 info["status"] = json!({"type":"notLoaded"});
-                info["turns"] = json!([{"id":format!("{}轮", OLD[2]),"status":"completed"}]);
                 json!({"thread":info})
             };
             // 仅放行原最终核实批次；新一轮核实不得被夹具凭空回答成静止。
-            apply(
+            let next = apply(
                 &mut m,
                 Event::Reply {
                     context,
                     result: Ok(value),
                 },
             );
+            pending.extend(next.into_iter().filter_map(|action| match action {
+                Action::Request(next) if next.method == "thread/turns/list" => Some(next),
+                _ => None,
+            }));
         }
         assert!(
             !m.relations.discoveries.contains_key(&op),

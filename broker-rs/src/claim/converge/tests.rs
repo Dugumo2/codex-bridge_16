@@ -998,8 +998,12 @@ fn 发现实际_rpc路径补查活动与goal并不学习旧代回包() {
                     assert_eq!(context.params.as_ref().unwrap()["includeTurns"], false);
                     json!({"thread":{"id":P,"canAcceptDirectInput":true}})
                 } else {
-                    json!({"thread":{"id":"子","status":{"type":"idle"},"turns":[{"id":"子轮","status":"completed"}]}})
+                    json!({"thread":{"id":"子","status":{"type":"idle"}}})
                 }
+            }
+            "thread/turns/list" => {
+                assert_eq!(context.params.as_ref().unwrap()["itemsView"], "notLoaded");
+                json!({"data":[{"id":"子轮","status":"completed"}],"nextCursor":null})
             }
             method => panic!("未预期方法 {method}"),
         };

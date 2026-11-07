@@ -37,10 +37,15 @@ pub(super) fn replies(m: &mut Machine, mock: &SubagentMock, actions: Vec<Action>
                     } else {
                         let mut info = mock.thread_info(thread).unwrap();
                         info["status"] = json!({"type":"idle"});
-                        // thread_info 只有元数据；真实发现还需要本夹具已观察到的完整轮次。
-                        info["turns"] = mock.threads[thread]["turns"].clone();
                         json!({"thread":info})
                     }
+                }
+                // thread_info 只有元数据；轮次由分页读给出，用本夹具已观察到的完整轮次。
+                "thread/turns/list" => {
+                    let thread = context.params.as_ref().unwrap()["threadId"]
+                        .as_str()
+                        .unwrap();
+                    json!({"data":mock.threads[thread]["turns"].clone(),"nextCursor":null})
                 }
                 method => panic!("未预期发现请求 {method}"),
             }

@@ -6,6 +6,7 @@ use serde_json::json;
 
 mod discovery;
 mod discovery_idle;
+mod discovery_turns;
 mod evidence;
 mod lineage_safety;
 mod placeholder;

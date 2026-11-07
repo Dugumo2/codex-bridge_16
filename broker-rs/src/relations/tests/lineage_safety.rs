@@ -114,8 +114,10 @@ fn discover_with_hold(
             "thread/read" => {
                 let mut info = mock.thread_info(thread).expect("快照线程已登记");
                 info["status"] = json!({"type": snapshot.map_or("idle", |s| s.1)});
-                info["turns"] = snapshot.map_or_else(|| json!([]), |s| s.2.clone());
                 json!({"thread": info})
+            }
+            "thread/turns/list" => {
+                json!({"data": snapshot.map_or_else(|| json!([]), |s| s.2.clone()), "nextCursor": null})
             }
             "thread/goal/get" => {
                 json!({"goal": snapshot.filter(|s| s.3).map(|_| json!({"status":"active"}))})
@@ -322,13 +324,14 @@ fn lineage_safety_候选转活动后真实绑定结果跨重新分类保留() {
 fn stale_check_reply(mock: &SubagentMock, context: &RequestContext) -> Value {
     if context.method == "thread/goal/get" {
         json!({"goal": null})
+    } else if context.method == "thread/turns/list" {
+        json!({"data": [{ "id": "历史轮", "status": "completed" }], "nextCursor": null})
     } else {
         let thread = context.params.as_ref().unwrap()["threadId"]
             .as_str()
             .unwrap();
         let mut info = mock.thread_info(thread).unwrap();
         info["status"] = json!({"type": "notLoaded"});
-        info["turns"] = json!([{ "id": "历史轮", "status": "completed" }]);
         json!({"thread": info})
     }
 }
@@ -926,15 +929,20 @@ fn lineage_safety_历史核实完成后活动通知立即撤证且发布前复�
             "活动通知不能保留旧静止证明：{status}"
         );
         assert!(m.convergences.ledgers[R].covered_epoch.is_none());
-        for context in held {
+        let mut pending: VecDeque<_> = held.into_iter().collect();
+        while let Some(context) = pending.pop_front() {
             let response = stale_check_reply(&mock, &context);
-            mock.inject(
+            let next = mock.inject(
                 &mut m,
                 Event::Reply {
                     context,
                     result: Ok(response),
                 },
             );
+            pending.extend(next.into_iter().filter_map(|action| match action {
+                Action::Request(next) if next.method == "thread/turns/list" => Some(next),
+                _ => None,
+            }));
         }
         let result = m.discovery_outcome(op).expect("其他回包放行后发现已结束");
         assert!(

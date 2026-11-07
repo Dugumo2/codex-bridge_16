@@ -16,6 +16,16 @@ pub struct SourceState {
     pub done: bool,
 }
 
+/// 核对一个子代理：先读线程状态，再分页读轮次的编号和状态。
+/// 不读全部内容：历史一长，单条回包会超过 broker 的 10 MiB 上限，broker 只能退出。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildTurnRead {
+    pub status: Option<String>,
+    pub turns: Vec<(String, String)>,
+    pub cursors: BTreeSet<String>,
+    pub pages: usize,
+}
+
 /// 一次发现的进度；完成、到期或关闭时删除。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiscoveryWork {
@@ -33,6 +43,7 @@ pub struct DiscoveryWork {
     pub reads_in_flight: BTreeSet<String>,
     pub reads_total: usize,
     pub read_edges: BTreeMap<String, RelationEdge>,
+    pub turn_reads: BTreeMap<String, ChildTurnRead>,
     pub sources: BTreeMap<&'static str, SourceState>,
     pub reasons: BTreeSet<String>,
 }
@@ -904,8 +915,8 @@ impl Machine {
             }
             let mut params = json!({"threadId": thread});
             if method == "thread/read" {
-                // 根这里只核实输入能力，不读取父轮正文。
-                params["includeTurns"] = json!(thread != root);
+                // 根只核实输入能力；子代理的轮次随后分页读，这里都不带历史。
+                params["includeTurns"] = json!(false);
             }
             actions.push(Action::Request(RequestContext {
                 resume_retried: false,
@@ -968,7 +979,18 @@ impl Machine {
                 .copied()
                 == Some(self.stops.versions.get(thread).copied().unwrap_or(0));
         let mut valid = false;
-        if let Ok(value) = &result {
+        if method == "thread/turns/list" {
+            match self.discovery_turns_page(op_id, thread, &result) {
+                TurnsPage::Next(cursor) => {
+                    self.discovery_request_turns(op_id, thread, Some(cursor), actions);
+                    return;
+                }
+                TurnsPage::Done(read) => {
+                    valid = self.convergence_apply_child_turns(&run, thread, &read, actions);
+                }
+                TurnsPage::Invalid => {}
+            }
+        } else if let Ok(value) = &result {
             if !current_goal {
                 let work = self.relations.aux.work.get_mut(&op_id).unwrap();
                 work.reasons.insert("goalChanged".into());
@@ -1024,70 +1046,18 @@ impl Machine {
                 let status = info
                     .get("status")
                     .and_then(|s| s.get("type"))
-                    .and_then(Value::as_str);
-                let turns = info.get("turns").and_then(Value::as_array);
-                let inactive = matches!(status, Some("notLoaded" | "idle"))
-                    && turns.is_some_and(|turns| {
-                        turns.iter().all(|t| {
-                            matches!(
-                                t.get("status").and_then(Value::as_str),
-                                Some("completed" | "failed" | "interrupted" | "errored")
-                            )
-                        })
-                    });
-                if self.relations.aux.candidate_observations.len() >= MAX_OBSERVED_THREADS
-                    && !self
-                        .relations
-                        .aux
-                        .candidate_observations
-                        .contains_key(thread)
-                {
-                    if let Some(first) = self
-                        .relations
-                        .aux
-                        .candidate_observations
-                        .keys()
-                        .next()
-                        .cloned()
-                    {
-                        self.relations.aux.candidate_observations.remove(&first);
-                    }
-                }
-                self.relations.aux.candidate_observations.insert(
-                    thread.into(),
-                    CandidateObservation {
-                        conn_epoch: self.relations.conn_epoch,
-                        inactive,
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let work = self.relations.aux.work.get_mut(&op_id).unwrap();
+                work.turn_reads.insert(
+                    thread.to_owned(),
+                    ChildTurnRead {
+                        status,
+                        ..Default::default()
                     },
                 );
-                let historical_only = self.historical_subagent_for_run(&run, thread);
-                if historical_only && inactive {
-                    valid = true;
-                }
-                let verified_closed = self.convergences.closed_threads.contains(thread)
-                    && self.convergences.observations.iter().any(|((t, _), o)| {
-                        t == thread
-                            && o.result == Some(crate::sa1b::ActivityResultStatus::Shutdown)
-                            && o.conn_epoch == self.relations.conn_epoch
-                    });
-                if status != Some("notLoaded") || verified_closed {
-                    if let Some(turns) = info.get("turns").and_then(Value::as_array) {
-                        for turn in turns {
-                            if let (Some(id), Some(status)) = (
-                                turn.get("id").and_then(Value::as_str),
-                                turn.get("status").and_then(Value::as_str),
-                            ) {
-                                self.convergence_observe_activity(thread, id, status, false);
-                                let ended = matches!(
-                                    status,
-                                    "completed" | "failed" | "interrupted" | "errored"
-                                );
-                                self.observe_turn(thread, id, true, ended, actions);
-                            }
-                        }
-                        valid = true;
-                    }
-                }
+                self.discovery_request_turns(op_id, thread, None, actions);
+                return;
             }
         }
         if !valid {
@@ -1103,6 +1073,162 @@ impl Machine {
         }
         self.convergence_sync_facts(&run);
     }
+
+    /// 一页只要轮次的编号和状态。保持正序，和轮次发生的先后一致。
+    fn discovery_request_turns(
+        &mut self,
+        op_id: u64,
+        thread: &str,
+        cursor: Option<String>,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(generation) = self.relations.discoveries.get(&op_id).map(|o| o.generation) else {
+            return;
+        };
+        let work = self.relations.aux.work.get_mut(&op_id).unwrap();
+        work.checks_in_flight
+            .insert((thread.to_owned(), "thread/turns/list".to_owned()));
+        let mut params = json!({
+            "threadId": thread,
+            "limit": PAGE_LIMIT,
+            "sortDirection": "asc",
+            "itemsView": "notLoaded",
+        });
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        actions.push(Action::Request(RequestContext {
+            resume_retried: false,
+            stream_id: None,
+            review_id: None,
+            client: None,
+            token: None,
+            operation: Operation::Discovery { op_id, generation },
+            method: "thread/turns/list".into(),
+            params: Some(params),
+        }));
+    }
+
+    /// 收下一页轮次。失败、格式不对、重复游标、页数超限都判这个子代理未核实。
+    fn discovery_turns_page(
+        &mut self,
+        op_id: u64,
+        thread: &str,
+        result: &Result<Value, Value>,
+    ) -> TurnsPage {
+        let work = self.relations.aux.work.get_mut(&op_id).unwrap();
+        let Some(mut read) = work.turn_reads.remove(thread) else {
+            return TurnsPage::Invalid;
+        };
+        let Some(page) = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("data"))
+            .and_then(Value::as_array)
+        else {
+            return TurnsPage::Invalid;
+        };
+        // 缺编号或状态的轮次记成空串：不算已结束，也不会当活动记录。
+        read.turns.extend(page.iter().map(|turn| {
+            let field = |name: &str| {
+                turn.get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            (field("id"), field("status"))
+        }));
+        read.pages += 1;
+        let next = result
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("nextCursor"))
+            .and_then(Value::as_str)
+            .filter(|cursor| !cursor.is_empty())
+            .map(str::to_owned);
+        let Some(cursor) = next else {
+            return TurnsPage::Done(read);
+        };
+        if read.pages >= crate::claim::status_read::STATUS_MAX_PAGES
+            || !read.cursors.insert(cursor.clone())
+        {
+            work.reasons.insert(format!("turnPages:{thread}"));
+            return TurnsPage::Invalid;
+        }
+        work.turn_reads.insert(thread.to_owned(), read);
+        TurnsPage::Next(cursor)
+    }
+
+    /// 线程状态和全部轮次都到齐后的判定。返回这个子代理是否核实通过。
+    fn convergence_apply_child_turns(
+        &mut self,
+        run: &str,
+        thread: &str,
+        read: &ChildTurnRead,
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        let status = read.status.as_deref();
+        let inactive = matches!(status, Some("notLoaded" | "idle"))
+            && read.turns.iter().all(|(_, status)| {
+                matches!(
+                    status.as_str(),
+                    "completed" | "failed" | "interrupted" | "errored"
+                )
+            });
+        if self.relations.aux.candidate_observations.len() >= MAX_OBSERVED_THREADS
+            && !self
+                .relations
+                .aux
+                .candidate_observations
+                .contains_key(thread)
+        {
+            if let Some(first) = self
+                .relations
+                .aux
+                .candidate_observations
+                .keys()
+                .next()
+                .cloned()
+            {
+                self.relations.aux.candidate_observations.remove(&first);
+            }
+        }
+        self.relations.aux.candidate_observations.insert(
+            thread.into(),
+            CandidateObservation {
+                conn_epoch: self.relations.conn_epoch,
+                inactive,
+            },
+        );
+        let mut valid = self.historical_subagent_for_run(run, thread) && inactive;
+        let verified_closed = self.convergences.closed_threads.contains(thread)
+            && self.convergences.observations.iter().any(|((t, _), o)| {
+                t == thread
+                    && o.result == Some(crate::sa1b::ActivityResultStatus::Shutdown)
+                    && o.conn_epoch == self.relations.conn_epoch
+            });
+        if status != Some("notLoaded") || verified_closed {
+            for (id, status) in &read.turns {
+                if id.is_empty() || status.is_empty() {
+                    continue;
+                }
+                self.convergence_observe_activity(thread, id, status, false);
+                let ended = matches!(
+                    status.as_str(),
+                    "completed" | "failed" | "interrupted" | "errored"
+                );
+                self.observe_turn(thread, id, true, ended, actions);
+            }
+            valid = true;
+        }
+        valid
+    }
+}
+
+enum TurnsPage {
+    Next(String),
+    Done(ChildTurnRead),
+    Invalid,
 }
 
 fn op_deadline_left(machine: &Machine, op_id: u64) -> u64 {

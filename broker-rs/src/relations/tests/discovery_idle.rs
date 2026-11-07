@@ -138,9 +138,9 @@ fn 一直有回包时超过二十秒也不算超时并能完成() {
             "thread/read" => {
                 let mut info = mock.thread_info(&thread).expect("线程已登记");
                 info["status"] = json!({"type": "idle"});
-                info["turns"] = json!([]);
                 json!({"thread": info})
             }
+            "thread/turns/list" => json!({"data": [], "nextCursor": null}),
             "thread/goal/get" => json!({"goal": null}),
             _ => continue,
         };
@@ -249,9 +249,9 @@ fn 本地超时后的迟到回包不延期且发现仍不完整() {
             "thread/read" => {
                 let mut info = mock.thread_info(&thread).expect("线程已登记");
                 info["status"] = json!({"type": "idle"});
-                info["turns"] = json!([]);
                 json!({"thread": info})
             }
+            "thread/turns/list" => json!({"data": [], "nextCursor": null}),
             "thread/goal/get" => json!({"goal": null}),
             _ => continue,
         };
@@ -292,9 +292,9 @@ fn 重查换代后旧定时器不影响新期限() {
             "thread/read" => {
                 let mut info = mock.thread_info(&thread).expect("线程已登记");
                 info["status"] = json!({"type": "idle"});
-                info["turns"] = json!([]);
                 json!({"thread": info})
             }
+            "thread/turns/list" => json!({"data": [], "nextCursor": null}),
             "thread/goal/get" => json!({"goal": null}),
             _ => continue,
         };
