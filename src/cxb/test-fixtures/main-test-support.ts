@@ -101,7 +101,12 @@ export class Processes {
       try {
         if (child.pid !== undefined && alive(child.pid)) child.kill("SIGKILL");
         await bounded(exited, 5000, "强制结束后未收到退出事件");
-        if (child.pid !== undefined) await waitForProcessGone(child.pid, 5000, "强制结束后 PID 仍存活");
+        if (child.pid !== undefined) {
+          await waitForProcessGone(child.pid, 5000, "强制结束后 PID 仍存活");
+          // 和成功路径一样：已确认退出就不留登记，否则这个号之后被占用会让 allExited 误报。
+          this.pids.delete(child.pid);
+          this.children.delete(child.pid);
+        }
       } catch (cleanupError) { errors.push(cleanupError); }
       finally {
         // 后代仍持有写端时，本地读端也必须主动关闭。

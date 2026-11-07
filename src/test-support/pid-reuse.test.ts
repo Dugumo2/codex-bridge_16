@@ -1,5 +1,5 @@
 // 进程号被无关程序占用时，测试清理不能把那个程序结束掉；真正遗留的测试进程仍要回收并上报。
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -7,6 +7,7 @@ import { Processes } from "../cxb/test-fixtures/main-test-support";
 import { SrHost } from "../cxb/test-fixtures/sr-host";
 import { ProcessTracker } from "../cxb/test-fixtures/ws-test-support";
 import { isTestProcess, processGone, reapTestProcess, readProcessIdentity, waitForProcessGone, type ProcessIdentity } from "./process-identity";
+import { startManaged, stopManaged, type ManagedProcess } from "./upstream-isolation";
 
 /** 模拟占用了旧进程号的无关程序：用 ping 是因为它和测试自己拉起的程序都不同名。 */
 function spawnBystander() {
@@ -33,6 +34,19 @@ async function withProcess(child: Spawned, work: () => Promise<void>): Promise<v
 async function expectStillRunning(child: Spawned): Promise<void> {
   await Bun.sleep(300);
   expect(child.exitCode).toBeNull();
+}
+
+/** 让对这个进程号的第一次判活看到「已不存在」，模拟 stopManaged 走到「关 stdin 等退出」那条路。 */
+function firstProbeSeesNothing(pid: number) {
+  const realKill = process.kill.bind(process);
+  let first = true;
+  return spyOn(process, "kill").mockImplementation(((target: number, signal?: string | number) => {
+    if (target === pid && signal === 0 && first) {
+      first = false;
+      throw Object.assign(new Error("没有这个进程"), { code: "ESRCH" });
+    }
+    return realKill(target, signal);
+  }) as typeof process.kill);
 }
 
 describe.skipIf(process.platform !== "win32")("按进程号回收前核实身份", () => {
@@ -87,6 +101,77 @@ describe.skipIf(process.platform !== "win32")("按进程号回收前核实身份
       await expectStillRunning(bystander);
     });
   }, 30_000);
+
+  test("真实上游的回收：进程已退出、进程号被无关程序占用时不用 taskkill 结束它", async () => {
+    const bystander = spawnBystander();
+    await withProcess(bystander, async () => {
+      // 关 stdin 后进程退出，但后代还占着管道，closed 超过 2 秒才到；这时句柄已显示退出，而这个号已被 ping 占用。
+      const child = { pid: bystander.pid, exitCode: null as number | null, signalCode: null, stdin: { end() { child.exitCode = 0; } } };
+      const closed = Bun.sleep(2500).then(() => 0);
+      const spy = firstProbeSeesNothing(bystander.pid);
+      try {
+        await stopManaged({ child, closed } as unknown as ManagedProcess);
+      } finally {
+        spy.mockRestore();
+      }
+      await expectStillRunning(bystander);
+    });
+  }, 40_000);
+
+  test("真实上游的回收：等 2 秒后进程还在运行时仍用 taskkill 回收", async () => {
+    const managed = startManaged([process.execPath, "-e", "setTimeout(() => {}, 120000)"], { cwd: tmpdir(), env: process.env });
+    const pid = managed.child.pid;
+    const spy = firstProbeSeesNothing(pid);
+    try {
+      await stopManaged(managed);
+    } finally {
+      spy.mockRestore();
+      managed.child.kill();
+    }
+    expect(managed.child.exitCode !== null || managed.child.signalCode !== null).toBe(true);
+    expect(await processGone(pid)).toBe(true);
+  }, 40_000);
+
+  test("真实上游的回收：还在运行的进程连同后代一起回收", async () => {
+    // 后代要 detached：普通子进程会随父进程一起结束，那样不用 /T 也看不出区别。
+    const script = `const c = require("node:child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { detached: true, stdio: "ignore", windowsHide: true }); c.unref(); console.log("后代=" + c.pid); setTimeout(() => {}, 120000);`;
+    const managed = startManaged([process.execPath, "-e", script], { cwd: tmpdir(), env: process.env });
+    let descendant = 0;
+    try {
+      const deadline = Date.now() + 15_000;
+      while (!descendant && Date.now() < deadline) {
+        descendant = Number(/后代=(\d+)/.exec(managed.output().stdout)?.[1] ?? 0);
+        await Bun.sleep(25);
+      }
+      expect(descendant).toBeGreaterThan(0);
+      await stopManaged(managed);
+      expect(managed.child.exitCode !== null || managed.child.signalCode !== null).toBe(true);
+      expect(await processGone(descendant)).toBe(true);
+    } finally {
+      managed.child.kill();
+      if (descendant) await reapTestProcess(descendant);
+    }
+  }, 40_000);
+
+  test("端到端测试的进程登记：运行超时并确认退出后不再留登记，进程号之后被占用也不算存活", async () => {
+    const processes = new Processes();
+    const spawned: number[] = [];
+    const realAdd = processes.add.bind(processes);
+    processes.add = (pid: number) => { spawned.push(pid); realAdd(pid); };
+    await expect(processes.run(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { cwd: tmpdir(), env: process.env, limitMs: 500 })).rejects.toThrow("子进程执行失败");
+    expect(spawned).toHaveLength(1);
+    // 进程已确认退出；此后这个号被别的程序占用，判活会看到它「还活着」。
+    const realKill = process.kill.bind(process);
+    const spy = spyOn(process, "kill").mockImplementation(((target: number, signal?: string | number) => {
+      if (target === spawned[0] && signal === 0) return true;
+      return realKill(target, signal);
+    }) as typeof process.kill);
+    try {
+      expect(processes.allExited()).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 40_000);
 
   test("读到真实身份：这次测试拉起的 bun 算测试进程，ping 不算", async () => {
     const sleeper = spawnSleeper();
