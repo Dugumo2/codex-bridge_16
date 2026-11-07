@@ -71,6 +71,16 @@ impl Machine {
                 ),
             _ => DISCOVERY_MS,
         };
+        let idle_timeout_ms = match &caller {
+            DiscoveryCaller::Converge { token, .. } => Some(
+                self.runs
+                    .runs
+                    .get(&token.run_id)
+                    .and_then(|r| r.convergence_config.as_ref())
+                    .map_or(DISCOVERY_MS, |c| c.discovery_timeout_ms),
+            ),
+            _ => None,
+        };
         self.relations.discoveries.insert(
             op_id,
             DiscoveryOperation {
@@ -81,6 +91,7 @@ impl Machine {
                 caller,
                 started_at_ms: now,
                 deadline_ms: now.saturating_add(timeout),
+                idle_timeout_ms,
                 completed: false,
             },
         );
@@ -218,6 +229,7 @@ impl Machine {
                 return;
             }
         }
+        self.discovery_note_progress(op_id);
         let check_thread = context
             .params
             .as_ref()
@@ -348,6 +360,32 @@ impl Machine {
         self.discovery_maybe_finish(op_id, actions);
     }
 
+    /// 上游还在回话就不算卡住：请求数有上限（页数、成员数、重查一次），慢但健康的发现总能走完。
+    /// 错误回包也算回话，错误本身由后面记入不完整原因。总期限仍是上限，这里只记时间，不重设定时器。
+    fn discovery_note_progress(&mut self, op_id: u64) {
+        let now = self.clock.mono_ms;
+        let Some(op) = self.relations.discoveries.get(&op_id) else {
+            return;
+        };
+        let (Some(idle), DiscoveryCaller::Converge { token, .. }) =
+            (op.idle_timeout_ms, &op.caller)
+        else {
+            return;
+        };
+        let limit = self
+            .convergences
+            .runs
+            .get(&token.run_id)
+            .map_or(op.deadline_ms, |r| r.deadline_mono_ms);
+        let next = now.saturating_add(idle).min(limit);
+        let op = self
+            .relations
+            .discoveries
+            .get_mut(&op_id)
+            .expect("发现操作存在");
+        op.deadline_ms = op.deadline_ms.max(next);
+    }
+
     /// 分页推进：失败、重复游标、页数超限都判不完整并结束该来源。
     fn discovery_next(
         &mut self,
@@ -439,7 +477,7 @@ impl Machine {
                     .expect("发现进度存在");
                 work.rerun = true;
                 work.reads_total = 0;
-                // 重查保留已发现成员，只重新遍历来源；期限不重置。
+                // 重查保留已发现成员，只重新遍历来源；期限不因重查重置。
                 let remaining = op_deadline_left(self, op_id);
                 actions.push(Action::Schedule {
                     token: Self::relation_token(),
@@ -473,6 +511,18 @@ impl Machine {
             .is_some_and(|o| !o.completed && o.generation == generation)
         {
             return;
+        }
+        // 定时之后收到过回包，期限已经后移：到新的期限再判断。
+        if self.relations.discoveries[&op_id].idle_timeout_ms.is_some() {
+            let left = op_deadline_left(self, op_id);
+            if left > 0 {
+                actions.push(Action::Schedule {
+                    token: Self::relation_token(),
+                    kind: TimerKind::DiscoveryDeadline { op_id, generation },
+                    delay_ms: left,
+                });
+                return;
+            }
         }
         if let Some(work) = self.relations.aux.work.get_mut(&op_id) {
             work.reasons.insert("timeout".into());

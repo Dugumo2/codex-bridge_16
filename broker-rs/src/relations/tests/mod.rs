@@ -5,6 +5,7 @@ use crate::test_support::subagent::SubagentMock;
 use serde_json::json;
 
 mod discovery;
+mod discovery_idle;
 mod evidence;
 mod lineage_safety;
 mod placeholder;

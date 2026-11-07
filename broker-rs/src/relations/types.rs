@@ -362,6 +362,9 @@ pub struct DiscoveryOperation {
     pub caller: DiscoveryCaller,
     pub started_at_ms: u64,
     pub deadline_ms: u64,
+    /// 协调器的发现按「多久没有回包」判超时：每个有效回包把 `deadline_ms` 往后推这么久，不超过总期限。
+    /// 其他调用方有人在等结果，是 None，`deadline_ms` 从头到尾不变。
+    pub idle_timeout_ms: Option<u64>,
     pub completed: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
