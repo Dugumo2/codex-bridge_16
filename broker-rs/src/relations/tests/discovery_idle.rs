@@ -193,6 +193,79 @@ fn 本地超时和连接失败不算进展() {
     }
 }
 
+/// 迟到回包不延期是有意的：请求一旦本地失败，这次发现已注定不完整，早点结束才能早点重试。
+#[test]
+fn 本地超时后的迟到回包不延期且发现仍不完整() {
+    let (mut m, mut mock) = machine();
+    let t0 = m.clock.mono_ms;
+    let (op, actions) = begin_converge(&mut m);
+    let timed_out_request = request(&actions, "thread/list", Some(false));
+    m.clock.mono_ms = t0 + 5_000;
+    mock.inject(
+        &mut m,
+        Event::TimedOut {
+            tag: 1,
+            deadline: std::time::Instant::now(),
+            context: timed_out_request.clone(),
+            error: json!({"code": -32603, "message": "本地超时"}),
+        },
+    );
+    m.clock.mono_ms = t0 + 10_000;
+    let mut queue: VecDeque<Action> = mock
+        .inject(
+            &mut m,
+            Event::LateReply {
+                context: timed_out_request,
+                result: empty_page(),
+            },
+        )
+        .into_iter()
+        .collect();
+    assert_eq!(
+        m.relations.discoveries[&op].deadline_ms,
+        t0 + DISCOVERY_MS,
+        "迟到回包不延期"
+    );
+    queue.extend(actions);
+    // 其余请求都正常回复，看它最后会不会判完整。
+    let mut calls = 0;
+    while m.discovery_outcome(op).is_none() {
+        let action = queue.pop_front().expect("发现应当走完");
+        let Action::Request(context) = action else {
+            continue;
+        };
+        if context.method == "thread/list" && context.params.as_ref().unwrap()["archived"] == false
+        {
+            continue;
+        }
+        let thread = context
+            .params
+            .as_ref()
+            .and_then(|p| p["threadId"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let result = match context.method.as_str() {
+            "thread/list" | "thread/loaded/list" => json!({"data": [], "nextCursor": null}),
+            "thread/read" => {
+                let mut info = mock.thread_info(&thread).expect("线程已登记");
+                info["status"] = json!({"type": "idle"});
+                info["turns"] = json!([]);
+                json!({"thread": info})
+            }
+            "thread/goal/get" => json!({"goal": null}),
+            _ => continue,
+        };
+        calls += 1;
+        assert!(calls < 64, "发现请求必须有界完成");
+        queue.extend(answer(&mut m, &mut mock, context, Ok(result)));
+    }
+    let state = &m.discovery_outcome(op).unwrap().state;
+    assert!(!state.complete, "本地失败过的发现不能判完整");
+    assert!(state
+        .incomplete_reasons
+        .contains(&"pageError:unarchived".to_owned()));
+}
+
 #[test]
 fn 重查换代后旧定时器不影响新期限() {
     let (mut m, mut mock) = machine();
