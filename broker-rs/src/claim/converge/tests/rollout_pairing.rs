@@ -12,7 +12,7 @@ use crate::relations::rollout_pairing::{ROLLOUT_POLL_MS, ROLLOUT_WAIT_MS};
 use crate::test_support::rollout as fx;
 
 /// 安装夹具并建好父、子线程的会话文件：父线程当前轮已开始，子线程「旧轮」已开始。
-fn files(m: &Machine) {
+pub(super) fn files(m: &Machine) {
     fx::install();
     fx::create(P);
     fx::create(C);
@@ -28,7 +28,7 @@ fn files(m: &Machine) {
     turn_marker(C, "旧轮", at + 1);
 }
 
-fn turn_marker(thread: &str, turn: &str, at: u64) {
+pub(super) fn turn_marker(thread: &str, turn: &str, at: u64) {
     fx::append_line(
         thread,
         at,
@@ -44,7 +44,7 @@ fn turn_marker(thread: &str, turn: &str, at: u64) {
 }
 
 /// 父线程文件里的协作工具调用（工具执行前写入）。
-fn call_line(m: &Machine, id: &str, name: &str, target: &str, message: &str) {
+pub(super) fn call_line(m: &Machine, id: &str, name: &str, target: &str, message: &str) {
     fx::append_line(
         P,
         m.clock.now_ms,
@@ -55,7 +55,7 @@ fn call_line(m: &Machine, id: &str, name: &str, target: &str, message: &str) {
 }
 
 /// 子线程文件里收到的消息（与 raw 的 agent_message 同形）。
-fn message_line(m: &Machine, child: &str, id: &str, kind: &str, message: &str) {
+pub(super) fn message_line(m: &Machine, child: &str, id: &str, kind: &str, message: &str) {
     let text = format!(
         "Message Type: {kind}\nTask name: /root/{child}\nSender: /root\nPayload:\n{message}"
     );
@@ -68,7 +68,7 @@ fn message_line(m: &Machine, child: &str, id: &str, kind: &str, message: &str) {
     );
 }
 
-fn interacted_to(m: &mut Machine, id: &str, child: &str) -> Vec<Action> {
+pub(super) fn interacted_to(m: &mut Machine, id: &str, child: &str) -> Vec<Action> {
     let (a, b) = SubagentMock::v2_activity("interacted", P, T, id, child);
     let mut out = apply(m, a);
     out.extend(apply(m, b));
@@ -76,7 +76,7 @@ fn interacted_to(m: &mut Machine, id: &str, child: &str) -> Vec<Action> {
 }
 
 /// 推进时钟走完轮询，直到没有在等的读取或超过给定时长。
-fn poll_for(m: &mut Machine, mock: &SubagentMock, ms: u64) -> Vec<Action> {
+pub(super) fn poll_for(m: &mut Machine, mock: &SubagentMock, ms: u64) -> Vec<Action> {
     let mut all = vec![];
     let mut spent = 0;
     while spent < ms {
