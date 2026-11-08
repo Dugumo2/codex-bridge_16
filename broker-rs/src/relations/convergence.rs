@@ -467,6 +467,31 @@ impl Machine {
                 }
                 fact.verified = bound && observation.is_some() && member.conflict.is_none();
             }
+            // 未归属轮只在运行中阻塞，不授予停止权与汇总权：观察到它已结束（结束通知或发现回读）
+            // 就移出账本。结束是不可逆事实，不限连接代际；它只在未结束时进入 keys，不会留下结果引用。
+            // 之后若补上归属，按归属轮重建。
+            let ended_unbound: Vec<ActivityKey> = ledger
+                .activities
+                .iter()
+                .filter(|fact| fact.key.thread_id == *thread)
+                .filter(|fact| {
+                    fact.key.turn_id.as_ref().is_some_and(|turn| {
+                        !member.bindings.contains(turn)
+                            && self
+                                .convergences
+                                .observations
+                                .get(&(thread.clone(), turn.clone()))
+                                .is_some_and(|ended| ended.result.is_some())
+                    })
+                })
+                .map(|fact| fact.key.clone())
+                .collect();
+            if !ended_unbound.is_empty() {
+                ledger
+                    .activities
+                    .retain(|fact| !ended_unbound.contains(&fact.key));
+                ledger.work_epoch = ledger.work_epoch.saturating_add(1);
+            }
             // 只撤销已有操作原因且全部得到反证的占位；真实轮与未知观察保持原身份。
             if clear_placeholder {
                 let previous = ledger.activities.len();
