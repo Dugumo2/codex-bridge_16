@@ -175,6 +175,7 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
     turn_marker(C, U, m.clock.now_ms);
     message_line(&m, C, "入站", "NEW_TASK", "新工作");
     fx::with(|f| f.hold = true);
+    let started_at = m.clock.mono_ms;
     let actions = apply(&mut m, mock.turn_started(C, U));
     all.extend(replies(&mut m, &mock, actions));
     all.extend(fx::poll(&mut m));
@@ -206,9 +207,38 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
     );
 
     // 消费记录读到：U 归属这次跟进，按归属轮重建。
+    assert!(
+        m.clock.mono_ms >= started_at + 30_000,
+        "前置：归属确认晚于 30 秒摘要暂存期限"
+    );
     all.extend(fx::release_held(&mut m));
     all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
     pending(&m, 0);
+    // 续期的摘要在归属确认后按到达顺序补写，各写一次。
+    let late: Vec<String> = all
+        .iter()
+        .flat_map(|a| match a {
+            Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => lines.clone(),
+            _ => vec![],
+        })
+        .filter(|l| l.contains(U) && l.contains("\"late\":true"))
+        .map(|l| l.split(' ').nth(2).unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        late.first().map(String::as_str),
+        Some("轮次开始"),
+        "补写从 U 的开始摘要起：{late:?}"
+    );
+    assert_eq!(
+        late.last().map(String::as_str),
+        Some("轮次完成"),
+        "补写到 U 的完成摘要止：{late:?}"
+    );
+    assert_eq!(
+        late.iter().filter(|k| k.as_str() == "轮次开始").count(),
+        1,
+        "不重复补写：{late:?}"
+    );
     assert_eq!(op(&m, "跟进").proven_turns[C], [U.to_owned()].into());
     assert!(
         m.binding(C, U)

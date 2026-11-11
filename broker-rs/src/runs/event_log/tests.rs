@@ -587,7 +587,7 @@ fn tree_log_明确不归本运行的历史兄弟暂存超限不写缺口() {
     assert_eq!(gaps, ["unknown".to_owned()].into());
 }
 
-/// 本运行的子代理某一轮只消费了平级或下级的协作消息（如兄弟子代理之间互发）：到期正常丢弃，不写缺口。
+/// 本运行的子代理某一轮只消费了协作消息（平级、跨分支、下级向上，如兄弟子代理之间互发）：到期正常丢弃，不写缺口。
 /// 消费了直接上级的消息、上下混合、跨层下发、只有别的轮有协作记录、没有任何消费记录的，照常写缺口。
 #[test]
 fn tree_log_只被协作消息唤醒的轮次到期不写缺口_其余照常() {
@@ -607,6 +607,7 @@ fn tree_log_只被协作消息唤醒的轮次到期不写缺口_其余照常() {
             &[("t", "/root/甲", "/root/乙"), ("t", "/root", "/root/乙")],
             true,
         ),
+        ("跨分支", &[("t", "/root/甲/丙", "/root/乙")], false),
         ("跨层下发", &[("t", "/root", "/root/甲/乙")], true),
         (
             "协作记录在别的轮",
@@ -722,29 +723,70 @@ fn tree_log_候选运行结束后证据进行中也不续期() {
     assert!(logs(&a).iter().any(|l| l.2 == "记录缺口"));
 }
 
-/// 发件方向的判定只看路径层级：平级与下级是协作，直接上级和跨层下发不是。
+/// 发件方向的判定与线程关系上的平级、向上拒绝同义：同一棵树里发件人不是收件人的上级就是协作。
 #[test]
 fn tree_log_协作消息方向判定() {
-    assert!(collaboration_delivery("/root/甲", "/root/乙"));
-    assert!(collaboration_delivery("/root/乙/丙", "/root/乙"));
-    assert!(collaboration_delivery("/root/乙/丙/丁", "/root/乙"));
-    assert!(collaboration_delivery("/root/a/x", "/root/a/y"));
-    assert!(!collaboration_delivery("/root", "/root/乙"));
-    assert!(!collaboration_delivery("/root/甲", "/root/甲/乙"));
-    assert!(!collaboration_delivery("/root", "/root/甲/乙"));
-    assert!(!collaboration_delivery("/root/乙", "/root/乙"));
-    assert!(
-        collaboration_delivery("/root/乙x", "/root/乙"),
-        "名字前缀相同的是平级"
-    );
-    assert!(
-        !collaboration_delivery("/root/乙x/丙", "/root/乙"),
-        "名字前缀相同的平级的下级，不是乙的下级"
-    );
-    assert!(
-        !collaboration_delivery("/root/甲/丙", "/root/乙"),
-        "别的分支的下级"
-    );
+    for (author, recipient, expect, why) in [
+        ("/root/甲", "/root/乙", true, "平级"),
+        ("/root/乙/丙", "/root/乙", true, "下级向上"),
+        ("/root/乙/丙/丁", "/root/乙", true, "隔层下级向上"),
+        ("/root/a/x", "/root/a/y", true, "深层平级"),
+        ("/root/甲/丙", "/root/乙", true, "跨分支"),
+        ("/root/a/x", "/root/b/y", true, "跨分支到别的分支的下级"),
+        ("/root/乙x", "/root/乙", true, "名字前缀相同的平级"),
+        (
+            "/root/乙x/丙",
+            "/root/乙",
+            true,
+            "名字前缀相同的平级的下级也是跨分支",
+        ),
+        ("/root", "/root/乙", false, "直接上级"),
+        ("/root/甲", "/root/甲/乙", false, "直接上级"),
+        ("/root", "/root/甲/乙", false, "跨层的祖先"),
+        ("/root/乙", "/root/乙", false, "自己"),
+        ("/other/甲", "/root/乙", false, "不同的树"),
+        ("", "/root/乙", false, "空路径"),
+    ] {
+        assert_eq!(
+            collaboration_delivery(author, recipient),
+            expect,
+            "{why}：{author} → {recipient}"
+        );
+    }
+}
+
+/// 同一轮先后消费了上级和平级的消息：只要出现过一次非协作消息就不算纯协作，
+/// 别的轮写满记录也不能把它翻成纯协作；整轮被挤出后变成「没有记录」，同样照常写缺口。
+#[test]
+fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
+    for (order, fill) in [
+        (["/root", "/root/甲"], 1023),
+        (["/root/甲", "/root"], 1023),
+        (["/root", "/root/甲"], 1024),
+    ] {
+        let mut m = setup();
+        candidate(&mut m, "乙", "root");
+        for author in order {
+            m.note_event_log_delivery("乙", "t", author, "/root/乙");
+        }
+        for n in 0..fill {
+            m.note_event_log_delivery("别的线程", &format!("轮{n}"), "/root/甲", "/root/丁");
+        }
+        assert!(
+            !m.turn_collaboration_only("乙", "t"),
+            "前置：{order:?} 挤入 {fill} 轮后不是纯协作"
+        );
+        let mut a = vec![];
+        m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
+        let generation = m.runs.event_log.timer.unwrap();
+        m.clock.mono_ms = PENDING_MS;
+        a.clear();
+        m.sweep_event_log(generation, &mut a);
+        assert!(
+            logs(&a).iter().any(|l| l.2 == "记录缺口"),
+            "{order:?} 挤入 {fill} 轮"
+        );
+    }
 }
 
 /// 上一运行留下的历史兄弟：本运行对它没有任何管理证据，它被唤醒的轮次摘要按血缘暂存后，

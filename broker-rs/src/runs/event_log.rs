@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 const PER_THREAD_BYTES: usize = 64 * 1024;
 const GLOBAL_BYTES: usize = 1024 * 1024;
 const PENDING_MS: u64 = 30_000;
-/// 消费方向记录的条数上限；挤掉的旧记录只会让那一轮少一条协作证据，照常记缺口，不会误吞。
-const DELIVERY_NOTES: usize = 1024;
+/// 记录消费方向的轮数上限。满了整轮挤掉最旧的：那一轮变成「没有消费记录」，照常记缺口，不会误吞。
+const DELIVERY_TURNS: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct EventLog {
@@ -20,24 +20,28 @@ pub(super) struct EventLog {
     pending: VecDeque<Pending>,
     bytes: usize,
     timer: Option<u64>,
-    deliveries: VecDeque<DeliveryNote>,
+    deliveries: VecDeque<TurnDeliveries>,
 }
 
-/// v2 子代理某一轮消费的一条代理间消息的方向。配对用的消费记录只留证据期限，
-/// 这里单独留一份，供暂存到期时判断这一轮是不是只被平级或下级的协作消息唤醒。
+/// v2 子代理某一轮消费过的代理间消息的方向汇总。配对用的消费记录只留证据期限，
+/// 这里按轮单独留一份，供暂存到期时判断这一轮是不是只被协作消息唤醒。
+/// 只要消费过一条非协作消息，`collaboration_only` 就永久为假，不随后来的记录翻转。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DeliveryNote {
+struct TurnDeliveries {
     thread: String,
     turn: String,
-    collaboration: bool,
+    collaboration_only: bool,
 }
 
-/// 发件人是收件人的平级（同一个直接上级）或下级：协作消息，不授予管理权。
-/// 直接上级发来的不算；跨层下发（如根直接发给孙）也不算，那是归属冲突，照常留缺口。
+/// 协作消息：发件人与收件人同属一棵代理树，且发件人不是收件人的上级（平级、跨分支、下级向上）。
+/// 与线程关系上的平级、向上拒绝（`relations/facts.rs` 的 `followup_rejection`）同一语义。
+/// 上级（含跨层的祖先）发来的不算，它们可能是本运行的跟进；自己发给自己也不算。
 fn collaboration_delivery(author: &str, recipient: &str) -> bool {
-    let parent = |path: &str| path.rsplit_once('/').map(|(head, _)| head.to_owned());
-    author.starts_with(&format!("{recipient}/"))
-        || (author != recipient && parent(author).is_some() && parent(author) == parent(recipient))
+    let root = |path: &str| path.split('/').nth(1).map(str::to_owned);
+    author != recipient
+        && root(author).is_some()
+        && root(author) == root(recipient)
+        && !recipient.starts_with(&format!("{author}/"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -563,27 +567,32 @@ impl Machine {
         author: &str,
         recipient: &str,
     ) {
-        let notes = &mut self.runs.event_log.deliveries;
-        if notes.len() >= DELIVERY_NOTES {
-            notes.pop_front();
+        let collaboration = collaboration_delivery(author, recipient);
+        let turns = &mut self.runs.event_log.deliveries;
+        if let Some(known) = turns
+            .iter_mut()
+            .find(|t| t.thread == thread && t.turn == turn)
+        {
+            known.collaboration_only &= collaboration;
+            return;
         }
-        notes.push_back(DeliveryNote {
+        if turns.len() >= DELIVERY_TURNS {
+            turns.pop_front();
+        }
+        turns.push_back(TurnDeliveries {
             thread: thread.into(),
             turn: turn.into(),
-            collaboration: collaboration_delivery(author, recipient),
+            collaboration_only: collaboration,
         });
     }
 
-    /// 这一轮有消费记录，而且消费的全是平级或下级发来的协作消息。
+    /// 这一轮有消费记录，而且消费的全是协作消息。
     fn turn_collaboration_only(&self, thread: &str, turn: &str) -> bool {
-        let mut notes = self
-            .runs
+        self.runs
             .event_log
             .deliveries
             .iter()
-            .filter(|n| n.thread == thread && n.turn == turn)
-            .peekable();
-        notes.peek().is_some() && notes.all(|n| n.collaboration)
+            .any(|t| t.thread == thread && t.turn == turn && t.collaboration_only)
     }
 
     /// 暂存到期或关闭时清掉已明确判定不归该运行管理的候选：它们的摘要本来就不该写进该运行，
@@ -626,7 +635,8 @@ impl Machine {
     }
 
     /// 还在进行、可能把这个线程的轮次归给该运行的证据：等配对或等发起方绑定的跟进、
-    /// 等会话文件的跟进、等首轮的派生。它们都有各自的期限，到期会转成结果或未证明。
+    /// 等会话文件的跟进、等首轮的派生。多数有自己的证据期限，到期转成结果或未证明；
+    /// 等 v2 配对的不受证据期限约束（`evidence_expirable`），靠父轮结束、收敛总期限和运行结束收口。
     fn event_log_evidence_in_flight(&self, run: &str, thread: &str) -> bool {
         self.relations.operations.values().any(|op| {
             op.outcome == EvidenceOutcome::Pending
@@ -644,7 +654,7 @@ impl Machine {
     }
 
     /// 到期的暂存：候选运行还在进行、且它的归属证据还在进行时续期，不按 30 秒丢
-    /// （证据各有期限，运行结束即停，字节上限照旧兜底）；否则清掉明确不归的候选，其余记缺口。
+    /// （运行结束即停，收敛总期限与字节上限兜底）；否则清掉明确不归的候选，其余记缺口。
     /// 续期的条目留在原位，补写时仍按到达顺序。
     fn expire_event_log(&mut self, actions: &mut Vec<Action>) {
         let pending = std::mem::take(&mut self.runs.event_log.pending);
