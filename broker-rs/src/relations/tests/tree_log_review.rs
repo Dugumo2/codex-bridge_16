@@ -175,19 +175,57 @@ fn tree_log_review_祖先未绑定的孙事件超限与过期留下缺口() {
     assert!(overflow
         .iter()
         .all(|r| r["runId"] == R && r["parentThreadId"] == C));
-    let timer = actions
-        .iter()
-        .find_map(|a| match a {
-            Action::Schedule {
-                token,
-                kind: kind @ TimerKind::Run(RunTimer::EventLogSweep { .. }),
-                ..
-            } => Some((token.clone(), kind.clone())),
-            _ => None,
-        })
-        .expect("孙候选摘要有到期计时");
+    let sweep_timer = |actions: &[Action]| {
+        actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Schedule {
+                    token,
+                    kind: kind @ TimerKind::Run(RunTimer::EventLogSweep { .. }),
+                    ..
+                } => Some((token.clone(), kind.clone())),
+                _ => None,
+            })
+            .expect("孙候选摘要有到期计时")
+    };
+    let timer = sweep_timer(&actions);
     m.clock.mono_ms += 30_000;
     m.clock.now_ms += 30_000;
+    assert!(
+        m.relations
+            .operations
+            .values()
+            .any(|op| op.receivers.contains(G)
+                && op.run_id.is_empty()
+                && op.outcome == EvidenceOutcome::Pending),
+        "前置：孙的派生证据还在等祖先绑定"
+    );
+    let renewed = mock.inject(
+        &mut m,
+        Event::Timer {
+            token: timer.0,
+            kind: timer.1,
+        },
+    );
+    assert!(
+        !log_rows(&renewed).iter().any(|r| r["threadId"] == G),
+        "归属证据还在进行：暂存续期，不写缺口"
+    );
+    // 证据等到期限转成未证明后，暂存再到期才写缺口（写得出缺口即说明续期时摘要仍在暂存）。
+    let timer = sweep_timer(&renewed);
+    m.clock.mono_ms += 30_000;
+    m.clock.now_ms += 30_000;
+    let mut evidence = vec![];
+    m.facts_expire(&mut evidence);
+    assert!(
+        m.relations
+            .operations
+            .values()
+            .any(|op| op.receivers.contains(G)
+                && op.outcome == EvidenceOutcome::Unproven
+                && op.proof_expired),
+        "前置：孙的派生证据到期转未证明"
+    );
     let expired = mock.inject(
         &mut m,
         Event::Timer {

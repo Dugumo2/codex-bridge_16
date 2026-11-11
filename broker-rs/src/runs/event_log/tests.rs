@@ -587,6 +587,166 @@ fn tree_log_明确不归本运行的历史兄弟暂存超限不写缺口() {
     assert_eq!(gaps, ["unknown".to_owned()].into());
 }
 
+/// 本运行的子代理某一轮只消费了平级或下级的协作消息（如兄弟子代理之间互发）：到期正常丢弃，不写缺口。
+/// 消费了直接上级的消息、上下混合、跨层下发、只有别的轮有协作记录、没有任何消费记录的，照常写缺口。
+#[test]
+fn tree_log_只被协作消息唤醒的轮次到期不写缺口_其余照常() {
+    /// （用例名，消费记录（轮，发件人，收件人），是否写缺口）
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str, &'a str)], bool);
+    let cases: &[Case] = &[
+        ("平级", &[("t", "/root/甲", "/root/乙")], false),
+        ("下级向上", &[("t", "/root/乙/丙", "/root/乙")], false),
+        (
+            "两条平级",
+            &[("t", "/root/甲", "/root/乙"), ("t", "/root/丁", "/root/乙")],
+            false,
+        ),
+        ("直接上级", &[("t", "/root", "/root/乙")], true),
+        (
+            "上级加平级",
+            &[("t", "/root/甲", "/root/乙"), ("t", "/root", "/root/乙")],
+            true,
+        ),
+        ("跨层下发", &[("t", "/root", "/root/甲/乙")], true),
+        (
+            "协作记录在别的轮",
+            &[("另一轮", "/root/甲", "/root/乙")],
+            true,
+        ),
+        ("没有消费记录", &[], true),
+    ];
+    for (name, notes, expect_gap) in cases {
+        let mut m = setup();
+        candidate(&mut m, "乙", "root");
+        for (turn, author, recipient) in *notes {
+            m.note_event_log_delivery("乙", turn, author, recipient);
+        }
+        assert!(
+            !m.historical_subagent_for_run("run-a", "乙"),
+            "前置：不是历史子代理"
+        );
+        let mut a = vec![];
+        m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
+        assert_eq!(m.runs.event_log.pending.len(), 1, "前置：{name} 已暂存");
+        let generation = m.runs.event_log.timer.unwrap();
+        m.clock.mono_ms = PENDING_MS;
+        a.clear();
+        m.sweep_event_log(generation, &mut a);
+        assert!(m.runs.event_log.pending.is_empty(), "{name}");
+        let gap = logs(&a).iter().any(|l| l.2 == "记录缺口");
+        assert_eq!(gap, *expect_gap, "{name}");
+    }
+}
+
+/// 归属证据还在进行（跟进等配对）时，暂存到期续期、不写缺口；证据之后转成过期未证明，再到期才写缺口。
+/// 续期不打乱顺序；协作消费记录也不能越过过期证据把它吞掉。
+#[test]
+fn tree_log_归属证据进行中到期续期_转过期后写缺口() {
+    for collaboration in [false, true] {
+        let mut m = setup();
+        candidate(&mut m, "乙", "root");
+        if collaboration {
+            m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
+        }
+        evidence_to(
+            &mut m,
+            "乙",
+            EvidenceKind::V2Interacted,
+            EvidenceOutcome::Pending,
+            false,
+            false,
+        );
+        let mut a = vec![];
+        let first = Some(
+            json!({"threadId":"乙","turnId":"t","item":{"id":"一","type":"agentMessage","text":"第一条"}}),
+        );
+        m.buffer_child_event_log("乙", "item/completed", &first, false, &mut a);
+        m.clock.mono_ms = PENDING_MS / 2;
+        let second = Some(
+            json!({"threadId":"乙","turnId":"t","item":{"id":"二","type":"agentMessage","text":"第二条"}}),
+        );
+        m.buffer_child_event_log("乙", "item/completed", &second, false, &mut a);
+        let generation = m.runs.event_log.timer.unwrap();
+        m.clock.mono_ms = PENDING_MS;
+        a.clear();
+        m.sweep_event_log(generation, &mut a);
+        assert!(logs(&a).is_empty(), "证据进行中不写缺口");
+        let kept: Vec<_> = m
+            .runs
+            .event_log
+            .pending
+            .iter()
+            .map(|p| p.summary.item.clone())
+            .collect();
+        assert_eq!(
+            kept,
+            [Some("一".to_owned()), Some("二".to_owned())],
+            "续期后仍按到达顺序"
+        );
+        let generation = m.runs.event_log.timer.expect("续期后重新计时");
+        let op = m.relations.operations.values_mut().next().unwrap();
+        op.outcome = EvidenceOutcome::Unproven;
+        op.proof_expired = true;
+        m.clock.mono_ms = PENDING_MS * 2;
+        a.clear();
+        m.sweep_event_log(generation, &mut a);
+        assert!(m.runs.event_log.pending.is_empty());
+        assert_eq!(m.runs.event_log.bytes, 0);
+        let gaps = logs(&a).iter().filter(|l| l.2 == "记录缺口").count();
+        assert_eq!(gaps, 2, "证据过期后写缺口（协作记录：{collaboration}）");
+    }
+}
+
+/// 候选运行已经结束：即使证据仍标为进行中也不再续期，到期照常写缺口，不会无限续期。
+#[test]
+fn tree_log_候选运行结束后证据进行中也不续期() {
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    evidence_to(
+        &mut m,
+        "乙",
+        EvidenceKind::V2Interacted,
+        EvidenceOutcome::Pending,
+        false,
+        false,
+    );
+    let mut a = vec![];
+    m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
+    assert_eq!(m.runs.event_log.pending.len(), 1, "前置：已暂存");
+    m.runs.runs.get_mut("run-a").unwrap().state = RunState::Ended;
+    let generation = m.runs.event_log.timer.unwrap();
+    m.clock.mono_ms = PENDING_MS;
+    a.clear();
+    m.sweep_event_log(generation, &mut a);
+    assert!(m.runs.event_log.pending.is_empty());
+    assert!(logs(&a).iter().any(|l| l.2 == "记录缺口"));
+}
+
+/// 发件方向的判定只看路径层级：平级与下级是协作，直接上级和跨层下发不是。
+#[test]
+fn tree_log_协作消息方向判定() {
+    assert!(collaboration_delivery("/root/甲", "/root/乙"));
+    assert!(collaboration_delivery("/root/乙/丙", "/root/乙"));
+    assert!(collaboration_delivery("/root/乙/丙/丁", "/root/乙"));
+    assert!(collaboration_delivery("/root/a/x", "/root/a/y"));
+    assert!(!collaboration_delivery("/root", "/root/乙"));
+    assert!(!collaboration_delivery("/root/甲", "/root/甲/乙"));
+    assert!(!collaboration_delivery("/root", "/root/甲/乙"));
+    assert!(!collaboration_delivery("/root/乙", "/root/乙"));
+    assert!(
+        collaboration_delivery("/root/乙x", "/root/乙"),
+        "名字前缀相同的是平级"
+    );
+    assert!(
+        !collaboration_delivery("/root/乙x/丙", "/root/乙"),
+        "名字前缀相同的平级的下级，不是乙的下级"
+    );
+    assert!(
+        !collaboration_delivery("/root/甲/丙", "/root/乙"),
+        "别的分支的下级"
+    );
+}
+
 /// 上一运行留下的历史兄弟：本运行对它没有任何管理证据，它被唤醒的轮次摘要按血缘暂存后，
 /// 到期或关闭清理时正常丢弃，不写「记录缺口」；同一时刻血缘不明的候选照常告警。
 #[test]

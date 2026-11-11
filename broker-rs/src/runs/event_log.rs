@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 const PER_THREAD_BYTES: usize = 64 * 1024;
 const GLOBAL_BYTES: usize = 1024 * 1024;
 const PENDING_MS: u64 = 30_000;
+/// 消费方向记录的条数上限；挤掉的旧记录只会让那一轮少一条协作证据，照常记缺口，不会误吞。
+const DELIVERY_NOTES: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct EventLog {
@@ -18,6 +20,24 @@ pub(super) struct EventLog {
     pending: VecDeque<Pending>,
     bytes: usize,
     timer: Option<u64>,
+    deliveries: VecDeque<DeliveryNote>,
+}
+
+/// v2 子代理某一轮消费的一条代理间消息的方向。配对用的消费记录只留证据期限，
+/// 这里单独留一份，供暂存到期时判断这一轮是不是只被平级或下级的协作消息唤醒。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryNote {
+    thread: String,
+    turn: String,
+    collaboration: bool,
+}
+
+/// 发件人是收件人的平级（同一个直接上级）或下级：协作消息，不授予管理权。
+/// 直接上级发来的不算；跨层下发（如根直接发给孙）也不算，那是归属冲突，照常留缺口。
+fn collaboration_delivery(author: &str, recipient: &str) -> bool {
+    let parent = |path: &str| path.rsplit_once('/').map(|(head, _)| head.to_owned());
+    author.starts_with(&format!("{recipient}/"))
+        || (author != recipient && parent(author).is_some() && parent(author) == parent(recipient))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -535,30 +555,81 @@ impl Machine {
         }
     }
 
-    /// 暂存到期或关闭时清掉已明确判定不归该运行管理的候选：它们的摘要本来就不该写进该运行，
-    /// 正常丢弃，不是覆盖缺口。典型是上一运行留下的历史兄弟被平级消息唤醒的轮次。
-    ///
-    /// 「明确」指分类用的同一判定——它是别的运行的历史子代理、本运行对它没有任何管理证据
-    /// （[`historical_subagent_for_run`](Machine::historical_subagent_for_run)）——而且此刻也没有
-    /// 任何还可能把它归给本运行的未决证据：等配对或等发起方绑定的跟进、等会话文件的跟进、等首轮的派生。
-    /// 兄弟的轮次还在跑时分类会因活动而暂缓收尾，但那是收敛要等它，不是归属未定。
-    /// 证据等到期限才转未证明，只说明归属没证明出来，不算明确排除（`proof_expired`）；
-    /// 只记事实的未证明（上游 completed 通知）、定案不是自己的、明确被拒绝的（平级、向上）都不算未决。
-    /// 其余候选（血缘或历史不明、证据未决或过期）照常记缺口。
-    fn settle_pending_candidates(&self, pending: &mut Pending) {
-        let thread = pending.thread.clone();
-        pending
-            .candidates
-            .retain(|(run, _)| !self.event_log_disowned(run, &thread));
+    /// v2 子代理消费代理间消息时记下这一轮的消费方向（见 `DeliveryNote`）。
+    pub(crate) fn note_event_log_delivery(
+        &mut self,
+        thread: &str,
+        turn: &str,
+        author: &str,
+        recipient: &str,
+    ) {
+        let notes = &mut self.runs.event_log.deliveries;
+        if notes.len() >= DELIVERY_NOTES {
+            notes.pop_front();
+        }
+        notes.push_back(DeliveryNote {
+            thread: thread.into(),
+            turn: turn.into(),
+            collaboration: collaboration_delivery(author, recipient),
+        });
     }
 
-    fn event_log_disowned(&self, run: &str, thread: &str) -> bool {
-        if !self.historical_subagent_for_run(run, thread) {
+    /// 这一轮有消费记录，而且消费的全是平级或下级发来的协作消息。
+    fn turn_collaboration_only(&self, thread: &str, turn: &str) -> bool {
+        let mut notes = self
+            .runs
+            .event_log
+            .deliveries
+            .iter()
+            .filter(|n| n.thread == thread && n.turn == turn)
+            .peekable();
+        notes.peek().is_some() && notes.all(|n| n.collaboration)
+    }
+
+    /// 暂存到期或关闭时清掉已明确判定不归该运行管理的候选：它们的摘要本来就不该写进该运行，
+    /// 正常丢弃，不是覆盖缺口。
+    ///
+    /// 「明确」要先满足：此刻没有任何还可能把它归给本运行的证据（`event_log_evidence_in_flight`），
+    /// 也没有等到期限才转未证明的证据（`proof_expired`，只说明归属没证明出来，不算明确排除）；
+    /// 只记事实的未证明（上游 completed 通知）、定案不是自己的、明确被拒绝的（平级、向上）都不算未决。
+    /// 再满足以下之一：
+    /// - 它是别的运行的历史子代理、本运行对它没有任何管理证据
+    ///   （[`historical_subagent_for_run`](Machine::historical_subagent_for_run)），典型是上一运行留下的兄弟；
+    /// - 这一轮消费的全是平级或下级发来的协作消息（`turn_collaboration_only`），典型是本运行的
+    ///   兄弟子代理之间互发、被平级拒绝纳管后唤醒的轮次。证据落在这一轮自己的消费记录上，
+    ///   不拿别的轮、别的时刻的拒绝推断。
+    ///
+    /// 兄弟的轮次还在跑时分类会因活动而暂缓收尾，但那是收敛要等它，不是归属未定。
+    /// 其余候选（血缘或历史不明、证据过期、没有消费记录的 v1 平级消息）照常记缺口。
+    fn settle_pending_candidates(&self, pending: &mut Pending) {
+        let thread = pending.thread.clone();
+        let turn = pending.turn.clone();
+        pending
+            .candidates
+            .retain(|(run, _)| !self.event_log_disowned(run, &thread, &turn));
+    }
+
+    fn event_log_disowned(&self, run: &str, thread: &str, turn: &str) -> bool {
+        if self.event_log_evidence_in_flight(run, thread) {
             return false;
         }
-        let unresolved = self.relations.operations.values().any(|op| {
-            (op.outcome == EvidenceOutcome::Pending
-                || (op.outcome == EvidenceOutcome::Unproven && op.proof_expired))
+        let expired = self.relations.operations.values().any(|op| {
+            op.outcome == EvidenceOutcome::Unproven
+                && op.proof_expired
+                && (op.run_id == run || op.run_id.is_empty())
+                && op.receivers.contains(thread)
+                && !op.rejected_receivers.contains_key(thread)
+        });
+        !expired
+            && (self.historical_subagent_for_run(run, thread)
+                || self.turn_collaboration_only(thread, turn))
+    }
+
+    /// 还在进行、可能把这个线程的轮次归给该运行的证据：等配对或等发起方绑定的跟进、
+    /// 等会话文件的跟进、等首轮的派生。它们都有各自的期限，到期会转成结果或未证明。
+    fn event_log_evidence_in_flight(&self, run: &str, thread: &str) -> bool {
+        self.relations.operations.values().any(|op| {
+            op.outcome == EvidenceOutcome::Pending
                 && (op.run_id == run || op.run_id.is_empty())
                 && op.receivers.contains(thread)
                 && !op.rejected_receivers.contains_key(thread)
@@ -569,14 +640,28 @@ impl Machine {
             .waits
             .values()
             .any(|w| w.child == thread)
-            || self.relations.aux.spawn_waits.contains_key(thread);
-        !unresolved
+            || self.relations.aux.spawn_waits.contains_key(thread)
     }
 
+    /// 到期的暂存：候选运行还在进行、且它的归属证据还在进行时续期，不按 30 秒丢
+    /// （证据各有期限，运行结束即停，字节上限照旧兜底）；否则清掉明确不归的候选，其余记缺口。
+    /// 续期的条目留在原位，补写时仍按到达顺序。
     fn expire_event_log(&mut self, actions: &mut Vec<Action>) {
         let pending = std::mem::take(&mut self.runs.event_log.pending);
         for mut event in pending {
             if event.expires <= self.clock.mono_ms {
+                if event.candidates.iter().any(|(run, _)| {
+                    self.runs.runs.get(run).is_some_and(|r| {
+                        matches!(
+                            r.state,
+                            super::RunState::Running | super::RunState::Stopping
+                        )
+                    }) && self.event_log_evidence_in_flight(run, &event.thread)
+                }) {
+                    event.expires = self.clock.mono_ms.saturating_add(PENDING_MS);
+                    self.runs.event_log.pending.push_back(event);
+                    continue;
+                }
                 self.runs.event_log.bytes -= event.bytes;
                 self.settle_pending_candidates(&mut event);
                 self.pending_gap(&event, "归属确认前摘要暂存过期", actions);
