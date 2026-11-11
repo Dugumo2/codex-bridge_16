@@ -793,29 +793,41 @@ fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
     }
 }
 
-/// 腾位先删已结束、没有暂存摘要的轮，其次删纯协作轮；还在用的纯协作轮不能为它们让位。
-/// 只有表里全是可能还在用的非协作轮时才挤掉含上级消息的轮，此后新登记的轮一律不算纯协作。
+/// 腾位先删纯协作轮；只有表里全是含上级消息的轮时才挤掉最旧的，此后新登记的轮一律不算纯协作。
+/// 已结束的轮也不例外：会话文件里同一轮的消费记录可能迟到，挤掉后重新登记不能翻成纯协作。
 #[test]
 fn tree_log_消费方向表腾位顺序() {
-    // 已结束的轮先让位：乙这一轮的纯协作记录保住，到期正常丢弃。
+    // 已结束的混合轮被挤出，之后经会话文件迟到读到同一轮的平级消息：仍不算纯协作，照常写缺口。
     let mut m = setup();
     candidate(&mut m, "乙", "root");
-    m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
-    for n in 0..1023 {
+    m.record("乙").ended_turns.push_back("t".into());
+    m.note_event_log_delivery("乙", "t", "/root", "/root/乙");
+    for n in 0..1024 {
         let thread = format!("已结束{n}");
         m.record(&thread).ended_turns.push_back("旧轮".into());
         m.note_event_log_delivery(&thread, "旧轮", "/root", "/root/丁");
     }
-    m.note_event_log_delivery("新线程", "新轮", "/root", "/root/戊");
-    assert!(m.turn_collaboration_only("乙", "t"), "已结束的轮先让位");
-    assert!(!m.runs.event_log.deliveries_lossy);
+    assert!(
+        !m.runs
+            .event_log
+            .deliveries
+            .iter()
+            .any(|t| t.thread == "乙" && t.turn == "t"),
+        "前置：乙这一轮已被挤出"
+    );
+    m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
+    assert!(m.runs.event_log.deliveries_lossy);
+    assert!(
+        !m.turn_collaboration_only("乙", "t"),
+        "迟到记录不能把挤出的混合轮翻成纯协作"
+    );
     let mut a = vec![];
     m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
     let generation = m.runs.event_log.timer.unwrap();
     m.clock.mono_ms = PENDING_MS;
     a.clear();
     m.sweep_event_log(generation, &mut a);
-    assert!(!logs(&a).iter().any(|l| l.2 == "记录缺口"));
+    assert!(logs(&a).iter().any(|l| l.2 == "记录缺口"));
 
     // 有纯协作轮可删时只删它们，不挤含上级消息的轮，也不进入「记录不全」。
     let mut m = setup();

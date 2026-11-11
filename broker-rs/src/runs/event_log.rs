@@ -593,27 +593,14 @@ impl Machine {
         });
     }
 
-    /// 表满时腾出一个位置，按安全程度依次尝试：
-    /// 1. 已结束、也没有暂存摘要的轮：不会再消费消息，也不会再用到，删掉无损；
-    /// 2. 最旧的纯协作轮：删掉后这一轮只会变成「没有记录」照常记缺口，或重新登记时仍如实反映；
-    /// 3. 都没有时才挤掉最旧的轮，它可能含非协作消息、之后又被当新轮登记成纯协作，
+    /// 表满时腾出一个位置：
+    /// 1. 优先删最旧的纯协作轮：删掉后这一轮只会变成「没有记录」照常记缺口，或重新登记时仍如实反映；
+    /// 2. 没有纯协作轮时才挤掉最旧的轮。它含非协作消息，之后可能又收到同一轮的消费记录
+    ///    （轮已结束也一样：会话文件里的记录可能迟到读到），被当新轮登记成纯协作，
     ///    所以记下 `deliveries_lossy`，此后新登记的轮一律不算纯协作。
     fn make_room_for_delivery(&mut self) {
-        let finished = self.runs.event_log.deliveries.iter().position(|t| {
-            self.records
-                .get(&t.thread)
-                .is_some_and(|r| r.ended_turns.iter().any(|ended| ended == &t.turn))
-                && !self
-                    .runs
-                    .event_log
-                    .pending
-                    .iter()
-                    .any(|p| p.thread == t.thread && p.turn == t.turn)
-        });
         let log = &mut self.runs.event_log;
-        if let Some(index) =
-            finished.or_else(|| log.deliveries.iter().position(|t| t.collaboration_only))
-        {
+        if let Some(index) = log.deliveries.iter().position(|t| t.collaboration_only) {
             log.deliveries.remove(index);
         } else {
             log.deliveries.pop_front();
