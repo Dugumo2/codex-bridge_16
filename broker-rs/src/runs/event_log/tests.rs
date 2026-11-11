@@ -755,14 +755,17 @@ fn tree_log_协作消息方向判定() {
     }
 }
 
-/// 同一轮先后消费了上级和平级的消息：只要出现过一次非协作消息就不算纯协作，
-/// 别的轮写满记录也不能把它翻成纯协作；整轮被挤出后变成「没有记录」，同样照常写缺口。
+/// 同一轮先后消费了上级和平级的消息：只要出现过一次非协作消息就不算纯协作。
+/// 别的轮写满记录（纯协作轮或同样含上级消息的轮）、之后这一轮又收到平级消息，都不能把它翻成纯协作。
 #[test]
 fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
-    for (order, fill) in [
-        (["/root", "/root/甲"], 1023),
-        (["/root/甲", "/root"], 1023),
-        (["/root", "/root/甲"], 1024),
+    for (order, fill, filler_author) in [
+        (["/root", "/root/甲"], 1023, "/root/甲"),
+        (["/root/甲", "/root"], 1023, "/root/甲"),
+        (["/root", "/root/甲"], 1024, "/root/甲"),
+        (["/root", "/root/甲"], 2048, "/root/甲"),
+        (["/root", "/root/甲"], 1024, "/root"),
+        (["/root/甲", "/root"], 2048, "/root"),
     ] {
         let mut m = setup();
         candidate(&mut m, "乙", "root");
@@ -770,11 +773,12 @@ fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
             m.note_event_log_delivery("乙", "t", author, "/root/乙");
         }
         for n in 0..fill {
-            m.note_event_log_delivery("别的线程", &format!("轮{n}"), "/root/甲", "/root/丁");
+            m.note_event_log_delivery("别的线程", &format!("轮{n}"), filler_author, "/root/丁");
         }
+        m.note_event_log_delivery("乙", "t", "/root/丙", "/root/乙");
         assert!(
             !m.turn_collaboration_only("乙", "t"),
-            "前置：{order:?} 挤入 {fill} 轮后不是纯协作"
+            "前置：{order:?} 挤入 {fill} 轮（{filler_author}）再收平级消息后不是纯协作"
         );
         let mut a = vec![];
         m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
@@ -784,9 +788,69 @@ fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
         m.sweep_event_log(generation, &mut a);
         assert!(
             logs(&a).iter().any(|l| l.2 == "记录缺口"),
-            "{order:?} 挤入 {fill} 轮"
+            "{order:?} 挤入 {fill} 轮（{filler_author}）"
         );
     }
+}
+
+/// 腾位先删已结束、没有暂存摘要的轮，其次删纯协作轮；还在用的纯协作轮不能为它们让位。
+/// 只有表里全是可能还在用的非协作轮时才挤掉含上级消息的轮，此后新登记的轮一律不算纯协作。
+#[test]
+fn tree_log_消费方向表腾位顺序() {
+    // 已结束的轮先让位：乙这一轮的纯协作记录保住，到期正常丢弃。
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
+    for n in 0..1023 {
+        let thread = format!("已结束{n}");
+        m.record(&thread).ended_turns.push_back("旧轮".into());
+        m.note_event_log_delivery(&thread, "旧轮", "/root", "/root/丁");
+    }
+    m.note_event_log_delivery("新线程", "新轮", "/root", "/root/戊");
+    assert!(m.turn_collaboration_only("乙", "t"), "已结束的轮先让位");
+    assert!(!m.runs.event_log.deliveries_lossy);
+    let mut a = vec![];
+    m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
+    let generation = m.runs.event_log.timer.unwrap();
+    m.clock.mono_ms = PENDING_MS;
+    a.clear();
+    m.sweep_event_log(generation, &mut a);
+    assert!(!logs(&a).iter().any(|l| l.2 == "记录缺口"));
+
+    // 有纯协作轮可删时只删它们，不挤含上级消息的轮，也不进入「记录不全」。
+    let mut m = setup();
+    m.note_event_log_delivery("乙", "t", "/root", "/root/乙");
+    for n in 0..2048 {
+        m.note_event_log_delivery("别的线程", &format!("轮{n}"), "/root/甲", "/root/丁");
+    }
+    assert!(!m.runs.event_log.deliveries_lossy, "纯协作轮先让位");
+    assert!(m
+        .runs
+        .event_log
+        .deliveries
+        .iter()
+        .any(|t| t.thread == "乙" && t.turn == "t"));
+
+    // 全是还在用的非协作轮：只能挤掉最旧的，此后新登记的纯协作轮也不算纯协作，照常写缺口。
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    for n in 0..1024 {
+        m.note_event_log_delivery("别的线程", &format!("轮{n}"), "/root", "/root/丁");
+    }
+    assert!(!m.runs.event_log.deliveries_lossy, "前置：刚好填满还没挤");
+    m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
+    assert!(m.runs.event_log.deliveries_lossy);
+    assert!(
+        !m.turn_collaboration_only("乙", "t"),
+        "记录可能不全的轮不算纯协作"
+    );
+    let mut a = vec![];
+    m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
+    let generation = m.runs.event_log.timer.unwrap();
+    m.clock.mono_ms = PENDING_MS;
+    a.clear();
+    m.sweep_event_log(generation, &mut a);
+    assert!(logs(&a).iter().any(|l| l.2 == "记录缺口"));
 }
 
 /// 上一运行留下的历史兄弟：本运行对它没有任何管理证据，它被唤醒的轮次摘要按血缘暂存后，

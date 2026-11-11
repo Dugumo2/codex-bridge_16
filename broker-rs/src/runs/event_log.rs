@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 const PER_THREAD_BYTES: usize = 64 * 1024;
 const GLOBAL_BYTES: usize = 1024 * 1024;
 const PENDING_MS: u64 = 30_000;
-/// 记录消费方向的轮数上限。满了整轮挤掉最旧的：那一轮变成「没有消费记录」，照常记缺口，不会误吞。
+/// 记录消费方向的轮数上限，腾位规则见 `make_room_for_delivery`。
 const DELIVERY_TURNS: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -21,11 +21,15 @@ pub(super) struct EventLog {
     bytes: usize,
     timer: Option<u64>,
     deliveries: VecDeque<TurnDeliveries>,
+    /// 曾经挤掉过含非协作消息、且可能还会收到消息的轮：此后新登记的轮无法证明记录完整
+    /// （可能正是被挤掉的那一轮），一律不算纯协作，直到 broker 重启。
+    deliveries_lossy: bool,
 }
 
 /// v2 子代理某一轮消费过的代理间消息的方向汇总。配对用的消费记录只留证据期限，
 /// 这里按轮单独留一份，供暂存到期时判断这一轮是不是只被协作消息唤醒。
-/// 只要消费过一条非协作消息，`collaboration_only` 就永久为假，不随后来的记录翻转。
+/// 只要消费过一条非协作消息，`collaboration_only` 就永久为假，不随后来的记录翻转；
+/// 腾位时也不会把这样的轮挤掉后又当成新轮重新登记成纯协作（见 `make_room_for_delivery`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TurnDeliveries {
     thread: String,
@@ -559,7 +563,7 @@ impl Machine {
         }
     }
 
-    /// v2 子代理消费代理间消息时记下这一轮的消费方向（见 `DeliveryNote`）。
+    /// v2 子代理消费代理间消息时记下这一轮的消费方向（见 `TurnDeliveries`）。
     pub(crate) fn note_event_log_delivery(
         &mut self,
         thread: &str,
@@ -568,22 +572,53 @@ impl Machine {
         recipient: &str,
     ) {
         let collaboration = collaboration_delivery(author, recipient);
-        let turns = &mut self.runs.event_log.deliveries;
-        if let Some(known) = turns
+        if let Some(known) = self
+            .runs
+            .event_log
+            .deliveries
             .iter_mut()
             .find(|t| t.thread == thread && t.turn == turn)
         {
             known.collaboration_only &= collaboration;
             return;
         }
-        if turns.len() >= DELIVERY_TURNS {
-            turns.pop_front();
+        if self.runs.event_log.deliveries.len() >= DELIVERY_TURNS {
+            self.make_room_for_delivery();
         }
-        turns.push_back(TurnDeliveries {
+        let trusted = !self.runs.event_log.deliveries_lossy;
+        self.runs.event_log.deliveries.push_back(TurnDeliveries {
             thread: thread.into(),
             turn: turn.into(),
-            collaboration_only: collaboration,
+            collaboration_only: collaboration && trusted,
         });
+    }
+
+    /// 表满时腾出一个位置，按安全程度依次尝试：
+    /// 1. 已结束、也没有暂存摘要的轮：不会再消费消息，也不会再用到，删掉无损；
+    /// 2. 最旧的纯协作轮：删掉后这一轮只会变成「没有记录」照常记缺口，或重新登记时仍如实反映；
+    /// 3. 都没有时才挤掉最旧的轮，它可能含非协作消息、之后又被当新轮登记成纯协作，
+    ///    所以记下 `deliveries_lossy`，此后新登记的轮一律不算纯协作。
+    fn make_room_for_delivery(&mut self) {
+        let finished = self.runs.event_log.deliveries.iter().position(|t| {
+            self.records
+                .get(&t.thread)
+                .is_some_and(|r| r.ended_turns.iter().any(|ended| ended == &t.turn))
+                && !self
+                    .runs
+                    .event_log
+                    .pending
+                    .iter()
+                    .any(|p| p.thread == t.thread && p.turn == t.turn)
+        });
+        let log = &mut self.runs.event_log;
+        if let Some(index) =
+            finished.or_else(|| log.deliveries.iter().position(|t| t.collaboration_only))
+        {
+            log.deliveries.remove(index);
+        } else {
+            log.deliveries.pop_front();
+            log.deliveries_lossy = true;
+        }
     }
 
     /// 这一轮有消费记录，而且消费的全是协作消息。

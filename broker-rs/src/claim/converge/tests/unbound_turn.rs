@@ -234,11 +234,13 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
         Some("轮次完成"),
         "补写到 U 的完成摘要止：{late:?}"
     );
-    assert_eq!(
-        late.iter().filter(|k| k.as_str() == "轮次开始").count(),
-        1,
-        "不重复补写：{late:?}"
-    );
+    for kind in ["轮次开始", "轮次完成"] {
+        assert_eq!(
+            late.iter().filter(|k| k.as_str() == kind).count(),
+            1,
+            "{kind} 不重复补写：{late:?}"
+        );
+    }
     assert_eq!(op(&m, "跟进").proven_turns[C], [U.to_owned()].into());
     assert!(
         m.binding(C, U)
