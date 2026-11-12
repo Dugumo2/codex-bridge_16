@@ -125,6 +125,29 @@ fn item(thread: &str, turn: &str) -> Option<Value> {
     )
 }
 
+/// 上游格式（UUIDv7）的轮号，前 48 位是开始毫秒。
+fn turn_at(ms: u64) -> String {
+    format!(
+        "{:08x}-{:04x}-7000-8000-000000000000",
+        ms >> 16,
+        ms & 0xffff
+    )
+}
+
+/// 给这一轮暂存一条摘要并等到到期，返回有没有写缺口。
+fn expires_with_gap(m: &mut Machine, thread: &str, turn: &str) -> bool {
+    let mut a = vec![];
+    m.buffer_child_event_log(thread, "item/completed", &item(thread, turn), false, &mut a);
+    assert_eq!(m.runs.event_log.pending.len(), 1, "前置：已暂存");
+    let generation = m.runs.event_log.timer.unwrap();
+    m.clock.mono_ms += PENDING_MS;
+    m.clock.now_ms += PENDING_MS;
+    a.clear();
+    m.sweep_event_log(generation, &mut a);
+    assert!(m.runs.event_log.pending.is_empty());
+    logs(&a).iter().any(|l| l.2 == "记录缺口")
+}
+
 #[test]
 fn tree_log_实际tab边界与正文标志不会混淆() {
     let mut m = setup();
@@ -616,18 +639,19 @@ fn tree_log_只被协作消息唤醒的轮次到期不写缺口_其余照常() {
         ),
         ("没有消费记录", &[], true),
     ];
+    let id = |label: &str| turn_at(if label == "t" { 5000 } else { 5001 });
     for (name, notes, expect_gap) in cases {
         let mut m = setup();
         candidate(&mut m, "乙", "root");
         for (turn, author, recipient) in *notes {
-            m.note_event_log_delivery("乙", turn, author, recipient);
+            m.note_event_log_delivery("乙", &id(turn), author, recipient);
         }
         assert!(
             !m.historical_subagent_for_run("run-a", "乙"),
             "前置：不是历史子代理"
         );
         let mut a = vec![];
-        m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
+        m.buffer_child_event_log("乙", "item/completed", &item("乙", &id("t")), false, &mut a);
         assert_eq!(m.runs.event_log.pending.len(), 1, "前置：{name} 已暂存");
         let generation = m.runs.event_log.timer.unwrap();
         m.clock.mono_ms = PENDING_MS;
@@ -646,8 +670,10 @@ fn tree_log_归属证据进行中到期续期_转过期后写缺口() {
     for collaboration in [false, true] {
         let mut m = setup();
         candidate(&mut m, "乙", "root");
+        let t = turn_at(5000);
         if collaboration {
-            m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
+            m.note_event_log_delivery("乙", &t, "/root/甲", "/root/乙");
+            assert!(m.turn_collaboration_only("乙", &t), "前置：协作记录已登记");
         }
         evidence_to(
             &mut m,
@@ -659,12 +685,12 @@ fn tree_log_归属证据进行中到期续期_转过期后写缺口() {
         );
         let mut a = vec![];
         let first = Some(
-            json!({"threadId":"乙","turnId":"t","item":{"id":"一","type":"agentMessage","text":"第一条"}}),
+            json!({"threadId":"乙","turnId":&t,"item":{"id":"一","type":"agentMessage","text":"第一条"}}),
         );
         m.buffer_child_event_log("乙", "item/completed", &first, false, &mut a);
         m.clock.mono_ms = PENDING_MS / 2;
         let second = Some(
-            json!({"threadId":"乙","turnId":"t","item":{"id":"二","type":"agentMessage","text":"第二条"}}),
+            json!({"threadId":"乙","turnId":&t,"item":{"id":"二","type":"agentMessage","text":"第二条"}}),
         );
         m.buffer_child_event_log("乙", "item/completed", &second, false, &mut a);
         let generation = m.runs.event_log.timer.unwrap();
@@ -755,114 +781,244 @@ fn tree_log_协作消息方向判定() {
     }
 }
 
+/// 轮号里的开始时间只认上游的 UUIDv7；别的格式没有开始时间，这样的轮不登记消费方向，协作消息也不免告警。
+#[test]
+fn tree_log_轮号开始时间只认uuid7() {
+    assert_eq!(
+        turn_started_ms("01a1ba72-3987-76a0-a329-b91bc39b3682"),
+        Some(0x01a1_ba72_3987)
+    );
+    assert_eq!(turn_started_ms(&turn_at(5000)), Some(5000));
+    for (turn, why) in [
+        ("01a1ba72-3987-46a0-a329-b91bc39b3682", "版本 4"),
+        ("01a1ba72-3987-76a0-a329-b91bc39b368", "少一位"),
+        ("01a1ba7203987-76a0-a329-b91bc39b3682", "分隔符位置不对"),
+        ("+1a1ba72-3987-76a0-a329-b91bc39b3682", "带符号"),
+        ("01a1ba72-39g7-76a0-a329-b91bc39b3682", "不是十六进制"),
+        ("01a1ba72-3987-76a0-c329-b91bc39b3682", "变体不是 RFC 4122"),
+        ("01a1ba72-3987-76a0-a329-b91bc39b36zz", "后半段不是十六进制"),
+        ("01a1ba72-3987-76a0-a329+b91bc39b3682", "后半段分隔符不对"),
+        ("01a1ba72-3987-76-0-a329-b91bc39b3682", "版本段里混进分隔符"),
+        ("消息轮消息轮消息轮消息轮", "36 字节但不是编号"),
+        ("消息轮", "不是编号"),
+        ("", "空"),
+    ] {
+        assert_eq!(turn_started_ms(turn), None, "{why}");
+    }
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    m.note_event_log_delivery("乙", "消息轮", "/root/甲", "/root/乙");
+    assert!(
+        m.runs.event_log.deliveries.is_empty(),
+        "前置：没有开始时间的轮不登记"
+    );
+    assert!(expires_with_gap(&mut m, "乙", "消息轮"));
+}
+
 /// 同一轮先后消费了上级和平级的消息：只要出现过一次非协作消息就不算纯协作。
-/// 别的轮写满记录（纯协作轮或同样含上级消息的轮）、之后这一轮又收到平级消息，都不能把它翻成纯协作。
+/// 之后更晚开始的轮把它挤出记录，它再收到平级消息也登记不回来，照常写缺口。
 #[test]
 fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
     for (order, fill, filler_author) in [
-        (["/root", "/root/甲"], 1023, "/root/甲"),
+        (["/root", "/root/甲"], 1023_u64, "/root/甲"),
         (["/root/甲", "/root"], 1023, "/root/甲"),
         (["/root", "/root/甲"], 1024, "/root/甲"),
-        (["/root", "/root/甲"], 2048, "/root/甲"),
-        (["/root", "/root/甲"], 1024, "/root"),
-        (["/root/甲", "/root"], 2048, "/root"),
+        (["/root/甲", "/root"], 1024, "/root"),
+        (["/root", "/root/甲"], 3000, "/root/甲"),
+        (["/root", "/root/甲"], 3000, "/root"),
     ] {
         let mut m = setup();
         candidate(&mut m, "乙", "root");
+        let t = turn_at(5000);
         for author in order {
-            m.note_event_log_delivery("乙", "t", author, "/root/乙");
+            m.note_event_log_delivery("乙", &t, author, "/root/乙");
         }
         for n in 0..fill {
-            m.note_event_log_delivery("别的线程", &format!("轮{n}"), filler_author, "/root/丁");
+            m.note_event_log_delivery("别的线程", &turn_at(6000 + n), filler_author, "/root/丁");
         }
-        m.note_event_log_delivery("乙", "t", "/root/丙", "/root/乙");
-        assert!(
-            !m.turn_collaboration_only("乙", "t"),
-            "前置：{order:?} 挤入 {fill} 轮（{filler_author}）再收平级消息后不是纯协作"
+        let kept = m.runs.event_log.deliveries.keys().any(|k| k.1 == "乙");
+        assert_eq!(
+            kept,
+            fill < 1024,
+            "前置：挤入 {fill} 轮后乙这一轮还在不在表里"
         );
-        let mut a = vec![];
-        m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
-        let generation = m.runs.event_log.timer.unwrap();
-        m.clock.mono_ms = PENDING_MS;
-        a.clear();
-        m.sweep_event_log(generation, &mut a);
+        m.note_event_log_delivery("乙", &t, "/root/丙", "/root/乙");
         assert!(
-            logs(&a).iter().any(|l| l.2 == "记录缺口"),
+            !m.turn_collaboration_only("乙", &t),
+            "{order:?} 挤入 {fill} 轮（{filler_author}）再收平级消息后不是纯协作"
+        );
+        assert_eq!(
+            m.runs.event_log.deliveries.len() as u64,
+            (fill + 1).min(1024),
+            "迟到记录不占位、不挤别的轮"
+        );
+        assert!(
+            expires_with_gap(&mut m, "乙", &t),
             "{order:?} 挤入 {fill} 轮（{filler_author}）"
         );
     }
 }
 
-/// 腾位先删纯协作轮；只有表里全是含上级消息的轮时才挤掉最旧的，此后新登记的轮一律不算纯协作。
-/// 已结束的轮也不例外：会话文件里同一轮的消费记录可能迟到，挤掉后重新登记不能翻成纯协作。
+/// 表满时只丢开始最早的一轮，留下的是开始最晚的那些：被丢的轮登记不回来，留下的轮结论不变。
+/// 同一毫秒开始的两轮，一轮被丢、另一轮还在时也一样。
 #[test]
-fn tree_log_消费方向表腾位顺序() {
-    // 已结束的混合轮被挤出，之后经会话文件迟到读到同一轮的平级消息：仍不算纯协作，照常写缺口。
+fn tree_log_消费方向表只丢开始最早的轮() {
+    let mut m = setup();
+    candidate(&mut m, "子一", "root");
+    candidate(&mut m, "子二", "root");
+    // 两轮同一毫秒开始：子一消费过上级的消息，子二只消费过平级的。
+    let t = turn_at(5000);
+    m.note_event_log_delivery("子一", &t, "/root", "/root/子一");
+    m.note_event_log_delivery("子二", &t, "/root/甲", "/root/子二");
+    // 再登记 1023 个更晚开始、含上级消息的轮，表里多出一轮。
+    for n in 0..1023 {
+        m.note_event_log_delivery("别的线程", &turn_at(6000 + n), "/root", "/root/丁");
+    }
+    let has = |m: &Machine, thread: &str| m.runs.event_log.deliveries.keys().any(|k| k.1 == thread);
+    assert!(
+        !has(&m, "子一") && has(&m, "子二"),
+        "前置：同毫秒的两轮只挤掉了子一"
+    );
+    assert_eq!(m.runs.event_log.deliveries.len(), 1024);
+    // 被丢的子一再收到平级消息：和表里最早的一轮同时开始，登记不回来，也不挤别的轮。
+    m.note_event_log_delivery("子一", &t, "/root/甲", "/root/子一");
+    assert!(!m.turn_collaboration_only("子一", &t));
+    assert!(has(&m, "子二"), "迟到记录不挤掉别的轮");
+    // 开始最晚的一轮一直在表里：再收到平级消息仍是「消费过上级消息」，没有被当成新轮。
+    let newest = turn_at(6000 + 1022);
+    m.note_event_log_delivery("别的线程", &newest, "/root/甲", "/root/丁");
+    assert!(
+        !m.turn_collaboration_only("别的线程", &newest),
+        "留下的是开始最晚的轮"
+    );
+    assert!(expires_with_gap(&mut m, "子一", &t));
+    assert!(
+        !expires_with_gap(&mut m, "子二", &t),
+        "还在表里的纯协作轮不受影响"
+    );
+}
+
+/// 长期运行攒下很多用不到的旧轮（都消费过上级消息）：从开始最早的丢起，之后新开始的轮照常登记，
+/// 兄弟互发唤醒的轮仍不写缺口。
+#[test]
+fn tree_log_长期累计旧轮后新协作轮仍不写缺口() {
     let mut m = setup();
     candidate(&mut m, "乙", "root");
-    m.record("乙").ended_turns.push_back("t".into());
-    m.note_event_log_delivery("乙", "t", "/root", "/root/乙");
-    for n in 0..1024 {
-        let thread = format!("已结束{n}");
-        m.record(&thread).ended_turns.push_back("旧轮".into());
-        m.note_event_log_delivery(&thread, "旧轮", "/root", "/root/丁");
+    for n in 0..5000 {
+        m.note_event_log_delivery(
+            &format!("旧线程{n}"),
+            &turn_at(5000 + n),
+            "/root",
+            "/root/丁",
+        );
     }
-    assert!(
-        !m.runs
-            .event_log
-            .deliveries
-            .iter()
-            .any(|t| t.thread == "乙" && t.turn == "t"),
-        "前置：乙这一轮已被挤出"
+    assert_eq!(
+        m.runs.event_log.deliveries.len(),
+        1024,
+        "前置：表已写满并腾过位"
     );
-    m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
-    assert!(m.runs.event_log.deliveries_lossy);
-    assert!(
-        !m.turn_collaboration_only("乙", "t"),
-        "迟到记录不能把挤出的混合轮翻成纯协作"
-    );
-    let mut a = vec![];
-    m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
-    let generation = m.runs.event_log.timer.unwrap();
-    m.clock.mono_ms = PENDING_MS;
-    a.clear();
-    m.sweep_event_log(generation, &mut a);
-    assert!(logs(&a).iter().any(|l| l.2 == "记录缺口"));
+    let t = turn_at(20_000);
+    m.note_event_log_delivery("乙", &t, "/root/甲", "/root/乙");
+    assert!(m.turn_collaboration_only("乙", &t));
+    assert!(!expires_with_gap(&mut m, "乙", &t));
+}
 
-    // 有纯协作轮可删时只删它们，不挤含上级消息的轮，也不进入「记录不全」。
-    let mut m = setup();
-    m.note_event_log_delivery("乙", "t", "/root", "/root/乙");
-    for n in 0..2048 {
-        m.note_event_log_delivery("别的线程", &format!("轮{n}"), "/root/甲", "/root/丁");
-    }
-    assert!(!m.runs.event_log.deliveries_lossy, "纯协作轮先让位");
-    assert!(m
-        .runs
-        .event_log
-        .deliveries
-        .iter()
-        .any(|t| t.thread == "乙" && t.turn == "t"));
-
-    // 全是还在用的非协作轮：只能挤掉最旧的，此后新登记的纯协作轮也不算纯协作，照常写缺口。
+/// 表满之后才第一次见到的更早开始的轮：登记不进来，也不挤别的轮；它的记录不全，照常写缺口。
+#[test]
+fn tree_log_表满后更早开始的轮不登记() {
     let mut m = setup();
     candidate(&mut m, "乙", "root");
     for n in 0..1024 {
-        m.note_event_log_delivery("别的线程", &format!("轮{n}"), "/root", "/root/丁");
+        m.note_event_log_delivery("别的线程", &turn_at(6000 + n), "/root/甲", "/root/丁");
     }
-    assert!(!m.runs.event_log.deliveries_lossy, "前置：刚好填满还没挤");
-    m.note_event_log_delivery("乙", "t", "/root/甲", "/root/乙");
-    assert!(m.runs.event_log.deliveries_lossy);
-    assert!(
-        !m.turn_collaboration_only("乙", "t"),
-        "记录可能不全的轮不算纯协作"
+    let t = turn_at(5000);
+    m.note_event_log_delivery("乙", &t, "/root", "/root/乙");
+    m.note_event_log_delivery("乙", &t, "/root/甲", "/root/乙");
+    let oldest = m.runs.event_log.deliveries.keys().next().unwrap();
+    assert_eq!(
+        (oldest.0, oldest.1.as_str()),
+        (6000, "别的线程"),
+        "前置：乙这一轮没有登记，也没有挤掉别的轮"
     );
-    let mut a = vec![];
-    m.buffer_child_event_log("乙", "item/completed", &item("乙", "t"), false, &mut a);
-    let generation = m.runs.event_log.timer.unwrap();
-    m.clock.mono_ms = PENDING_MS;
-    a.clear();
-    m.sweep_event_log(generation, &mut a);
-    assert!(logs(&a).iter().any(|l| l.2 == "记录缺口"));
+    assert_eq!(m.runs.event_log.deliveries.len(), 1024);
+    assert!(expires_with_gap(&mut m, "乙", &t));
+}
+
+/// core 启动前开始的轮可能在启动前消费过消息：不登记，协作消息也不免告警；启动后开始的轮照常。
+/// 启动时刻是 core 创建时记下的 `Clock.started_ms`，之后墙钟回拨也不会把更早开始的轮放进来。
+#[test]
+fn tree_log_core启动前开始的轮不免告警() {
+    let mut m = setup();
+    for thread in ["前", "同时", "后", "回拨"] {
+        candidate(&mut m, thread, "root");
+    }
+    m.clock.started_ms = 40_000;
+    m.clock.now_ms = 50_000;
+    m.clock.mono_ms = 10_000;
+    for (thread, started, expect_gap) in [
+        ("前", 39_999, true),
+        ("同时", 40_000, true),
+        ("后", 40_001, false),
+    ] {
+        let t = turn_at(started);
+        m.note_event_log_delivery(thread, &t, "/root/甲", &format!("/root/{thread}"));
+        assert_eq!(expires_with_gap(&mut m, thread, &t), expect_gap, "{thread}");
+    }
+    m.clock.now_ms -= 30_000;
+    let t = turn_at(39_000);
+    m.note_event_log_delivery("回拨", &t, "/root/甲", "/root/回拨");
+    assert!(expires_with_gap(&mut m, "回拨", &t));
+}
+
+/// 启动后、第一次登记前墙钟被回拨：按当下墙钟倒推会把启动时刻算早，启动前开始的轮混进来；
+/// 用创建时记下的启动时刻，这一轮仍不登记，照常记缺口。
+#[test]
+fn tree_log_首次登记前墙钟回拨不放进启动前的轮() {
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    m.clock.started_ms = 50_000;
+    // 运行 10 秒后墙钟被回拨 20 秒：倒推出的启动时刻是 30 秒。
+    m.clock.mono_ms = 10_000;
+    m.clock.now_ms = 40_000;
+    assert!(
+        m.runs.event_log.deliveries.is_empty(),
+        "前置：这是第一次登记"
+    );
+    assert!(
+        m.clock.now_ms - m.clock.mono_ms < 49_000,
+        "前置：倒推出的启动时刻早于这一轮"
+    );
+    let t = turn_at(49_000);
+    m.note_event_log_delivery("乙", &t, "/root/甲", "/root/乙");
+    assert!(
+        m.runs.event_log.deliveries.is_empty(),
+        "启动前开始的轮不登记"
+    );
+    assert!(expires_with_gap(&mut m, "乙", &t));
+}
+
+/// 墙钟短暂前跳又恢复：启动时刻不被抬高，恢复后新开始的协作轮照常登记、不写缺口。
+#[test]
+fn tree_log_墙钟前跳后恢复新轮仍免告警() {
+    let mut m = setup();
+    for thread in ["跳", "恢复"] {
+        candidate(&mut m, thread, "root");
+    }
+    m.clock.started_ms = 40_000;
+    // 运行 10 秒时墙钟前跳到 150 秒，这时开始的轮带的也是前跳后的时间。
+    m.clock.mono_ms = 10_000;
+    m.clock.now_ms = 150_000;
+    let jumped = m.clock.now_ms - m.clock.mono_ms;
+    let t = turn_at(149_000);
+    m.note_event_log_delivery("跳", &t, "/root/甲", "/root/跳");
+    assert!(!expires_with_gap(&mut m, "跳", &t));
+    // 墙钟恢复正常：运行 60 秒、墙钟 100 秒。
+    m.clock.mono_ms = 60_000;
+    m.clock.now_ms = 100_000;
+    let t = turn_at(99_000);
+    assert!(99_000 < jumped, "前置：前跳时倒推出的启动时刻晚于这一轮");
+    m.note_event_log_delivery("恢复", &t, "/root/甲", "/root/恢复");
+    assert!(!expires_with_gap(&mut m, "恢复", &t));
 }
 
 /// 上一运行留下的历史兄弟：本运行对它没有任何管理证据，它被唤醒的轮次摘要按血缘暂存后，

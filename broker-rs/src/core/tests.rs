@@ -107,6 +107,7 @@ async fn mi_真实存储跨重启递增epoch且保留确认登记改道和创建
             now_ms: now - epoch * 1000,
             mono_ms: 0,
             entropy: epoch,
+            started_ms: 0,
         });
         h.core.restore();
         if let Some(old) = &previous {
@@ -543,6 +544,7 @@ impl Harness {
             next_tag: 0,
             last_activity: Instant::now(),
             started: Instant::now(),
+            started_wall_ms: 0,
             phase: Phase::Running,
         };
         let (writer, client_output) = mpsc::unbounded_channel();
@@ -1708,6 +1710,7 @@ async fn 核心线回包已接收转发延迟且旧本地截止先到仍处理�
         next_tag: 0,
         last_activity: Instant::now(),
         started: Instant::now(),
+        started_wall_ms: 0,
         phase: Phase::Running,
     };
     let (client_writer, _client_output) = mpsc::unbounded_channel();
@@ -2068,6 +2071,7 @@ async fn 核心迟到处理晚于线上截止新收尾截止先到暂停回包�
         next_tag: 0,
         last_activity: Instant::now(),
         started: Instant::now(),
+        started_wall_ms: 0,
         phase: Phase::Running,
     };
     let (client_writer, _client_output) = mpsc::unbounded_channel();
@@ -2253,6 +2257,33 @@ async fn 服务器已断开不等补读且无存储关闭零等待() {
     );
 }
 
+/// 启动时刻（core 创建时记下的墙钟）每一步都原样带进时钟，不随当下墙钟或运行时长变化。
+/// 创建时取墙钟的那一行在 `Core::new`，测试夹具不经过它。
+#[tokio::test(start_paused = true)]
+async fn 启动时刻每一步原样带进时钟() {
+    let mut h = Harness::new(false);
+    assert!(h.core.fixed_clock.is_none(), "前置：走真实时钟");
+    h.core.started_wall_ms = 777;
+    h.core
+        .mailbox
+        .send(CoreMsg::Conn(ConnEvent::Message {
+            conn: 1,
+            message: Ok(proto::request(
+                json!(1),
+                "turn/start",
+                Some(json!({"threadId":"线程"})),
+            )),
+        }))
+        .unwrap();
+    h.core.restore();
+    h.core.handle(h.inbox.recv().await.unwrap());
+    assert_eq!(h.core.machine.clock.started_ms, 777);
+    assert!(
+        h.core.machine.clock.now_ms > 777,
+        "前置：这一步按真实墙钟填了当下时间"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn 恢复先于排队请求且固定时钟注入() {
     let mut h = Harness::new(false);
@@ -2260,6 +2291,7 @@ async fn 恢复先于排队请求且固定时钟注入() {
         now_ms: 123,
         entropy: 456,
         mono_ms: 0,
+        started_ms: 0,
     });
     h.core
         .mailbox
@@ -2284,6 +2316,7 @@ async fn 恢复先于排队请求且固定时钟注入() {
             now_ms: 123,
             entropy: 456,
             mono_ms: 0,
+            started_ms: 0,
         }
     );
 }

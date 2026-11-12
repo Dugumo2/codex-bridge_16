@@ -789,6 +789,9 @@ pub struct Clock {
     pub entropy: u64,
     /// 单调毫秒（core 启动起算），供 #26d 托管回收这类不能受墙钟调整影响的判断。
     pub mono_ms: u64,
+    /// core 创建时的墙钟毫秒：只取一次，之后墙钟怎么调都不变。
+    /// 判断「某件事是不是在本次 core 启动前就开始了」用它，不要用 `now_ms - mono_ms` 倒推。
+    pub started_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

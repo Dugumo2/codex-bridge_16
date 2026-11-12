@@ -105,10 +105,13 @@ fn 未归属轮_跟进轮后自开一轮_结束通知丢失由发现回读补上
     unbound_turn_released(Shape::AfterFollowup, true);
 }
 
+/// 被消息唤醒的那一轮的轮号。消费方向按轮号里的开始时间登记，要用上游的格式（UUIDv7），开始时间晚于 core 启动。
+const MESSAGE_TURN: &str = "ffffffff-ffff-7000-8000-000000000001";
+
 /// 子代理 C 的一轮由消费的消息唤醒、没有本运行的操作归属。经真实通知入口（raw 消费记录、条目通知）走到摘要暂存到期，
 /// 返回到期那一步之前的全部动作。
 fn consumed_turn_expired(author: &str) -> Vec<Action> {
-    const U: &str = "消息轮";
+    const U: &str = MESSAGE_TURN;
     let (mut m, mut mock) = base();
     let mut all = complete(&mut m, &mut mock, C, "旧轮", "completed");
     let actions = apply(&mut m, mock.turn_started(C, U));
@@ -144,7 +147,7 @@ fn 记录缺口_只被平级消息唤醒的轮到期不告警_上级消息照常
     let control = consumed_turn_expired("/root");
     let gap = control.iter().any(|a| {
         matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
-            if lines.iter().any(|l| l.contains("beforeBindingUnknown") && l.contains("消息轮")))
+            if lines.iter().any(|l| l.contains("beforeBindingUnknown") && l.contains(MESSAGE_TURN)))
     });
     assert!(gap, "对照：上级消息唤醒却无归属证据，必须留缺口");
 }

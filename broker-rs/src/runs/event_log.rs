@@ -5,12 +5,12 @@ use crate::relations::{BindingStatus, EvidenceOutcome, MemberChange, RelationKin
 use crate::store::StoreOp;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 const PER_THREAD_BYTES: usize = 64 * 1024;
 const GLOBAL_BYTES: usize = 1024 * 1024;
 const PENDING_MS: u64 = 30_000;
-/// 记录消费方向的轮数上限，腾位规则见 `make_room_for_delivery`。
+/// 记录消费方向的轮数上限，腾位规则见 `note_event_log_delivery`。
 const DELIVERY_TURNS: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -20,21 +20,30 @@ pub(super) struct EventLog {
     pending: VecDeque<Pending>,
     bytes: usize,
     timer: Option<u64>,
-    deliveries: VecDeque<TurnDeliveries>,
-    /// 曾经挤掉过含非协作消息、且可能还会收到消息的轮：此后新登记的轮无法证明记录完整
-    /// （可能正是被挤掉的那一轮），一律不算纯协作，直到 broker 重启。
-    deliveries_lossy: bool,
+    /// v2 子代理各轮消费过的代理间消息的方向汇总：键是（轮开始毫秒，线程，轮），值是「消费的全是协作消息」。
+    /// 配对用的消费记录只留证据期限，这里按轮单独留一份，供暂存到期时判断这一轮是不是只被协作消息唤醒。
+    /// 只要消费过一条非协作消息，值就永久为假，不随后来的记录翻转。
+    /// 条目只有表满腾位这一条路离开（见 `note_event_log_delivery`），运行结束、绑定清理都不删。
+    deliveries: BTreeMap<(u64, String, String), bool>,
 }
 
-/// v2 子代理某一轮消费过的代理间消息的方向汇总。配对用的消费记录只留证据期限，
-/// 这里按轮单独留一份，供暂存到期时判断这一轮是不是只被协作消息唤醒。
-/// 只要消费过一条非协作消息，`collaboration_only` 就永久为假，不随后来的记录翻转；
-/// 腾位时也不会把这样的轮挤掉后又当成新轮重新登记成纯协作（见 `make_room_for_delivery`）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TurnDeliveries {
-    thread: String,
-    turn: String,
-    collaboration_only: bool,
+/// 轮号里的开始毫秒。上游的轮号是 UUIDv7，前 48 位是生成时刻的毫秒时间戳；
+/// 只认格式完整的 UUIDv7（版本 7、RFC 4122 变体），别的格式没有开始时间。
+fn turn_started_ms(turn: &str) -> Option<u64> {
+    let b = turn.as_bytes();
+    let well_formed = b.len() == 36
+        && b.iter().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => *c == b'-',
+            _ => c.is_ascii_hexdigit(),
+        })
+        && b[14] == b'7'
+        && matches!(b[19], b'8' | b'9' | b'a' | b'b' | b'A' | b'B');
+    if !well_formed {
+        return None;
+    }
+    let high = u64::from_str_radix(&turn[..8], 16).ok()?;
+    let low = u64::from_str_radix(&turn[9..13], 16).ok()?;
+    Some((high << 16) | low)
 }
 
 /// 协作消息：发件人与收件人同属一棵代理树，且发件人不是收件人的上级（平级、跨分支、下级向上）。
@@ -563,7 +572,19 @@ impl Machine {
         }
     }
 
-    /// v2 子代理消费代理间消息时记下这一轮的消费方向（见 `TurnDeliveries`）。
+    /// v2 子代理消费代理间消息时记下这一轮的消费方向（见 `EventLog::deliveries`）。
+    ///
+    /// 表里留的始终是登记过的轮里开始最晚的那些：表满时丢开始最早的一轮；
+    /// 新来的轮不比表里最早的一轮晚时，丢的是它自己（不登记）。
+    /// 所以一轮的记录一旦被丢，它的开始时间就不晚于表里最早的一轮，之后再收到消息也登记不进来；
+    /// 反过来，能登记进来的轮一定从没登记过，值如实反映它消费过的全部消息。
+    /// 被丢过记录的轮查不到记录，按没有消费记录照常记缺口，不会被后到的协作消息翻成纯协作；
+    /// 长期运行攒下的旧轮从最早的丢起，不影响之后新开始的轮。
+    /// 判断只比较轮号里的时间，不要求时钟单调：时钟回拨只会让新轮登记不进来、照常记缺口。
+    /// 轮号不带开始时间的不登记。
+    /// 开始时间不晚于本次 core 启动时刻（`Clock.started_ms`，创建时记下、不随墙钟调整变化）的轮也不登记：
+    /// 它可能在启动前消费过消息，记录不全。已知局限：broker 重启之前墙钟就已被回拨时，
+    /// 重启前开始的轮可能晚于新的启动时刻，仍会被登记。
     pub(crate) fn note_event_log_delivery(
         &mut self,
         thread: &str,
@@ -572,49 +593,34 @@ impl Machine {
         recipient: &str,
     ) {
         let collaboration = collaboration_delivery(author, recipient);
-        if let Some(known) = self
-            .runs
-            .event_log
-            .deliveries
-            .iter_mut()
-            .find(|t| t.thread == thread && t.turn == turn)
-        {
-            known.collaboration_only &= collaboration;
+        let Some(started) = turn_started_ms(turn) else {
+            return;
+        };
+        if started <= self.clock.started_ms {
             return;
         }
-        if self.runs.event_log.deliveries.len() >= DELIVERY_TURNS {
-            self.make_room_for_delivery();
-        }
-        let trusted = !self.runs.event_log.deliveries_lossy;
-        self.runs.event_log.deliveries.push_back(TurnDeliveries {
-            thread: thread.into(),
-            turn: turn.into(),
-            collaboration_only: collaboration && trusted,
-        });
-    }
-
-    /// 表满时腾出一个位置：
-    /// 1. 优先删最旧的纯协作轮：删掉后这一轮只会变成「没有记录」照常记缺口，或重新登记时仍如实反映；
-    /// 2. 没有纯协作轮时才挤掉最旧的轮。它含非协作消息，之后可能又收到同一轮的消费记录
-    ///    （轮已结束也一样：会话文件里的记录可能迟到读到），被当新轮登记成纯协作，
-    ///    所以记下 `deliveries_lossy`，此后新登记的轮一律不算纯协作。
-    fn make_room_for_delivery(&mut self) {
         let log = &mut self.runs.event_log;
-        if let Some(index) = log.deliveries.iter().position(|t| t.collaboration_only) {
-            log.deliveries.remove(index);
-        } else {
-            log.deliveries.pop_front();
-            log.deliveries_lossy = true;
+        let key = (started, thread.to_owned(), turn.to_owned());
+        if let Some(known) = log.deliveries.get_mut(&key) {
+            *known &= collaboration;
+            return;
         }
+        if log.deliveries.len() >= DELIVERY_TURNS {
+            let oldest = log.deliveries.first_key_value().map_or(0, |(k, _)| k.0);
+            if started <= oldest {
+                return;
+            }
+            log.deliveries.pop_first();
+        }
+        log.deliveries.insert(key, collaboration);
     }
 
     /// 这一轮有消费记录，而且消费的全是协作消息。
     fn turn_collaboration_only(&self, thread: &str, turn: &str) -> bool {
-        self.runs
-            .event_log
-            .deliveries
-            .iter()
-            .any(|t| t.thread == thread && t.turn == turn && t.collaboration_only)
+        turn_started_ms(turn).is_some_and(|started| {
+            let key = (started, thread.to_owned(), turn.to_owned());
+            self.runs.event_log.deliveries.get(&key) == Some(&true)
+        })
     }
 
     /// 暂存到期或关闭时清掉已明确判定不归该运行管理的候选：它们的摘要本来就不该写进该运行，
