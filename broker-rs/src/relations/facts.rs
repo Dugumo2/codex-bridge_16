@@ -173,6 +173,11 @@ impl Machine {
                 relevant
             }
             "turn/started" => {
+                if claimed {
+                    if let Some(turn) = &turn {
+                        self.v2_observe_start(&thread, turn);
+                    }
+                }
                 if let (false, Some(turn)) = (claimed, &turn) {
                     self.v2_observe_start(&thread, turn);
                     self.convergence_observe_activity(&thread, turn, "running", false);
@@ -276,6 +281,19 @@ impl Machine {
             self.clock.mono_ms,
             self.relations.aux.version,
         );
+        if self.relations.attachments.len() >= MAX_ATTACHMENTS
+            && !self.relations.attachments.contains_key(thread)
+        {
+            if let Some(oldest) = self
+                .relations
+                .attachments
+                .iter()
+                .min_by_key(|(_, a)| a.observed_at_ms)
+                .map(|(t, _)| t.clone())
+            {
+                self.observation_continuity_lost(&oldest, "附着凭据淘汰");
+            }
+        }
         let attachments = &mut self.relations.attachments;
         if let Some(existing) = attachments.get_mut(thread) {
             existing.conn_epoch = epoch;
@@ -340,6 +358,7 @@ impl Machine {
 
     /// 卸载、关闭、删除使附着证据立即失效。
     pub(crate) fn detach_evidence(&mut self, thread: &str) {
+        self.observation_continuity_lost(thread, "附着或订阅连续性失效");
         if let Some(a) = self.relations.attachments.get_mut(thread) {
             a.valid = false;
         }
@@ -1536,12 +1555,16 @@ impl Machine {
             return;
         }
         let now = self.clock.mono_ms;
+        let mut lost_starts = Vec::new();
         let aux = &mut self.relations.aux;
         if !aux.observed.contains_key(thread) {
             if aux.observed.len() >= MAX_OBSERVED_THREADS {
                 if let Some(oldest) = aux.observed_order.pop_front() {
+                    lost_starts.push(oldest.clone());
                     aux.observed.remove(&oldest);
                     aux.live_turn_starts
+                        .retain(|(thread, _), _| thread != &oldest);
+                    aux.coverage_starts
                         .retain(|(thread, _), _| thread != &oldest);
                 }
             }
@@ -1564,12 +1587,20 @@ impl Machine {
                 });
                 while list.len() > MAX_OBSERVED_TURNS {
                     if let Some(old) = list.pop_front() {
+                        if !old.completed {
+                            lost_starts.push(thread.to_owned());
+                        }
+                        aux.coverage_starts
+                            .remove(&(thread.into(), old.turn.clone()));
                         aux.live_turn_starts.remove(&(thread.into(), old.turn));
                     }
                 }
                 (true, true)
             }
         };
+        for thread in lost_starts {
+            self.observation_continuity_lost(&thread, "真实开始凭据淘汰");
+        }
         // 配对重试必须先于事件标志去重：发现回查已恢复有效观察，但 started/completed 可能均未变化。
         self.retry_v2_pairing(thread, actions);
         if !changed {

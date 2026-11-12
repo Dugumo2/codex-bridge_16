@@ -145,6 +145,7 @@ pub(super) fn parse_call(item: &Value) -> Option<ParsedCall> {
 
 /// 子代理收到的一条消息：只留身份、类型与内容摘要。
 pub(super) struct ParsedDelivery {
+    pub raw: Value,
     pub id: String,
     pub author: String,
     pub recipient: String,
@@ -186,6 +187,7 @@ pub(super) fn parse_delivery(item: &Value) -> Option<ParsedDelivery> {
         return None;
     }
     Some(ParsedDelivery {
+        raw: item.clone(),
         id: id.into(),
         author: author.into(),
         recipient: recipient.into(),
@@ -204,6 +206,7 @@ impl Machine {
     ) -> bool {
         self.prune_v2_deliveries();
         self.note_raw_thread(thread);
+        self.coverage_raw_witness(thread, turn);
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
                 let Some(call) = parse_call(item) else {
@@ -424,6 +427,18 @@ impl Machine {
         wall_ms: u64,
         actions: &mut Vec<Action>,
     ) -> bool {
+        // 覆盖消费必须先于配对查重；文件来源永远不能授予完整观察资格。
+        if source == EvidenceSource::RolloutFile {
+            self.coverage_veto(Some(thread), Some(turn), "文件来源消费", true);
+        } else {
+            let collaboration = crate::runs::event_log::collaboration_delivery(
+                &delivery.author,
+                &delivery.recipient,
+            );
+            if self.coverage_consume(thread, turn, &delivery.id, &delivery.raw, collaboration) {
+                self.observation_gap(Some(thread), "完成后新增或冲突消费");
+            }
+        }
         if self
             .relations
             .aux
@@ -453,10 +468,8 @@ impl Machine {
             message: delivery.message,
             trigger: delivery.trigger,
         };
-        let (author, recipient) = (fact.author.clone(), fact.recipient.clone());
         aux.v2_index.add_delivery(&fact);
         aux.v2_deliveries.push_back(fact);
-        self.note_event_log_delivery(thread, turn, &author, &recipient);
         self.retry_v2_pairing(thread, actions);
         true
     }
@@ -511,6 +524,7 @@ impl Machine {
                 self.relations.conn_epoch,
                 self.relations.aux.observation_seq,
             ));
+        self.coverage_real_start(thread, turn);
     }
 
     pub(super) fn v2_start(&self, op: &EvidenceOperation) -> Option<&FollowupStart> {

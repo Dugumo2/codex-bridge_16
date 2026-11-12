@@ -29,9 +29,14 @@ pub mod select;
 pub mod shared;
 pub mod ws;
 
+#[cfg(test)]
+mod gap_tests;
+
 /// app-server 主动发给 broker 的消息，按到达顺序交付。
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
+    /// 入站记录无法解释；与通知和回包沿同一条有序事件链交付。
+    ObservationGap { reason: String },
     /// 私有 app-server 进程实例已退出；身份用于结算旧实例上的生命周期请求。
     PrivateInstanceExited {
         instance: crate::store::lifecycle::Instance,

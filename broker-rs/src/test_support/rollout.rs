@@ -195,6 +195,9 @@ fn read(machine: &mut Machine, request: crate::rollout::RolloutReadRequest) -> V
         Event::RolloutRead {
             id: request.id,
             thread: request.thread,
+            conn_epoch: request.conn_epoch,
+            observation_gen: request.observation_gen,
+            issued_seq: request.issued_seq,
             result,
         },
     )
@@ -212,6 +215,14 @@ pub(crate) fn release_held(machine: &mut Machine) -> Vec<Action> {
         service(machine, &mut next);
         out.extend(next);
     }
+    out
+}
+
+/// 只让最早一个物理任务结束，其余任务继续扣留。
+pub(crate) fn release_one_held(machine: &mut Machine) -> Vec<Action> {
+    let request = with(|f| f.held.remove(0));
+    let mut out = read(machine, request);
+    service(machine, &mut out);
     out
 }
 

@@ -584,6 +584,7 @@ impl Machine {
         {
             if value["thread"]["status"]["type"] == "notLoaded" {
                 if value["thread"]["id"].as_str() == Some(thread.as_str()) {
+                    self.observation_continuity_lost(&thread, "thread/read:notLoaded");
                     self.record_closed_runtime(&thread, "thread/read:notLoaded");
                     match self.status_reads.reads[&read_id].caller.clone() {
                         StatusCaller::StopVerify { tag } => {

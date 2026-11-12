@@ -16,6 +16,8 @@ use serde_json::Value;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path};
 
+mod validation;
+
 /// 首次读取的末尾窗口。
 pub const TAIL_BYTES: u64 = 256 * 1024;
 /// 为确定窗口起点所在的轮向前多读的总上限（含首个窗口）。
@@ -38,6 +40,9 @@ pub struct RolloutCursor {
 pub struct RolloutReadRequest {
     pub id: u64,
     pub thread: String,
+    pub conn_epoch: u64,
+    pub observation_gen: u64,
+    pub issued_seq: u64,
     pub path: String,
     /// None 表示首次读取（末尾窗口）。
     pub cursor: Option<RolloutCursor>,
@@ -164,7 +169,154 @@ fn is_collab_call(payload: &Value) -> bool {
             .is_some_and(|n| matches!(n, "followup_task" | "send_message"))
 }
 
-/// 一行完整内容（不含换行符）。返回 Ok(None) 表示与配对无关的行；Err 表示坏行。
+/// 只接受当前协议能解释的消息片段；未知片段不能借外层已知类型被吞掉。
+fn message_content_valid(payload: &Value, agent: bool) -> bool {
+    payload
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .all(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("input_text") => part.get("text").is_some_and(Value::is_string),
+                    Some("encrypted_content") if agent => {
+                        part.get("encrypted_content").is_some_and(Value::is_string)
+                    }
+                    Some("output_text") if !agent => part.get("text").is_some_and(Value::is_string),
+                    Some("input_audio") if !agent => {
+                        part.get("audio_url").is_some_and(Value::is_string)
+                    }
+                    Some("input_image") if !agent => validation::image(part),
+                    _ => false,
+                })
+        })
+}
+
+/// 文件事件与公开通知字段不同，按 0.160.0 持久化 EventMsg 的最小结构检查。
+fn irrelevant_event_valid(kind: &str, payload: &Value) -> bool {
+    if !validation::event_options(kind, payload) {
+        return false;
+    }
+    let string = |field: &str| payload.get(field).is_some_and(Value::is_string);
+    match kind {
+        "context_compacted" => true,
+        "token_count" => {
+            validation::optional(payload, "info", validation::usage_info)
+                && validation::optional(payload, "rate_limits", validation::rate_limits)
+        }
+        "agent_message" => {
+            string("message") && validation::optional(payload, "phase", validation::message_phase)
+        }
+        "warning" => string("message"),
+        "error" => validation::error_event(payload),
+        "agent_reasoning" | "agent_reasoning_raw_content" => string("text"),
+        "agent_message_content_delta" | "plan_delta" => {
+            string("thread_id") && string("turn_id") && string("item_id") && string("delta")
+        }
+        "reasoning_content_delta" | "reasoning_raw_content_delta" => {
+            string("thread_id")
+                && string("turn_id")
+                && string("item_id")
+                && string("delta")
+                && validation::defaulted(
+                    payload,
+                    if kind == "reasoning_content_delta" {
+                        "summary_index"
+                    } else {
+                        "content_index"
+                    },
+                    Value::is_i64,
+                )
+        }
+        "exec_command_begin" | "exec_command_end" => {
+            let command = payload
+                .get("command")
+                .and_then(Value::as_array)
+                .is_some_and(|a| a.iter().all(Value::is_string));
+            string("call_id")
+                && string("turn_id")
+                && command
+                && string("cwd")
+                && payload
+                    .get("parsed_cmd")
+                    .is_some_and(validation::parsed_commands)
+                && validation::defaulted(payload, "source", validation::command_source)
+                && validation::defaulted(
+                    payload,
+                    if kind == "exec_command_begin" {
+                        "started_at_ms"
+                    } else {
+                        "completed_at_ms"
+                    },
+                    Value::is_i64,
+                )
+                && (kind == "exec_command_begin"
+                    || (string("stdout")
+                        && string("stderr")
+                        && payload.get("exit_code").is_some_and(validation::i32_value)
+                        && string("formatted_output")
+                        && payload
+                            .get("status")
+                            .is_some_and(validation::terminal_status)
+                        && payload.get("duration").is_some_and(validation::duration)))
+        }
+        "exec_command_output_delta" => {
+            string("call_id")
+                && payload.get("chunk").is_some_and(validation::base64_bytes)
+                && matches!(
+                    payload.get("stream").and_then(Value::as_str),
+                    Some("stdout" | "stderr")
+                )
+        }
+        "patch_apply_begin" => {
+            string("call_id")
+                && validation::defaulted(payload, "turn_id", Value::is_string)
+                && payload.get("changes").is_some_and(validation::changes)
+                && payload.get("auto_approved").is_some_and(Value::is_boolean)
+        }
+        "patch_apply_end" => {
+            string("call_id")
+                && string("stdout")
+                && string("stderr")
+                && payload
+                    .get("status")
+                    .is_some_and(validation::terminal_status)
+                && validation::defaulted(payload, "turn_id", Value::is_string)
+                && payload.get("success").is_some_and(Value::is_boolean)
+                && validation::defaulted(payload, "changes", validation::changes)
+        }
+        "mcp_tool_call_begin" | "mcp_tool_call_end" => {
+            let invocation = payload.get("invocation").is_some_and(|v| {
+                v.get("server").is_some_and(Value::is_string)
+                    && v.get("tool").is_some_and(Value::is_string)
+            });
+            string("call_id")
+                && invocation
+                && (kind == "mcp_tool_call_begin"
+                    || (payload.get("result").is_some_and(validation::mcp_result)
+                        && payload.get("duration").is_some_and(validation::duration)))
+        }
+        "web_search_begin" => string("call_id"),
+        "web_search_end" => {
+            string("call_id")
+                && string("query")
+                && payload.get("action").is_some_and(validation::web_action)
+                && validation::optional(payload, "results", Value::is_array)
+        }
+        "view_image_tool_call" => string("call_id") && string("path"),
+        "plan_update" => {
+            payload.get("plan").is_some_and(validation::plan)
+                && validation::optional(payload, "explanation", Value::is_string)
+                && payload.as_object().is_some_and(|m| {
+                    m.keys()
+                        .all(|key| matches!(key.as_str(), "type" | "plan" | "explanation"))
+                })
+        }
+        _ => false,
+    }
+}
+
+/// 一行完整内容（不含换行符）。只有能解释为无关的记录返回 Ok(None)；Err 表示无法解释。
 /// `lost`：读取起点所在的轮未知；遇到轮次标记后清除。
 fn parse_line(
     line: &[u8],
@@ -177,36 +329,235 @@ fn parse_line(
     }
     let value: Value = serde_json::from_slice(line).map_err(|_| ())?;
     let kind = value.get("type").and_then(Value::as_str).ok_or(())?;
-    let payload = value.get("payload");
+    let payload = value.get("payload").filter(|p| p.is_object()).ok_or(())?;
     match kind {
         "event_msg" => {
-            let payload = payload.ok_or(())?;
-            if matches!(
-                payload.get("type").and_then(Value::as_str),
-                Some("task_started" | "turn_started")
-            ) {
-                let id = payload.get("turn_id").and_then(Value::as_str).ok_or(())?;
-                *turn = Some(id.to_owned());
-                *lost = false;
+            match payload.get("type").and_then(Value::as_str).ok_or(())? {
+                "task_started" | "turn_started" => {
+                    if payload
+                        .get("root_turn_id")
+                        .is_some_and(|v| !v.is_null() && !v.is_string())
+                        || payload
+                            .get("model_context_window")
+                            .is_some_and(|v| !v.is_null() && !v.is_i64())
+                    {
+                        return Err(());
+                    }
+                    if !validation::defaulted(
+                        payload,
+                        "collaboration_mode_kind",
+                        validation::mode_kind,
+                    ) || !validation::optional(payload, "started_at", Value::is_i64)
+                        || !validation::optional(payload, "trace_id", Value::is_string)
+                    {
+                        return Err(());
+                    }
+                    let id = payload
+                        .get("turn_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or(())?;
+                    *turn = Some(id.to_owned());
+                    *lost = false;
+                }
+                "task_complete" | "turn_complete" | "turn_aborted" => {
+                    let aborted = payload["type"] == "turn_aborted";
+                    if !validation::optional(payload, "error", validation::error_event)
+                        || (!aborted
+                            && !validation::optional(
+                                payload,
+                                "last_agent_message",
+                                Value::is_string,
+                            ))
+                        || (aborted && !payload.get("reason").is_some_and(validation::abort_reason))
+                    {
+                        return Err(());
+                    }
+                    for field in ["started_at", "completed_at", "duration_ms"] {
+                        if !validation::optional(payload, field, Value::is_i64) {
+                            return Err(());
+                        }
+                    }
+                    if !aborted
+                        && !validation::optional(payload, "time_to_first_token_ms", Value::is_i64)
+                    {
+                        return Err(());
+                    }
+                    payload
+                        .get("turn_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or(())?;
+                    *turn = None;
+                    *lost = false;
+                }
+                known if irrelevant_event_valid(known, payload) => {}
+                _ => return Err(()),
             }
             Ok(None)
         }
         "turn_context" => {
-            if let Some(id) = payload
-                .and_then(|p| p.get("turn_id"))
-                .and_then(Value::as_str)
-            {
-                *turn = Some(id.to_owned());
-                *lost = false;
+            if payload.get("cwd").is_some_and(|v| !v.is_string()) {
+                return Err(());
             }
+            let id = payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or(())?;
+            *turn = Some(id.to_owned());
+            *lost = false;
             Ok(None)
         }
         "response_item" => {
-            let payload = payload.ok_or(())?;
-            let message = payload.get("type").and_then(Value::as_str) == Some("agent_message");
-            if !message && !is_collab_call(payload) {
-                return Ok(None);
+            let kind = payload.get("type").and_then(Value::as_str).ok_or(())?;
+            if !crate::relations::coverage_observation::validation::response_optional_fields(
+                payload,
+            ) {
+                return Err(());
             }
+            let message = match kind {
+                "agent_message" => {
+                    for field in ["author", "recipient"] {
+                        payload
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .ok_or(())?;
+                    }
+                    if !message_content_valid(payload, true) {
+                        return Err(());
+                    }
+                    true
+                }
+                "message" => {
+                    let role = payload.get("role").and_then(Value::as_str).ok_or(())?;
+                    if !message_content_valid(payload, false) {
+                        return Err(());
+                    }
+                    match role {
+                        "user" | "developer" | "system" => true,
+                        "assistant" => return Ok(None),
+                        _ => return Err(()),
+                    }
+                }
+                "function_call" => {
+                    for field in ["name", "call_id", "arguments"] {
+                        payload.get(field).and_then(Value::as_str).ok_or(())?;
+                    }
+                    if !validation::optional(payload, "encrypted_function_args", |v| {
+                        v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
+                    }) {
+                        return Err(());
+                    }
+                    if !is_collab_call(payload) {
+                        return Ok(None);
+                    }
+                    false
+                }
+                "reasoning" => {
+                    if !validation::reasoning(payload) {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "function_call_output" | "custom_tool_call_output" => {
+                    if kind == "custom_tool_call_output" {
+                        payload.get("call_id").and_then(Value::as_str).ok_or(())?;
+                    } else if payload
+                        .get("call_id")
+                        .is_some_and(|v| !v.is_null() && !v.is_string())
+                    {
+                        return Err(());
+                    }
+                    let output = payload.get("output").ok_or(())?;
+                    if !validation::tool_output(output) {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "custom_tool_call" => {
+                    for field in ["name", "call_id", "input"] {
+                        payload.get(field).and_then(Value::as_str).ok_or(())?;
+                    }
+                    if !validation::optional(payload, "status", Value::is_string) {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "local_shell_call" => {
+                    if !matches!(
+                        payload["status"].as_str(),
+                        Some("completed" | "in_progress" | "incomplete")
+                    ) || !payload.get("action").is_some_and(validation::shell_action)
+                    {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "image_generation_call" => {
+                    payload.get("status").and_then(Value::as_str).ok_or(())?;
+                    payload.get("result").and_then(Value::as_str).ok_or(())?;
+                    return Ok(None);
+                }
+                "web_search_call" => {
+                    if payload
+                        .get("status")
+                        .is_some_and(|v| !v.is_null() && !v.is_string())
+                        || !validation::optional(payload, "action", validation::web_action)
+                    {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "tool_search_call" => {
+                    payload.get("execution").and_then(Value::as_str).ok_or(())?;
+                    payload.get("arguments").ok_or(())?;
+                    if !validation::optional(payload, "status", Value::is_string) {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "tool_search_output" => {
+                    for field in ["execution", "status"] {
+                        payload.get(field).and_then(Value::as_str).ok_or(())?;
+                    }
+                    payload.get("tools").and_then(Value::as_array).ok_or(())?;
+                    return Ok(None);
+                }
+                "additional_tools" => {
+                    payload.get("role").and_then(Value::as_str).ok_or(())?;
+                    payload.get("tools").and_then(Value::as_array).ok_or(())?;
+                    return Ok(None);
+                }
+                "configuration_update" => {
+                    if !payload
+                        .get("reasoning")
+                        .is_some_and(|v| v.get("effort").is_some_and(Value::is_string))
+                    {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "compaction_trigger" => return Ok(None),
+                "context_compaction" => {
+                    if payload
+                        .get("encrypted_content")
+                        .is_some_and(|v| !v.is_null() && !v.is_string())
+                    {
+                        return Err(());
+                    }
+                    return Ok(None);
+                }
+                "compaction" | "compaction_summary" => {
+                    payload
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .ok_or(())?;
+                    return Ok(None);
+                }
+                _ => return Err(()),
+            };
             let wall_ms = value
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -228,8 +579,76 @@ fn parse_line(
                 turn_lost: message && turn.is_none() && *lost,
             }))
         }
-        _ => Ok(None),
+        "session_meta" => {
+            payload
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or(())?;
+            for field in ["timestamp", "cwd", "originator", "cli_version"] {
+                if payload.get(field).is_some_and(|v| !v.is_string()) {
+                    return Err(());
+                }
+            }
+            Ok(None)
+        }
+        "compacted" => {
+            payload.get("message").and_then(Value::as_str).ok_or(())?;
+            if !validation::optional(payload, "replacement_history", replacement_history_valid) {
+                return Err(());
+            }
+            Ok(None)
+        }
+        "inter_agent_communication_metadata" => {
+            payload
+                .get("trigger_turn")
+                .and_then(Value::as_bool)
+                .ok_or(())?;
+            Ok(None)
+        }
+        "world_state" => {
+            payload.get("full").and_then(Value::as_bool).ok_or(())?;
+            payload.get("state").and_then(Value::as_object).ok_or(())?;
+            Ok(None)
+        }
+        "security_risk_score" => {
+            let scores = payload.get("scores").and_then(Value::as_object).ok_or(())?;
+            if !scores.values().all(Value::is_number) {
+                return Err(());
+            }
+            Ok(None)
+        }
+        "token_usage_record" => {
+            for field in [
+                "thread_id",
+                "turn_id",
+                "session_id",
+                "root_turn_id",
+                "response_id",
+            ] {
+                payload.get(field).and_then(Value::as_str).ok_or(())?;
+            }
+            for field in ["usage", "turn_token_usage", "thread_token_usage"] {
+                if !payload.get(field).is_some_and(validation::usage) {
+                    return Err(());
+                }
+            }
+            Ok(None)
+        }
+        _ => Err(()),
     }
+}
+
+/// 压缩替换历史是结构化 ResponseItem 列表；校验其形状但不把历史消息登记为当前消费。
+fn replacement_history_valid(value: &Value) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.iter().all(|item| {
+            let line = serde_json::json!({"type":"response_item", "payload":item,
+            "timestamp":"1970-01-01T00:00:00.000Z"});
+            let bytes = serde_json::to_vec(&line).expect("JSON可序列化");
+            parse_line(&bytes, &mut None, &mut false).is_ok()
+        })
+    })
 }
 
 /// 只处理到最后一个换行符：返回解析出的条目与已消费的字节数（含最后的换行符）。
@@ -246,7 +665,11 @@ fn parse_lines(
         match parse_line(line, turn, lost) {
             Ok(Some(entry)) => chunk.entries.push(entry),
             Ok(None) => {}
-            Err(()) => chunk.bad_lines = chunk.bad_lines.saturating_add(1),
+            Err(()) => {
+                chunk.bad_lines = chunk.bad_lines.saturating_add(1);
+                *turn = None;
+                *lost = true;
+            }
         }
     }
     last + 1
@@ -336,6 +759,8 @@ fn read_follow(
                 pos = i + 1;
                 chunk.skipped_lines += 1;
                 chunk.cursor.skipping = false;
+                turn = None;
+                lost = true;
             }
             None => {
                 chunk.cursor.offset += buf.len() as u64;
@@ -349,6 +774,8 @@ fn read_follow(
         // 一整次读取都没有换行：这一行超过上限，跳过到下一个换行符。
         chunk.cursor.offset += buf.len() as u64;
         chunk.cursor.skipping = true;
+        turn = None;
+        lost = true;
     } else {
         chunk.cursor.offset += (pos + consumed) as u64;
     }

@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 const PER_THREAD_BYTES: usize = 64 * 1024;
 const GLOBAL_BYTES: usize = 1024 * 1024;
 const PENDING_MS: u64 = 30_000;
-/// 记录消费方向的轮数上限，腾位规则见 `note_event_log_delivery`。
-const DELIVERY_TURNS: usize = 1024;
+/// 覆盖轮与独立消费指纹的容量上限。
+const COVERAGE_TURNS: usize = 1024;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct EventLog {
@@ -20,11 +20,12 @@ pub(super) struct EventLog {
     pending: VecDeque<Pending>,
     bytes: usize,
     timer: Option<u64>,
-    /// v2 子代理各轮消费过的代理间消息的方向汇总：键是（轮开始毫秒，线程，轮），值是「消费的全是协作消息」。
-    /// 配对用的消费记录只留证据期限，这里按轮单独留一份，供暂存到期时判断这一轮是不是只被协作消息唤醒。
-    /// 只要消费过一条非协作消息，值就永久为假，不随后来的记录翻转。
-    /// 条目只有表满腾位这一条路离开（见 `note_event_log_delivery`），运行结束、绑定清理都不删。
-    deliveries: BTreeMap<(u64, String, String), bool>,
+    timer_deadline: Option<u64>,
+    coverage: BTreeMap<(u64, String, String), TurnCoverage>,
+    evicted_through_ms: Option<u64>,
+    fingerprints: BTreeMap<(String, String, String), [u8; 32]>,
+    /// 事件处理中只能暂留，统一尾部才允许协作丢弃。
+    processing_step: bool,
 }
 
 /// 轮号里的开始毫秒。上游的轮号是 UUIDv7，前 48 位是生成时刻的毫秒时间戳；
@@ -49,7 +50,7 @@ fn turn_started_ms(turn: &str) -> Option<u64> {
 /// 协作消息：发件人与收件人同属一棵代理树，且发件人不是收件人的上级（平级、跨分支、下级向上）。
 /// 与线程关系上的平级、向上拒绝（`relations/facts.rs` 的 `followup_rejection`）同一语义。
 /// 上级（含跨层的祖先）发来的不算，它们可能是本运行的跟进；自己发给自己也不算。
-fn collaboration_delivery(author: &str, recipient: &str) -> bool {
+pub(crate) fn collaboration_delivery(author: &str, recipient: &str) -> bool {
     let root = |path: &str| path.split('/').nth(1).map(str::to_owned);
     author != recipient
         && root(author).is_some()
@@ -74,6 +75,8 @@ struct Pending {
     summary: Summary,
     candidates: Vec<(String, String)>,
     bytes: usize,
+    #[serde(skip)]
+    awaiting_coverage: bool,
 }
 
 fn clean(text: &str, max: usize) -> (String, bool) {
@@ -425,6 +428,7 @@ impl Machine {
                 summary,
                 candidates: candidates.clone(),
                 bytes: 0,
+                awaiting_coverage: false,
             };
             pending.bytes = serde_json::to_vec(&pending).expect("摘要可序列化").len();
             let thread_bytes: usize = self
@@ -438,7 +442,7 @@ impl Machine {
             if pending.bytes + thread_bytes > PER_THREAD_BYTES
                 || pending.bytes + self.runs.event_log.bytes > GLOBAL_BYTES
             {
-                self.settle_pending_candidates(&mut pending);
+                self.settle_pending_candidates(&mut pending, false);
                 self.pending_gap(&pending, "归属确认前摘要暂存超限", actions);
                 continue;
             }
@@ -572,57 +576,6 @@ impl Machine {
         }
     }
 
-    /// v2 子代理消费代理间消息时记下这一轮的消费方向（见 `EventLog::deliveries`）。
-    ///
-    /// 表里留的始终是登记过的轮里开始最晚的那些：表满时丢开始最早的一轮；
-    /// 新来的轮不比表里最早的一轮晚时，丢的是它自己（不登记）。
-    /// 所以一轮的记录一旦被丢，它的开始时间就不晚于表里最早的一轮，之后再收到消息也登记不进来；
-    /// 反过来，能登记进来的轮一定从没登记过，值如实反映它消费过的全部消息。
-    /// 被丢过记录的轮查不到记录，按没有消费记录照常记缺口，不会被后到的协作消息翻成纯协作；
-    /// 长期运行攒下的旧轮从最早的丢起，不影响之后新开始的轮。
-    /// 判断只比较轮号里的时间，不要求时钟单调：时钟回拨只会让新轮登记不进来、照常记缺口。
-    /// 轮号不带开始时间的不登记。
-    /// 开始时间不晚于本次 core 启动时刻（`Clock.started_ms`，创建时记下、不随墙钟调整变化）的轮也不登记：
-    /// 它可能在启动前消费过消息，记录不全。已知局限：broker 重启之前墙钟就已被回拨时，
-    /// 重启前开始的轮可能晚于新的启动时刻，仍会被登记。
-    pub(crate) fn note_event_log_delivery(
-        &mut self,
-        thread: &str,
-        turn: &str,
-        author: &str,
-        recipient: &str,
-    ) {
-        let collaboration = collaboration_delivery(author, recipient);
-        let Some(started) = turn_started_ms(turn) else {
-            return;
-        };
-        if started <= self.clock.started_ms {
-            return;
-        }
-        let log = &mut self.runs.event_log;
-        let key = (started, thread.to_owned(), turn.to_owned());
-        if let Some(known) = log.deliveries.get_mut(&key) {
-            *known &= collaboration;
-            return;
-        }
-        if log.deliveries.len() >= DELIVERY_TURNS {
-            let oldest = log.deliveries.first_key_value().map_or(0, |(k, _)| k.0);
-            if started <= oldest {
-                return;
-            }
-            log.deliveries.pop_first();
-        }
-        log.deliveries.insert(key, collaboration);
-    }
-
-    /// 这一轮有消费记录，而且消费的全是协作消息。
-    fn turn_collaboration_only(&self, thread: &str, turn: &str) -> bool {
-        turn_started_ms(turn).is_some_and(|started| {
-            let key = (started, thread.to_owned(), turn.to_owned());
-            self.runs.event_log.deliveries.get(&key) == Some(&true)
-        })
-    }
-
     /// 暂存到期或关闭时清掉已明确判定不归该运行管理的候选：它们的摘要本来就不该写进该运行，
     /// 正常丢弃，不是覆盖缺口。
     ///
@@ -632,21 +585,21 @@ impl Machine {
     /// 再满足以下之一：
     /// - 它是别的运行的历史子代理、本运行对它没有任何管理证据
     ///   （[`historical_subagent_for_run`](Machine::historical_subagent_for_run)），典型是上一运行留下的兄弟；
-    /// - 这一轮消费的全是平级或下级发来的协作消息（`turn_collaboration_only`），典型是本运行的
+    /// - 这一轮消费的全是平级或下级发来的协作消息（完整覆盖处置允许协作排除），典型是本运行的
     ///   兄弟子代理之间互发、被平级拒绝纳管后唤醒的轮次。证据落在这一轮自己的消费记录上，
     ///   不拿别的轮、别的时刻的拒绝推断。
     ///
     /// 兄弟的轮次还在跑时分类会因活动而暂缓收尾，但那是收敛要等它，不是归属未定。
     /// 其余候选（血缘或历史不明、证据过期、没有消费记录的 v1 平级消息）照常记缺口。
-    fn settle_pending_candidates(&self, pending: &mut Pending) {
+    fn settle_pending_candidates(&self, pending: &mut Pending, collaboration: bool) {
         let thread = pending.thread.clone();
         let turn = pending.turn.clone();
         pending
             .candidates
-            .retain(|(run, _)| !self.event_log_disowned(run, &thread, &turn));
+            .retain(|(run, _)| !self.event_log_disowned(run, &thread, &turn, collaboration));
     }
 
-    fn event_log_disowned(&self, run: &str, thread: &str, turn: &str) -> bool {
+    fn event_log_disowned(&self, run: &str, thread: &str, turn: &str, collaboration: bool) -> bool {
         if self.event_log_evidence_in_flight(run, thread) {
             return false;
         }
@@ -659,7 +612,9 @@ impl Machine {
         });
         !expired
             && (self.historical_subagent_for_run(run, thread)
-                || self.turn_collaboration_only(thread, turn))
+                || (collaboration
+                    && self.coverage_disposition(thread, turn)
+                        == CoverageDisposition::AllowCollaborationExclusion))
     }
 
     /// 还在进行、可能把这个线程的轮次归给该运行的证据：等配对或等发起方绑定的跟进、
@@ -687,33 +642,61 @@ impl Machine {
     fn expire_event_log(&mut self, actions: &mut Vec<Action>) {
         let pending = std::mem::take(&mut self.runs.event_log.pending);
         for mut event in pending {
-            if event.expires <= self.clock.mono_ms {
-                if event.candidates.iter().any(|(run, _)| {
+            if event.expires <= self.clock.mono_ms || event.awaiting_coverage {
+                let evidence_wait = event.candidates.iter().any(|(run, _)| {
                     self.runs.runs.get(run).is_some_and(|r| {
                         matches!(
                             r.state,
                             super::RunState::Running | super::RunState::Stopping
                         )
                     }) && self.event_log_evidence_in_flight(run, &event.thread)
-                }) {
+                });
+                let coverage_wait = self.coverage_disposition(&event.thread, &event.turn)
+                    == CoverageDisposition::Wait;
+                if evidence_wait || coverage_wait {
+                    event.awaiting_coverage = coverage_wait;
                     event.expires = self.clock.mono_ms.saturating_add(PENDING_MS);
+                    if coverage_wait {
+                        if let Some(deadline) = self.coverage_read_deadline(&event.thread) {
+                            // 已到期票据由同一步 drive_rollout 撤销；避免挂零延时忙循环。
+                            event.expires = event
+                                .expires
+                                .min(deadline.max(self.clock.mono_ms.saturating_add(1)));
+                        }
+                    }
                     self.runs.event_log.pending.push_back(event);
                     continue;
                 }
                 self.runs.event_log.bytes -= event.bytes;
-                self.settle_pending_candidates(&mut event);
+                self.settle_pending_candidates(&mut event, true);
                 self.pending_gap(&event, "归属确认前摘要暂存过期", actions);
             } else {
                 self.runs.event_log.pending.push_back(event);
             }
         }
+        #[cfg(test)]
+        self.capture_event_log_checkpoint();
     }
 
+    /// step 的全部入站及后处理共享一道临时结算屏障。
+    pub(crate) fn begin_event_log_step(&mut self) {
+        self.runs.event_log.processing_step = true;
+    }
+
+    /// 所有反证及读取回包处理完后，重评此前因屏障或开放轮而暂留的摘要。
+    pub(crate) fn settle_event_log_step(&mut self, actions: &mut Vec<Action>) {
+        self.runs.event_log.processing_step = false;
+        self.expire_event_log(actions);
+        self.schedule_event_log(actions);
+    }
     fn schedule_event_log(&mut self, actions: &mut Vec<Action>) {
-        if self.runs.event_log.timer.is_some() {
+        let deadline = self.runs.event_log.pending.iter().map(|p| p.expires).min();
+        if self.runs.event_log.timer.is_some() && self.runs.event_log.timer_deadline == deadline {
             return;
         }
-        if let Some(deadline) = self.runs.event_log.pending.iter().map(|p| p.expires).min() {
+        self.cancel_event_log_timer(actions);
+        if let Some(deadline) = deadline {
+            self.runs.event_log.timer_deadline = Some(deadline);
             let generation = self.runs.generation();
             self.runs.event_log.timer = Some(generation);
             schedule(
@@ -730,13 +713,15 @@ impl Machine {
             return;
         }
         self.runs.event_log.timer = None;
+        self.runs.event_log.timer_deadline = None;
         self.expire_event_log(actions);
         self.schedule_event_log(actions);
     }
 
     pub(crate) fn clear_pending_event_log(&mut self, actions: &mut Vec<Action>) {
+        self.coverage_veto(None, None, "broker 关闭", false);
         for mut pending in std::mem::take(&mut self.runs.event_log.pending) {
-            self.settle_pending_candidates(&mut pending);
+            self.settle_pending_candidates(&mut pending, false);
             self.pending_gap(&pending, "broker 关闭时归属尚未确认", actions);
         }
         self.runs.event_log.bytes = 0;
@@ -744,6 +729,7 @@ impl Machine {
     }
 
     fn cancel_event_log_timer(&mut self, actions: &mut Vec<Action>) {
+        self.runs.event_log.timer_deadline = None;
         if self.runs.event_log.timer.take().is_some() {
             actions.push(Action::Unschedule {
                 key: crate::claim::TimerKey::EventLogSweep,
@@ -815,6 +801,10 @@ impl Machine {
         );
     }
 }
+
+mod coverage;
+use coverage::TurnCoverage;
+pub(crate) use coverage::{CoverageDisposition, StartProof};
 
 #[cfg(test)]
 mod tests;

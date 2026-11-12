@@ -79,6 +79,9 @@ pub enum CoreMsg {
     RolloutRead {
         id: u64,
         thread: String,
+        conn_epoch: u64,
+        observation_gen: u64,
+        issued_seq: u64,
         result: Result<crate::rollout::RolloutChunk, crate::rollout::RolloutError>,
     },
 }
@@ -161,8 +164,6 @@ pub struct Core {
     last_activity: Instant,
     /// 单调时钟的起点，`Clock.mono_ms` 从这里起算。
     started: Instant,
-    /// 创建时的墙钟毫秒，`Clock.started_ms` 原样取它。
-    started_wall_ms: u64,
     phase: Phase,
 }
 
@@ -214,10 +215,6 @@ impl Core {
             next_tag: 0,
             last_activity: Instant::now(),
             started: Instant::now(),
-            started_wall_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
             phase: Phase::Running,
         }
     }
@@ -314,8 +311,22 @@ impl Core {
                 }
             }
             CoreMsg::Conn(ev) => self.on_conn_event(ev),
-            CoreMsg::RolloutRead { id, thread, result } => {
-                self.dispatch(Event::RolloutRead { id, thread, result });
+            CoreMsg::RolloutRead {
+                id,
+                thread,
+                conn_epoch,
+                observation_gen,
+                issued_seq,
+                result,
+            } => {
+                self.dispatch(Event::RolloutRead {
+                    id,
+                    thread,
+                    conn_epoch,
+                    observation_gen,
+                    issued_seq,
+                    result,
+                });
             }
             CoreMsg::BreakerProbeTimer { generation } => {
                 if self
@@ -662,6 +673,12 @@ impl Core {
 
     fn on_app_event(&mut self, ev: AppEvent) {
         match ev {
+            AppEvent::ObservationGap { reason } => {
+                self.dispatch(Event::ObservationGap {
+                    thread: None,
+                    reason,
+                });
+            }
             AppEvent::Responsive => {
                 self.touch();
                 self.dispatch(Event::AppResponsive);
@@ -707,6 +724,11 @@ impl Core {
                 self.dispatch(Event::AppReplyWritten { op, outcome })
             }
             AppEvent::Closed { reason } => {
+                // 先终止连续观察，再处理关闭结算；不能让排队中的完成证明越过断开。
+                self.dispatch(Event::ObservationGap {
+                    thread: None,
+                    reason: reason.clone(),
+                });
                 self.app_disconnected = true;
                 if self.phase == Phase::Running {
                     tracing::error!(%reason, "app-server 意外退出，broker 关闭");

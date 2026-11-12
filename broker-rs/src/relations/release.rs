@@ -634,6 +634,8 @@ impl Machine {
             let Some(thread) = context.params.as_ref().and_then(|p| p["threadId"].as_str()) else {
                 continue;
             };
+            // 即使尚未识别血缘，发送订阅切换也已中断连续观察。
+            self.observation_continuity_lost(thread, "订阅操作切换");
             if self.thread_relation(thread).is_some()
                 && (context.method == "thread/unsubscribe"
                     || self.relations.aux.released.contains_key(thread)

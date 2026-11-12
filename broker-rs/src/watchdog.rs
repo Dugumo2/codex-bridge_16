@@ -244,7 +244,9 @@ pub fn event_bytes(event: &crate::appserver::AppEvent) -> usize {
             Err(AppError::Closed(reason)) => error_len += reason.len(),
         },
         AppEvent::TimedOut { error, .. } => error_len += error.to_string().len(),
-        AppEvent::Closed { reason } => error_len += reason.len(),
+        AppEvent::Closed { reason } | AppEvent::ObservationGap { reason } => {
+            error_len += reason.len()
+        }
         AppEvent::LateDiscarded { .. }
         | AppEvent::LateEvicted { .. }
         | AppEvent::PrivateInstanceExited { .. }

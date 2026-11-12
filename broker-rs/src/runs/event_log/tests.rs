@@ -136,6 +136,7 @@ fn turn_at(ms: u64) -> String {
 
 /// 给这一轮暂存一条摘要并等到到期，返回有没有写缺口。
 fn expires_with_gap(m: &mut Machine, thread: &str, turn: &str) -> bool {
+    m.coverage_complete(thread, turn, &json!({"status":"completed"}), 3, true);
     let mut a = vec![];
     m.buffer_child_event_log(thread, "item/completed", &item(thread, turn), false, &mut a);
     assert_eq!(m.runs.event_log.pending.len(), 1, "前置：已暂存");
@@ -653,6 +654,7 @@ fn tree_log_只被协作消息唤醒的轮次到期不写缺口_其余照常() {
         let mut a = vec![];
         m.buffer_child_event_log("乙", "item/completed", &item("乙", &id("t")), false, &mut a);
         assert_eq!(m.runs.event_log.pending.len(), 1, "前置：{name} 已暂存");
+        m.coverage_complete("乙", &id("t"), &json!({"status":"completed"}), 3, true);
         let generation = m.runs.event_log.timer.unwrap();
         m.clock.mono_ms = PENDING_MS;
         a.clear();
@@ -674,6 +676,7 @@ fn tree_log_归属证据进行中到期续期_转过期后写缺口() {
         if collaboration {
             m.note_event_log_delivery("乙", &t, "/root/甲", "/root/乙");
             assert!(m.turn_collaboration_only("乙", &t), "前置：协作记录已登记");
+            m.coverage_complete("乙", &t, &json!({"status":"completed"}), 3, true);
         }
         evidence_to(
             &mut m,
@@ -809,7 +812,7 @@ fn tree_log_轮号开始时间只认uuid7() {
     candidate(&mut m, "乙", "root");
     m.note_event_log_delivery("乙", "消息轮", "/root/甲", "/root/乙");
     assert!(
-        m.runs.event_log.deliveries.is_empty(),
+        m.runs.event_log.coverage.is_empty(),
         "前置：没有开始时间的轮不登记"
     );
     assert!(expires_with_gap(&mut m, "乙", "消息轮"));
@@ -836,7 +839,7 @@ fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
         for n in 0..fill {
             m.note_event_log_delivery("别的线程", &turn_at(6000 + n), filler_author, "/root/丁");
         }
-        let kept = m.runs.event_log.deliveries.keys().any(|k| k.1 == "乙");
+        let kept = m.runs.event_log.coverage.keys().any(|k| k.1 == "乙");
         assert_eq!(
             kept,
             fill < 1024,
@@ -848,7 +851,7 @@ fn tree_log_混合消费的轮被挤出记录后仍写缺口() {
             "{order:?} 挤入 {fill} 轮（{filler_author}）再收平级消息后不是纯协作"
         );
         assert_eq!(
-            m.runs.event_log.deliveries.len() as u64,
+            m.runs.event_log.coverage.len() as u64,
             (fill + 1).min(1024),
             "迟到记录不占位、不挤别的轮"
         );
@@ -874,12 +877,12 @@ fn tree_log_消费方向表只丢开始最早的轮() {
     for n in 0..1023 {
         m.note_event_log_delivery("别的线程", &turn_at(6000 + n), "/root", "/root/丁");
     }
-    let has = |m: &Machine, thread: &str| m.runs.event_log.deliveries.keys().any(|k| k.1 == thread);
+    let has = |m: &Machine, thread: &str| m.runs.event_log.coverage.keys().any(|k| k.1 == thread);
     assert!(
         !has(&m, "子一") && has(&m, "子二"),
         "前置：同毫秒的两轮只挤掉了子一"
     );
-    assert_eq!(m.runs.event_log.deliveries.len(), 1024);
+    assert_eq!(m.runs.event_log.coverage.len(), 1024);
     // 被丢的子一再收到平级消息：和表里最早的一轮同时开始，登记不回来，也不挤别的轮。
     m.note_event_log_delivery("子一", &t, "/root/甲", "/root/子一");
     assert!(!m.turn_collaboration_only("子一", &t));
@@ -913,7 +916,7 @@ fn tree_log_长期累计旧轮后新协作轮仍不写缺口() {
         );
     }
     assert_eq!(
-        m.runs.event_log.deliveries.len(),
+        m.runs.event_log.coverage.len(),
         1024,
         "前置：表已写满并腾过位"
     );
@@ -934,93 +937,32 @@ fn tree_log_表满后更早开始的轮不登记() {
     let t = turn_at(5000);
     m.note_event_log_delivery("乙", &t, "/root", "/root/乙");
     m.note_event_log_delivery("乙", &t, "/root/甲", "/root/乙");
-    let oldest = m.runs.event_log.deliveries.keys().next().unwrap();
+    let oldest = m.runs.event_log.coverage.keys().next().unwrap();
     assert_eq!(
         (oldest.0, oldest.1.as_str()),
         (6000, "别的线程"),
         "前置：乙这一轮没有登记，也没有挤掉别的轮"
     );
-    assert_eq!(m.runs.event_log.deliveries.len(), 1024);
+    assert_eq!(m.runs.event_log.coverage.len(), 1024);
     assert!(expires_with_gap(&mut m, "乙", &t));
 }
 
-/// core 启动前开始的轮可能在启动前消费过消息：不登记，协作消息也不免告警；启动后开始的轮照常。
-/// 启动时刻是 core 创建时记下的 `Clock.started_ms`，之后墙钟回拨也不会把更早开始的轮放进来。
+/// 墙钟不能建立覆盖：没有真实开始时，无论轮号早于或晚于当前时间都保守拒绝。
 #[test]
-fn tree_log_core启动前开始的轮不免告警() {
-    let mut m = setup();
-    for thread in ["前", "同时", "后", "回拨"] {
-        candidate(&mut m, thread, "root");
+fn tree_log_墙钟前跳与回拨均不能替代真实开始() {
+    for now in [1, 50_000, 150_000] {
+        let mut m = setup();
+        m.clock.now_ms = now;
+        candidate(&mut m, "乙", "root");
+        let turn = turn_at(49_000);
+        m.coverage_consume("乙", &turn, "消息", &json!({"author":"/root/甲"}), true);
+        assert!(matches!(
+            m.runs.event_log.coverage.values().next(),
+            Some(TurnCoverage::Veto { .. })
+        ));
+        assert!(expires_with_gap(&mut m, "乙", &turn));
     }
-    m.clock.started_ms = 40_000;
-    m.clock.now_ms = 50_000;
-    m.clock.mono_ms = 10_000;
-    for (thread, started, expect_gap) in [
-        ("前", 39_999, true),
-        ("同时", 40_000, true),
-        ("后", 40_001, false),
-    ] {
-        let t = turn_at(started);
-        m.note_event_log_delivery(thread, &t, "/root/甲", &format!("/root/{thread}"));
-        assert_eq!(expires_with_gap(&mut m, thread, &t), expect_gap, "{thread}");
-    }
-    m.clock.now_ms -= 30_000;
-    let t = turn_at(39_000);
-    m.note_event_log_delivery("回拨", &t, "/root/甲", "/root/回拨");
-    assert!(expires_with_gap(&mut m, "回拨", &t));
 }
-
-/// 启动后、第一次登记前墙钟被回拨：按当下墙钟倒推会把启动时刻算早，启动前开始的轮混进来；
-/// 用创建时记下的启动时刻，这一轮仍不登记，照常记缺口。
-#[test]
-fn tree_log_首次登记前墙钟回拨不放进启动前的轮() {
-    let mut m = setup();
-    candidate(&mut m, "乙", "root");
-    m.clock.started_ms = 50_000;
-    // 运行 10 秒后墙钟被回拨 20 秒：倒推出的启动时刻是 30 秒。
-    m.clock.mono_ms = 10_000;
-    m.clock.now_ms = 40_000;
-    assert!(
-        m.runs.event_log.deliveries.is_empty(),
-        "前置：这是第一次登记"
-    );
-    assert!(
-        m.clock.now_ms - m.clock.mono_ms < 49_000,
-        "前置：倒推出的启动时刻早于这一轮"
-    );
-    let t = turn_at(49_000);
-    m.note_event_log_delivery("乙", &t, "/root/甲", "/root/乙");
-    assert!(
-        m.runs.event_log.deliveries.is_empty(),
-        "启动前开始的轮不登记"
-    );
-    assert!(expires_with_gap(&mut m, "乙", &t));
-}
-
-/// 墙钟短暂前跳又恢复：启动时刻不被抬高，恢复后新开始的协作轮照常登记、不写缺口。
-#[test]
-fn tree_log_墙钟前跳后恢复新轮仍免告警() {
-    let mut m = setup();
-    for thread in ["跳", "恢复"] {
-        candidate(&mut m, thread, "root");
-    }
-    m.clock.started_ms = 40_000;
-    // 运行 10 秒时墙钟前跳到 150 秒，这时开始的轮带的也是前跳后的时间。
-    m.clock.mono_ms = 10_000;
-    m.clock.now_ms = 150_000;
-    let jumped = m.clock.now_ms - m.clock.mono_ms;
-    let t = turn_at(149_000);
-    m.note_event_log_delivery("跳", &t, "/root/甲", "/root/跳");
-    assert!(!expires_with_gap(&mut m, "跳", &t));
-    // 墙钟恢复正常：运行 60 秒、墙钟 100 秒。
-    m.clock.mono_ms = 60_000;
-    m.clock.now_ms = 100_000;
-    let t = turn_at(99_000);
-    assert!(99_000 < jumped, "前置：前跳时倒推出的启动时刻晚于这一轮");
-    m.note_event_log_delivery("恢复", &t, "/root/甲", "/root/恢复");
-    assert!(!expires_with_gap(&mut m, "恢复", &t));
-}
-
 /// 上一运行留下的历史兄弟：本运行对它没有任何管理证据，它被唤醒的轮次摘要按血缘暂存后，
 /// 到期或关闭清理时正常丢弃，不写「记录缺口」；同一时刻血缘不明的候选照常告警。
 #[test]
@@ -1058,5 +1000,1692 @@ fn tree_log_明确不归本运行的历史兄弟暂存到期与关闭清理都�
             .map(|l| l.3["threadId"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(gaps, ["unknown"], "关闭：{close}");
+    }
+}
+
+// 方案 B 复现：通知、消费和计时器都经真实 claim::step 入口，不直接填方向表。
+fn gap_b_apply(m: &mut Machine, event: crate::claim::Event) -> Vec<Action> {
+    let (next, actions) = crate::claim::step(std::mem::take(m), event);
+    *m = next;
+    actions
+}
+
+fn gap_b_notify(m: &mut Machine, method: &str, params: Value) -> Vec<Action> {
+    gap_b_apply(
+        m,
+        crate::claim::Event::Notification {
+            method: method.into(),
+            params: Some(params),
+        },
+    )
+}
+
+fn gap_b_started(m: &mut Machine, turn: &str) -> Vec<Action> {
+    gap_b_notify(
+        m,
+        "turn/started",
+        json!({"threadId":"乙", "turn":{"id":turn,"status":"inProgress"}}),
+    )
+}
+
+fn gap_b_completed(m: &mut Machine, turn: &str) -> Vec<Action> {
+    gap_b_notify(
+        m,
+        "turn/completed",
+        json!({"threadId":"乙", "turn":{"id":turn,"status":"completed","error":null}}),
+    )
+}
+
+fn gap_b_delivery(m: &mut Machine, turn: &str, id: &str, author: &str) -> Vec<Action> {
+    let recipient = "/root/乙";
+    let text = format!(
+        "Message Type: MESSAGE\nTask name: {recipient}\nSender: {author}\nPayload:\n核对结果"
+    );
+    gap_b_notify(
+        m,
+        "rawResponseItem/completed",
+        json!({
+            "threadId":"乙","turnId":turn,"item":{
+                "type":"agent_message","id":id,"author":author,"recipient":recipient,
+                "content":[{"type":"input_text","text":text}]
+            }
+        }),
+    )
+}
+
+/// 先验见证来自同线程前一真实 v7 轮：开始后收到合法 raw，结束后再登记候选。
+/// 此时没有血缘候选，所以种子轮不会污染被测暂存；没有用内部表伪造 raw 证据。
+fn gap_b_seeded() -> Machine {
+    let mut m = setup();
+    let seed = turn_at(4000);
+    gap_b_started(&mut m, &seed);
+    gap_b_delivery(&mut m, &seed, "种子消费", "/root/甲");
+    assert_eq!(
+        m.relations.aux.v2_raw_threads.get("乙"),
+        Some(&m.relations.conn_epoch),
+        "前置：种子真实 raw 已观察"
+    );
+    assert!(
+        m.relations
+            .aux
+            .live_turn_starts
+            .contains_key(&("乙".into(), seed.clone())),
+        "前置：亲眼观察种子开始"
+    );
+    gap_b_completed(&mut m, &seed);
+    assert!(
+        m.runs.event_log.pending.is_empty(),
+        "前置：种子不产生候选摘要"
+    );
+    assert!(
+        m.relations.attachments.get("乙").is_some_and(|a| a.valid),
+        "前置：种子结束没有退订"
+    );
+    candidate(&mut m, "乙", "root");
+    m
+}
+
+fn gap_b_summary(m: &mut Machine, turn: &str) {
+    gap_b_notify(m, "item/completed", item("乙", turn).unwrap());
+    assert!(
+        !m.historical_subagent_for_run("run-a", "乙"),
+        "前置：不是其他运行历史成员"
+    );
+    assert!(m.binding("乙", turn).is_none(), "前置：目标轮尚未绑定");
+    assert!(
+        !m.event_log_evidence_in_flight("run-a", "乙"),
+        "前置：没有归属证据遮挡到期判断"
+    );
+    assert!(
+        m.relations.operations.values().all(|o| !o.proof_expired),
+        "前置：没有过期证据掩盖免报分支"
+    );
+    assert!(
+        m.runs
+            .event_log
+            .pending
+            .iter()
+            .any(|p| p.turn == turn && p.summary.item.as_deref() == Some("same-item")),
+        "前置：目标摘要已入队"
+    );
+    assert!(m.runs.event_log.bytes > 0, "前置：摘要实际占用字节");
+}
+
+fn gap_b_sweep(m: &mut Machine) -> Vec<Action> {
+    let generation = m.runs.event_log.timer.expect("前置：有实际暂存计时器");
+    m.clock.mono_ms += PENDING_MS + 1;
+    m.clock.now_ms += PENDING_MS + 1;
+    gap_b_apply(
+        m,
+        crate::claim::Event::Timer {
+            token: crate::claim::ClaimToken {
+                thread_id: String::new(),
+                claim_id: 0,
+            },
+            kind: crate::claim::TimerKind::Run(crate::runs::RunTimer::EventLogSweep { generation }),
+        },
+    )
+}
+
+fn gap_b_has_gap(actions: &[Action], turn: &str) -> bool {
+    logs(actions)
+        .iter()
+        .any(|l| l.2 == "记录缺口" && l.3["turnId"] == turn)
+}
+
+#[test]
+fn gap_b_red_有先验raw的未结束协作轮到期仍保留摘要() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let bytes = m.runs.event_log.bytes;
+    let actions = gap_b_sweep(&mut m);
+    assert!(!gap_b_has_gap(&actions, &turn), "完整开放轮暂不报缺口");
+    assert!(
+        m.runs.event_log.pending.iter().any(|p| p.turn == turn),
+        "未结束轮必须继续暂存，不能提前丢摘要"
+    );
+    assert_eq!(m.runs.event_log.bytes, bytes, "续期不能扣掉暂存字节");
+}
+
+#[test]
+fn gap_b_red_到期之后同轮上级消息仍可否决全部摘要() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let original_count = m
+        .runs
+        .event_log
+        .pending
+        .iter()
+        .filter(|p| p.turn == turn)
+        .count();
+    assert!(original_count >= 2, "前置：开始与条目都已暂存");
+    let mut all = gap_b_sweep(&mut m);
+    all.extend(gap_b_delivery(&mut m, &turn, "迟到上级", "/root"));
+    all.extend(gap_b_completed(&mut m, &turn));
+    if m.runs.event_log.timer.is_some() {
+        all.extend(gap_b_sweep(&mut m));
+    }
+    let gaps = logs(&all)
+        .iter()
+        .filter(|l| l.2 == "记录缺口" && l.3["turnId"] == turn)
+        .count();
+    assert!(
+        gaps >= original_count,
+        "上级消息不能只保住后来的完成摘要，原先 {original_count} 条摘要必须写缺口，实际 {gaps}"
+    );
+}
+
+#[test]
+fn gap_b_red_晚订阅缺真实started的协作轮仍写缺口() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_delivery(&mut m, &turn, "晚订阅后首条", "/root/甲");
+    assert!(
+        !m.relations
+            .aux
+            .live_turn_starts
+            .contains_key(&("乙".into(), turn.clone())),
+        "前置：目标轮真实开始未观察"
+    );
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "既往 raw 能力不能替代本轮完整开始"
+    );
+}
+
+#[test]
+fn gap_b_red_本轮首条raw不能追认开始时的资格() {
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    let turn = turn_at(5000);
+    assert!(!m.relations.aux.v2_raw_threads.contains_key("乙"));
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "首次raw", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "开始以后见到 raw 不能追认先验凭据"
+    );
+}
+
+#[test]
+fn gap_b_red_未结束协作轮在关闭时必须报缺口() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let actions = gap_b_apply(&mut m, crate::claim::Event::Shutdown);
+    assert!(
+        gap_b_has_gap(&actions, &turn),
+        "关闭时尚未完成的纯协作外观不能免报"
+    );
+    assert!(m.runs.event_log.pending.is_empty());
+    assert_eq!(m.runs.event_log.bytes, 0);
+}
+
+#[test]
+fn gap_b_red_消费去重不能跳过相同id的非协作反证() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "重复id", "/root/甲");
+    gap_b_delivery(&mut m, &turn, "重复id", "/root");
+    gap_b_delivery(&mut m, &turn, "后续兄弟", "/root/丙");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "去重之前必须保留冲突消费，之后的协作不能覆盖它"
+    );
+}
+
+#[test]
+fn gap_b_red_跨轮复用id不能跳过本轮上级消费() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "种子消费", "/root");
+    gap_b_delivery(&mut m, &turn, "本轮兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "跨轮复用 id 不能令上级先于兄弟的轮变成全协作"
+    );
+}
+
+#[test]
+fn gap_b_red_上级后兄弟完成仍为混合消费() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "上级", "/root");
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "含其他是吸收态，不能用最后一条覆盖"
+    );
+}
+
+#[test]
+fn gap_b_red_重复completed不破坏完整协作轮() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let mut all = gap_b_completed(&mut m, &turn);
+    all.extend(gap_b_completed(&mut m, &turn));
+    all.extend(gap_b_sweep(&mut m));
+    assert!(!gap_b_has_gap(&all, &turn), "一致重复完成须幂等");
+    assert!(
+        m.runs.event_log.pending.is_empty(),
+        "完整结束后不应永久暂存"
+    );
+}
+
+#[test]
+fn gap_b_red_未知生命周期通知撤销协作免报() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+    gap_b_notify(&mut m, "thread/runtime/replaced", json!({"threadId":"乙"}));
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "未知生命周期不能被当作无关通知吞掉"
+    );
+}
+
+#[test]
+fn gap_b_red_无法解释的raw消费必须撤销资格() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+    gap_b_notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":"乙","turnId":turn,"item":{
+            "type":"agent_message","id":"坏记录","author":"/root","recipient":"/root/乙","content":false
+        }}),
+    );
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "合法 JSON 但消费结构无法解释时必须保守报缺口"
+    );
+}
+
+#[test]
+fn gap_b_red_冷恢复无raw的轮保持保守缺口() {
+    let mut m = setup();
+    candidate(&mut m, "乙", "root");
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_summary(&mut m, &turn);
+    assert!(
+        !m.relations.aux.v2_raw_threads.contains_key("乙"),
+        "前置：无 raw 见证"
+    );
+    gap_b_completed(&mut m, &turn);
+    assert!(gap_b_has_gap(&gap_b_sweep(&mut m), &turn));
+}
+
+/// 仅用于覆盖表的容量和方向单元测试；完整入口授信另由 gap_b_* 测试验证。
+impl Machine {
+    fn note_event_log_delivery(&mut self, thread: &str, turn: &str, author: &str, recipient: &str) {
+        self.coverage_start(
+            thread,
+            turn,
+            Some(StartProof {
+                conn_epoch: self.relations.conn_epoch,
+                observation_gen: 1,
+                start_seq: 2,
+                raw_seq_at_start: 1,
+            }),
+        );
+        let raw = json!({"author":author,"recipient":recipient});
+        let item = format!("{author}:{recipient}");
+        self.coverage_consume(
+            thread,
+            turn,
+            &item,
+            &raw,
+            collaboration_delivery(author, recipient),
+        );
+    }
+
+    fn turn_collaboration_only(&self, thread: &str, turn: &str) -> bool {
+        let Some(ms) = turn_started_ms(turn) else {
+            return false;
+        };
+        matches!(
+            self.runs
+                .event_log
+                .coverage
+                .get(&(ms, thread.into(), turn.into())),
+            Some(TurnCoverage::Open {
+                consumption: coverage::Consumption::CollaborationOnly,
+                ..
+            }) | Some(TurnCoverage::Complete {
+                consumption: coverage::Consumption::CollaborationOnly,
+                ..
+            })
+        )
+    }
+} // 此组入口复现只依赖旧有测试助手，可移植到修改前快照运行。
+#[test]
+fn gap_b_red_v4_先完成后开始不能制造覆盖() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_completed(&mut m, &turn);
+    assert!(
+        matches!(gap_b_coverage(&m, &turn), TurnCoverage::Veto { .. }),
+        "没有真实开始的完成必须立即否决，不能暂时封存"
+    );
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "结束先到不能被迟来的开始复活"
+    );
+}
+
+#[test]
+fn gap_b_red_v4_完成后矛盾终态不能免报() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    gap_b_notify(
+        &mut m,
+        "turn/completed",
+        json!({"threadId":"乙","turn":{"id":turn,"status":"failed","error":{"message":"矛盾"}}}),
+    );
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "已封存终态不可被新终态覆盖"
+    );
+}
+
+#[test]
+fn gap_b_red_v4_完成后新增同轮消费不能免报() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "迟到兄弟", "/root/丙");
+    assert!(
+        gap_b_has_gap(&gap_b_sweep(&mut m), &turn),
+        "完成后新增消费意味着结束证明不完整"
+    );
+}
+
+#[test]
+fn gap_b_red_v4_未完成纯协作轮容量超限仍报告() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let mut actions = Vec::new();
+    for n in 0..250 {
+        actions.extend(gap_b_notify(&mut m, "item/completed", json!({"threadId":"乙","turnId":turn,"item":{"id":format!("容量-{n}"),"type":"agentMessage","text":"完整摘要".repeat(100)}})));
+    }
+    assert!(
+        m.runs.event_log.bytes <= PER_THREAD_BYTES,
+        "前置：容量上限确实生效"
+    );
+    assert!(
+        gap_b_has_gap(&actions, &turn),
+        "强制容量处置不能启用协作排除"
+    );
+}
+
+fn gap_b_coverage(m: &Machine, turn: &str) -> TurnCoverage {
+    m.runs.event_log.coverage[&(turn_started_ms(turn).unwrap(), "乙".into(), turn.into())].clone()
+}
+
+#[test]
+fn gap_b_完成退订与重复边界保持封存序号和消费指纹() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    let sealed = gap_b_coverage(&m, &turn);
+    assert!(
+        matches!(sealed, TurnCoverage::Complete { .. }),
+        "前置：真实通知已封存"
+    );
+    m.detach_evidence("乙");
+    assert!(!m.relations.attachments["乙"].valid, "前置：当前附着已失效");
+    assert!(
+        m.coverage_observation_gen("乙").is_none(),
+        "前置：raw 未来授信已封锁"
+    );
+    assert_eq!(
+        m.coverage_disposition("乙", &turn),
+        CoverageDisposition::AllowCollaborationExclusion
+    );
+    gap_b_completed(&mut m, &turn);
+    assert_eq!(
+        gap_b_coverage(&m, &turn),
+        sealed,
+        "一致完成保留原 end_seq 与消费汇总"
+    );
+    gap_b_started(&mut m, &turn);
+    assert_eq!(
+        gap_b_coverage(&m, &turn),
+        sealed,
+        "重复开始不能重开或重拍快照"
+    );
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    assert_eq!(
+        gap_b_coverage(&m, &turn),
+        sealed,
+        "精确重复消费不改变封存证明"
+    );
+    assert!(!gap_b_has_gap(&gap_b_sweep(&mut m), &turn));
+    assert!(m.runs.event_log.pending.is_empty());
+    assert_eq!(m.runs.event_log.bytes, 0);
+}
+
+#[test]
+fn gap_b_开放轮退订立即否决而完成不需要当前附着() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    assert_eq!(
+        m.coverage_disposition("乙", &turn),
+        CoverageDisposition::Wait
+    );
+    m.detach_evidence("乙");
+    assert!(matches!(
+        gap_b_coverage(&m, &turn),
+        TurnCoverage::Veto { .. }
+    ));
+    gap_b_completed(&mut m, &turn);
+    assert!(gap_b_has_gap(&gap_b_sweep(&mut m), &turn));
+}
+
+#[test]
+fn gap_b_嵌套扫描不能在事件处理结束之前协作丢弃() {
+    for counterevidence in [false, true] {
+        let mut m = gap_b_seeded();
+        let turn = turn_at(5000);
+        gap_b_started(&mut m, &turn);
+        gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+        gap_b_summary(&mut m, &turn);
+        gap_b_completed(&mut m, &turn);
+        let count = m.runs.event_log.pending.len();
+        let bytes = m.runs.event_log.bytes;
+        m.clock.mono_ms += PENDING_MS + 1;
+        m.begin_event_log_step();
+        let mut actions = Vec::new();
+        m.expire_event_log(&mut actions);
+        assert_eq!(
+            m.runs.event_log.pending.len(),
+            count,
+            "处理中嵌套扫描不能删除摘要"
+        );
+        assert_eq!(m.runs.event_log.bytes, bytes, "处理中不可扣除字节");
+        assert!(logs(&actions).is_empty());
+        if counterevidence {
+            m.coverage_veto(Some("乙"), Some(&turn), "同一步文件反证", true);
+        }
+        m.settle_event_log_step(&mut actions);
+        assert!(m.runs.event_log.pending.is_empty());
+        assert_eq!(m.runs.event_log.bytes, 0);
+        assert_eq!(
+            gap_b_has_gap(&actions, &turn),
+            counterevidence,
+            "尾部使用本步最终事实"
+        );
+    }
+}
+
+#[test]
+fn gap_b_开放续期后结束在尾部立即释放原摘要() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let count = m.runs.event_log.pending.len();
+    let bytes = m.runs.event_log.bytes;
+    let mut actions = gap_b_sweep(&mut m);
+    assert_eq!(m.runs.event_log.pending.len(), count);
+    assert_eq!(m.runs.event_log.bytes, bytes);
+    actions.extend(gap_b_completed(&mut m, &turn));
+    assert!(
+        !m.runs.event_log.pending.iter().any(|p| p.awaiting_coverage),
+        "已经到期暂留的摘要不再等额外用户事件"
+    );
+    if m.runs.event_log.timer.is_some() {
+        actions.extend(gap_b_sweep(&mut m));
+    }
+    assert!(!gap_b_has_gap(&actions, &turn));
+    assert!(m.runs.event_log.pending.is_empty());
+    assert_eq!(m.runs.event_log.bytes, 0);
+}
+
+#[test]
+fn gap_b_零消费完成不能协作免报() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(matches!(
+        gap_b_coverage(&m, &turn),
+        TurnCoverage::Complete {
+            consumption: coverage::Consumption::Unseen,
+            ..
+        }
+    ));
+    assert!(gap_b_has_gap(&gap_b_sweep(&mut m), &turn));
+}
+
+#[test]
+fn gap_b_配对ttl淘汰不清除上级消费汇总() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "上级", "/root");
+    assert!(m.relations.aux.v2_deliveries.iter().any(|d| d.id == "上级"));
+    m.clock.mono_ms += crate::relations::EVIDENCE_TTL_MS + 1;
+    m.facts_expire(&mut Vec::new());
+    assert!(
+        !m.relations.aux.v2_deliveries.iter().any(|d| d.id == "上级"),
+        "前置：配对证据已实际淘汰"
+    );
+    assert!(matches!(
+        gap_b_coverage(&m, &turn),
+        TurnCoverage::Open {
+            consumption: coverage::Consumption::ContainsOther,
+            ..
+        }
+    ));
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(matches!(
+        gap_b_coverage(&m, &turn),
+        TurnCoverage::Complete {
+            consumption: coverage::Consumption::ContainsOther,
+            ..
+        }
+    ));
+    assert!(gap_b_has_gap(&gap_b_sweep(&mut m), &turn));
+}
+
+#[test]
+fn gap_b_完成轮等待真实结果回包后尾部解除票据屏障() {
+    use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    m.clock.mono_ms = 15_000;
+    let ticket = ReadTicket {
+        id: 777,
+        thread: "乙".into(),
+        conn_epoch: m.relations.conn_epoch,
+        observation_gen: m.coverage_read_observation_gen("乙"),
+        issued_seq: m.coverage_next_seq().unwrap(),
+        deadline: 45_000,
+        state: ReadTicketState::Active,
+    };
+    m.relations
+        .aux
+        .rollout
+        .coverage_reads
+        .insert(ticket.id, ticket.clone());
+    assert_eq!(m.coverage_read_deadline("乙"), Some(45_000));
+    assert_eq!(
+        m.coverage_disposition("乙", &turn),
+        CoverageDisposition::Wait
+    );
+    let bytes = m.runs.event_log.bytes;
+    let count = m.runs.event_log.pending.len();
+    m.clock.mono_ms = 30_001;
+    let generation = m.runs.event_log.timer.unwrap();
+    let mut actions = gap_b_apply(
+        &mut m,
+        crate::claim::Event::Timer {
+            token: crate::claim::ClaimToken {
+                thread_id: String::new(),
+                claim_id: 0,
+            },
+            kind: crate::claim::TimerKind::Run(crate::runs::RunTimer::EventLogSweep { generation }),
+        },
+    );
+    assert_eq!(
+        m.runs.event_log.pending.len(),
+        count,
+        "读取未决时已完成轮仍保留"
+    );
+    assert_eq!(m.runs.event_log.bytes, bytes);
+    assert_eq!(m.runs.event_log.pending.front().unwrap().expires, 45_000);
+    actions.extend(gap_b_apply(
+        &mut m,
+        crate::claim::Event::RolloutRead {
+            id: ticket.id,
+            thread: ticket.thread,
+            conn_epoch: ticket.conn_epoch,
+            observation_gen: ticket.observation_gen,
+            issued_seq: ticket.issued_seq,
+            result: Ok(crate::rollout::RolloutChunk::default()),
+        },
+    ));
+    assert!(
+        m.relations.aux.rollout.coverage_reads.is_empty(),
+        "实际回包释放物理票据"
+    );
+    assert!(
+        m.runs.event_log.pending.is_empty(),
+        "空结果也在同一步尾部重评暂留摘要"
+    );
+    assert_eq!(m.runs.event_log.bytes, 0);
+    assert!(!gap_b_has_gap(&actions, &turn));
+}
+
+#[test]
+fn gap_b_水位单调且同毫秒否决轮淘汰不能复活() {
+    let mut m = setup();
+    let oldest = turn_at(5000);
+    m.coverage_veto(Some("乙"), Some(&oldest), "原始反证", true);
+    for n in 0..COVERAGE_TURNS as u64 {
+        m.coverage_start("填充", &turn_at(6000 + n), None);
+    }
+    assert_eq!(m.runs.event_log.coverage.len(), COVERAGE_TURNS);
+    assert_eq!(m.runs.event_log.evicted_through_ms, Some(5000));
+    assert!(!m
+        .runs
+        .event_log
+        .coverage
+        .contains_key(&(5000, "乙".into(), oldest.clone())));
+    m.coverage_start(
+        "乙",
+        &oldest,
+        Some(StartProof {
+            conn_epoch: 0,
+            observation_gen: 0,
+            start_seq: 2,
+            raw_seq_at_start: 1,
+        }),
+    );
+    assert!(m.coverage_turn_seen("乙", &oldest), "即便缺失也记得已淘汰");
+    assert!(!m
+        .runs
+        .event_log
+        .coverage
+        .contains_key(&(5000, "乙".into(), oldest.clone())));
+    m.coverage_start("回拨", &turn_at(4000), None);
+    assert_eq!(
+        m.runs.event_log.evicted_through_ms,
+        Some(5000),
+        "迟到更早轮不能降低水位"
+    );
+    let same_ms = "00000000-1388-7000-8000-000000000001";
+    m.coverage_start(
+        "同毫秒",
+        same_ms,
+        Some(StartProof {
+            conn_epoch: 0,
+            observation_gen: 0,
+            start_seq: 2,
+            raw_seq_at_start: 1,
+        }),
+    );
+    assert!(!m.runs.event_log.coverage.keys().any(|k| k.1 == "同毫秒"));
+}
+
+#[test]
+fn gap_b_完成指纹忽略展示字段但规范化错误对象键顺序() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_notify(
+        &mut m,
+        "turn/completed",
+        json!({"threadId":"乙","turn":{"id":turn,"status":"failed","error":{"a":1,"b":{"c":2,"d":3}},"usage":10}}),
+    );
+    let sealed = gap_b_coverage(&m, &turn);
+    assert!(matches!(sealed, TurnCoverage::Complete { .. }));
+    m.detach_evidence("乙");
+    let duplicate: Value = serde_json::from_str(&format!(r#"{{"threadId":"乙","turn":{{"id":"{turn}","status":"failed","error":{{"b":{{"d":3,"c":2}},"a":1}},"usage":99}}}}"#)).unwrap();
+    gap_b_notify(&mut m, "turn/completed", duplicate);
+    assert_eq!(gap_b_coverage(&m, &turn), sealed);
+    assert!(!gap_b_has_gap(&gap_b_sweep(&mut m), &turn));
+}
+
+#[test]
+fn gap_b_全局容量强制处置不能使用完成协作豁免() {
+    let mut m = setup();
+    let mut actions = Vec::new();
+    for n in 0..80 {
+        let thread = format!("容量线程-{n}");
+        let turn = turn_at(5000 + n);
+        candidate(&mut m, &thread, "root");
+        m.note_event_log_delivery(&thread, &turn, "/root/甲", "/root/乙");
+        m.coverage_complete(&thread, &turn, &json!({"status":"completed"}), 3, true);
+        assert_eq!(
+            m.coverage_disposition(&thread, &turn),
+            CoverageDisposition::AllowCollaborationExclusion
+        );
+        for item in 0..60 {
+            m.buffer_child_event_log(&thread, "item/completed", &Some(json!({
+                "threadId":thread,"turnId":turn,"item":{"id":format!("摘要-{item}"),"type":"agentMessage","text":"x".repeat(240)}
+            })), false, &mut actions);
+        }
+        let per_thread: usize = m
+            .runs
+            .event_log
+            .pending
+            .iter()
+            .filter(|p| p.thread == thread)
+            .map(|p| p.bytes)
+            .sum();
+        assert!(
+            per_thread < PER_THREAD_BYTES,
+            "前置：每线程尚未达到本地上限"
+        );
+    }
+    assert!(m.runs.event_log.bytes <= GLOBAL_BYTES);
+    assert!(
+        m.runs.event_log.bytes > GLOBAL_BYTES - PER_THREAD_BYTES,
+        "前置：全局容量已真实吃满"
+    );
+    assert!(logs(&actions)
+        .iter()
+        .any(|l| l.2 == "记录缺口" && l.3["summary"] == "归属确认前摘要暂存超限"));
+    actions.clear();
+    m.clear_pending_event_log(&mut actions);
+    assert_eq!(m.runs.event_log.bytes, 0);
+    assert!(m.runs.event_log.pending.is_empty());
+    assert!(
+        logs(&actions).iter().any(|l| l.2 == "记录缺口"),
+        "关闭也不使用已完成协作豁免"
+    );
+}
+
+#[test]
+fn gap_b_配对容量淘汰不能抹去上级消费否决() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "上级", "/root");
+    assert!(m
+        .relations
+        .aux
+        .v2_deliveries
+        .iter()
+        .any(|d| d.thread == "乙" && d.id == "上级"));
+    for n in 0..crate::relations::MAX_OPERATIONS {
+        gap_b_notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({
+                "threadId":"填充","turnId":"只用于配对容量的非规范轮","item":{
+                    "type":"agent_message","id":format!("填充-{n}"),"author":"/root/甲","recipient":"/root/填充",
+                    "content":[{"type":"input_text","text":"Message Type: MESSAGE\nTask name: /root/填充\nSender: /root/甲\nPayload:\n核对结果"}]
+                }
+            }),
+        );
+    }
+    assert_eq!(
+        m.relations.aux.v2_deliveries.len(),
+        crate::relations::MAX_OPERATIONS
+    );
+    assert!(
+        !m.relations
+            .aux
+            .v2_deliveries
+            .iter()
+            .any(|d| d.thread == "乙" && d.id == "上级"),
+        "前置：上级消费已被配对容量实际淘汰"
+    );
+    assert!(
+        matches!(
+            gap_b_coverage(&m, &turn),
+            TurnCoverage::Open {
+                consumption: coverage::Consumption::ContainsOther,
+                ..
+            }
+        ),
+        "覆盖事实仍独立保留"
+    );
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    assert!(matches!(
+        gap_b_coverage(&m, &turn),
+        TurnCoverage::Complete {
+            consumption: coverage::Consumption::ContainsOther,
+            ..
+        }
+    ));
+    assert!(gap_b_has_gap(&gap_b_sweep(&mut m), &turn));
+}
+
+#[test]
+fn gap_b_续期后的迟到绑定按原顺序补写所有摘要() {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let count = m.runs.event_log.pending.len();
+    gap_b_sweep(&mut m);
+    assert_eq!(
+        m.runs.event_log.pending.len(),
+        count,
+        "前置：开放轮到期摘要全部保留"
+    );
+    bind(&mut m, "run-a", "乙", &turn, "root");
+    let mut actions = Vec::new();
+    m.flush_bound_event_log("run-a", "乙", &turn, "root", &mut actions);
+    let rows = logs(&actions);
+    assert_eq!(rows.len(), count);
+    assert_eq!(rows.first().unwrap().2, "轮次开始");
+    assert!(rows.iter().all(|r| r.3["late"] == true));
+    assert!(!gap_b_has_gap(&actions, &turn));
+    assert!(m.runs.event_log.pending.is_empty());
+    assert_eq!(m.runs.event_log.bytes, 0);
+    actions.clear();
+    m.flush_bound_event_log("run-a", "乙", &turn, "root", &mut actions);
+    assert!(logs(&actions).is_empty(), "绑定补写恰好一次");
+}
+
+#[test]
+fn gap_b_完成轮读取定时到期在同一步重评全部摘要() {
+    use crate::relations::rollout_pairing::{ReadTicket, ReadTicketState};
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    gap_b_completed(&mut m, &turn);
+    m.clock.mono_ms = 15_000;
+    let ticket = ReadTicket {
+        id: 777,
+        thread: "乙".into(),
+        conn_epoch: m.relations.conn_epoch,
+        observation_gen: m.coverage_read_observation_gen("乙"),
+        issued_seq: m.coverage_next_seq().unwrap(),
+        deadline: 45_000,
+        state: ReadTicketState::Active,
+    };
+    m.relations
+        .aux
+        .rollout
+        .coverage_reads
+        .insert(ticket.id, ticket.clone());
+    assert_eq!(m.coverage_read_deadline("乙"), Some(45_000));
+    assert_eq!(
+        m.coverage_disposition("乙", &turn),
+        CoverageDisposition::Wait
+    );
+    let bytes = m.runs.event_log.bytes;
+    let count = m.runs.event_log.pending.len();
+    m.clock.mono_ms = 30_001;
+    let generation = m.runs.event_log.timer.unwrap();
+    let mut actions = gap_b_apply(
+        &mut m,
+        crate::claim::Event::Timer {
+            token: crate::claim::ClaimToken {
+                thread_id: String::new(),
+                claim_id: 0,
+            },
+            kind: crate::claim::TimerKind::Run(crate::runs::RunTimer::EventLogSweep { generation }),
+        },
+    );
+    assert_eq!(
+        m.runs.event_log.pending.len(),
+        count,
+        "读取未决时已完成轮仍保留"
+    );
+    assert_eq!(m.runs.event_log.bytes, bytes);
+    assert_eq!(m.runs.event_log.pending.front().unwrap().expires, 45_000);
+    let (deadline, generation) = m
+        .relations
+        .aux
+        .rollout
+        .timer
+        .expect("Active 票据拥有独立定时器");
+    assert_eq!(deadline, ticket.deadline);
+    m.clock.mono_ms = deadline;
+    actions.extend(gap_b_apply(
+        &mut m,
+        crate::claim::Event::Timer {
+            token: crate::claim::ClaimToken {
+                thread_id: String::new(),
+                claim_id: 0,
+            },
+            kind: crate::claim::TimerKind::RolloutPoll { generation },
+        },
+    ));
+    assert_eq!(
+        m.relations.aux.rollout.coverage_reads[&ticket.id].state,
+        ReadTicketState::Retired
+    );
+    assert!(
+        m.relations.aux.rollout.timer.is_none(),
+        "退休占位不反复调度"
+    );
+    assert!(matches!(
+        gap_b_coverage(&m, &turn),
+        TurnCoverage::Veto { .. }
+    ));
+    assert!(m.coverage_observation_gen("乙").is_none());
+    assert!(
+        m.runs.event_log.pending.is_empty(),
+        "到期不依赖新的用户事件便重评摘要"
+    );
+    assert_eq!(m.runs.event_log.bytes, 0);
+    assert_eq!(
+        logs(&actions)
+            .iter()
+            .filter(|l| l.2 == "记录缺口" && l.3["turnId"] == turn)
+            .count(),
+        count
+    );
+}
+
+// 附加到 runs/event_log/tests.rs：直接验证原有摘要及字节未被提前丢失。
+#[test]
+fn gap_b_review1_raw系统和开发者输入令完成前摘要最终写缺口() {
+    for role in ["system", "developer", "assistant"] {
+        let mut m = gap_b_seeded();
+        let turn = turn_at(5000);
+        gap_b_started(&mut m, &turn);
+        gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+        gap_b_summary(&mut m, &turn);
+        assert!(m.coverage_open_proof("乙", &turn).is_some());
+        let bytes = m.runs.event_log.bytes;
+        let count = m.runs.event_log.pending.len();
+        assert!(bytes > 0 && count >= 2, "前置：原始摘要及开始记录实际暂存");
+        let mut all = gap_b_notify(
+            &mut m,
+            "rawResponseItem/completed",
+            json!({"threadId":"乙","turnId":turn,
+            "item":{"type":"message","role":role,"content":[{"type":if role=="assistant" {"output_text"} else {"input_text"},"text":"新内容"}]}}),
+        );
+        assert_eq!(
+            m.runs.event_log.bytes, bytes,
+            "raw不进入摘要，也不得删除既有摘要"
+        );
+        assert_eq!(m.runs.event_log.pending.len(), count);
+        if role == "assistant" {
+            assert!(m.coverage_open_proof("乙", &turn).is_some());
+        } else {
+            assert!(
+                m.coverage_open_proof("乙", &turn).is_none(),
+                "{role}输入必须否决"
+            );
+        }
+        all.extend(gap_b_completed(&mut m, &turn));
+        all.extend(gap_b_sweep(&mut m));
+        if role == "assistant" {
+            assert!(!gap_b_has_gap(&all, &turn), "合法输出对照最终免报");
+        } else {
+            let gaps = logs(&all)
+                .iter()
+                .filter(|line| line.2 == "记录缺口" && line.3["turnId"] == turn)
+                .count();
+            assert!(
+                gaps >= count,
+                "{role}输入必须保住全部{count}条原始摘要，实际缺口{gaps}"
+            );
+        }
+        assert_eq!(m.runs.event_log.bytes, 0);
+        assert!(m.runs.event_log.pending.is_empty());
+    }
+}
+
+impl Machine {
+    /// 其他入口测试只读检查指定轮暂存与全局字节，不暴露或修改内部覆盖状态。
+    pub(crate) fn event_log_pending_stats(
+        &self,
+        thread: &str,
+        turn: &str,
+    ) -> (usize, usize, usize) {
+        let selected: Vec<_> = self
+            .runs
+            .event_log
+            .pending
+            .iter()
+            .filter(|p| p.thread == thread && p.turn == turn)
+            .collect();
+        (
+            selected.len(),
+            selected.iter().map(|p| p.bytes).sum(),
+            self.runs.event_log.bytes,
+        )
+    }
+}
+
+#[test]
+fn gap_b_review1_新增合法展示与工具输出完整日志零缺口() {
+    let mut cases: Vec<(&str, Value)> = Vec::new();
+    for tool in [
+        "sendMessage",
+        "followupTask",
+        "interruptAgent",
+        "listAgents",
+    ] {
+        for status in ["completed", "interrupted"] {
+            cases.push(("item/completed", json!({"type":"collabAgentToolCall","id":format!("合法{tool}-{status}"),
+                "tool":tool,"status":status,"senderThreadId":"乙","receiverThreadIds":[],"agentsStates":{},
+                "prompt":null,"model":null,"reasoningEffort":null})));
+        }
+    }
+    cases.push((
+        "item/completed",
+        json!({"type":"webSearch","id":"搜索","query":"问题","action":null,"results":null}),
+    ));
+    cases.push((
+        "item/completed",
+        json!({"type":"sleep","id":"等待","durationMs":10}),
+    ));
+    for kind in ["function_call_output", "custom_tool_call_output"] {
+        cases.push(("rawResponseItem/completed", json!({"type":kind,"call_id":"工具调用","output":[{"type":"encrypted_content","encrypted_content":"密文"}]})));
+    }
+    cases.push(("item/completed", json!({"type":"functionCallOutput","id":"展示加密结果","name":"工具","output":[{"type":"encrypted_content","encrypted_content":"密文"}]})));
+    for (method, output) in cases {
+        let mut m = gap_b_seeded();
+        let turn = turn_at(5000);
+        gap_b_started(&mut m, &turn);
+        gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+        gap_b_summary(&mut m, &turn);
+        let proof = m
+            .coverage_open_proof("乙", &turn)
+            .cloned()
+            .expect("前置：真实先验raw和开始已授予Open");
+        let (count, bytes, _) = m.event_log_pending_stats("乙", &turn);
+        assert!(count >= 2 && bytes > 0);
+        let mut actions = gap_b_notify(
+            &mut m,
+            method,
+            json!({"threadId":"乙","turnId":turn,"item":output}),
+        );
+        assert_eq!(
+            m.coverage_open_proof("乙", &turn),
+            Some(&proof),
+            "合法输出不能破坏真实Open：{output}"
+        );
+        assert_eq!(
+            m.coverage_observation_gen("乙"),
+            Some(proof.observation_gen)
+        );
+        let (after_count, after_bytes, _) = m.event_log_pending_stats("乙", &turn);
+        assert!(
+            after_count >= count && after_bytes >= bytes,
+            "输出不能提前丢弃原摘要"
+        );
+        actions.extend(gap_b_completed(&mut m, &turn));
+        assert!(matches!(
+            gap_b_coverage(&m, &turn),
+            TurnCoverage::Complete { .. }
+        ));
+        actions.extend(gap_b_sweep(&mut m));
+        assert!(
+            !gap_b_has_gap(&actions, &turn),
+            "合法输出全流程零误报：{output}"
+        );
+        assert_eq!(m.event_log_pending_stats("乙", &turn), (0, 0, 0));
+    }
+}
+
+#[derive(Debug)]
+struct GapStepCheckpoint {
+    processing: bool,
+    count: usize,
+    bytes: usize,
+    total_bytes: usize,
+    coverage: Option<TurnCoverage>,
+}
+
+struct GapStepTrace {
+    thread: String,
+    turn: String,
+    checkpoints: Vec<GapStepCheckpoint>,
+}
+
+thread_local! {
+    static GAP_STEP_TRACE: std::cell::RefCell<Option<GapStepTrace>> = const { std::cell::RefCell::new(None) };
+}
+
+struct GapStepTraceGuard;
+
+impl GapStepTraceGuard {
+    fn start(thread: &str, turn: &str) -> Self {
+        GAP_STEP_TRACE.with(|slot| {
+            assert!(slot.borrow().is_none(), "同线程不得嵌套安装采集器");
+            *slot.borrow_mut() = Some(GapStepTrace {
+                thread: thread.into(),
+                turn: turn.into(),
+                checkpoints: Vec::new(),
+            });
+        });
+        Self
+    }
+
+    fn finish(self) -> Vec<GapStepCheckpoint> {
+        GAP_STEP_TRACE.with(|slot| slot.borrow_mut().take().expect("采集器已安装").checkpoints)
+    }
+}
+
+impl Drop for GapStepTraceGuard {
+    fn drop(&mut self) {
+        GAP_STEP_TRACE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+impl Machine {
+    /// 发布构建没有该钩子；只读采集实际 step 内生产 expire 完成时的状态。
+    pub(super) fn capture_event_log_checkpoint(&self) {
+        GAP_STEP_TRACE.with(|slot| {
+            if let Some(trace) = slot.borrow_mut().as_mut() {
+                let (count, bytes, total_bytes) =
+                    self.event_log_pending_stats(&trace.thread, &trace.turn);
+                let coverage = turn_started_ms(&trace.turn)
+                    .and_then(|ms| {
+                        self.runs.event_log.coverage.get(&(
+                            ms,
+                            trace.thread.clone(),
+                            trace.turn.clone(),
+                        ))
+                    })
+                    .cloned();
+                trace.checkpoints.push(GapStepCheckpoint {
+                    processing: self.runs.event_log.processing_step,
+                    count,
+                    bytes,
+                    total_bytes,
+                    coverage,
+                });
+            }
+        });
+    }
+}
+
+#[test]
+fn gap_b_review1_真实完成自动退订与同一步读取反证均经过嵌套结算屏障() {
+    use crate::relations::rollout_pairing::{
+        ReadTicket, ReadTicketState, RolloutFile, RolloutPathState,
+    };
+    for counterevidence in [false, true] {
+        let mut m = gap_b_seeded();
+        let turn = turn_at(5000);
+        gap_b_started(&mut m, &turn);
+        gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+        gap_b_summary(&mut m, &turn);
+        let start = m
+            .coverage_open_proof("乙", &turn)
+            .cloned()
+            .expect("前置：真实通知已建立Open");
+        assert_eq!(
+            m.coverage_observation_gen("乙"),
+            Some(start.observation_gen)
+        );
+        let (count, bytes, total_bytes) = m.event_log_pending_stats("乙", &turn);
+        assert!(count >= 2 && bytes > 0);
+        assert!(
+            !m.event_log_evidence_in_flight("run-a", "乙"),
+            "前置：没有独立归属续期遮挡"
+        );
+        if counterevidence {
+            // 文件读取在此前已经派出；与摘要同一时刻到期，但只会在完成通知的后处理退休。
+            let ticket = ReadTicket {
+                id: 880,
+                thread: "乙".into(),
+                conn_epoch: m.relations.conn_epoch,
+                observation_gen: start.observation_gen,
+                issued_seq: m.coverage_next_seq().unwrap(),
+                deadline: PENDING_MS,
+                state: ReadTicketState::Active,
+            };
+            m.relations
+                .aux
+                .rollout
+                .coverage_reads
+                .insert(ticket.id, ticket);
+            assert_eq!(m.coverage_read_deadline("乙"), Some(PENDING_MS));
+        } else {
+            // 根已释放的持久快照：本轮仍在活动，自动退订须等真实 completed 处理。
+            m.records.entry("root".into()).or_default().last_run = Some("run-a".into());
+            m.relations.contexts.get_mut("run-a").unwrap().authority = Authority::Revoked;
+            assert!(!m.claims.contains_key("root"));
+            assert!(!m.records["root"].subscribed);
+            assert!(m.child_activity_protected("乙"));
+            assert!(!m.relation_needs_subscription("乙"));
+            assert!(m.relations.attachments["乙"].valid);
+            assert!(!m.relations.aux.released.contains_key("乙"));
+            assert!(
+                m.coverage_read_deadline("乙").is_none(),
+                "前置：没有读取屏障掩盖处理中屏障"
+            );
+            // 已停止跟随的文件游标会在同一次 step 后处理清掉；没有票据或文件消费反证。
+            m.relations.aux.rollout.files.insert(
+                "乙".into(),
+                RolloutFile {
+                    epoch: m.relations.conn_epoch,
+                    path: RolloutPathState::Ready("D:\\unused-乙.jsonl".into()),
+                    cursor: Some(crate::rollout::RolloutCursor {
+                        offset: 128,
+                        ..Default::default()
+                    }),
+                    reading: None,
+                    reads: 2,
+                    next_at: 0,
+                },
+            );
+        }
+        m.clock.mono_ms = PENDING_MS + 1;
+        m.clock.now_ms += PENDING_MS + 1;
+        let capture = GapStepTraceGuard::start("乙", &turn);
+        let mut actions = gap_b_completed(&mut m, &turn);
+        let checkpoints = capture.finish();
+        let nested = checkpoints
+            .iter()
+            .find(|point| {
+                point.processing && matches!(point.coverage, Some(TurnCoverage::Complete { .. }))
+            })
+            .expect("真实completed必须在封存后经commit_notification触发嵌套expire");
+        assert_eq!(
+            (nested.count, nested.bytes, nested.total_bytes),
+            (count, bytes, total_bytes),
+            "真实step中途原摘要与字节必须全部保留"
+        );
+        assert!(
+            checkpoints.iter().any(|point| !point.processing),
+            "同一次真实step确实进入统一尾部"
+        );
+        if counterevidence {
+            assert_eq!(
+                m.relations.aux.rollout.coverage_reads[&880].state,
+                ReadTicketState::Retired
+            );
+            assert!(matches!(
+                gap_b_coverage(&m, &turn),
+                TurnCoverage::Veto { .. }
+            ));
+            assert!(m.coverage_observation_gen("乙").is_none());
+            assert_eq!(
+                logs(&actions)
+                    .iter()
+                    .filter(|row| row.2 == "记录缺口" && row.3["turnId"] == turn)
+                    .count(),
+                count,
+                "完成后的同一步票据反证必须保住全部原摘要"
+            );
+        } else {
+            assert!(actions.iter().any(|action| matches!(action, Action::Request(context) if context.method == "thread/unsubscribe" && context.params.as_ref().is_some_and(|p| p["threadId"] == "乙"))), "必须真正走完成触发的自动退订请求");
+            assert!(m.relations.aux.released.contains_key("乙"));
+            assert!(!m.relations.attachments["乙"].valid);
+            assert!(m.coverage_observation_gen("乙").is_none());
+            assert!(
+                matches!(gap_b_coverage(&m, &turn), TurnCoverage::Complete { .. }),
+                "自动退订不可污染之前封存的完成"
+            );
+            assert_eq!(
+                m.coverage_disposition("乙", &turn),
+                CoverageDisposition::AllowCollaborationExclusion
+            );
+            assert!(m.relations.aux.rollout.files["乙"].cursor.is_none());
+            assert_eq!(
+                m.relations.aux.rollout.files["乙"].reads, 0,
+                "同一步实际清理停止跟随文件"
+            );
+            assert!(!gap_b_has_gap(&actions, &turn));
+            let sealed = gap_b_coverage(&m, &turn);
+            let unsubscribe = actions
+                .iter()
+                .find_map(|action| match action {
+                    Action::Request(context) if context.method == "thread/unsubscribe" => {
+                        Some(context.clone())
+                    }
+                    _ => None,
+                })
+                .expect("自动退订请求确已发出");
+            actions.extend(gap_b_apply(
+                &mut m,
+                crate::claim::Event::Reply {
+                    context: unsubscribe,
+                    result: Ok(json!({"status":"unsubscribed"})),
+                },
+            ));
+            actions.extend(gap_b_completed(&mut m, &turn));
+            assert_eq!(
+                gap_b_coverage(&m, &turn),
+                sealed,
+                "实际退订回包后重复完成保持原封存证明"
+            );
+        }
+        if m.runs.event_log.timer.is_some() {
+            actions.extend(gap_b_sweep(&mut m));
+        }
+        assert_eq!(m.event_log_pending_stats("乙", &turn), (0, 0, 0));
+        assert_eq!(gap_b_has_gap(&actions, &turn), counterevidence);
+    }
+}
+
+// 第二轮实现审查日志入口红测：仅追加到原有 event_log 测试模块，不改生产状态。
+fn gap_b_review2_log_sequence(label: &str, method: &str, output: Value, expect_gap: bool) {
+    let mut m = gap_b_seeded();
+    let turn = turn_at(5000);
+    gap_b_started(&mut m, &turn);
+    gap_b_delivery(&mut m, &turn, "兄弟消费", "/root/甲");
+    gap_b_summary(&mut m, &turn);
+    let proof = m
+        .coverage_open_proof("乙", &turn)
+        .cloned()
+        .expect("前置：真实开始和先验raw建立Open");
+    assert_eq!(
+        m.coverage_observation_gen("乙"),
+        Some(proof.observation_gen)
+    );
+    assert_eq!(
+        m.coverage_disposition("乙", &turn),
+        CoverageDisposition::Wait
+    );
+    assert!(!m.event_log_evidence_in_flight("run-a", "乙"));
+    assert!(!m.historical_subagent_for_run("run-a", "乙"));
+    assert!(m.relations.operations.values().all(|op| !op.proof_expired));
+    assert!(
+        m.coverage_read_deadline("乙").is_none(),
+        "前置：无读取屏障掩盖结构检查"
+    );
+    let original = m.runs.event_log.pending.clone();
+    let (count, bytes, _) = m.event_log_pending_stats("乙", &turn);
+    assert!(count >= 2 && bytes > 0, "前置：开始与摘要真实占用暂存字节");
+    let mut actions = gap_b_notify(
+        &mut m,
+        method,
+        json!({"threadId":"乙","turnId":turn,"item":output}),
+    );
+    let (after_count, after_bytes, _) = m.event_log_pending_stats("乙", &turn);
+    assert!(
+        after_count >= count && after_bytes >= bytes,
+        "{label}不能提前删除原摘要"
+    );
+    for pending in &original {
+        assert!(
+            m.runs.event_log.pending.contains(pending),
+            "{label}必须逐条保留原始摘要，不只比较总数"
+        );
+    }
+    if !expect_gap {
+        assert_eq!(
+            m.coverage_open_proof("乙", &turn),
+            Some(&proof),
+            "合法结构必须保持原Open：{label}"
+        );
+        assert_eq!(
+            m.coverage_observation_gen("乙"),
+            Some(proof.observation_gen)
+        );
+    }
+    actions.extend(gap_b_completed(&mut m, &turn));
+    actions.extend(gap_b_sweep(&mut m));
+    let gaps = logs(&actions)
+        .iter()
+        .filter(|row| row.2 == "记录缺口" && row.3["turnId"] == turn)
+        .count();
+    if expect_gap {
+        assert!(
+            gaps >= count,
+            "{label}的已声明坏结构必须保住全部{count}条原始摘要并写缺口，实际{gaps}"
+        );
+        assert!(matches!(
+            gap_b_coverage(&m, &turn),
+            TurnCoverage::Veto { .. }
+        ));
+        assert!(m.coverage_observation_gen("乙").is_none());
+    } else {
+        assert_eq!(gaps, 0, "合法结构或不透明载荷最终不得误报：{label}");
+        assert!(matches!(
+            gap_b_coverage(&m, &turn),
+            TurnCoverage::Complete { .. }
+        ));
+    }
+    assert_eq!(
+        m.event_log_pending_stats("乙", &turn),
+        (0, 0, 0),
+        "最终暂存及字节必须清零：{label}"
+    );
+}
+
+#[test]
+fn gap_b_review2_log_command_actions坏结构最终全部写缺口() {
+    for actions in [
+        json!([7]),
+        json!([{"type":"read","command":"cat f","name":"f"}]),
+        json!([{"type":"search","command":"rg q","query":7}]),
+    ] {
+        gap_b_review2_log_sequence(
+            "commandActions",
+            "item/completed",
+            json!({"type":"commandExecution","id":"坏命令","command":"echo x","cwd":"D:\\w","status":"completed","commandActions":actions}),
+            true,
+        );
+    }
+}
+
+#[test]
+fn gap_b_review2_log_changes坏结构最终全部写缺口() {
+    for changes in [
+        json!([7]),
+        json!([{"path":"f","diff":"补丁","kind":{"type":"update","move_path":7}}]),
+        json!([{"path":"f","kind":{"type":"add"}}]),
+    ] {
+        gap_b_review2_log_sequence(
+            "changes",
+            "item/completed",
+            json!({"type":"fileChange","id":"坏补丁","status":"completed","changes":changes}),
+            true,
+        );
+    }
+}
+
+#[test]
+fn gap_b_review2_log_agents_states坏结构最终全部写缺口() {
+    for states in [
+        json!({"child":7}),
+        json!({"child":{"status":"futureState"}}),
+        json!({"child":{"status":"completed","message":7}}),
+    ] {
+        gap_b_review2_log_sequence(
+            "agentsStates",
+            "item/completed",
+            json!({"type":"collabAgentToolCall","id":"坏代理状态","tool":"wait","status":"completed","senderThreadId":"乙","receiverThreadIds":[],"agentsStates":states}),
+            true,
+        );
+    }
+}
+
+#[test]
+fn gap_b_review2_log_mcp已声明嵌套坏结构最终全部写缺口() {
+    for (field, value) in [
+        ("appContext", json!({"connectorId":7})),
+        (
+            "mcpAppUi",
+            json!({"resourceUri":"ui://结果","preferredModelDisplayMode":"futureMode"}),
+        ),
+        ("result", json!({"content":7})),
+        ("error", json!({"message":7})),
+        ("readOnlyHint", json!(7)),
+    ] {
+        let mut item = json!({"type":"mcpToolCall","id":"坏MCP","server":"测试","tool":"读取","status":"completed","arguments":{"任意":[7,null]}});
+        item[field] = value;
+        gap_b_review2_log_sequence(field, "item/completed", item, true);
+    }
+}
+
+#[test]
+fn gap_b_review2_log_dynamic已声明内容坏结构最终全部写缺口() {
+    for (field, value) in [
+        ("contentItems", json!([7])),
+        ("contentItems", json!([{"type":"inputImage","imageUrl":7}])),
+        ("success", json!(7)),
+        ("namespace", json!(["错误"])),
+    ] {
+        let mut item = json!({"type":"dynamicToolCall","id":"坏动态工具","tool":"读取","status":"completed","arguments":7});
+        item[field] = value;
+        gap_b_review2_log_sequence(field, "item/completed", item, true);
+    }
+}
+
+#[test]
+fn gap_b_review2_log_agent_message元数据坏结构最终全部写缺口() {
+    for (field, value) in [
+        ("phase", json!(7)),
+        ("phase", json!("futurePhase")),
+        ("memoryCitation", json!(7)),
+        (
+            "memoryCitation",
+            json!({"entries":[{"path":"f","lineStart":4294967296_u64,"lineEnd":1,"note":"备注"}],"threadIds":[]}),
+        ),
+        ("delivery", json!("futureDelivery")),
+        ("questions", json!([{"title":"问题","options":[7]}])),
+    ] {
+        let mut item = json!({"type":"agentMessage","id":"坏展示元数据","text":"输出"});
+        item[field] = value;
+        gap_b_review2_log_sequence(field, "item/completed", item, true);
+    }
+}
+
+#[test]
+fn gap_b_review2_log_command可选类型与数值边界最终全部写缺口() {
+    for (field, value) in [
+        ("pluginId", json!(7)),
+        ("source", json!("futureSource")),
+        ("exitCode", json!(2147483648_u64)),
+        ("durationMs", json!(18446744073709551615_u64)),
+    ] {
+        let mut item = json!({"type":"commandExecution","id":"坏命令元数据","command":"echo x","cwd":"D:\\w","status":"completed","commandActions":[]});
+        item[field] = value;
+        gap_b_review2_log_sequence(field, "item/completed", item, true);
+    }
+}
+
+#[test]
+fn gap_b_review2_log_raw可选坏结构最终全部写缺口() {
+    for (label, item) in [
+        (
+            "加密参数元素",
+            json!({"type":"function_call","call_id":"普通调用","name":"ordinary_tool","arguments":"不要求JSON","encrypted_function_args":[7]}),
+        ),
+        (
+            "raw命名空间",
+            json!({"type":"function_call","call_id":"普通调用","name":"ordinary_tool","arguments":"{}","namespace":7}),
+        ),
+        (
+            "公开透传元数据",
+            json!({"type":"reasoning","summary":[],"internal_chat_message_metadata_passthrough":{"turn_id":7}}),
+        ),
+        (
+            "raw阶段",
+            json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"输出"}],"phase":7}),
+        ),
+        (
+            "图片detail",
+            json!({"type":"function_call_output","call_id":"普通调用","output":[{"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"futureDetail"}]}),
+        ),
+        (
+            "shell环境变量",
+            json!({"type":"local_shell_call","status":"completed","action":{"type":"exec","command":["echo","ok"],"env":{"X":7}}}),
+        ),
+        (
+            "shell负超时",
+            json!({"type":"local_shell_call","status":"completed","action":{"type":"exec","command":[],"timeout_ms":-1}}),
+        ),
+    ] {
+        gap_b_review2_log_sequence(label, "rawResponseItem/completed", item, true);
+    }
+}
+
+#[test]
+fn gap_b_review2_log_image_generation可选坏结构最终全部写缺口() {
+    for (field, value) in [
+        ("transparentBackground", json!(7)),
+        ("savedPath", json!(7)),
+        ("failure", json!({"type":"usageLimitExceeded","limitId":7})),
+    ] {
+        let mut item = json!({"type":"imageGeneration","id":"坏图片元数据","status":"completed","result":"图像"});
+        item[field] = value;
+        gap_b_review2_log_sequence(field, "item/completed", item, true);
+    }
+}
+
+#[test]
+fn gap_b_review2_log_合法结构缺省null与opaque对照最终零缺口() {
+    let public = vec![
+        json!({"type":"commandExecution","id":"命令","command":"echo x","cwd":"D:\\w","status":"completed","commandActions":[
+            {"type":"read","command":"cat f","name":"f","path":"D:\\w\\f"},
+            {"type":"listFiles","command":"ls","path":null},
+            {"type":"search","command":"rg q","query":null},
+            {"type":"unknown","command":"echo x"}],"source":"unifiedExecInteraction","exitCode":-2147483648_i64,"durationMs":-1,"pluginId":null}),
+        json!({"type":"commandExecution","id":"缺省来源","command":"echo x","cwd":"D:\\w","status":"completed","commandActions":[]}),
+        json!({"type":"fileChange","id":"补丁","status":"completed","changes":[
+            {"path":"f","diff":"补丁","kind":{"type":"add"}},
+            {"path":"g","diff":"补丁","kind":{"type":"delete"}},
+            {"path":"h","diff":"补丁","kind":{"type":"update","move_path":null}}]}),
+        json!({"type":"collabAgentToolCall","id":"代理状态","tool":"wait","status":"completed","senderThreadId":"乙","receiverThreadIds":[],"agentsStates":{"unused":{"status":"completed","message":null}},"prompt":null,"reasoningEffort":"未来有效强度"}),
+        json!({"type":"agentMessage","id":"消息","text":"输出","phase":"final_answer","delivery":"async","memoryCitation":{"entries":[{"path":"f","lineStart":0,"lineEnd":4294967295_u64,"note":"备注"}],"threadIds":["旧线程"]},"questions":[{"title":"问题","options":["甲","乙"]}]}),
+        json!({"type":"agentMessage","id":"空可选","text":"输出","phase":null,"delivery":null,"memoryCitation":null,"questions":null,"未知附加字段":{"可兼容":7}}),
+        json!({"type":"mcpToolCall","id":"MCP","server":"测试","tool":"读取","status":"completed","arguments":[7,null,{"未知":false}],
+            "appContext":{"connectorId":"连接器","appName":null},"mcpAppUi":{"resourceUri":"ui://结果","preferredModelDisplayMode":"inline"},"readOnlyHint":false,
+            "result":{"content":[7,null,{"未知内容":{"任意":false}}],"structuredContent":7,"_meta":[7]},"error":null}),
+        json!({"type":"dynamicToolCall","id":"动态","tool":"读取","status":"completed","arguments":7,"namespace":null,"success":true,"durationMs":-1,
+            "contentItems":[{"type":"inputText","text":"输出"},{"type":"inputImage","imageUrl":"image://结果"},{"type":"inputAudio","audioUrl":"audio://结果"}]}),
+        json!({"type":"dynamicToolCall","id":"动态空可选","tool":"读取","status":"completed","arguments":null,"contentItems":null,"success":null}),
+        json!({"type":"reasoning","id":"默认空数组"}),
+    ];
+    for item in public {
+        gap_b_review2_log_sequence("合法public结构", "item/completed", item, false);
+    }
+    for item in [
+        json!({"type":"function_call","call_id":"普通调用","name":"ordinary_tool","arguments":"不要求JSON","namespace":null,"encrypted_function_args":["密文"]}),
+        json!({"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"输出"}],"internal_chat_message_metadata_passthrough":{"turn_id":"原样轮号"}}),
+        json!({"type":"function_call_output","call_id":"普通调用","output":[{"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"low"}]}),
+        json!({"type":"local_shell_call","status":"completed","call_id":null,"action":{"type":"exec","command":["echo","ok"],"timeout_ms":0,"working_directory":null,"user":"用户","env":{"X":"值"}}}),
+        json!({"type":"tool_search_call","execution":"server","arguments":[7,null,{"任意":"值"}]}),
+        json!({"type":"tool_search_output","execution":"server","status":"completed","tools":[7,null,{"任意":"值"}]}),
+    ] {
+        gap_b_review2_log_sequence("合法raw或opaque", "rawResponseItem/completed", item, false);
     }
 }

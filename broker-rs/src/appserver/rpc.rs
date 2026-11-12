@@ -19,6 +19,18 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const WRITE_LIMIT: Duration = Duration::from_secs(10);
 const MAX_ACKED_REPLIES: usize = crate::inbox::MAX_ITEMS;
 
+/// 传输损坏也必须占据原有入站队列中的位置，不能通过旁路抢先或迟到。
+pub(super) enum Inbound {
+    Text(String),
+    ObservationGap(String),
+}
+
+impl From<String> for Inbound {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
 enum Outbound {
     Message(String),
     Reply(u64),
@@ -62,6 +74,15 @@ struct Pending {
 }
 
 impl State {
+    fn observation_gap(&self, reason: impl Into<String>) {
+        if self.closed_reason.is_none() {
+            if let Some(events) = &self.events {
+                let _ = events.send(AppEvent::ObservationGap {
+                    reason: reason.into(),
+                });
+            }
+        }
+    }
     fn finish_ack(&mut self, op: u64, outcome: ReplyOutcome) {
         if self.acked.remove(&op).is_some() {
             if let Some(events) = &self.events {
@@ -213,7 +234,11 @@ impl Shared {
         let value = match serde_json::from_str::<Value>(text) {
             Ok(value) => value,
             Err(error) => {
-                tracing::warn!(%error, "app-server 入站 JSON 解析失败，跳过");
+                tracing::warn!(%error, "app-server 入站 JSON 解析失败，报告观察缺口");
+                self.state
+                    .lock()
+                    .unwrap()
+                    .observation_gap("app-server 入站 JSON 解析失败");
                 return;
             }
         };
@@ -223,7 +248,11 @@ impl Shared {
             || (value.get("method").is_some()
                 && (value.get("result").is_some() || value.get("error").is_some()));
         if malformed {
-            tracing::warn!("app-server 入站消息形状不正确，跳过");
+            tracing::warn!("app-server 入站消息形状不正确，报告观察缺口");
+            self.state
+                .lock()
+                .unwrap()
+                .observation_gap("app-server 入站消息形状不正确");
             return;
         }
         let incoming = Incoming::classify(value);
@@ -248,11 +277,13 @@ impl Shared {
                         }),
                         _ => {
                             tracing::warn!("app-server 错误回包形状不正确，跳过");
+                            state.observation_gap("app-server 错误回包形状不正确");
                             return;
                         }
                     }
                 } else {
                     tracing::warn!("app-server 回包缺少 result 和 error，跳过");
+                    state.observation_gap("app-server 回包缺少 result 和 error");
                     return;
                 };
                 // 请求表保持数字 id 的精确类型；仅服务端请求使用 String(id) 去重。
@@ -296,6 +327,7 @@ impl Shared {
             }
             Incoming::Invalid(_) => {
                 tracing::warn!("app-server 入站消息形状不正确，跳过");
+                state.observation_gap("app-server 入站消息无法分类");
             }
         }
     }
@@ -683,12 +715,27 @@ async fn write_outbound<W: MessageWriter>(
 /// 创建客户端。EOF、写失败、fail/close 共用一次关闭状态转换。
 /// `cleanup` 在写入器被丢弃之后执行，例如关闭 stdin 后等待子进程退出。
 pub fn new_client<W, C, F>(
-    mut inbound: mpsc::UnboundedReceiver<String>,
+    inbound: mpsc::UnboundedReceiver<String>,
+    writer: W,
+    cleanup: C,
+    request_timeout_ms: Option<u64>,
+) -> (ClientHandle, mpsc::UnboundedReceiver<AppEvent>)
+where
+    W: MessageWriter,
+    C: FnOnce() -> F + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    new_client_inbound(inbound, writer, cleanup, request_timeout_ms)
+}
+
+pub(super) fn new_client_inbound<I, W, C, F>(
+    mut inbound: mpsc::UnboundedReceiver<I>,
     mut writer: W,
     cleanup: C,
     request_timeout_ms: Option<u64>,
 ) -> (ClientHandle, mpsc::UnboundedReceiver<AppEvent>)
 where
+    I: Into<Inbound> + Send + 'static,
     W: MessageWriter,
     C: FnOnce() -> F + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
@@ -731,7 +778,10 @@ where
                 _ = read_shutdown.wait_for(|closed| *closed) => break,
                 _ = read_drain.wait_for(|draining| *draining) => break,
                 text = inbound.recv() => match text {
-                    Some(text) => reader_shared.dispatch(&text),
+                    Some(message) => match message.into() {
+                        Inbound::Text(text) => reader_shared.dispatch(&text),
+                        Inbound::ObservationGap(reason) => reader_shared.state.lock().unwrap().observation_gap(reason),
+                    },
                     None => {
                         reader_shared.fail("入站传输已结束".into());
                         break;
@@ -1513,6 +1563,12 @@ mod tests {
         }
         m.feed(json!({"id":1,"result":42}));
         assert_eq!(request.await.unwrap(), Ok(json!(42)));
+        for _ in 0..7 {
+            assert!(matches!(
+                m.events.recv().await,
+                Some(AppEvent::ObservationGap { .. })
+            ));
+        }
         m.barrier().await;
         m.client.close().await;
     }
