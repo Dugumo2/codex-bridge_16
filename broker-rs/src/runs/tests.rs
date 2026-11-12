@@ -122,7 +122,6 @@ fn machine() -> Machine {
         now_ms: 1_000,
         entropy: 7,
         mono_ms: 0,
-        started_ms: 0,
     };
     m
 }

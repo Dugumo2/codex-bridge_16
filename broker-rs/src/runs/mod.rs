@@ -40,7 +40,7 @@ pub mod budget;
 pub mod child_diag;
 pub mod child_history;
 mod diagnostics;
-mod event_log;
+pub(crate) mod event_log;
 pub mod stall;
 #[cfg(test)]
 mod tests;

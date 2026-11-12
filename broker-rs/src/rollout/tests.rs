@@ -206,7 +206,7 @@ fn 坏行_缺字段_未知类型与未知字段_不崩溃且只计坏行() {
     let mut text = task_started("2026-11-05T01:00:00.000Z", "轮");
     text += "这不是 JSON\n";
     text += "{\"type\":\"response_item\"}\n";
-    // 缺时间戳的消息是坏行；未知顶层类型与未知字段照常忽略。
+    // 消费缺字段或时间戳仍是坏行；已知元数据及扩展字段可忽略。
     text += &format!(
         "{}\n",
         json!({"type":"response_item","payload":{"type":"agent_message","id":"无时间"}})
@@ -232,7 +232,7 @@ fn 坏行_缺字段_未知类型与未知字段_不崩溃且只计坏行() {
     append(&path, &text);
     let chunk = read_chunk(&path_str(&path), None).unwrap();
     assert_eq!(chunk.bad_lines, 3);
-    assert_eq!(chunk.entries.len(), 1);
+    assert_eq!(chunk.entries.len(), 2, "用户输入也作为文件消费反证交付");
     assert_eq!(chunk.cursor.offset, text.len() as u64);
 }
 
@@ -282,9 +282,11 @@ fn 超长行整行跳过_之后的行照常读到() {
     }
     assert_eq!(skipped, 1);
     assert_eq!(entries.len(), 1);
-    assert!(
-        matches!(&entries[0].record, RolloutRecord::Message { turn: Some(t), .. } if t == "轮")
-    );
+    assert!(matches!(
+        &entries[0].record,
+        RolloutRecord::Message { turn: None, .. }
+    ));
+    assert!(entries[0].turn_lost, "超长行可能隐藏边界，旧锚点必须失效");
 }
 
 /// 前面是一大段全零，末尾才有内容；首次只读末尾窗口，跟随只读新增。
@@ -412,4 +414,114 @@ fn 窗口里只有工具输出没有消息时也向前找到当前轮() {
         &next.entries[..],
         [RolloutEntry { record: RolloutRecord::Message { turn: Some(t), .. }, turn_lost: false, .. }] if t == "忙碌轮"
     ));
+}
+
+/// 合法 JSON 仍可能无法解释；真实读取器必须把这一点带到覆盖判定入口。
+#[test]
+fn gap_b_red_合法json但无法解释的记录必须报告坏行并失去轮锚点() {
+    for (tag, kind, payload) in [
+        ("缺类型", "response_item", json!({"id":"未知"})),
+        ("数字类型", "response_item", json!({"type":7,"id":"未知"})),
+        (
+            "未知条目",
+            "response_item",
+            json!({"type":"future_consumed_input","id":"未知"}),
+        ),
+        (
+            "坏角色",
+            "response_item",
+            json!({"type":"message","role":7,"content":[]}),
+        ),
+        (
+            "未知外层",
+            "future_rollout_record",
+            json!({"type":"agent_message"}),
+        ),
+        (
+            "坏边界",
+            "event_msg",
+            json!({"type":"task_started","turn_id":7}),
+        ),
+        (
+            "未知事件",
+            "event_msg",
+            json!({"type":"future_runtime_unloaded"}),
+        ),
+    ] {
+        let path = temp_file(tag);
+        let mut text = task_started("2026-11-05T01:00:00.000Z", "原轮");
+        text += &line("2026-11-05T01:00:01.000Z", kind, payload);
+        text += &message("2026-11-05T01:00:02.000Z", "后续消费", "不能沿用原轮");
+        append(&path, &text);
+        let chunk = read_chunk(&path_str(&path), None).unwrap();
+        assert_eq!(
+            chunk.cursor.offset,
+            text.len() as u64,
+            "{tag}：完整行确已读完"
+        );
+        assert_eq!(chunk.entries.len(), 1, "{tag}：读到后续消费，不是空文件");
+        assert!(chunk.bad_lines > 0, "{tag}：不能静默当作无关记录");
+        assert!(
+            matches!(
+                &chunk.entries[0].record,
+                RolloutRecord::Message { turn: None, .. }
+            ),
+            "{tag}：无法解释记录之后不能继续沿用旧轮锚点"
+        );
+    }
+}
+
+#[test]
+fn gap_b_red_确认无关记录与尚未补齐的半行不制造坏行() {
+    let path = temp_file("known-and-partial");
+    let mut text = task_started("2026-11-05T01:00:00.000Z", "轮");
+    text += &line(
+        "2026-11-05T01:00:01.000Z",
+        "response_item",
+        json!({"type":"reasoning","summary":[]}),
+    );
+    append(&path, &text);
+    let unknown = line(
+        "2026-11-05T01:00:02.000Z",
+        "response_item",
+        json!({"type":"future_consumed_input"}),
+    );
+    let (head, tail) = unknown.split_at(unknown.len() / 2);
+    append(&path, head);
+    let first = read_chunk(&path_str(&path), None).unwrap();
+    assert_eq!(first.bad_lines, 0, "确认无关记录和半行都不能误报");
+    assert_eq!(first.cursor.offset, text.len() as u64, "半行未被消费");
+    append(&path, tail);
+    let second = read_chunk(&path_str(&path), Some(&first.cursor)).unwrap();
+    assert_eq!(second.bad_lines, 1, "补全后未知记录才进入覆盖缺口");
+}
+
+#[test]
+fn 无关输出字段不清轮锚但配置推理等级拒绝空串() {
+    for (payload, bad) in [
+        (json!({"type":"reasoning","summary":[7]}), false),
+        (
+            json!({"type":"function_call_output","output":[{"type":"future_output"}]}),
+            false,
+        ),
+        (
+            json!({"type":"configuration_update","reasoning":{"effort":""}}),
+            true,
+        ),
+        (
+            json!({"type":"configuration_update","reasoning":{"effort":"future_effort"}}),
+            false,
+        ),
+    ] {
+        let path = temp_file("coverage-fields");
+        let mut text = task_started("2026-11-05T01:00:00.000Z", "原轮");
+        text += &line("2026-11-05T01:00:01.000Z", "response_item", payload);
+        text += &message("2026-11-05T01:00:02.000Z", "后续消费", "消息");
+        append(&path, &text);
+        let chunk = read_chunk(&path_str(&path), None).unwrap();
+        assert_eq!(chunk.bad_lines, u32::from(bad));
+        assert!(
+            matches!(&chunk.entries[0].record, RolloutRecord::Message { turn, .. } if turn.is_none() == bad)
+        );
+    }
 }

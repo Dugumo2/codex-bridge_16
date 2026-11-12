@@ -79,6 +79,10 @@ async fn 文本请求往返且二进制通知按_utf8_解码() {
             .unwrap(),
         json!({"ok":true})
     );
+    assert!(matches!(
+        bounded(events.recv()).await,
+        Some(AppEvent::ObservationGap { .. })
+    ));
     assert_eq!(
         bounded(events.recv()).await,
         Some(AppEvent::Notification {

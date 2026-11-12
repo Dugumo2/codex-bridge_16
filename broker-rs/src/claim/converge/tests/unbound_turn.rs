@@ -139,11 +139,14 @@ fn consumed_turn_expired(author: &str) -> Vec<Action> {
     all
 }
 
-/// 兄弟子代理之间互发：这一轮只消费了平级发来的协作消息，本来就不归本运行管，暂存到期正常丢弃，不留「记录缺口」。
+/// 首次 raw 在本轮开始之后才观察到，兄弟消息不能追认开始覆盖，仍应保守记缺口。
 /// 对照：同样没有归属证据、消费的却是直接上级（根）的消息，照常留缺口。
 #[test]
-fn 记录缺口_只被平级消息唤醒的轮到期不告警_上级消息照常告警() {
-    assert_no_alarm(&consumed_turn_expired("/root/兄弟"));
+fn 记录缺口_缺先验覆盖的首轮平级与上级消息均告警() {
+    let first = consumed_turn_expired("/root/兄弟");
+    assert!(first.iter().any(|a| matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
+        if lines.iter().any(|line| line.contains("beforeBindingUnknown") && line.contains(MESSAGE_TURN)))),
+        "首轮没有先验 raw 见证，平级消息也不能追认覆盖");
     let control = consumed_turn_expired("/root");
     let gap = control.iter().any(|a| {
         matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
@@ -173,11 +176,10 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
     assert!(op(&m, "跟进").v2_strict, "前置：按会话文件严格配对");
     pending(&m, 1);
 
-    // 子代理读到跟进开出 U，消费记录已写入文件，但读取被暂扣。
+    // 子代理读到跟进开出 U，消费记录延迟落盘；IO 本身持续正常返回，避免跨入读取超时语义。
     m.clock.now_ms += 20;
     turn_marker(C, U, m.clock.now_ms);
-    message_line(&m, C, "入站", "NEW_TASK", "新工作");
-    fx::with(|f| f.hold = true);
+
     let started_at = m.clock.mono_ms;
     let actions = apply(&mut m, mock.turn_started(C, U));
     all.extend(replies(&mut m, &mock, actions));
@@ -209,12 +211,26 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
         "跟进未核销前不得进入汇总"
     );
 
-    // 消费记录读到：U 归属这次跟进，按归属轮重建。
+    // 摘要已等待超过 30 秒；此时消费记录才落盘，由新的有效读取确认归属。
     assert!(
         m.clock.mono_ms >= started_at + 30_000,
         "前置：归属确认晚于 30 秒摘要暂存期限"
     );
-    all.extend(fx::release_held(&mut m));
+    assert!(
+        fx::with(|f| f.held.is_empty()),
+        "前置：不是已超时退休的物理读取"
+    );
+    assert!(
+        m.relations
+            .aux
+            .rollout
+            .coverage_reads
+            .values()
+            .all(|ticket| ticket.state
+                != crate::relations::rollout_pairing::ReadTicketState::Retired),
+        "前置：持续空读没有跨入票据退休路径"
+    );
+    message_line(&m, C, "入站", "NEW_TASK", "新工作");
     all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
     pending(&m, 0);
     // 续期的摘要在归属确认后按到达顺序补写，各写一次。

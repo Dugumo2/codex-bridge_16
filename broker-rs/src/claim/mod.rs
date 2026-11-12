@@ -778,7 +778,15 @@ pub enum Event {
     RolloutRead {
         id: u64,
         thread: String,
+        conn_epoch: u64,
+        observation_gen: u64,
+        issued_seq: u64,
         result: Result<crate::rollout::RolloutChunk, crate::rollout::RolloutError>,
+    },
+    /// 与通知共用有序入站链的观察缺口，不能只记录传输告警。
+    ObservationGap {
+        thread: Option<String>,
+        reason: String,
     },
 }
 
@@ -789,9 +797,6 @@ pub struct Clock {
     pub entropy: u64,
     /// 单调毫秒（core 启动起算），供 #26d 托管回收这类不能受墙钟调整影响的判断。
     pub mono_ms: u64,
-    /// core 创建时的墙钟毫秒：只取一次，之后墙钟怎么调都不变。
-    /// 判断「某件事是不是在本次 core 启动前就开始了」用它，不要用 `now_ms - mono_ms` 倒推。
-    pub started_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -860,6 +865,8 @@ pub struct Machine {
 
 /// 所有输入通过同一个纯函数迁移；运行时只持有返回的新状态。
 pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
+    state.begin_event_log_step();
+    state.coverage_check_epoch();
     state.diagnostic_batch_active = true;
     let mut actions = Vec::new();
     state.child_subscription_event(&event, &mut actions);
@@ -1013,7 +1020,10 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
             state.live_conns.insert(conn);
         }
         Event::Disconnected { conn } => state.disconnect(conn, &mut actions),
-        Event::Shutdown => state.shutdown(&mut actions),
+        Event::Shutdown => {
+            state.observation_gap(None, "broker 关闭");
+            state.shutdown(&mut actions);
+        }
         Event::ShutdownBegin => state.quiesce(&mut actions),
         Event::ShutdownStopOwn => state.begin_shutdown_stops(&mut actions),
         Event::Initialized { conn, cxb } => {
@@ -1043,8 +1053,22 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
                 state.runs_finalized = true;
             }
         }
-        Event::RolloutRead { id, thread, result } => {
-            state.rollout_read_done(id, &thread, result, &mut actions)
+        Event::RolloutRead {
+            id,
+            thread,
+            conn_epoch,
+            observation_gen,
+            issued_seq,
+            result,
+        } => state.rollout_read_done(
+            id,
+            &thread,
+            (conn_epoch, observation_gen, issued_seq),
+            result,
+            &mut actions,
+        ),
+        Event::ObservationGap { thread, reason } => {
+            state.observation_gap(thread.as_deref(), &reason)
         }
     }
     if let Some(thread) = settled_goal {
@@ -1135,6 +1159,7 @@ pub fn step(mut state: Machine, event: Event) -> (Machine, Vec<Action>) {
     #[cfg(test)]
     state.assert_held_accounting();
     state.diagnostic_batch_active = false;
+    state.settle_event_log_step(&mut actions);
     (state, actions)
 }
 
@@ -2399,6 +2424,7 @@ impl Machine {
 
     /// #5 的到达阶段先于 completed 查重与 goal 学习。
     fn arrive_notification(&mut self, event: HeldNotification, actions: &mut Vec<Action>) {
+        self.coverage_preprocess_notification(&event);
         self.runtime_notification(&event);
         // 先撤销历史根的旧证据，避免关系通知中的同步协调提前确认树停止。
         if !self.closing {

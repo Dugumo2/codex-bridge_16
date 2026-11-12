@@ -5,7 +5,7 @@
 //! 传输约定：
 //! - 握手与帧编解码全部交给 tokio-tungstenite（`client_async`），不手写（1.1 节，上游 shared-server.ts 手写，不照搬）；
 //! - 入站：Text 帧原样作为一条消息交给 rpc 读端；Binary 帧按 UTF-8 解码后同样处理（上游只认 Text，
-//!   见 shared-server.ts:295；Binary 解码失败时记告警并丢弃）；Ping 由库自动回 Pong；收到 Close 后视为对端结束；
+//!   见 shared-server.ts:295；Binary 解码失败时按序投递观察缺口）；Ping 由库自动回 Pong；收到 Close 后视为对端结束；
 //! - 单条消息上限 10 MiB，与私有档 stdout 的行上限一致（清单 1.2 第 13 条），超限按出错关闭；
 //! - 出站：每条消息写成一个 Text 帧，不带换行；写失败返回 Err，由 rpc 层按「出站写入失败」关闭；
 //! - 关闭：rpc 正常关闭时先发 Close 帧再结束底层流（上游 shared-server.ts:354–367）；**1 秒期限覆盖发送
@@ -64,13 +64,13 @@ where
     let (input, inbound) = mpsc::unbounded_channel();
     let mut reader = tokio::spawn(async move {
         while let Some(message) = source.next().await {
-            let text = match message {
-                Ok(Message::Text(text)) => text.to_string(),
+            let incoming = match message {
+                Ok(Message::Text(text)) => rpc::Inbound::Text(text.to_string()),
                 Ok(Message::Binary(bytes)) => match String::from_utf8(bytes.to_vec()) {
-                    Ok(text) => text,
+                    Ok(text) => rpc::Inbound::Text(text),
                     Err(error) => {
-                        tracing::warn!(%error, "丢弃不是 UTF-8 的 WebSocket 二进制消息");
-                        continue;
+                        tracing::warn!(%error, "不是 UTF-8 的 WebSocket 二进制消息，报告观察缺口");
+                        rpc::Inbound::ObservationGap("WebSocket 二进制消息不是 UTF-8".into())
                     }
                 },
                 Ok(Message::Close(_)) => break,
@@ -82,7 +82,7 @@ where
                 }
             };
             // RPC 开始关闭后仍读控制帧，直到 Close 或关闭期限；不再积压业务消息。
-            let _ = input.send(text);
+            let _ = input.send(incoming);
         }
     });
     let (release, released) = oneshot::channel();
@@ -90,7 +90,7 @@ where
         sink: Some(sink),
         release: Some(release),
     };
-    Ok(rpc::new_client(
+    Ok(rpc::new_client_inbound(
         inbound,
         writer,
         move || async move {

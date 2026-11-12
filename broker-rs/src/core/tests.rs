@@ -7,6 +7,55 @@ use super::*;
 use crate::appserver::rpc;
 use crate::claim::{Operation, State};
 
+#[tokio::test]
+async fn 方案b_core真实rpc缺口先于完成并全局封锁() {
+    let mut h = Harness::new(false);
+    assert!(!h.core.machine.relations.aux.raw_globally_blocked);
+    h.app_input.send("{bad".into()).unwrap();
+    h.app_input.send(r#"{"method":"turn/completed","params":{"threadId":"线程","turn":{"id":"01900000-0000-7000-8000-000000000001","status":"completed"}}}"#.into()).unwrap();
+    let first = h.inbox.recv().await.unwrap();
+    assert!(
+        matches!(&first, CoreMsg::App(AppEvent::ObservationGap { .. })),
+        "前置：来自真实RPC读取任务的缺口先交付"
+    );
+    h.core.handle(first);
+    assert!(h.core.machine.relations.aux.raw_globally_blocked);
+    let completed = h.inbox.recv().await.unwrap();
+    assert!(
+        matches!(&completed, CoreMsg::App(AppEvent::Notification { method, .. }) if method == "turn/completed")
+    );
+    h.core.handle(completed);
+    assert!(h.core.machine.relations.aux.raw_globally_blocked);
+    h.core.app.close().await;
+}
+
+#[tokio::test]
+async fn 方案b_core仅客户端重连不封锁但上游断开封锁() {
+    let mut h = Harness::new(false);
+    assert!(h.core.conns.contains_key(&1));
+    assert!(!h.core.machine.relations.aux.raw_globally_blocked);
+    h.core.handle(CoreMsg::Conn(ConnEvent::Closed {
+        conn: 1,
+        reason: CloseReason::Eof,
+    }));
+    let (writer, _output) = mpsc::unbounded_channel();
+    h.core
+        .handle(CoreMsg::Conn(ConnEvent::Connected { conn: 2, writer }));
+    assert!(h.core.conns.contains_key(&2));
+    assert!(
+        !h.core.machine.relations.aux.raw_globally_blocked,
+        "前端客户端重连没有造成上游观察断档"
+    );
+    h.core.app.inner.fail("上游传输断开");
+    h.pump_until(|message| matches!(message, CoreMsg::App(AppEvent::Closed { .. })))
+        .await;
+    assert!(h.core.app_disconnected);
+    assert!(
+        h.core.machine.relations.aux.raw_globally_blocked,
+        "上游断开必须先封锁再关闭结算"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn mi_共享rpc真实超时释放换代后迟到核实持久化原运行() {
     tokio::time::resume();
@@ -107,7 +156,6 @@ async fn mi_真实存储跨重启递增epoch且保留确认登记改道和创建
             now_ms: now - epoch * 1000,
             mono_ms: 0,
             entropy: epoch,
-            started_ms: 0,
         });
         h.core.restore();
         if let Some(old) = &previous {
@@ -544,7 +592,6 @@ impl Harness {
             next_tag: 0,
             last_activity: Instant::now(),
             started: Instant::now(),
-            started_wall_ms: 0,
             phase: Phase::Running,
         };
         let (writer, client_output) = mpsc::unbounded_channel();
@@ -1710,7 +1757,6 @@ async fn 核心线回包已接收转发延迟且旧本地截止先到仍处理�
         next_tag: 0,
         last_activity: Instant::now(),
         started: Instant::now(),
-        started_wall_ms: 0,
         phase: Phase::Running,
     };
     let (client_writer, _client_output) = mpsc::unbounded_channel();
@@ -2071,7 +2117,6 @@ async fn 核心迟到处理晚于线上截止新收尾截止先到暂停回包�
         next_tag: 0,
         last_activity: Instant::now(),
         started: Instant::now(),
-        started_wall_ms: 0,
         phase: Phase::Running,
     };
     let (client_writer, _client_output) = mpsc::unbounded_channel();
@@ -2257,33 +2302,6 @@ async fn 服务器已断开不等补读且无存储关闭零等待() {
     );
 }
 
-/// 启动时刻（core 创建时记下的墙钟）每一步都原样带进时钟，不随当下墙钟或运行时长变化。
-/// 创建时取墙钟的那一行在 `Core::new`，测试夹具不经过它。
-#[tokio::test(start_paused = true)]
-async fn 启动时刻每一步原样带进时钟() {
-    let mut h = Harness::new(false);
-    assert!(h.core.fixed_clock.is_none(), "前置：走真实时钟");
-    h.core.started_wall_ms = 777;
-    h.core
-        .mailbox
-        .send(CoreMsg::Conn(ConnEvent::Message {
-            conn: 1,
-            message: Ok(proto::request(
-                json!(1),
-                "turn/start",
-                Some(json!({"threadId":"线程"})),
-            )),
-        }))
-        .unwrap();
-    h.core.restore();
-    h.core.handle(h.inbox.recv().await.unwrap());
-    assert_eq!(h.core.machine.clock.started_ms, 777);
-    assert!(
-        h.core.machine.clock.now_ms > 777,
-        "前置：这一步按真实墙钟填了当下时间"
-    );
-}
-
 #[tokio::test(start_paused = true)]
 async fn 恢复先于排队请求且固定时钟注入() {
     let mut h = Harness::new(false);
@@ -2291,7 +2309,6 @@ async fn 恢复先于排队请求且固定时钟注入() {
         now_ms: 123,
         entropy: 456,
         mono_ms: 0,
-        started_ms: 0,
     });
     h.core
         .mailbox
@@ -2316,7 +2333,6 @@ async fn 恢复先于排队请求且固定时钟注入() {
             now_ms: 123,
             entropy: 456,
             mono_ms: 0,
-            started_ms: 0,
         }
     );
 }

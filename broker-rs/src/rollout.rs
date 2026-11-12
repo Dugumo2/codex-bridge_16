@@ -38,6 +38,9 @@ pub struct RolloutCursor {
 pub struct RolloutReadRequest {
     pub id: u64,
     pub thread: String,
+    pub conn_epoch: u64,
+    pub observation_gen: u64,
+    pub issued_seq: u64,
     pub path: String,
     /// None 表示首次读取（末尾窗口）。
     pub cursor: Option<RolloutCursor>,
@@ -164,8 +167,57 @@ fn is_collab_call(payload: &Value) -> bool {
             .is_some_and(|n| matches!(n, "followup_task" | "send_message"))
 }
 
-/// 一行完整内容（不含换行符）。返回 Ok(None) 表示与配对无关的行；Err 表示坏行。
-/// `lost`：读取起点所在的轮未知；遇到轮次标记后清除。
+/// 只检查代理间消费的正文结构；其他输出的内部字段不参与覆盖判断。
+fn message_content_valid(payload: &Value) -> bool {
+    payload
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .all(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("input_text") => part.get("text").is_some_and(Value::is_string),
+                    Some("encrypted_content") => {
+                        part.get("encrypted_content").is_some_and(Value::is_string)
+                    }
+                    _ => false,
+                })
+        })
+}
+
+/// 类型已确认是输出或元数据时忽略其内部结构；未知事件仍可能隐藏消费或轮边界。
+fn irrelevant_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "context_compacted"
+            | "token_count"
+            | "agent_message"
+            | "warning"
+            | "error"
+            | "agent_reasoning"
+            | "agent_reasoning_raw_content"
+            | "agent_message_delta"
+            | "agent_reasoning_delta"
+            | "agent_reasoning_raw_content_delta"
+            | "agent_message_content_delta"
+            | "plan_delta"
+            | "reasoning_content_delta"
+            | "reasoning_raw_content_delta"
+            | "exec_command_begin"
+            | "exec_command_end"
+            | "exec_command_output_delta"
+            | "patch_apply_begin"
+            | "patch_apply_end"
+            | "mcp_tool_call_begin"
+            | "mcp_tool_call_end"
+            | "web_search_begin"
+            | "web_search_end"
+            | "view_image_tool_call"
+            | "plan_update"
+    )
+}
+
+/// Ok(None) 只表示已确认无关；可能是消费或轮边界却无法解析时报告坏行。
 fn parse_line(
     line: &[u8],
     turn: &mut Option<String>,
@@ -177,36 +229,102 @@ fn parse_line(
     }
     let value: Value = serde_json::from_slice(line).map_err(|_| ())?;
     let kind = value.get("type").and_then(Value::as_str).ok_or(())?;
-    let payload = value.get("payload");
     match kind {
         "event_msg" => {
-            let payload = payload.ok_or(())?;
-            if matches!(
-                payload.get("type").and_then(Value::as_str),
-                Some("task_started" | "turn_started")
-            ) {
-                let id = payload.get("turn_id").and_then(Value::as_str).ok_or(())?;
-                *turn = Some(id.to_owned());
-                *lost = false;
+            let payload = value.get("payload").ok_or(())?;
+            match payload.get("type").and_then(Value::as_str).ok_or(())? {
+                "task_started" | "turn_started" => {
+                    let id = payload
+                        .get("turn_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or(())?;
+                    *turn = Some(id.to_owned());
+                    *lost = false;
+                }
+                "task_complete" | "turn_complete" | "turn_aborted" => {
+                    payload
+                        .get("turn_id")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or(())?;
+                    *turn = None;
+                    *lost = false;
+                }
+                known if irrelevant_event(known) => {}
+                _ => return Err(()),
             }
             Ok(None)
         }
         "turn_context" => {
-            if let Some(id) = payload
+            let id = value
+                .get("payload")
                 .and_then(|p| p.get("turn_id"))
                 .and_then(Value::as_str)
-            {
-                *turn = Some(id.to_owned());
-                *lost = false;
-            }
+                .filter(|s| !s.is_empty())
+                .ok_or(())?;
+            *turn = Some(id.to_owned());
+            *lost = false;
             Ok(None)
         }
         "response_item" => {
-            let payload = payload.ok_or(())?;
-            let message = payload.get("type").and_then(Value::as_str) == Some("agent_message");
-            if !message && !is_collab_call(payload) {
-                return Ok(None);
-            }
+            let payload = value.get("payload").ok_or(())?;
+            let kind = payload.get("type").and_then(Value::as_str).ok_or(())?;
+            let message = match kind {
+                "agent_message" => {
+                    for field in ["author", "recipient"] {
+                        payload
+                            .get(field)
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .ok_or(())?;
+                    }
+                    if !message_content_valid(payload) {
+                        return Err(());
+                    }
+                    true
+                }
+                "message" => match payload.get("role").and_then(Value::as_str) {
+                    Some("user" | "developer" | "system") => true,
+                    Some("assistant") => return Ok(None),
+                    _ => return Err(()),
+                },
+                "function_call" => {
+                    if !is_collab_call(payload) {
+                        return Ok(None);
+                    }
+                    // 保留既有协作调用的配对输入，不验证其他工具的内部参数。
+                    for field in ["call_id", "arguments"] {
+                        payload.get(field).and_then(Value::as_str).ok_or(())?;
+                    }
+                    false
+                }
+                "configuration_update" => {
+                    // 本轮明确要求修复的 P3：这是配置记录唯一保留的值校验。
+                    payload
+                        .get("reasoning")
+                        .and_then(|v| v.get("effort"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .ok_or(())?;
+                    return Ok(None);
+                }
+                "reasoning"
+                | "function_call_output"
+                | "custom_tool_call_output"
+                | "custom_tool_call"
+                | "local_shell_call"
+                | "image_generation_call"
+                | "web_search_call"
+                | "tool_search_call"
+                | "tool_search_output"
+                | "additional_tools"
+                | "compaction_trigger"
+                | "context_compaction"
+                | "compaction"
+                | "compaction_summary" => return Ok(None),
+                _ => return Err(()),
+            };
             let wall_ms = value
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -228,7 +346,13 @@ fn parse_line(
                 turn_lost: message && turn.is_none() && *lost,
             }))
         }
-        _ => Ok(None),
+        "session_meta"
+        | "compacted"
+        | "inter_agent_communication_metadata"
+        | "world_state"
+        | "security_risk_score"
+        | "token_usage_record" => Ok(None),
+        _ => Err(()),
     }
 }
 
@@ -246,7 +370,11 @@ fn parse_lines(
         match parse_line(line, turn, lost) {
             Ok(Some(entry)) => chunk.entries.push(entry),
             Ok(None) => {}
-            Err(()) => chunk.bad_lines = chunk.bad_lines.saturating_add(1),
+            Err(()) => {
+                chunk.bad_lines = chunk.bad_lines.saturating_add(1);
+                *turn = None;
+                *lost = true;
+            }
         }
     }
     last + 1
@@ -336,6 +464,8 @@ fn read_follow(
                 pos = i + 1;
                 chunk.skipped_lines += 1;
                 chunk.cursor.skipping = false;
+                turn = None;
+                lost = true;
             }
             None => {
                 chunk.cursor.offset += buf.len() as u64;
@@ -349,6 +479,8 @@ fn read_follow(
         // 一整次读取都没有换行：这一行超过上限，跳过到下一个换行符。
         chunk.cursor.offset += buf.len() as u64;
         chunk.cursor.skipping = true;
+        turn = None;
+        lost = true;
     } else {
         chunk.cursor.offset += (pos + consumed) as u64;
     }

@@ -10,6 +10,7 @@ pub mod types;
 
 mod classification;
 pub mod convergence;
+pub(crate) mod coverage_observation;
 pub(crate) use classification::{CandidateClassification, CandidateObservation, Membership};
 mod discovery;
 mod facts;
@@ -147,6 +148,12 @@ pub struct RelationsAux {
     /// 原始工具调用先于执行结果；只存身份、顺序和期限，不保存参数正文。
     pub followup_starts: BTreeMap<EvidenceKey, v2_pairing::FollowupStart>,
     pub observation_seq: u64,
+    /// 覆盖入口顺序与不可恢复的连续观察凭据，不随配对清理或连接换代删除。
+    pub(crate) coverage_seq: u64,
+    pub(crate) coverage_epoch: Option<u64>,
+    pub(crate) raw_globally_blocked: bool,
+    pub(crate) raw_observations: BTreeMap<String, coverage_observation::RawObservation>,
+    pub(crate) coverage_starts: BTreeMap<(String, String), coverage_observation::RawStart>,
     /// 仅真实 turn/started 登记；发现或迟到 completed 不能伪造轮次开始。
     pub live_turn_starts: BTreeMap<(String, String), (u64, u64)>,
     pub v2_receiver_paths: BTreeMap<EvidenceKey, String>,

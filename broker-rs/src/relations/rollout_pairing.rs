@@ -33,6 +33,26 @@ pub const ROLLOUT_FLOOR_SLACK_MS: u64 = 10_000;
 pub const MAX_ROLLOUT_FILES: usize = 64;
 /// 文件读取或路径请求失败后，这么久内不重试；过后遇到新跟进重新取路径、重新读。
 pub const ROLLOUT_RETRY_MS: u64 = 30_000;
+/// 逻辑到期并不释放物理 IO 占位，只有真实结果能收尾。
+pub const COVERAGE_READ_MS: u64 = 30_000;
+pub const MAX_COVERAGE_READS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadTicketState {
+    Active,
+    Retired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadTicket {
+    pub id: u64,
+    pub thread: String,
+    pub conn_epoch: u64,
+    pub observation_gen: u64,
+    pub issued_seq: u64,
+    pub deadline: u64,
+    pub state: ReadTicketState,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RolloutPathState {
@@ -81,6 +101,9 @@ pub struct RolloutCall {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RolloutState {
+    /// 与配对文件生命周期分离；跨连接代际保留直到 IO 实际返回。
+    pub coverage_reads: BTreeMap<u64, ReadTicket>,
+    pub next_read_id: u64,
     pub files: BTreeMap<String, RolloutFile>,
     pub waits: BTreeMap<EvidenceKey, RolloutWait>,
     /// (父线程, call_id) → 调用。读到时对应的 Interacted 可能还没来。
@@ -112,6 +135,50 @@ fn read_failure(error: RolloutError) -> V2FallbackReason {
 }
 
 impl Machine {
+    pub(crate) fn coverage_read_deadline(&self, thread: &str) -> Option<u64> {
+        self.relations
+            .aux
+            .rollout
+            .coverage_reads
+            .values()
+            .filter(|t| t.thread == thread && t.state == ReadTicketState::Active)
+            .map(|t| t.deadline)
+            .min()
+    }
+
+    /// 先撤销，再退休；禁止换代、清文件或超时重新获得物理 IO 名额。
+    fn retire_coverage_reads(&mut self, all: bool) {
+        let retired: Vec<(u64, String)> = self
+            .relations
+            .aux
+            .rollout
+            .coverage_reads
+            .values()
+            .filter(|t| {
+                t.state == ReadTicketState::Active
+                    && (all
+                        || t.deadline <= self.clock.mono_ms
+                        || t.conn_epoch != self.relations.conn_epoch
+                        || t.observation_gen != self.coverage_read_observation_gen(&t.thread))
+            })
+            .map(|t| (t.id, t.thread.clone()))
+            .collect();
+        for (id, thread) in retired {
+            self.observation_gap(Some(&thread), "会话文件读取被保守放弃");
+            if let Some(ticket) = self.relations.aux.rollout.coverage_reads.get_mut(&id) {
+                ticket.state = ReadTicketState::Retired;
+            }
+            if let Some(file) = self.relations.aux.rollout.files.get_mut(&thread) {
+                if file.reading == Some(id) {
+                    file.reading = None;
+                    file.cursor = None;
+                    file.path = RolloutPathState::Failed(V2FallbackReason::RolloutLost);
+                    file.next_at = self.clock.mono_ms.saturating_add(ROLLOUT_RETRY_MS);
+                }
+            }
+        }
+    }
+
     /// 只有确认本连接里没送过 raw 的线程才读会话文件；送过 raw 的、或登记满了能力未知的，一次都不读。
     fn file_allowed(&self, thread: &str) -> bool {
         self.raw_capability(thread) == RawCapability::NotSeen
@@ -510,12 +577,20 @@ impl Machine {
 
     /// 每步末尾：定案到期或有结果的等待、补发路径与读取、维护轮询计时。没有文件模式的操作时什么都不做。
     pub(crate) fn drive_rollout(&mut self, actions: &mut Vec<Action>) {
+        self.retire_coverage_reads(self.closing);
         if self.closing {
             self.rollout_stop(actions);
             return;
         }
         let state = &self.relations.aux.rollout;
-        if state.waits.is_empty() && state.files.is_empty() && state.timer.is_none() {
+        if state.waits.is_empty()
+            && state.files.is_empty()
+            && state.timer.is_none()
+            && !state
+                .coverage_reads
+                .values()
+                .any(|t| t.state == ReadTicketState::Active)
+        {
             return;
         }
         let epoch = self.relations.conn_epoch;
@@ -563,6 +638,15 @@ impl Machine {
             .waits
             .values()
             .map(|w| w.deadline_ms)
+            .chain(
+                self.relations
+                    .aux
+                    .rollout
+                    .coverage_reads
+                    .values()
+                    .filter(|t| t.state == ReadTicketState::Active)
+                    .map(|t| t.deadline),
+            )
             .min();
         // 不再需要的文件停止跟随：清掉游标（重新需要时从末尾重来），只留路径与失败结论。
         let state = &mut self.relations.aux.rollout;
@@ -635,17 +719,46 @@ impl Machine {
                         due = Some(due.map_or(f.next_at, |d| d.min(f.next_at)));
                         continue;
                     }
+                    if self.relations.aux.rollout.coverage_reads.len() >= MAX_COVERAGE_READS {
+                        continue;
+                    }
+                    let Some(id) = self.relations.aux.rollout.next_read_id.checked_add(1) else {
+                        continue;
+                    };
                     let request = RolloutReadRequest {
-                        id: 0,
+                        id,
                         thread: thread.clone(),
+                        conn_epoch: epoch,
+                        observation_gen: self.coverage_read_observation_gen(thread),
+                        issued_seq: 0,
                         path: path.clone(),
                         cursor: f.cursor.clone(),
                     };
-                    let id = self.relations.aux.rollout.next();
+                    let Some(issued_seq) = self.coverage_next_seq() else {
+                        continue;
+                    };
+                    let deadline = now.saturating_add(COVERAGE_READ_MS);
                     let state = &mut self.relations.aux.rollout;
+                    state.next_read_id = id;
+                    state.coverage_reads.insert(
+                        id,
+                        ReadTicket {
+                            id,
+                            thread: thread.clone(),
+                            conn_epoch: epoch,
+                            observation_gen: request.observation_gen,
+                            issued_seq,
+                            deadline,
+                            state: ReadTicketState::Active,
+                        },
+                    );
+                    due = Some(due.map_or(deadline, |d| d.min(deadline)));
                     state.reads_issued = state.reads_issued.saturating_add(1);
                     state.files.get_mut(thread).expect("文件登记存在").reading = Some(id);
-                    actions.push(Action::ReadRollout(RolloutReadRequest { id, ..request }));
+                    actions.push(Action::ReadRollout(RolloutReadRequest {
+                        issued_seq,
+                        ..request
+                    }));
                 }
                 Some(RolloutPathState::Requested(_) | RolloutPathState::Failed(_)) => {}
             }
@@ -704,6 +817,7 @@ impl Machine {
     }
 
     fn rollout_stop(&mut self, actions: &mut Vec<Action>) {
+        self.retire_coverage_reads(true);
         let state = &mut self.relations.aux.rollout;
         state.waits.clear();
         state.files.clear();
@@ -764,11 +878,59 @@ impl Machine {
         &mut self,
         id: u64,
         thread: &str,
+        identity: (u64, u64, u64),
         result: Result<RolloutChunk, RolloutError>,
         actions: &mut Vec<Action>,
     ) {
         let now = self.clock.mono_ms;
         let epoch = self.relations.conn_epoch;
+        let (conn_epoch, observation_gen, issued_seq) = identity;
+        // 身份只认派读时冻结的票据，绝不以当前 file.reading 补造身份。
+        let Some(ticket) = self.relations.aux.rollout.coverage_reads.get(&id) else {
+            self.observation_gap(None, "未知会话文件读取票据");
+            return;
+        };
+        if ticket.thread != thread
+            || ticket.conn_epoch != conn_epoch
+            || ticket.observation_gen != observation_gen
+            || ticket.issued_seq != issued_seq
+        {
+            self.observation_gap(None, "会话文件读取票据身份冲突");
+            return;
+        }
+        self.retire_coverage_reads(false);
+        let ticket = self
+            .relations
+            .aux
+            .rollout
+            .coverage_reads
+            .remove(&id)
+            .expect("已核验票据");
+        if ticket.state == ReadTicketState::Retired {
+            return;
+        }
+        // 所有文件反证先于 files、reading、needed、raw、floor 及消费去重过滤。
+        match &result {
+            Ok(chunk) => {
+                if chunk.bad_lines > 0 || chunk.skipped_lines > 0 || chunk.cursor.skipping {
+                    self.observation_gap(Some(thread), "会话文件含无法解释或跳过的记录");
+                }
+                for entry in &chunk.entries {
+                    if let RolloutRecord::Message { turn, .. } = &entry.record {
+                        self.coverage_veto(
+                            Some(thread),
+                            turn.as_deref(),
+                            "文件来源消费不能证明实时覆盖",
+                            true,
+                        );
+                        if turn.is_none() {
+                            self.observation_gap(Some(thread), "文件消费没有可靠轮锚点");
+                        }
+                    }
+                }
+            }
+            Err(_) => self.observation_gap(Some(thread), "会话文件读取失败"),
+        }
         let Some(file) = self.relations.aux.rollout.files.get_mut(thread) else {
             return;
         };
