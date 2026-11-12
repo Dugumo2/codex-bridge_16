@@ -105,6 +105,53 @@ fn 未归属轮_跟进轮后自开一轮_结束通知丢失由发现回读补上
     unbound_turn_released(Shape::AfterFollowup, true);
 }
 
+/// 被消息唤醒的那一轮的轮号。消费方向按轮号里的开始时间登记，要用上游的格式（UUIDv7），开始时间晚于 core 启动。
+const MESSAGE_TURN: &str = "ffffffff-ffff-7000-8000-000000000001";
+
+/// 子代理 C 的一轮由消费的消息唤醒、没有本运行的操作归属。经真实通知入口（raw 消费记录、条目通知）走到摘要暂存到期，
+/// 返回到期那一步之前的全部动作。
+fn consumed_turn_expired(author: &str) -> Vec<Action> {
+    const U: &str = MESSAGE_TURN;
+    let (mut m, mut mock) = base();
+    let mut all = complete(&mut m, &mut mock, C, "旧轮", "completed");
+    let actions = apply(&mut m, mock.turn_started(C, U));
+    all.extend(replies(&mut m, &mock, actions));
+    let text = format!(
+        "Message Type: MESSAGE\nTask name: /root/{C}\nSender: {author}\nPayload:\n请帮忙核对"
+    );
+    let actions = notify(
+        &mut m,
+        "rawResponseItem/completed",
+        json!({"threadId":C,"turnId":U,"item":{
+        "type":"agent_message","id":"amsg-1","author":author,"recipient":format!("/root/{C}"),
+        "content":[{"type":"input_text","text":text}]}}),
+    );
+    all.extend(replies(&mut m, &mock, actions));
+    let item = |id: &str| json!({"threadId":C,"turnId":U,"item":{"id":id,"type":"agentMessage","text":"处理中"}});
+    let actions = notify(&mut m, "item/completed", item("条目一"));
+    all.extend(replies(&mut m, &mock, actions));
+    assert!(m.binding(C, U).is_none(), "前置：U 没有本运行的操作归属");
+    // 下一条摘要到达时先处理已到期的暂存（与计时器到期走同一出口）。
+    m.clock.mono_ms += 31_000;
+    m.clock.now_ms += 31_000;
+    let actions = notify(&mut m, "item/completed", item("条目二"));
+    all.extend(replies(&mut m, &mock, actions));
+    all
+}
+
+/// 兄弟子代理之间互发：这一轮只消费了平级发来的协作消息，本来就不归本运行管，暂存到期正常丢弃，不留「记录缺口」。
+/// 对照：同样没有归属证据、消费的却是直接上级（根）的消息，照常留缺口。
+#[test]
+fn 记录缺口_只被平级消息唤醒的轮到期不告警_上级消息照常告警() {
+    assert_no_alarm(&consumed_turn_expired("/root/兄弟"));
+    let control = consumed_turn_expired("/root");
+    let gap = control.iter().any(|a| {
+        matches!(a, Action::Store(crate::store::StoreOp::AppendLog { lines, .. })
+            if lines.iter().any(|l| l.contains("beforeBindingUnknown") && l.contains(MESSAGE_TURN)))
+    });
+    assert!(gap, "对照：上级消息唤醒却无归属证据，必须留缺口");
+}
+
 /// 迟到归属的完整往返：文件严格跟进在等消费记录时，子代理开出承载轮 U，记录还没读到，U 暂时未归属；
 /// U 结束后移出账本，这期间跟进的等待和占位仍阻塞收尾。记录读到后 U 归属这次跟进，
 /// 按归属轮重建、核实并带上结果引用，汇总读取包含 U。
@@ -131,6 +178,7 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
     turn_marker(C, U, m.clock.now_ms);
     message_line(&m, C, "入站", "NEW_TASK", "新工作");
     fx::with(|f| f.hold = true);
+    let started_at = m.clock.mono_ms;
     let actions = apply(&mut m, mock.turn_started(C, U));
     all.extend(replies(&mut m, &mock, actions));
     all.extend(fx::poll(&mut m));
@@ -162,9 +210,40 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
     );
 
     // 消费记录读到：U 归属这次跟进，按归属轮重建。
+    assert!(
+        m.clock.mono_ms >= started_at + 30_000,
+        "前置：归属确认晚于 30 秒摘要暂存期限"
+    );
     all.extend(fx::release_held(&mut m));
     all.extend(poll_for(&mut m, &mock, ROLLOUT_POLL_MS));
     pending(&m, 0);
+    // 续期的摘要在归属确认后按到达顺序补写，各写一次。
+    let late: Vec<String> = all
+        .iter()
+        .flat_map(|a| match a {
+            Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) => lines.clone(),
+            _ => vec![],
+        })
+        .filter(|l| l.contains(U) && l.contains("\"late\":true"))
+        .map(|l| l.split(' ').nth(2).unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        late.first().map(String::as_str),
+        Some("轮次开始"),
+        "补写从 U 的开始摘要起：{late:?}"
+    );
+    assert_eq!(
+        late.last().map(String::as_str),
+        Some("轮次完成"),
+        "补写到 U 的完成摘要止：{late:?}"
+    );
+    for kind in ["轮次开始", "轮次完成"] {
+        assert_eq!(
+            late.iter().filter(|k| k.as_str() == kind).count(),
+            1,
+            "{kind} 不重复补写：{late:?}"
+        );
+    }
     assert_eq!(op(&m, "跟进").proven_turns[C], [U.to_owned()].into());
     assert!(
         m.binding(C, U)
@@ -203,13 +282,6 @@ fn 未归属轮_结束移出后消费记录迟到补上归属_重建并进入汇
     all.extend(replies(&mut m, &mock, actions));
     assert_eq!(m.runs.runs[R].state, RunState::Ended);
     assert_eq!(m.runs.runs[R].status, Some(RunStatus::Completed));
-    // 已知既有行为（待定项「记录缺口」）：归属确认晚于摘要暂存期限（30 秒）时，U 的暂存摘要过期并记一条缺口。
-    // 只放过这一类，其他告警照常拦截；处理该项后删去这段过滤。
-    let mut rest = all;
-    for action in &mut rest {
-        if let Action::Store(crate::store::StoreOp::AppendLog { lines, .. }) = action {
-            lines.retain(|line| !(line.contains("beforeBindingUnknown") && line.contains(U)));
-        }
-    }
-    assert_no_alarm(&rest);
+    // 归属确认晚于摘要暂存期限（30 秒）：跟进证据还在等消费记录，暂存续期，补上归属后补写，不留缺口。
+    assert_no_alarm(&all);
 }

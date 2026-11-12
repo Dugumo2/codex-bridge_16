@@ -161,6 +161,8 @@ pub struct Core {
     last_activity: Instant,
     /// 单调时钟的起点，`Clock.mono_ms` 从这里起算。
     started: Instant,
+    /// 创建时的墙钟毫秒，`Clock.started_ms` 原样取它。
+    started_wall_ms: u64,
     phase: Phase,
 }
 
@@ -212,6 +214,10 @@ impl Core {
             next_tag: 0,
             last_activity: Instant::now(),
             started: Instant::now(),
+            started_wall_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
             phase: Phase::Running,
         }
     }

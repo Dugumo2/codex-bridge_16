@@ -453,8 +453,10 @@ impl Machine {
             message: delivery.message,
             trigger: delivery.trigger,
         };
+        let (author, recipient) = (fact.author.clone(), fact.recipient.clone());
         aux.v2_index.add_delivery(&fact);
         aux.v2_deliveries.push_back(fact);
+        self.note_event_log_delivery(thread, turn, &author, &recipient);
         self.retry_v2_pairing(thread, actions);
         true
     }

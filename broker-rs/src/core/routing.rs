@@ -24,6 +24,7 @@ impl Core {
             now_ms,
             entropy: RandomState::new().hash_one((now_ms, self.next_tag)),
             mono_ms: self.started.elapsed().as_millis() as u64,
+            started_ms: self.started_wall_ms,
         };
         #[cfg(test)]
         if let Some(clock) = &self.fixed_clock {
