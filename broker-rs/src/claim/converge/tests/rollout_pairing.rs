@@ -1850,12 +1850,6 @@ fn gap_b_red_raw使线程停止文件跟随后在途文件消费和坏行仍否�
         (false, "替换reading"),
         (false, "floor过滤"),
         (false, "重复id"),
-        (true, "嵌套推理"),
-        (true, "嵌套工具输出"),
-        (true, "嵌套本地命令"),
-        (true, "嵌套命令终态"),
-        (true, "嵌套补丁终态"),
-        (true, "嵌套补丁空映射"),
     ] {
         // 覆盖资格测试使用真实规范轮号，避免旧配对夹具的“旧轮”消费本身先触发身份否决。
         let (mut m, mut mock) = setup();
@@ -1938,41 +1932,7 @@ fn gap_b_red_raw使线程停止文件跟随后在途文件消费和坏行仍否�
             m.clock.now_ms
         };
         if malformed {
-            let nested = match registration {
-                "嵌套推理" => {
-                    Some(("response_item", json!({"type":"reasoning","summary":[7]})))
-                }
-                "嵌套工具输出" => Some((
-                    "response_item",
-                    json!({"type":"function_call_output","output":[{"type":"future_input"}]}),
-                )),
-                "嵌套本地命令" => Some((
-                    "response_item",
-                    json!({"type":"local_shell_call","status":"completed","action":{}}),
-                )),
-                "嵌套命令终态" => Some((
-                    "event_msg",
-                    json!({"type":"exec_command_end","call_id":"c",
-                    "turn_id":GAP_B_FILE_TURN,"command":["echo"],"cwd":"D:\\w","parsed_cmd":[],
-                    "stdout":"","stderr":"","exit_code":0,"formatted_output":"","duration":{"secs":0,"nanos":1},"status":"future"}),
-                )),
-                "嵌套补丁终态" => Some((
-                    "event_msg",
-                    json!({"type":"patch_apply_end","call_id":"c",
-                    "stdout":"","stderr":"","success":true,"status":"future"}),
-                )),
-                "嵌套补丁空映射" => Some((
-                    "event_msg",
-                    json!({"type":"patch_apply_end","call_id":"c",
-                    "stdout":"","stderr":"","success":true,"status":"completed","changes":null}),
-                )),
-                _ => None,
-            };
-            if let Some((kind, item)) = nested {
-                fx::append_line(C, file_wall, kind, item);
-            } else {
-                fx::append_raw(C, "这不是JSON\n");
-            }
+            fx::append_raw(C, "这不是JSON\n");
         } else {
             fx::append_line(
                 C,
@@ -1985,12 +1945,6 @@ fn gap_b_red_raw使线程停止文件跟随后在途文件消费和坏行仍否�
         let actual = crate::rollout::read_chunk(&request.path, request.cursor.as_ref()).unwrap();
         if malformed {
             assert!(actual.bad_lines > 0, "前置：真实读取器产出坏行信号");
-            if registration.starts_with("嵌套") {
-                assert!(
-                    actual.entries.is_empty(),
-                    "只有嵌套坏结构，不借Message文件消费触发否决"
-                );
-            }
         } else {
             assert!(
                 actual.entries.iter().any(|e| matches!(&e.record,

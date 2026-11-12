@@ -69,13 +69,8 @@ fn completion_fingerprint(value: &Value) -> Option<[u8; 32]> {
     if !matches!(status, "completed" | "failed" | "interrupted") {
         return None;
     }
-    let error = value.get("error").unwrap_or(&Value::Null);
-    if !error.is_null() && !error.is_object() {
-        return None;
-    }
-    Some(stable_fingerprint(
-        &serde_json::json!({"status":status,"error":error}),
-    ))
+    // 完成事实只取终态；错误正文和新增展示字段不改变这一轮是否已经结束。
+    Some(stable_fingerprint(&serde_json::json!({"status":status})))
 }
 
 fn key(thread: &str, turn: &str) -> Option<(u64, String, String)> {

@@ -249,10 +249,13 @@ impl Shared {
                 && (value.get("result").is_some() || value.get("error").is_some()));
         if malformed {
             tracing::warn!("app-server 入站消息形状不正确，报告观察缺口");
-            self.state
-                .lock()
-                .unwrap()
-                .observation_gap("app-server 入站消息形状不正确");
+            // 已能确定为 RPC 回包时，不把无关回包的坏字段升级为消费观察缺口。
+            if !value.is_object() || value.get("method").is_some() || value.get("id").is_none() {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .observation_gap("app-server 入站消息形状不正确");
+            }
             return;
         }
         let incoming = Incoming::classify(value);
@@ -277,13 +280,11 @@ impl Shared {
                         }),
                         _ => {
                             tracing::warn!("app-server 错误回包形状不正确，跳过");
-                            state.observation_gap("app-server 错误回包形状不正确");
                             return;
                         }
                     }
                 } else {
                     tracing::warn!("app-server 回包缺少 result 和 error，跳过");
-                    state.observation_gap("app-server 回包缺少 result 和 error");
                     return;
                 };
                 // 请求表保持数字 id 的精确类型；仅服务端请求使用 String(id) 去重。

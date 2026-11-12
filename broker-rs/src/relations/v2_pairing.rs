@@ -145,6 +145,7 @@ pub(super) fn parse_call(item: &Value) -> Option<ParsedCall> {
 
 /// 子代理收到的一条消息：只留身份、类型与内容摘要。
 pub(super) struct ParsedDelivery {
+    /// 去重只比较消费事实，不把新增展示或宿主字段当作冲突消费。
     pub raw: Value,
     pub id: String,
     pub author: String,
@@ -187,7 +188,7 @@ pub(super) fn parse_delivery(item: &Value) -> Option<ParsedDelivery> {
         return None;
     }
     Some(ParsedDelivery {
-        raw: item.clone(),
+        raw: serde_json::json!({"author":author,"recipient":recipient,"trigger":trigger,"message":message}),
         id: id.into(),
         author: author.into(),
         recipient: recipient.into(),

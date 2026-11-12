@@ -91,6 +91,9 @@ async fn 方案b_rpc合法无关回包不产生观察缺口() {
     for text in [
         r#"{"id":999,"result":null}"#,
         r#"{"id":999,"error":{"code":-32601,"message":"unknown"}}"#,
+        r#"{"id":999,"error":{"message":7}}"#,
+        r#"{"id":999}"#,
+        r#"{"id":{},"result":null}"#,
         r#"{"method":"turn/completed"}"#,
     ] {
         input.send(text.into()).unwrap();

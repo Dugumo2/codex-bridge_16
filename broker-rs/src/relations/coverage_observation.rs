@@ -1,5 +1,4 @@
 //! 连续观察凭据：真实开始只使用先验 raw，任何断档在本进程内不可恢复。
-pub(crate) mod validation;
 use super::*;
 use crate::runs::event_log::StartProof;
 
@@ -335,10 +334,7 @@ impl Machine {
                     if !matches!(
                         completed.get("status").and_then(Value::as_str),
                         Some("completed" | "failed" | "interrupted")
-                    ) || completed
-                        .get("error")
-                        .is_some_and(|error| !error.is_null() && !error.is_object())
-                    {
+                    ) {
                         self.observation_gap(Some(thread), "无法解释的完成终态");
                     }
                     if self.coverage_complete(thread, turn, completed, seq, valid) {
@@ -354,21 +350,21 @@ impl Machine {
                     }
                 }
             }
-            "rawResponse/completed" => {
-                if thread.is_none() || turn.is_none() {
-                    self.observation_gap(thread, "raw响应缺少有效身份");
-                }
-            }
+            // 这是响应级用量/展示通知，不是轮完成或消费记录。
+            "rawResponse/completed" => {}
             "rawResponseItem/completed" => {
                 let item = params.and_then(|p| p.get("item"));
-                if thread.is_none() || turn.is_none() || !item.is_some_and(explained_raw_item) {
-                    self.observation_gap(thread, "raw条目无法解释");
+                let consumption = item.is_some_and(|i| i["type"] == "agent_message");
+                if !item.is_some_and(explained_raw_item)
+                    || (consumption && (thread.is_none() || turn.is_none()))
+                {
+                    self.observation_gap(thread, "raw消费或记录类型无法解释");
                 }
             }
             "item/started" | "item/completed" => {
                 let item = params.and_then(|p| p.get("item"));
-                if thread.is_none() || turn.is_none() || !item.is_some_and(explained_thread_item) {
-                    self.observation_gap(thread, "轮条目无法解释");
+                if !item.is_some_and(explained_thread_item) {
+                    self.observation_gap(thread, "条目可能包含未观察的输入");
                 }
             }
             "thread/started" => {
@@ -389,20 +385,7 @@ impl Machine {
                     (Some(thread), Some("notLoaded")) => {
                         self.observation_continuity_lost(thread, "线程卸载")
                     }
-                    (Some(_), Some("idle" | "systemError")) => {}
-                    (Some(_), Some("active"))
-                        if params
-                            .and_then(|p| p.get("status"))
-                            .and_then(|status| status.get("activeFlags"))
-                            .and_then(Value::as_array)
-                            .is_some_and(|flags| {
-                                flags.iter().all(|flag| {
-                                    matches!(
-                                        flag.as_str(),
-                                        Some("waitingOnApproval" | "waitingOnUserInput")
-                                    )
-                                })
-                            }) => {}
+                    (Some(_), Some("active" | "idle" | "systemError")) => {}
                     _ => self.observation_gap(thread, "线程状态无法解释"),
                 }
             }
@@ -425,265 +408,60 @@ impl Machine {
     }
 }
 
-fn string_array(value: &Value) -> bool {
-    value
-        .as_array()
-        .is_some_and(|items| items.iter().all(Value::is_string))
-}
-
-fn optional_text(item: &Value, field: &str) -> bool {
-    item.get(field)
-        .is_none_or(|value| value.is_null() || value.is_string())
-}
-
-fn raw_content(value: &Value) -> bool {
-    value.as_array().is_some_and(|parts| {
-        parts
-            .iter()
-            .all(|part| match part.get("type").and_then(Value::as_str) {
-                Some("input_text" | "output_text") => {
-                    part.get("text").is_some_and(Value::is_string)
-                }
-                Some("input_image") => {
-                    part.get("image_url").is_some_and(Value::is_string)
-                        || part.get("file_id").is_some_and(Value::is_string)
-                }
-                Some("input_audio") => part.get("audio_url").is_some_and(Value::is_string),
-                _ => false,
-            })
-    })
-}
-
-fn output_body(value: Option<&Value>) -> bool {
-    // 工具结果有独立的内容枚举，不能把加密结果误当未知输入，也不接纳 output_text。
-    value.is_some_and(|value| {
-        value.is_string()
-            || value.as_array().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .all(|part| match part.get("type").and_then(Value::as_str) {
-                        Some("input_text") => part.get("text").is_some_and(Value::is_string),
-                        Some("input_image") => {
-                            part.get("image_url").is_some_and(Value::is_string)
-                                || part.get("file_id").is_some_and(Value::is_string)
-                        }
-                        Some("input_audio") => part.get("audio_url").is_some_and(Value::is_string),
-                        Some("encrypted_content") => {
-                            part.get("encrypted_content").is_some_and(Value::is_string)
-                        }
-                        _ => false,
-                    })
-            })
-    })
-}
-
-/// 公开条目使用驼峰动作名，raw 使用下划线动作名；参数的可选性按上游枚举处理。
-fn explained_search_action(action: &Value, camel_case: bool) -> bool {
-    match action.get("type").and_then(Value::as_str) {
-        Some("search") => {
-            optional_text(action, "query")
-                && action
-                    .get("queries")
-                    .is_none_or(|queries| queries.is_null() || string_array(queries))
-        }
-        Some(kind) if kind == if camel_case { "openPage" } else { "open_page" } => {
-            optional_text(action, "url")
-        }
-        Some(kind)
-            if kind
-                == if camel_case {
-                    "findInPage"
-                } else {
-                    "find_in_page"
-                } =>
-        {
-            optional_text(action, "url") && optional_text(action, "pattern")
-        }
-        Some("other") => true,
-        _ => false,
-    }
-}
-
+/// 只判断是否可能漏掉消费；已确认的输出类型不检查正文、展示字段或内部枚举。
 fn explained_raw_item(item: &Value) -> bool {
-    if !validation::response_optional_fields(item) {
-        return false;
-    }
     match item.get("type").and_then(Value::as_str) {
         Some("agent_message") => v2_pairing::parse_delivery(item).is_some(),
-        Some("reasoning") => {
-            item.get("summary")
-                .and_then(Value::as_array)
-                .is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .all(|part| part["type"] == "summary_text" && part["text"].is_string())
-                })
-                && item.get("content").is_none_or(|value| {
-                    value.is_null()
-                        || value.as_array().is_some_and(|parts| {
-                            parts.iter().all(|part| {
-                                matches!(part["type"].as_str(), Some("reasoning_text" | "text"))
-                                    && part["text"].is_string()
-                            })
-                        })
-                })
-                && optional_text(item, "encrypted_content")
-        }
-        Some("function_call") => {
-            identity(item.get("call_id")).is_some()
-                && identity(item.get("name")).is_some()
-                && item.get("arguments").is_some_and(Value::is_string)
-        }
-        Some("function_call_output") => {
-            optional_text(item, "call_id") && output_body(item.get("output"))
-        }
-        Some("message") => {
-            matches!(item.get("role").and_then(Value::as_str), Some("assistant"))
-                && item.get("content").is_some_and(raw_content)
-        }
-        Some("custom_tool_call") => {
-            identity(item.get("call_id")).is_some()
-                && identity(item.get("name")).is_some()
-                && item.get("input").is_some_and(Value::is_string)
-        }
-        Some("custom_tool_call_output") => {
-            identity(item.get("call_id")).is_some() && output_body(item.get("output"))
-        }
-        Some("tool_search_call") => {
-            item.get("execution").is_some_and(Value::is_string)
-                && item.get("arguments").is_some()
-                && optional_text(item, "call_id")
-                && optional_text(item, "status")
-        }
-        Some("tool_search_output") => {
-            item.get("execution").is_some_and(Value::is_string)
-                && item.get("status").is_some_and(Value::is_string)
-                && item.get("tools").is_some_and(Value::is_array)
-                && optional_text(item, "call_id")
-        }
-        Some("web_search_call") => {
-            optional_text(item, "status")
-                && item
-                    .get("action")
-                    .is_none_or(|action| action.is_null() || explained_search_action(action, false))
-        }
-        Some("local_shell_call") => {
-            matches!(
-                item["status"].as_str(),
-                Some("in_progress" | "completed" | "incomplete")
-            ) && item["action"]["type"] == "exec"
-                && string_array(&item["action"]["command"])
-        }
-        Some("image_generation_call") => {
-            item.get("status").is_some_and(Value::is_string)
-                && item.get("result").is_some_and(Value::is_string)
-        }
-        Some("compaction" | "compaction_summary") => {
-            item.get("encrypted_content").is_some_and(Value::is_string)
-        }
-        Some("context_compaction") => optional_text(item, "encrypted_content"),
-        Some("compaction_trigger") => true,
-        // 用户、hook、附加工具及配置输入不属于已确认无关输出；保守处理。
+        // 输入仍是非协作反证；输出内容的格式不影响代理间消息的覆盖。
+        Some("message") => item.get("role").and_then(Value::as_str) == Some("assistant"),
+        Some(
+            "reasoning"
+            | "function_call"
+            | "function_call_output"
+            | "custom_tool_call"
+            | "custom_tool_call_output"
+            | "tool_search_call"
+            | "tool_search_output"
+            | "web_search_call"
+            | "local_shell_call"
+            | "image_generation_call"
+            | "additional_tools"
+            | "configuration_update"
+            | "compaction"
+            | "compaction_summary"
+            | "context_compaction"
+            | "compaction_trigger",
+        ) => true,
+        // 未知记录类型可能是新的消费记录，不能按已知输出放行。
         _ => false,
     }
 }
 
 fn explained_thread_item(item: &Value) -> bool {
-    if !validation::public_optional_fields(item) {
-        return false;
-    }
-    if identity(item.get("id")).is_none() {
-        return false;
-    }
-    let text = |key| item.get(key).is_some_and(Value::is_string);
-    let status = || {
-        matches!(
-            item["status"].as_str(),
-            Some("inProgress" | "completed" | "failed" | "declined")
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(
+            "agentMessage"
+                | "plan"
+                | "reasoning"
+                | "functionCallOutput"
+                | "commandExecution"
+                | "fileChange"
+                | "mcpToolCall"
+                | "dynamicToolCall"
+                | "collabAgentToolCall"
+                | "subAgentActivity"
+                | "imageView"
+                | "enteredReviewMode"
+                | "exitedReviewMode"
+                | "contextCompaction"
+                | "webSearch"
+                | "imageGeneration"
+                | "sleep"
         )
-    };
-    match item.get("type").and_then(Value::as_str) {
-        Some("agentMessage" | "plan") => text("text"),
-        Some("reasoning") => {
-            item.get("summary").is_none_or(string_array)
-                && item.get("content").is_none_or(string_array)
-        }
-        Some("functionCallOutput") => text("name") && output_body(item.get("output")),
-        Some("commandExecution") => {
-            text("command")
-                && text("cwd")
-                && status()
-                && item
-                    .get("commandActions")
-                    .is_some_and(validation::command_actions)
-        }
-        Some("fileChange") => status() && item.get("changes").is_some_and(validation::file_changes),
-        Some("mcpToolCall") => {
-            text("server")
-                && text("tool")
-                && matches!(
-                    item["status"].as_str(),
-                    Some("inProgress" | "completed" | "failed")
-                )
-                && item.get("arguments").is_some()
-        }
-        Some("dynamicToolCall") => {
-            text("tool")
-                && matches!(
-                    item["status"].as_str(),
-                    Some("inProgress" | "completed" | "failed")
-                )
-                && item.get("arguments").is_some()
-        }
-        Some("collabAgentToolCall") => {
-            matches!(
-                item["tool"].as_str(),
-                Some(
-                    "spawnAgent"
-                        | "sendInput"
-                        | "resumeAgent"
-                        | "wait"
-                        | "closeAgent"
-                        | "sendMessage"
-                        | "followupTask"
-                        | "interruptAgent"
-                        | "listAgents"
-                )
-            ) && matches!(
-                item["status"].as_str(),
-                Some("inProgress" | "completed" | "failed" | "interrupted")
-            ) && identity(item.get("senderThreadId")).is_some()
-                && item.get("receiverThreadIds").is_some_and(string_array)
-                && item
-                    .get("agentsStates")
-                    .is_some_and(validation::agent_states)
-        }
-        Some("subAgentActivity") => {
-            matches!(
-                item["kind"].as_str(),
-                Some("started" | "interacted" | "interrupted" | "completed")
-            ) && identity(item.get("agentThreadId")).is_some()
-                && identity(item.get("agentPath")).is_some()
-        }
-        Some("imageView") => text("path"),
-        Some("enteredReviewMode" | "exitedReviewMode") => text("review"),
-        Some("contextCompaction") => true,
-        Some("webSearch") => {
-            text("query")
-                && item
-                    .get("action")
-                    .is_none_or(|action| action.is_null() || explained_search_action(action, true))
-                && item
-                    .get("results")
-                    .is_none_or(|results| results.is_null() || results.is_array())
-        }
-        Some("sleep") => item.get("durationMs").is_some_and(Value::is_u64),
-        Some("imageGeneration") => {
-            text("status") && text("result") && optional_text(item, "revisedPrompt")
-        }
-        _ => false,
-    }
+    )
 }
+
 fn irrelevant_notification(method: &str) -> bool {
     matches!(
         method,
